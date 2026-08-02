@@ -1,0 +1,6 @@
+[tools]
+# xmake is intentionally not managed here — it is a system tool installed
+# on the host and not a version-pinned dev dependency.
+python = "3.13"
+
+"aqua:astral-sh/uv" = "latest"

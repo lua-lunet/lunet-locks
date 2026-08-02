@@ -1,0 +1,8 @@
+#!/usr/bin/env luajit
+-- Ad-hoc harness entrypoint. Thin bootstrap only: resolve the repo root, put
+-- scripts/lib and the project rock tree on package.path, enable the Teal
+-- loader, then hand off to typed Teal. See CONVENTIONS.md ("Scripts").
+local root = arg[0]:match("^(.*)/scripts/[^/]+$") or "."
+package.path = root .. "/scripts/lib/?.lua;" .. root .. "/.rocks/share/lua/5.1/?.lua;" .. package.path
+require("tl").loader()
+os.exit(require("nginx_counter")(root))

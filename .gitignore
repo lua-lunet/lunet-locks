@@ -1,0 +1,11 @@
+.DS_Store
+.env
+.tmp/
+.rocks/
+bin/
+build/
+docs/site/
+target/
+# Native crates are internal FFI components, not independent library releases yet.
+# Revisit this when packaging the project's own binary or a native library release.
+ext/*/Cargo.lock

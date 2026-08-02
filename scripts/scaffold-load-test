@@ -1,0 +1,7 @@
+#!/usr/bin/env luajit
+-- Thin bootstrap: resolve repo root, add scripts/lib and .rocks to
+-- package.path, enable tl.loader, then hand off to typed Teal.
+local root = arg[0]:match("^(.*)/scripts/[^/]+$") or "."
+package.path = root .. "/scripts/lib/?.lua;" .. root .. "/.rocks/share/lua/5.1/?.lua;" .. package.path
+require("tl").loader()
+os.exit(require("scaffold_harness")(root))
