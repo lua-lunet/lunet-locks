@@ -1,7 +1,5 @@
 use crate::locks::Service;
-use crate::vrr::{
-    Body, Header, Input, LogEntry, Message, NoJournal, Output, Replica, MAX_DATAGRAM,
-};
+use crate::vrr::{Body, Header, Input, LogEntry, Message, Output, Replica, MAX_DATAGRAM};
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -51,13 +49,10 @@ impl Node {
                         .service
                         .execute(message_id, client_id, request_num, execution_time, &payload)
                         .map_err(|_| SERVICE)?;
-                    let next = self.replica.step(
-                        &mut NoJournal,
-                        Input::Complete {
-                            slot,
-                            result: bytes,
-                        },
-                    );
+                    let next = self.replica.step(Input::Complete {
+                        slot,
+                        result: bytes,
+                    });
                     if self.replica.executed() != slot {
                         return Err(SERVICE);
                     }
@@ -106,7 +101,7 @@ impl Node {
             }
         }
         match catch_unwind(AssertUnwindSafe(|| {
-            let outputs = self.replica.step(&mut NoJournal, input);
+            let outputs = self.replica.step(input);
             self.run(outputs)
         })) {
             Ok(Ok(())) => OK,

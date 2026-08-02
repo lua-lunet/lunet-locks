@@ -27,8 +27,7 @@ the behavior currently exercised by tests.
 
 The current core does not implement state transfer, checkpoints, reconfiguration (including the
 paper's configuration generation, called its reconfiguration epoch-number), witnesses, batching,
-or network encryption. Peer messages are bounded to one UDP datagram so a later lunet UDP transport
-can encrypt and send each message without fragmentation at the application layer.
+or network encryption.
 
 ## Commands
 

@@ -6,39 +6,11 @@
 
 """Build the docs site with Zensical.
 
-First run creates docs/zensical.toml + docs/src/ via a temp project;
-subsequent runs just rebuild docs/site/.
 """
 
-import shutil
 import subprocess
-import tempfile
 from pathlib import Path
 
 doc_dir = Path(__file__).resolve().parent
-
-if not (doc_dir / "src").is_dir():
-    with tempfile.TemporaryDirectory() as tmpdir:
-        subprocess.run(["zensical", "new", "tmp"], cwd=tmpdir, check=True)
-        project = Path(tmpdir) / "tmp"
-        shutil.copy2(project / "zensical.toml", doc_dir / "zensical.toml")
-        shutil.copytree(project / "docs", doc_dir / "src")
-
-    toml_path = doc_dir / "zensical.toml"
-    config = toml_path.read_text()
-    config = config.replace(
-        'site_name = "Documentation"',
-        'site_name = "lunet-advisory-lock"',
-    )
-    config = config.replace(
-        'site_description = "A new project generated from the default template project."',
-        'site_description = "Advisory lock service using Viewstamped Replication on the lunet runtime."',
-    )
-    if "\ndocs_dir " not in config:
-        config = config.replace(
-            "[project]",
-            '[project]\ndocs_dir = "src"',
-        )
-    toml_path.write_text(config)
 
 subprocess.run(["zensical", "build"], cwd=doc_dir, check=True)

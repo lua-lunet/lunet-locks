@@ -1,8 +1,7 @@
 # Internal VRR Protocol
 
 Replica messages are binary strings at the Teal boundary. Each message is one fixed header followed
-by a serde JSON body. The body can later change to a compact codec without changing the header or
-the client protocol.
+by a serde JSON body.
 
 ## Membership and leadership
 
@@ -189,7 +188,3 @@ it become `normal`.
 Inbound and outbound peer messages are limited to 65,507 bytes, the maximum UDP payload. The leader
 computes the exact encoded `PREPARE` size before mutating its log, so an oversized request cannot
 consume a slot that backups never receive.
-
-The current complete-log form sends logs during epoch change and recovery. Compact state transfer
-and checkpoints may replace that encoding only if they reconstruct exactly one authoritative log
-and its committed prefix before activation.

@@ -2,10 +2,8 @@
 .env
 .tmp/
 .rocks/
-bin/
 build/
 docs/site/
 target/
-# Native crates are internal FFI components, not independent library releases yet.
-# Revisit this when packaging the project's own binary or a native library release.
+# Native crates are internal FFI components, not independent releases.
 ext/*/Cargo.lock

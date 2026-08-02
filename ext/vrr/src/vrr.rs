@@ -200,19 +200,6 @@ pub enum Status {
     Recovering,
 }
 
-pub trait Journal {
-    fn append(&mut self, entry: &LogEntry);
-    fn replace(&mut self, log: &[LogEntry]);
-    fn flush(&mut self, epoch: Epoch, commit: Slot);
-}
-
-pub struct NoJournal;
-impl Journal for NoJournal {
-    fn append(&mut self, _: &LogEntry) {}
-    fn replace(&mut self, _: &[LogEntry]) {}
-    fn flush(&mut self, _: Epoch, _: Slot) {}
-}
-
 #[derive(Clone)]
 struct ClientEntry {
     request_num: u64,
@@ -357,7 +344,7 @@ impl Replica {
         }
     }
 
-    pub fn step(&mut self, journal: &mut impl Journal, input: Input) -> Vec<Output> {
+    pub fn step(&mut self, input: Input) -> Vec<Output> {
         match input {
             Input::Request {
                 client_id,
@@ -365,15 +352,8 @@ impl Replica {
                 message_id,
                 execution_time,
                 payload,
-            } => self.request(
-                journal,
-                client_id,
-                request_num,
-                message_id,
-                execution_time,
-                payload,
-            ),
-            Input::Message { from, message } => self.receive(journal, from, message),
+            } => self.request(client_id, request_num, message_id, execution_time, payload),
+            Input::Message { from, message } => self.receive(from, message),
             Input::Idle if self.status == Status::Normal && self.is_leader() => {
                 vec![Output::Broadcast(
                     self.message(self.commit_slot, Body::Commit),
@@ -382,8 +362,8 @@ impl Replica {
             Input::LeaderTimeout if self.status != Status::Recovering => self
                 .epoch
                 .checked_add(1)
-                .map_or_else(Vec::new, |epoch| self.enter_change(journal, epoch)),
-            Input::Complete { slot, result } => self.complete(journal, slot, result),
+                .map_or_else(Vec::new, |epoch| self.enter_change(epoch)),
+            Input::Complete { slot, result } => self.complete(slot, result),
             Input::Recover { nonce } => {
                 self.status = Status::Recovering;
                 self.recovery_nonce = Some(nonce);
@@ -398,7 +378,6 @@ impl Replica {
 
     fn request(
         &mut self,
-        journal: &mut impl Journal,
         client_id: u64,
         request_num: u64,
         message_id: Uuid,
@@ -445,7 +424,6 @@ impl Replica {
                 result: None,
             },
         );
-        journal.append(&entry);
         vec![Output::Broadcast(self.message(
             self.slot,
             Body::Prepare {
@@ -455,12 +433,7 @@ impl Replica {
         ))]
     }
 
-    fn receive(
-        &mut self,
-        journal: &mut impl Journal,
-        from: NodeId,
-        message: Message,
-    ) -> Vec<Output> {
+    fn receive(&mut self, from: NodeId, message: Message) -> Vec<Output> {
         if !self.member(from) || from == self.node {
             return Vec::new();
         }
@@ -510,7 +483,6 @@ impl Replica {
                         result: None,
                     },
                 );
-                journal.append(&entry);
                 self.commit_slot = self.commit_slot.max(commit);
                 let mut out = self.pending_execution();
                 out.push(Output::To(from, self.message(self.slot, Body::PrepareOk)));
@@ -527,7 +499,6 @@ impl Replica {
                     Vec::new()
                 } else {
                     self.commit_slot = self.commit_slot.max(slot);
-                    journal.flush(self.epoch, self.commit_slot);
                     self.pending_execution()
                 }
             }
@@ -538,18 +509,17 @@ impl Replica {
                     && slot <= self.slot =>
             {
                 self.commit_slot = self.commit_slot.max(slot);
-                journal.flush(self.epoch, self.commit_slot);
                 self.pending_execution()
             }
             Body::StartEpochChange if self.status != Status::Recovering && epoch >= self.epoch => {
                 let mut out = if epoch > self.epoch {
-                    self.enter_change(journal, epoch)
+                    self.enter_change(epoch)
                 } else {
                     Vec::new()
                 };
                 if self.status == Status::EpochChange {
                     self.start_changes.insert(from);
-                    out.extend(self.qualify_change(journal));
+                    out.extend(self.qualify_change());
                 }
                 out
             }
@@ -561,7 +531,7 @@ impl Replica {
                     return Vec::new();
                 }
                 let mut out = if epoch > self.epoch {
-                    self.enter_change(journal, epoch)
+                    self.enter_change(epoch)
                 } else {
                     Vec::new()
                 };
@@ -569,7 +539,7 @@ impl Replica {
                     return out;
                 }
                 self.do_changes.insert(from, (latest_normal, state));
-                out.extend(self.finish_change(journal));
+                out.extend(self.finish_change());
                 out
             }
             Body::StartEpoch { state }
@@ -584,7 +554,7 @@ impl Replica {
                 }
                 self.epoch = epoch;
                 let retained_suffix = state.slot > state.commit;
-                self.adopt(journal, state);
+                self.adopt(state);
                 self.activate_epoch(epoch);
                 let mut out = if retained_suffix {
                     vec![Output::To(from, self.message(self.slot, Body::PrepareOk))]
@@ -618,7 +588,7 @@ impl Replica {
                     return Vec::new();
                 }
                 self.recovery.insert(from, (epoch, state));
-                self.finish_recovery(journal)
+                self.finish_recovery()
             }
             _ => Vec::new(),
         }
@@ -640,7 +610,7 @@ impl Replica {
         }]
     }
 
-    fn complete(&mut self, journal: &mut impl Journal, slot: Slot, result: Vec<u8>) -> Vec<Output> {
+    fn complete(&mut self, slot: Slot, result: Vec<u8>) -> Vec<Output> {
         if self.executing != Some(slot)
             || self.executed_slot.checked_add(1) != Some(slot)
             || slot > self.commit_slot
@@ -659,25 +629,23 @@ impl Replica {
         }
         self.executed_slot = slot;
         self.executing = None;
-        journal.flush(self.epoch, self.commit_slot);
         out.extend(self.pending_execution());
         out
     }
 
-    fn enter_change(&mut self, journal: &mut impl Journal, epoch: Epoch) -> Vec<Output> {
+    fn enter_change(&mut self, epoch: Epoch) -> Vec<Output> {
         self.epoch = epoch;
         self.status = Status::EpochChange;
         self.start_changes.clear();
         self.do_changes.clear();
         self.prepare_oks.clear();
         self.sent_do_change = false;
-        journal.flush(self.epoch, self.commit_slot);
         vec![Output::Broadcast(
             self.message(self.slot, Body::StartEpochChange),
         )]
     }
 
-    fn qualify_change(&mut self, journal: &mut impl Journal) -> Vec<Output> {
+    fn qualify_change(&mut self) -> Vec<Output> {
         if self.sent_do_change || self.start_changes.len() < self.quorum() - 1 {
             return Vec::new();
         }
@@ -692,13 +660,13 @@ impl Replica {
         if self.is_leader() {
             self.do_changes
                 .insert(self.node, (self.latest_normal, self.state()));
-            self.finish_change(journal)
+            self.finish_change()
         } else {
             vec![Output::To(self.leader_of(self.epoch), message)]
         }
     }
 
-    fn finish_change(&mut self, journal: &mut impl Journal) -> Vec<Output> {
+    fn finish_change(&mut self) -> Vec<Output> {
         if !self.sent_do_change
             || !self.do_changes.contains_key(&self.node)
             || self.do_changes.len() < self.quorum()
@@ -722,14 +690,11 @@ impl Replica {
             return Vec::new();
         }
         let epoch = self.epoch;
-        self.adopt(
-            journal,
-            LogState {
-                slot: best.slot,
-                commit: commit_slot,
-                log: best.log,
-            },
-        );
+        self.adopt(LogState {
+            slot: best.slot,
+            commit: commit_slot,
+            log: best.log,
+        });
         self.activate_epoch(epoch);
         let mut out = self.pending_execution();
         out.push(Output::Broadcast(self.message(
@@ -741,7 +706,7 @@ impl Replica {
         out
     }
 
-    fn finish_recovery(&mut self, journal: &mut impl Journal) -> Vec<Output> {
+    fn finish_recovery(&mut self) -> Vec<Output> {
         if self.recovery.len() < self.quorum() {
             return Vec::new();
         }
@@ -762,7 +727,7 @@ impl Replica {
             return Vec::new();
         }
         self.epoch = epoch;
-        self.adopt(journal, state);
+        self.adopt(state);
         self.activate_epoch(epoch);
         self.recovery_nonce = None;
         self.recovery.clear();
@@ -795,7 +760,7 @@ impl Replica {
             && state.log[..self.executed_slot as usize] == self.log[..self.executed_slot as usize]
     }
 
-    fn adopt(&mut self, journal: &mut impl Journal, state: LogState) {
+    fn adopt(&mut self, state: LogState) {
         let old_clients = std::mem::take(&mut self.clients);
         self.log = state.log;
         self.slot = state.slot;
@@ -820,7 +785,6 @@ impl Replica {
                 }
             }
         }
-        journal.replace(&self.log);
     }
 
     fn activate_epoch(&mut self, epoch: Epoch) {

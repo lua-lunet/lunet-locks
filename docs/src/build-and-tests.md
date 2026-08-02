@@ -20,7 +20,7 @@ sequenceDiagram
     Cargo-->>Make: libvrr.dylib / libvrr.so
     Make->>Cyan: cyan build --prune
     Cyan-->>Make: build/vrr.lua
-    Make->>Cyan: cyan check scripts and tests
+    Make->>Cyan: cyan check tests
     Make->>Tested: tested tests
     Tested-->>Developer: Rust/Teal/FFI result
 ```
@@ -35,25 +35,11 @@ This means the Teal wrapper is never built against a missing or stale native rel
 
 ## Rust tests
 
-The Rust suite is intentionally small. It gives confidence in shape and basic behavior before a
-later specialist invariant-testing phase:
-
 - serde JSON client round-trip;
 - free/live/expired SET behavior;
-- parsed-request cache avoids reparsing;
 - fixed 16-byte header and membership validation;
 - normal PREPARE/PREPARE_OK/execute and duplicate reply;
-- COMMIT-before-PREPARE retention;
-- qualified new-leader report during epoch change;
-- exact-maximum-epoch leader recovery.
-
-It does not attempt exhaustive scenario enumeration with example-based unit tests.
-
-The protocol requires arbitrary odd or even `K >= 3`. In particular, `K = 4` means `f = 1` and
-`Q = 3`: commitment needs the leader's self-accept plus two backup acknowledgements, epoch change
-needs three qualified reports including the prospective leader, and recovery needs three other
-normal responders. No dedicated `K = 4` test currently establishes that hardening; adding one is
-required before claiming that even-membership behavior is covered.
+- qualified new-leader report during epoch change.
 
 ## Teal and LuaJIT tests
 

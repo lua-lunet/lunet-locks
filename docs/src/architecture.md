@@ -33,8 +33,8 @@ reopen Church-side decisions while implementing State-side lock behavior.
 
 - lunet is the runtime and Teal is the shipped orchestration language. We prefer this small,
   explicit runtime over introducing a general web framework.
-- Rust owns the exhaustive protocol match, replica state, request caches, response caches, and lock
-  table. Teal does not reconstruct native protocol state.
+- Rust owns the exhaustive protocol match, replica state, client results, and lock table. Teal does
+  not reconstruct native protocol state.
 - One combined opaque node is the ownership boundary. We do not expose independently managed
   replica, lock-service, serializer, or output-buffer handles.
 - Construction immediately attaches a LuaJIT finalizer. Explicit `close()` first disarms that
@@ -42,7 +42,7 @@ reopen Church-side decisions while implementing State-side lock behavior.
 - Calls are synchronous at the ownership boundary. Each operation drains every resulting native
   output into Lua-owned records before returning to its caller.
 - Input strings remain Lua-owned and are borrowed with explicit lengths only for the native call.
-  Rust copies any bytes retained in a log, cache, or queue.
+  Rust copies any bytes retained in a log or queue.
 - LuaJIT owns one reusable UDP-sized output buffer and the scalar metadata cells. Rust copies queued
   bytes into that buffer; `ffi.string(buffer, length)` then creates an independent Lua string before
   the buffer is reused.
@@ -62,8 +62,7 @@ tests and this page updated in the same change.
 |---|---|---|
 | Sorted membership and local node index | Rust `Replica` | Configuration bytes enter once |
 | Epoch, status, log positions, log, client table | Rust `Replica` | No |
-| Parsed uncommitted client request cache | Rust `Service` | No |
-| Lock table and cached response JSON | Rust `Service` | No |
+| Lock table | Rust `Service` | No |
 | Pending broadcast/send/reply bytes | Rust facade queue | Copied out, then removed |
 | Opaque node pointer and output scratch cells | LuaJIT | Pointer only |
 | 65,507-byte output buffer | LuaJIT | Rust writes into caller memory |

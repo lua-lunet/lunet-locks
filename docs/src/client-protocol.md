@@ -1,8 +1,7 @@
 # External Client Protocol
 
 Clients send JSON. This is the advisory-lock application protocol, not the VRR peer protocol. Teal
-passes these bytes through the FFI without parsing them. Rust uses serde JSON today; a later codec
-can replace JSON without changing the replication core because VRR treats the payload as opaque.
+passes these bytes through the FFI without parsing them. Rust uses serde JSON.
 
 ## GET request
 
@@ -48,8 +47,7 @@ can replace JSON without changing the replication core because VRR treats the pa
 
 A retry of one logical request carries the same complete envelope. `message_id` is copied unchanged
 into the log for application correlation and tracing; duplicate suppression is exclusively by
-`(client_id, request_num)`. A future application reusing the replication core can generate its own
-correlation UUID when its client protocol has no equivalent field.
+`(client_id, request_num)`.
 
 Each client uses a stable `client_id`, monotonically increasing request numbers, and at most one
 outstanding request. It retries an unanswered request with the envelope unchanged and rejects any
@@ -117,25 +115,18 @@ sequenceDiagram
     Facade->>Service: decode JSON and obtain IDs
     Facade->>VRR: IDs, execution time, opaque original JSON
     alt new request accepted by leader
-        Facade->>Service: remember parsed request by message_id
         VRR-->>Facade: peer PREPARE output
     else stale or currently preparing duplicate
         VRR-->>Facade: no output
     else latest request already executed
-        VRR-->>Facade: Reply(message_id)
-        Facade->>Service: fetch cached response JSON
+        VRR-->>Facade: Reply(exact result bytes)
         Facade-->>Teal: reply bytes
     end
 
     VRR-->>Facade: Execute committed message_id and opaque payload
-    alt parsed request remains cached
-        Facade->>Service: execute cached request
-    else recovery or cache miss
-        Facade->>Service: parse opaque JSON, then execute
-    end
+    Facade->>Service: parse opaque JSON, then execute
     Service-->>Facade: response JSON
     Facade->>VRR: store result for latest client-table request
-    Facade->>Service: response JSON cached by message_id
     Facade-->>Teal: reply only when this node is leader
     Teal-->>Client: response JSON
 ```

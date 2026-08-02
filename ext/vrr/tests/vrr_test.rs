@@ -1,7 +1,5 @@
 use uuid::Uuid;
-use vrr::vrr::{
-    Body, Header, Input, LogEntry, LogState, Message, NoJournal, Output, Replica, Status, Tag,
-};
+use vrr::vrr::{Body, Header, Input, LogEntry, LogState, Message, Output, Replica, Status, Tag};
 
 fn members(count: usize) -> Vec<String> {
     (0..count).map(|index| format!("{index}:1")).collect()
@@ -35,7 +33,7 @@ fn message(epoch: u32, slot: u64, body: Body) -> Message {
 }
 
 fn receive(replica: &mut Replica, from: u32, message: Message) -> Vec<Output> {
-    replica.step(&mut NoJournal, Input::Message { from, message })
+    replica.step(Input::Message { from, message })
 }
 
 fn request(message: u8, request_num: u64) -> Input {
@@ -84,7 +82,7 @@ fn configuration_and_canonical_tags_are_unambiguous() {
 #[test]
 fn four_node_normal_commit_needs_two_distinct_backups() {
     let mut leader = node(4, 0);
-    let prepare = match leader.step(&mut NoJournal, request(1, 1)).pop().unwrap() {
+    let prepare = match leader.step(request(1, 1)).pop().unwrap() {
         Output::Broadcast(message) => message,
         output => panic!("unexpected {output:?}"),
     };
@@ -101,20 +99,14 @@ fn four_node_normal_commit_needs_two_distinct_backups() {
 
     let result = b"exact-result".to_vec();
     assert_eq!(
-        leader.step(
-            &mut NoJournal,
-            Input::Complete {
-                slot: 1,
-                result: result.clone(),
-            },
-        ),
+        leader.step(Input::Complete {
+            slot: 1,
+            result: result.clone(),
+        }),
         vec![Output::Reply(result.clone())]
     );
     assert_eq!(leader.executed(), 1);
-    assert_eq!(
-        leader.step(&mut NoJournal, request(9, 1)),
-        vec![Output::Reply(result)]
-    );
+    assert_eq!(leader.step(request(9, 1)), vec![Output::Reply(result)]);
     assert!(matches!(prepare.body, Body::Prepare { .. }));
 }
 
@@ -185,7 +177,7 @@ fn duplicate_prepare_resends_ack_but_conflict_and_gap_are_refused() {
 #[test]
 fn four_node_epoch_change_uses_two_votes_and_three_reports() {
     let mut leader = node(4, 1);
-    leader.step(&mut NoJournal, Input::LeaderTimeout);
+    leader.step(Input::LeaderTimeout);
     let report = |from_entry: LogEntry| {
         message(
             1,
@@ -217,7 +209,7 @@ fn four_node_epoch_change_uses_two_votes_and_three_reports() {
 #[test]
 fn four_node_recovery_requires_three_other_responders() {
     let mut replica = node(4, 3);
-    replica.step(&mut NoJournal, Input::Recover { nonce: 7 });
+    replica.step(Input::Recover { nonce: 7 });
     let leader_state = state(vec![entry(1, 1, 1)], 1);
     receive(
         &mut replica,
@@ -328,7 +320,7 @@ fn malformed_transferred_states_are_rejected_without_mutation() {
 #[test]
 fn epoch_change_selects_one_whole_log_and_rejects_uncovered_commit() {
     let mut leader = node(3, 1);
-    leader.step(&mut NoJournal, Input::LeaderTimeout);
+    leader.step(Input::LeaderTimeout);
     let short = state(vec![entry(1, 1, 1)], 0);
     receive(
         &mut leader,
@@ -357,7 +349,7 @@ fn epoch_change_selects_one_whole_log_and_rejects_uncovered_commit() {
     assert_eq!(installed.log, vec![entry(1, 1, 1)]);
 
     let mut rejected = node(3, 1);
-    rejected.step(&mut NoJournal, Input::LeaderTimeout);
+    rejected.step(Input::LeaderTimeout);
     receive(
         &mut rejected,
         0,
@@ -445,7 +437,7 @@ fn delayed_same_epoch_install_and_report_cannot_reinstall_stale_state() {
 #[test]
 fn reconstructed_client_table_does_not_mark_newer_suffix_executed() {
     let mut leader = node(3, 1);
-    leader.step(&mut NoJournal, Input::LeaderTimeout);
+    leader.step(Input::LeaderTimeout);
     let transferred = state(vec![entry(1, 1, 1), entry(2, 1, 2)], 1);
     receive(
         &mut leader,
@@ -464,15 +456,12 @@ fn reconstructed_client_table_does_not_mark_newer_suffix_executed() {
         .iter()
         .any(|output| matches!(output, Output::Execute { slot: 1, .. })));
     assert!(leader
-        .step(
-            &mut NoJournal,
-            Input::Complete {
-                slot: 1,
-                result: b"older".to_vec(),
-            },
-        )
+        .step(Input::Complete {
+            slot: 1,
+            result: b"older".to_vec(),
+        })
         .is_empty());
-    assert!(leader.step(&mut NoJournal, request(2, 2)).is_empty());
+    assert!(leader.step(request(2, 2)).is_empty());
     assert_eq!(leader.executed(), 1);
     assert_eq!(leader.commit(), 1);
 }
@@ -496,13 +485,10 @@ fn future_install_must_preserve_locally_executed_prefix_and_epoch_exhaustion_fai
     assert!(outputs
         .iter()
         .any(|output| matches!(output, Output::Execute { .. })));
-    backup.step(
-        &mut NoJournal,
-        Input::Complete {
-            slot: 1,
-            result: b"result".to_vec(),
-        },
-    );
+    backup.step(Input::Complete {
+        slot: 1,
+        result: b"result".to_vec(),
+    });
 
     let conflicting = state(vec![entry(1, 2, 1)], 1);
     assert!(receive(
@@ -526,6 +512,6 @@ fn future_install_must_preserve_locally_executed_prefix_and_epoch_exhaustion_fai
         ),
     );
     assert_eq!(backup.epoch(), u32::MAX);
-    assert!(backup.step(&mut NoJournal, Input::LeaderTimeout).is_empty());
+    assert!(backup.step(Input::LeaderTimeout).is_empty());
     assert_eq!(backup.epoch(), u32::MAX);
 }

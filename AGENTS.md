@@ -7,7 +7,6 @@ Local guidance for this repo. Keep it short, factual, and unsurprising.
 - `src/` is the shipped Teal source tree.
 - `build/` is Cyan output. Never hand-edit it.
 - `tests/` holds the forward-pass tests and the learning tests.
-- `scripts/` holds executable harnesses; no shell scripts.
 
 ## Toolchain
 
@@ -35,11 +34,3 @@ The currently pinned surprises are:
 ## Testing split
 
 - Pure modules stay free of `require("lunet")` and are testable in `tests/`.
-- Runtime-coupled code is exercised through harnesses, not unit tests.
-
-## Declarations / vendoring / FFI
-
-- Third-party runtime modules get `.d.tl` declaration files.
-- Vendored plain Lua belongs in `vendor/`, verbatim.
-- Native/Rust FFI belongs under `ext/<name>/` and is wired through `make`, not manual steps.
-- `lnt_shared` (shared-counter extension) is shipped in the v0.7.0 binary release; `require("lunet.lnt_shared")` works under `lunet-run`. Upstream docs tracked at [lua-lunet/lunet#134](https://github.com/lua-lunet/lunet/pull/134).
