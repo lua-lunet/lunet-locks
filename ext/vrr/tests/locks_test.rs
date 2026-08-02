@@ -1,23 +1,7 @@
-use uuid::Uuid;
-use vrr::locks::{Lease, Request, Response, Service};
+mod support;
 
-fn id(byte: u8) -> Uuid {
-    Uuid::from_bytes([byte; 16])
-}
-
-fn set(message: u8, client: u64, request: u64, holder: u8, expiry: u64) -> Request {
-    Request::Set {
-        message_id: id(message),
-        client_id: client,
-        request_num: request,
-        lock_id: 7,
-        lease: Lease {
-            lease_id: 9,
-            holder: id(holder),
-            expiry,
-        },
-    }
-}
+use support::{baseline_service, id, set};
+use vrr::locks::{Response, Service};
 
 #[test]
 fn client_json_round_trips() {
@@ -28,7 +12,7 @@ fn client_json_round_trips() {
 
 #[test]
 fn set_obeys_the_lease_rules() {
-    let mut service = Service::default();
+    let mut service = baseline_service();
     let first: Response = serde_json::from_slice(
         &service
             .execute(
@@ -73,7 +57,7 @@ fn set_obeys_the_lease_rules() {
 
 #[test]
 fn execution_rejects_an_envelope_payload_mismatch() {
-    let mut service = Service::default();
+    let mut service = baseline_service();
     let request = set(1, 1, 1, 1, 500);
     let payload = serde_json::to_vec(&request).unwrap();
     assert!(Service::validate(id(1), 1, 1, &payload));

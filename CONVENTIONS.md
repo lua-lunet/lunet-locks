@@ -58,6 +58,20 @@ reported as **invalid**, not failed: unhandled exceptions, tests with no asserti
 whose declared `expected` result is not actually produced. That behavior is pinned by a learning
 test in [`tests/teal_learning_test.tl`](tests/teal_learning_test.tl).
 
+`make test` is the stable validation entry point: it runs `make check`, the Teal tests, and the
+native extension's `cargo test` suite. Cargo discovers the extension's integration tests, so do
+not add per-suite Make targets that merely repeat `cargo test`.
+
+The shipped Teal, FFI ABI, core Rust crate, and default test path use stable Rust and long-lived
+dependencies. A stable test-only Rust dependency belongs in `[dev-dependencies]` and must not add
+a dependency edge into shipped artifacts.
+
+Experimental model checking and fuzzing are currently deferred. If needed, each harness belongs
+entirely beneath `not_stable_rust/`, with its own explicit toolchain and documented invocation;
+that isolated package may depend on the core crate, but production code and default targets must
+not depend on it. It is not run by `make test`. Document supported platforms, resource limits,
+corpus ownership, and counterexample reproduction next to any such harness before adding it.
+
 ## Dependencies
 
 - Lua deps install into the project-local tree: `make deps` → `luarocks --tree=.rocks`. No global

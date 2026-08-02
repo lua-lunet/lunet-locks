@@ -1,50 +1,7 @@
-use uuid::Uuid;
+mod support;
+
+use support::{entry, members, message, node, receive, request, state};
 use vrr::vrr::{Body, Header, Input, LogEntry, LogState, Message, Output, Replica, Status, Tag};
-
-fn members(count: usize) -> Vec<String> {
-    (0..count).map(|index| format!("{index}:1")).collect()
-}
-
-fn node(count: usize, index: usize) -> Replica {
-    Replica::new(members(count), &format!("{index}:1")).unwrap()
-}
-
-fn entry(slot: u64, client_id: u64, request_num: u64) -> LogEntry {
-    LogEntry {
-        slot,
-        client_id,
-        request_num,
-        message_id: Uuid::from_u128((client_id as u128) << 64 | request_num as u128),
-        execution_time: 100 + slot,
-        payload: format!("request-{slot}").into_bytes(),
-    }
-}
-
-fn state(log: Vec<LogEntry>, commit: u64) -> LogState {
-    LogState {
-        slot: log.len() as u64,
-        commit,
-        log,
-    }
-}
-
-fn message(epoch: u32, slot: u64, body: Body) -> Message {
-    Message { epoch, slot, body }
-}
-
-fn receive(replica: &mut Replica, from: u32, message: Message) -> Vec<Output> {
-    replica.step(Input::Message { from, message })
-}
-
-fn request(message: u8, request_num: u64) -> Input {
-    Input::Request {
-        client_id: 1,
-        request_num,
-        message_id: Uuid::from_bytes([message; 16]),
-        execution_time: 100,
-        payload: b"request".to_vec(),
-    }
-}
 
 #[test]
 fn configuration_and_canonical_tags_are_unambiguous() {

@@ -165,7 +165,7 @@ int32_t vrr_node_next(
 ```
 
 Lua numbers do not represent every `u64`. Lease fields remain JSON integers parsed by Rust;
-execution time and recovery nonce cross as decimal strings. A returned slot is split into exact
+execution time and a host-supplied, durably fresh recovery nonce cross as decimal strings. A returned slot is split into exact
 high and low `u32` values.
 
 ## Output kinds

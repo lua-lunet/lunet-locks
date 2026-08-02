@@ -363,7 +363,9 @@ impl Replica {
                 .epoch
                 .checked_add(1)
                 .map_or_else(Vec::new, |epoch| self.enter_change(epoch)),
-            Input::Complete { slot, result } => self.complete(slot, result),
+            Input::Complete { slot, result } if self.status != Status::Recovering => {
+                self.complete(slot, result)
+            }
             Input::Recover { nonce } => {
                 self.status = Status::Recovering;
                 self.recovery_nonce = Some(nonce);
@@ -526,7 +528,10 @@ impl Replica {
             Body::DoEpochChange {
                 latest_normal,
                 state,
-            } if epoch >= self.epoch && self.leader_of(epoch) == self.node => {
+            } if self.status != Status::Recovering
+                && epoch >= self.epoch
+                && self.leader_of(epoch) == self.node =>
+            {
                 if !self.valid_state_message(slot, &state) {
                     return Vec::new();
                 }

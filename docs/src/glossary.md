@@ -52,7 +52,8 @@ reconfiguration epoch-number means the out-of-scope **configuration generation**
   The lease is live only while its expiry is greater than the replicated predicted execution value.
 - **Locking service:** The lightweight replicated service that orders GET and SET operations for
   advisory locks and returns lease decisions.
-- **Nonce:** A fresh, nonrepeating identifier binding responses to one recovery attempt.
+- **Nonce:** A host-supplied, fresh nonrepeating identifier binding responses to one recovery
+  attempt; its source must remain nonrepeating across process restarts.
 - **Predicted execution value:** A nondeterministic input chosen before replication, stored in the
   log, and supplied unchanged to every executor.
 - **`Q`:** The strict-majority quorum `floor(K / 2) + 1 = K - f`.

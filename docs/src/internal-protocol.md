@@ -151,8 +151,10 @@ the committed prefix in slot order then rebuilds cached results.
 
 ## Recovery
 
-A restarting replica chooses a fresh nonce that cannot repeat across attempts, enters `recovering`,
-and sends `RECOVERY(node_id, nonce)` to all other members. Mismatched nonces are ignored. While
+A restarting replica enters `recovering` with a host-supplied fresh nonce that cannot repeat across
+attempts, including across process restarts, and sends `RECOVERY(node_id, nonce)` to all other
+members. The host obtains the nonce from durable monotonic state or another source with the same
+nonrepetition guarantee. Mismatched nonces are ignored. While
 recovering, it accepts no `PREPARE`, sends no `PREPARE_OK`, contributes to neither epoch-change
 exchange, does not answer another recovery, and does not count among its own responders.
 

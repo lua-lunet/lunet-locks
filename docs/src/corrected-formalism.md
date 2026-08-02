@@ -151,10 +151,12 @@ epoch clears old acknowledgement state keyed by `(epoch, slot)`.
 
 ## Isolated recovery
 
-A restarting replica enters `recovering`, chooses a fresh nonce that cannot repeat across attempts,
-and sends `RECOVERY` to every other member. It ignores mismatched nonces. Until completion it accepts
-no `PREPARE`, sends no `PREPARE_OK`, contributes to neither epoch-change exchange, answers no other
-recovery, and cannot count itself as a responder.
+A restarting replica enters `recovering` with a host-supplied fresh nonce that cannot repeat across
+attempts, including across process restarts, and sends `RECOVERY` to every other member. The host
+obtains that nonce from durable monotonic state or another source with the same nonrepetition
+guarantee. The replica ignores mismatched nonces. Until completion it accepts no `PREPARE`, sends
+no `PREPARE_OK`, contributes to neither epoch-change exchange, answers no other recovery, and
+cannot count itself as a responder.
 
 Only `normal` replicas respond. Every `RECOVERY_RESPONSE` carries epoch, nonce, and sender node ID.
 Only the deterministic leader of that response's exact epoch includes leader state: its log,
