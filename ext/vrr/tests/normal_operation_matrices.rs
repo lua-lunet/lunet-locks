@@ -272,21 +272,34 @@ fn prepare_ok_provenance_slot_epoch_and_quorum_matrix() {
                     Provenance::NonMember => 4,
                 };
                 let before = ReplicaSnapshot::capture(&replica);
+                let slot = slot_relation.slot() - 18;
                 let outputs = receive(
                     &mut replica,
                     from,
-                    message(
-                        epoch_relation.epoch(),
-                        slot_relation.slot() - 18,
-                        Body::PrepareOk,
-                    ),
+                    message(epoch_relation.epoch(), slot, Body::PrepareOk),
                 );
+                // Admission per the core's guard (`src/vrr.rs`): a member
+                // PrepareOk in the replica's epoch at or below the frontier
+                // is counted in the quorum accumulator. A below-frontier
+                // (slot 0) vote names no log entry and can never advance
+                // commit (`commit.max(0)` is a no-op), so admission is
+                // observable only in the accumulator; a single vote is below
+                // the K=4 quorum of two external votes.
                 let accepted = provenance == Provenance::Backup
                     && epoch_relation == Relation::Equal
-                    && slot_relation == Relation::Equal;
+                    && slot_relation != Relation::Greater;
                 if accepted {
                     assert!(outputs.is_empty());
                     assert_eq!(replica.commit(), 0);
+                    let mut expected = before.diagnostic().clone();
+                    expected.prepare_oks.entry(slot).or_default().insert(from);
+                    let after = ReplicaSnapshot::capture(&replica);
+                    assert_eq!(
+                        after.diagnostic(),
+                        &expected,
+                        "accepted prepare-ok {provenance:?} {epoch_relation:?} \
+                         {slot_relation:?} adds exactly the quorum vote"
+                    );
                 } else {
                     assert!(
                         outputs.is_empty(),

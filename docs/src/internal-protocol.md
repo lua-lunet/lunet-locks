@@ -85,7 +85,7 @@ sequenceDiagram
     C->>L: complete envelope and opaque payload
     L->>L: deduplicate; predict; append next slot; self-accept
     L->>B: PREPARE(epoch, slot, entry, commit_slot)
-    B->>B: obtain gaps; append contiguous entry
+    B->>B: accept only the next contiguous slot; refuse gaps
     B->>B: advance advertised commit_slot only with complete prefix
     B->>S: execute newly committed slots in order
     B->>L: PREPARE_OK(epoch, slot, node_id)
@@ -99,10 +99,16 @@ sequenceDiagram
 ```
 
 The leader's local append is immediate self-acceptance. Commitment requires `Q - 1` matching
-`PREPARE_OK` messages from distinct backups. A backup acknowledges only after accepting every entry
-through the named slot, so its acknowledgement certifies a complete contiguous prefix. Before a
-backup advances through an advertised commit slot, it obtains every missing entry through that
-slot. It executes only after commitment and never skips a gap.
+`PREPARE_OK` messages from distinct backups. A backup accepts only the exact next contiguous slot,
+so its acknowledgement certifies a complete contiguous prefix, and it never advances its advertised
+commit slot past its last contiguous slot. It executes only after commitment and never skips a gap.
+
+There is no gap-filling exchange: the message inventory has no `GET_STATE`/`NEW_STATE` pair, and a
+backup refuses a `PREPARE` or `COMMIT` that would skip entries it does not hold. A gapped backup
+therefore stalls, neither acknowledging nor advancing commitment, until an epoch change installs one
+authoritative whole log through `START_EPOCH` or a recovery installs authoritative state. The
+refusal is a liveness limit, not a safety hole: skipped entries never execute, and only the two
+implemented whole-log transfers resolve the stall.
 
 Entering a greater epoch clears acknowledgement state for older `(epoch, slot)` tokens. Old
 `PREPARE_OK` acknowledgements can never commit a different entry that later occupies the same slot.
@@ -174,19 +180,48 @@ sequenceDiagram
     L-->>X: RECOVERY_RESPONSE(exact maximum epoch, nonce, node_id, leader state)
     Note over X: Q distinct other normal responders
     X->>X: install exact-maximum-epoch leader log and frontiers
-    X->>X: rebuild accepted request numbers
-    X->>S: execute committed prefix; rebuild cached results
-    X->>X: set epoch and latest_normal_epoch; status=normal
+    X->>X: rebuild accepted request numbers; set epoch
+    alt no committed entries pending execution
+        X->>X: status=normal; set latest_normal_epoch
+    else committed entries remain unexecuted
+        X->>X: status=replaying; still isolated
+        loop host-driven completions in slot order until executed == commit
+            X->>S: execute next committed slot; rebuild cached result
+        end
+        X->>X: status=normal; set latest_normal_epoch
+    end
 ```
 
 The recoverer collects `Q` distinct normal responders other than itself, determines the exact maximum
 epoch among those responses, and requires the deterministic leader of exactly that epoch to be among
 the `Q` with state. Recovery therefore involves `Q + 1` communicating replicas including the
-recoverer. It remains isolated until reconstruction and committed execution complete; only then may
-it become `normal`.
+recoverer.
+
+After installing state, a recoverer with committed entries still unexecuted enters an explicit
+`replaying` phase; with none pending it activates immediately. Replay remains isolated: every
+normal-operation and epoch-change input stays fenced, and only host execution completions advance
+the committed prefix in slot order, rebuilding cached results without emitting client replies. The
+recoverer becomes `normal` exactly when its executed slot reaches the installed commit slot.
+
+The responder rule is deliberate and strict: responders must be distinct, other than the recoverer,
+and `normal`. At `K = 3` (`Q = 2`) and `K = 4` (`Q = 3`) every other member must therefore answer,
+so recovery stalls while even one additional member is crashed or itself not `normal`; it resumes
+when that member answers or the host retries the attempt later with a fresh nonce. This is a
+liveness cost, not a safety reduction: the crash bound `f = 1` still governs which simultaneous
+failures committed state survives, while the stricter responder set guarantees the recoverer hears
+from a quorum-intersecting set including the exact-maximum-epoch leader.
 
 ## Datagram bound
 
 Inbound and outbound peer messages are limited to 65,507 bytes, the maximum UDP payload. The leader
 computes the exact encoded `PREPARE` size before mutating its log, so an oversized request cannot
 consume a slot that backups never receive.
+
+All replicated state moves as one whole log per datagram: `DO_EPOCH_CHANGE`, `START_EPOCH`, and the
+leader's `RECOVERY_RESPONSE` each carry the complete log and must fit the same ceiling. Generated
+output that would exceed it is refused transactionally: the step's replica and service mutations roll
+back, previously queued outputs are preserved, and the node keeps serving, so the FFI is never left
+poisoned. With ordinary lock entries the whole-log transfer first exceeds the ceiling at 85 entries;
+an epoch change or recovery that needs such a transfer cannot proceed, making the ceiling a liveness
+limit rather than a correctness boundary. Chunked or checkpointed transfer that would lift it remains
+future work.

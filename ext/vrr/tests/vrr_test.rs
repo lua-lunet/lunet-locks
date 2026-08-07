@@ -1,6 +1,6 @@
 mod support;
 
-use support::{entry, members, message, node, receive, request, state};
+use support::{complete_committed_replay, entry, members, message, node, receive, request, state};
 use vrr::vrr::{Body, Header, Input, LogEntry, LogState, Message, Output, Replica, Status, Tag};
 
 #[test]
@@ -218,12 +218,18 @@ fn four_node_recovery_requires_three_other_responders() {
             },
         ),
     );
-    assert_eq!(replica.status(), Status::Normal);
+    assert_eq!(
+        replica.status(),
+        Status::Replaying,
+        "quorum completes recovery into the replay phase: the committed prefix is unexecuted"
+    );
     assert_eq!(replica.commit(), 1);
     assert!(matches!(
         outputs.as_slice(),
         [Output::Execute { slot: 1, .. }]
     ));
+    complete_committed_replay(&mut replica);
+    assert_eq!(replica.executed(), 1);
 }
 
 #[test]

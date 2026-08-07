@@ -30,7 +30,11 @@ pub struct Node {
 }
 
 impl Node {
-    fn run(&mut self, outputs: Vec<Output>) -> Result<(), i32> {
+    fn run(
+        replica: &mut Replica,
+        service: &mut Service,
+        outputs: Vec<Output>,
+    ) -> Result<VecDeque<Queued>, i32> {
         let mut pending = VecDeque::from(outputs);
         let mut staged = VecDeque::new();
         while let Some(output) = pending.pop_front() {
@@ -45,15 +49,14 @@ impl Node {
                     execution_time,
                     payload,
                 } => {
-                    let bytes = self
-                        .service
+                    let bytes = service
                         .execute(message_id, client_id, request_num, execution_time, &payload)
                         .map_err(|_| SERVICE)?;
-                    let next = self.replica.step(Input::Complete {
+                    let next = replica.step(Input::Complete {
                         slot,
                         result: bytes,
                     });
-                    if self.replica.executed() != slot {
+                    if replica.executed() != slot {
                         return Err(SERVICE);
                     }
                     for output in next.into_iter().rev() {
@@ -73,8 +76,7 @@ impl Node {
                 }
             }
         }
-        self.outputs.extend(staged);
-        Ok(())
+        Ok(staged)
     }
 
     fn peer(kind: u32, to: u32, message: Message) -> Result<Queued, i32> {
@@ -101,15 +103,17 @@ impl Node {
             }
         }
         match catch_unwind(AssertUnwindSafe(|| {
-            let outputs = self.replica.step(input);
-            self.run(outputs)
+            let mut replica = self.replica.clone();
+            let mut service = self.service.clone();
+            let outputs = replica.step(input);
+            let staged = Self::run(&mut replica, &mut service, outputs)?;
+            self.replica = replica;
+            self.service = service;
+            self.outputs.extend(staged);
+            Ok(())
         })) {
             Ok(Ok(())) => OK,
-            Ok(Err(error)) => {
-                self.poisoned = true;
-                self.outputs.clear();
-                error
-            }
+            Ok(Err(error)) => error,
             Err(_) => {
                 self.poisoned = true;
                 self.outputs.clear();
@@ -321,6 +325,20 @@ pub unsafe extern "C" fn vrr_node_recover(
     })
 }
 
+/// Dequeue the next queued output from the node's output ring buffer,
+/// writing its metadata through pointer out-parameters and its variable-
+/// length body into `out_data[..capacity]`.
+///
+/// Returns:
+/// - `0`  — no queued outputs remain (idempotent; re-check with
+///   `vrr_node_drain`).
+/// - `1`  — one output was dequeued; the caller must consume the metadata
+///   and body before the next call, as the space is reused.
+/// - `-1` — a required out-pointer (`*mut`) argument was null.
+/// - `-6` — the body length exceeds `capacity` or the body is non-empty
+///   while `out_data` is null.
+/// - `-127` — a catch-unwind guard caught an internal panic (the node
+///   must be discarded or recreated).
 #[no_mangle]
 pub unsafe extern "C" fn vrr_node_next(
     node: *mut c_void,

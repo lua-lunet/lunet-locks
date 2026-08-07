@@ -297,7 +297,8 @@ fn service_matrix_is_complete_correlated_and_deterministic() {
                                 },
                             ) => {
                                 let granted_expected = expected_live
-                                    .is_none_or(|current| current.holder == candidate_holder);
+                                    .is_none_or(|current| current.holder == candidate_holder)
+                                    && expiry.expiry() > EXECUTION_TIME;
                                 assert_eq!(
                                     (response_id, response_num, lock_id),
                                     (message_id, request_num, LOCK_ID),
@@ -382,8 +383,8 @@ fn lock_isolation_and_u64_extrema_are_preserved() {
                 message_id: id(13),
                 request_num: value,
                 lock_id: value,
-                granted: true,
-                lease: Some(lease)
+                granted: value == u64::MIN,
+                lease: if value == u64::MIN { Some(lease) } else { None },
             }
         );
         assert_eq!(

@@ -198,6 +198,13 @@ empty queue, or a negative error. The Teal wrapper maps negative values to excep
 At the raw C boundary, `(NULL, 0)` is accepted for borrowed bytes and `(NULL, nonzero)` is rejected.
 The Teal wrapper always supplies explicit Lua string lengths and a non-null output buffer.
 
+Generated peer output is checked against the same one-datagram ceiling before it is queued. A step
+whose generated datagram would exceed it — a whole-log `DO_EPOCH_CHANGE`, `START_EPOCH`, or
+`RECOVERY_RESPONSE`, first oversize at 85 ordinary lock entries — fails atomically with `-6`: the
+step's replica and service mutations roll back and previously queued outputs are preserved. The node
+keeps serving, so the ceiling is a liveness limit (that transfer cannot proceed while the log moves
+as one datagram), not corruption or poisoning.
+
 ## Native loading
 
 `src/vrr.tl` honors `LUNET_VRR_LIB`. Otherwise it chooses `dylib` or `so` from `ffi.os` and resolves

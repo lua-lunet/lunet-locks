@@ -27,8 +27,8 @@ reconfiguration epoch-number means the out-of-scope **configuration generation**
 - **Advisory lock (lock; plural locks):** A cooperative lock identified by `lock_id`. The service
   orders ownership decisions, but clients must voluntarily honor the result; it does not forcibly
   exclude unrelated external systems.
-- **Backup:** A non-leader replica that accepts contiguous proposals and executes only committed
-  entries.
+- **Backup:** A non-leader replica that accepts only the next contiguous slot, refuses gaps, and
+  executes only committed entries.
 - **Client envelope:** The unchanged retry unit containing `client_id`, `request_num`, `message_id`,
   and opaque value.
 - **Client table:** Per-client state containing the largest accepted request number and, after that
@@ -37,7 +37,8 @@ reconfiguration epoch-number means the out-of-scope **configuration generation**
 - **Configuration generation:** An out-of-scope identifier for a membership configuration, distinct
   from a fixed-membership epoch.
 - **Contiguous acceptance:** A backup acknowledges slot `s` only after accepting every entry through
-  `s`.
+  `s`. A proposal that would skip entries is refused: there is no gap-filling exchange, so a gapped
+  backup stalls until an epoch change or recovery installs authoritative state.
 - **Epoch:** A monotonically numbered fixed-membership leadership regime.
 - **Epoch change:** The two-exchange procedure that fences an old epoch and installs a later one.
 - **Executed slot:** The highest slot applied exactly once to the service.
@@ -60,7 +61,12 @@ reconfiguration epoch-number means the out-of-scope **configuration generation**
 - **Qualified report:** A `DO_EPOCH_CHANGE` sent after the sender's own
   `START_EPOCH_CHANGE` plus `Q - 1` matching messages from distinct peers.
 - **Recovery isolation:** A recoverer performs no normal, epoch-change, or response work and counts
-  in no quorum until reconstruction and committed execution finish.
+  in no quorum until reconstruction and committed execution finish; the replay phase carries the
+  same isolation.
+- **Replay phase (`replaying`):** The explicit recovery phase after state installation in which
+  host-driven completions execute the installed committed prefix in slot order, fenced from all
+  normal and epoch-change work, until the executed slot reaches the installed commit slot and the
+  replica activates as `normal`.
 - **Self-accept:** The leader's local append counts immediately, leaving `Q - 1` distinct backup
   acknowledgements for commitment.
 - **Slot:** The one-based ordering coordinate for log entries; slot zero denotes the empty prefix and

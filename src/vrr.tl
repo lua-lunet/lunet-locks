@@ -128,8 +128,8 @@ local function drain(self: Node): {Output}
       local kind: string
       if kind_number == 1 then
          kind = "broadcast"
-      elseif kind_number == 2 then
-         kind = "send"
+       elseif kind_number == 2 then
+          kind = "send"
        elseif kind_number == 3 then
           kind = "reply"
        else

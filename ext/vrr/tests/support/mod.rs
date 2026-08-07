@@ -4,7 +4,9 @@ use std::collections::HashSet;
 
 use uuid::Uuid;
 use vrr::locks::{Lease, Request, Service};
-use vrr::vrr::{Body, Input, LogEntry, LogState, Message, NodeId, Output, Replica, Status};
+use vrr::vrr::{
+    Body, Diagnostic, Input, LogEntry, LogState, Message, NodeId, Output, Replica, Status,
+};
 
 pub const MEMBER_COUNT: usize = 4;
 pub const EPOCH: u32 = 17;
@@ -244,26 +246,29 @@ pub fn baseline_service() -> Service {
     Service::default()
 }
 
+/// Complete replica state captured through the deliberate diagnostic
+/// boundary (`Replica::diagnostic`), covering every protocol-relevant piece
+/// of internal state: the public scalars and log, the in-flight execution
+/// marker, the client table and result history, the prepare-acknowledgement
+/// quorum accumulator, the epoch-change evidence (latest-normal, start-change
+/// votes, do-change reports, sent marker), and the recovery nonce and
+/// evidence map. Equality of two snapshots is complete state equality, so a
+/// refusal assertion over snapshots detects mutation of any of those
+/// accumulators — not accidental equality of the public getters alone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplicaSnapshot {
-    epoch: u32,
-    status: Status,
-    slot: u64,
-    commit: u64,
-    executed: u64,
-    log: Vec<LogEntry>,
+    diagnostic: Diagnostic,
 }
 
 impl ReplicaSnapshot {
     pub fn capture(replica: &Replica) -> Self {
         Self {
-            epoch: replica.epoch(),
-            status: replica.status(),
-            slot: replica.slot(),
-            commit: replica.commit(),
-            executed: replica.executed(),
-            log: replica.log().to_vec(),
+            diagnostic: replica.diagnostic(),
         }
+    }
+
+    pub fn diagnostic(&self) -> &Diagnostic {
+        &self.diagnostic
     }
 }
 
@@ -276,6 +281,56 @@ pub fn assert_replica_unchanged(
     assert_eq!(
         before, &after,
         "refused case {context:?} mutated replica state"
+    );
+}
+
+/// Drives `Input::Complete` through the committed frontier of a replica in the
+/// replay phase (`Status::Replaying`), asserting the phase contract at every
+/// step: each matching completion advances `executed` by exactly one slot,
+/// non-final completions keep the replica in `Status::Replaying` and emit the
+/// next committed `Output::Execute`, and the replica activates
+/// `Status::Normal` exactly when `executed` reaches `commit`, with no further
+/// execution emitted. Returns once the replica is fully activated.
+pub fn complete_committed_replay(replica: &mut Replica) {
+    assert_eq!(
+        replica.status(),
+        Status::Replaying,
+        "committed replay helper requires the replay phase"
+    );
+    let commit = replica.commit();
+    assert!(
+        replica.executed() < commit,
+        "committed replay helper requires unexecuted committed work"
+    );
+    while replica.executed() < commit {
+        let slot = replica.executed() + 1;
+        let out = replica.step(Input::Complete {
+            slot,
+            result: format!("replay-result-{slot}").into_bytes(),
+        });
+        assert_eq!(replica.executed(), slot, "completion advances executed");
+        if slot < commit {
+            assert_eq!(
+                replica.status(),
+                Status::Replaying,
+                "replica must not activate before the final committed completion"
+            );
+            assert!(
+                matches!(out.as_slice(), [Output::Execute { slot: next, .. }] if *next == slot + 1),
+                "completion must emit the next committed execution; got {out:?}"
+            );
+        } else {
+            assert!(
+                !out.iter()
+                    .any(|output| matches!(output, Output::Execute { .. })),
+                "no committed work remains after the final completion; got {out:?}"
+            );
+        }
+    }
+    assert_eq!(
+        replica.status(),
+        Status::Normal,
+        "replica activates exactly when executed reaches commit"
     );
 }
 

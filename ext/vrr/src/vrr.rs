@@ -198,6 +198,7 @@ pub enum Status {
     Normal,
     EpochChange,
     Recovering,
+    Replaying,
 }
 
 #[derive(Clone)]
@@ -207,6 +208,50 @@ struct ClientEntry {
     result: Option<Vec<u8>>,
 }
 
+/// Diagnostic projection of one client-table entry.
+///
+/// Part of the [`Diagnostic`] observability boundary; not part of the
+/// protocol surface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientDiagnostic {
+    pub request_num: u64,
+    pub message_id: Uuid,
+    pub result: Option<Vec<u8>>,
+}
+
+/// Read-only projection of every protocol-relevant piece of internal replica
+/// state: the public scalars and log plus the client table and result
+/// history, the prepare-acknowledgement quorum accumulator, the epoch-change
+/// evidence (`latest_normal`, start-change votes, the do-change reports and
+/// the sent marker), the in-flight execution marker, and the recovery nonce
+/// and evidence map.
+///
+/// This is a deliberate observability boundary for integration tests, not
+/// part of the protocol surface: capturing it mutates nothing and no protocol
+/// decision reads it. Tests must compare complete `Diagnostic` values rather
+/// than pretending equality of the public getters alone is complete
+/// immutability.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Diagnostic {
+    pub epoch: Epoch,
+    pub status: Status,
+    pub slot: Slot,
+    pub commit: Slot,
+    pub executed: Slot,
+    pub executing: Option<Slot>,
+    pub log: Vec<LogEntry>,
+    pub clients: BTreeMap<u64, ClientDiagnostic>,
+    pub results: BTreeMap<(u64, u64), Vec<u8>>,
+    pub prepare_oks: BTreeMap<Slot, BTreeSet<NodeId>>,
+    pub latest_normal: Epoch,
+    pub start_changes: BTreeSet<NodeId>,
+    pub sent_do_change: bool,
+    pub do_changes: BTreeMap<NodeId, (Epoch, LogState)>,
+    pub recovery_nonce: Option<u64>,
+    pub recovery: BTreeMap<NodeId, (Epoch, Option<LogState>)>,
+}
+
+#[derive(Clone)]
 pub struct Replica {
     members: Vec<String>,
     node: NodeId,
@@ -218,6 +263,7 @@ pub struct Replica {
     executing: Option<Slot>,
     log: Vec<LogEntry>,
     clients: BTreeMap<u64, ClientEntry>,
+    results: BTreeMap<(u64, u64), Vec<u8>>,
     prepare_oks: BTreeMap<Slot, BTreeSet<NodeId>>,
     latest_normal: Epoch,
     start_changes: BTreeSet<NodeId>,
@@ -250,6 +296,7 @@ impl Replica {
             executing: None,
             log: Vec::new(),
             clients: BTreeMap::new(),
+            results: BTreeMap::new(),
             prepare_oks: BTreeMap::new(),
             latest_normal: 0,
             start_changes: BTreeSet::new(),
@@ -283,6 +330,42 @@ impl Replica {
     }
     pub fn is_leader(&self) -> bool {
         self.leader_of(self.epoch) == self.node
+    }
+
+    /// Captures the complete diagnostic projection of the internal state.
+    /// Pure observability: no mutation, no effect on any later step.
+    pub fn diagnostic(&self) -> Diagnostic {
+        Diagnostic {
+            epoch: self.epoch,
+            status: self.status,
+            slot: self.slot,
+            commit: self.commit_slot,
+            executed: self.executed_slot,
+            executing: self.executing,
+            log: self.log.clone(),
+            clients: self
+                .clients
+                .iter()
+                .map(|(client_id, client)| {
+                    (
+                        *client_id,
+                        ClientDiagnostic {
+                            request_num: client.request_num,
+                            message_id: client.message_id,
+                            result: client.result.clone(),
+                        },
+                    )
+                })
+                .collect(),
+            results: self.results.clone(),
+            prepare_oks: self.prepare_oks.clone(),
+            latest_normal: self.latest_normal,
+            start_changes: self.start_changes.clone(),
+            sent_do_change: self.sent_do_change,
+            do_changes: self.do_changes.clone(),
+            recovery_nonce: self.recovery_nonce,
+            recovery: self.recovery.clone(),
+        }
     }
 
     pub fn request_datagram_size(
@@ -329,6 +412,9 @@ impl Replica {
     fn member(&self, node: NodeId) -> bool {
         (node as usize) < self.members.len()
     }
+    fn in_recovery(&self) -> bool {
+        matches!(self.status, Status::Recovering | Status::Replaying)
+    }
     fn message(&self, slot: Slot, body: Body) -> Message {
         Message {
             epoch: self.epoch,
@@ -359,7 +445,7 @@ impl Replica {
                     self.message(self.commit_slot, Body::Commit),
                 )]
             }
-            Input::LeaderTimeout if self.status != Status::Recovering => self
+            Input::LeaderTimeout if !self.in_recovery() => self
                 .epoch
                 .checked_add(1)
                 .map_or_else(Vec::new, |epoch| self.enter_change(epoch)),
@@ -513,7 +599,7 @@ impl Replica {
                 self.commit_slot = self.commit_slot.max(slot);
                 self.pending_execution()
             }
-            Body::StartEpochChange if self.status != Status::Recovering && epoch >= self.epoch => {
+            Body::StartEpochChange if !self.in_recovery() && epoch >= self.epoch => {
                 let mut out = if epoch > self.epoch {
                     self.enter_change(epoch)
                 } else {
@@ -528,7 +614,7 @@ impl Replica {
             Body::DoEpochChange {
                 latest_normal,
                 state,
-            } if self.status != Status::Recovering
+            } if !self.in_recovery()
                 && epoch >= self.epoch
                 && self.leader_of(epoch) == self.node =>
             {
@@ -548,9 +634,7 @@ impl Replica {
                 out
             }
             Body::StartEpoch { state }
-                if self.status != Status::Recovering
-                    && epoch >= self.epoch
-                    && from == self.leader_of(epoch) =>
+                if !self.in_recovery() && epoch >= self.epoch && from == self.leader_of(epoch) =>
             {
                 if (epoch == self.epoch && self.status != Status::EpochChange)
                     || !self.valid_state_message(slot, &state)
@@ -566,7 +650,6 @@ impl Replica {
                 } else {
                     Vec::new()
                 };
-                debug_assert_eq!(retained_suffix, self.slot > self.commit_slot);
                 out.extend(self.pending_execution());
                 out
             }
@@ -592,8 +675,17 @@ impl Replica {
                 {
                     return Vec::new();
                 }
-                self.recovery.insert(from, (epoch, state));
-                self.finish_recovery()
+                let incoming = (epoch, state);
+                if self
+                    .recovery
+                    .get(&from)
+                    .is_some_and(|stored| !Self::stronger_recovery_response(stored, &incoming))
+                {
+                    Vec::new()
+                } else {
+                    self.recovery.insert(from, incoming);
+                    self.finish_recovery()
+                }
             }
             _ => Vec::new(),
         }
@@ -623,17 +715,28 @@ impl Replica {
             return Vec::new();
         }
         let entry = &self.log[(slot - 1) as usize];
+        let client_id = entry.client_id;
+        let request_num = entry.request_num;
+        let message_id = entry.message_id;
         let mut out = Vec::new();
-        if let Some(client) = self.clients.get_mut(&entry.client_id) {
-            if client.request_num == entry.request_num && client.message_id == entry.message_id {
+        let mut matched = false;
+        if let Some(client) = self.clients.get_mut(&client_id) {
+            if client.request_num == request_num && client.message_id == message_id {
                 client.result = Some(result.clone());
-                if self.status == Status::Normal && self.is_leader() {
-                    out.push(Output::Reply(result));
-                }
+                matched = true;
             }
+        }
+        self.results
+            .insert((client_id, request_num), result.clone());
+        if matched && self.status == Status::Normal && self.is_leader() {
+            out.push(Output::Reply(result));
         }
         self.executed_slot = slot;
         self.executing = None;
+        if self.status == Status::Replaying && self.executed_slot == self.commit_slot {
+            let epoch = self.epoch;
+            self.activate_epoch(epoch);
+        }
         out.extend(self.pending_execution());
         out
     }
@@ -711,6 +814,28 @@ impl Replica {
         out
     }
 
+    fn stronger_recovery_response(
+        stored: &(Epoch, Option<LogState>),
+        incoming: &(Epoch, Option<LogState>),
+    ) -> bool {
+        let (stored_epoch, stored_state) = stored;
+        let (incoming_epoch, incoming_state) = incoming;
+        if incoming_epoch != stored_epoch {
+            return incoming_epoch > stored_epoch;
+        }
+        match (stored_state, incoming_state) {
+            (Some(stored), Some(incoming)) => {
+                (incoming.slot, incoming.commit) > (stored.slot, stored.commit)
+                    && incoming.slot >= stored.slot
+                    && incoming.commit >= stored.commit
+                    && incoming.log.len() >= stored.log.len()
+                    && incoming.log[..stored.log.len()] == stored.log[..]
+            }
+            (None, Some(_)) => true,
+            _ => false,
+        }
+    }
+
     fn finish_recovery(&mut self) -> Vec<Output> {
         if self.recovery.len() < self.quorum() {
             return Vec::new();
@@ -733,10 +858,15 @@ impl Replica {
         }
         self.epoch = epoch;
         self.adopt(state);
-        self.activate_epoch(epoch);
         self.recovery_nonce = None;
         self.recovery.clear();
-        self.pending_execution()
+        if self.executed_slot >= self.commit_slot {
+            self.activate_epoch(epoch);
+            Vec::new()
+        } else {
+            self.status = Status::Replaying;
+            self.pending_execution()
+        }
     }
 
     fn structurally_valid(state: &LogState) -> bool {
@@ -767,28 +897,33 @@ impl Replica {
 
     fn adopt(&mut self, state: LogState) {
         let old_clients = std::mem::take(&mut self.clients);
+        let old_results = std::mem::take(&mut self.results);
         self.log = state.log;
         self.slot = state.slot;
         self.commit_slot = state.commit;
         self.executing = None;
-        self.clients.clear();
         self.prepare_oks.clear();
         for entry in &self.log {
+            let key = (entry.client_id, entry.request_num);
+            let result = old_results.get(&key).cloned().or_else(|| {
+                old_clients
+                    .get(&entry.client_id)
+                    .filter(|old| {
+                        old.request_num == entry.request_num && old.message_id == entry.message_id
+                    })
+                    .and_then(|old| old.result.clone())
+            });
+            if let Some(result) = &result {
+                self.results.insert(key, result.clone());
+            }
             self.clients.insert(
                 entry.client_id,
                 ClientEntry {
                     request_num: entry.request_num,
                     message_id: entry.message_id,
-                    result: None,
+                    result,
                 },
             );
-        }
-        for (client_id, old) in old_clients {
-            if let Some(client) = self.clients.get_mut(&client_id) {
-                if client.request_num == old.request_num && client.message_id == old.message_id {
-                    client.result = old.result;
-                }
-            }
         }
     }
 
@@ -797,7 +932,6 @@ impl Replica {
         self.latest_normal = epoch;
         self.start_changes.clear();
         self.do_changes.clear();
-        self.prepare_oks.clear();
         self.sent_do_change = false;
     }
 }

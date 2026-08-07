@@ -94,6 +94,8 @@ predicted-value rule. Every replica uses that unchanged value; no replica sample
 executing the request.
 
 - A lease is live only when `expiry > execution_time`.
+- A candidate lease that is already expired (`expiry <= execution_time`) is rejected without regard to
+  the incumbent or the holder.
 - An absent or expired lease is free for any holder.
 - A live lease can only be replaced by the same holder UUID.
 - The same holder can extend or replace its own lease.

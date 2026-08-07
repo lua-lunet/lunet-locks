@@ -250,16 +250,32 @@ fn recovery_response_nonce_provenance_and_transfer_matrix_is_finite() {
                 slot,
                 Body::RecoveryResponse {
                     nonce: nonce.value(),
-                    state,
+                    state: state.clone(),
                 },
             ),
         );
+        // Admission per the core's own predicate (`src/vrr.rs`): the nonce
+        // must match, and `state.is_some() == (from == leader_of(epoch))` —
+        // so a matching nonleader response with `state: None` is valid
+        // quorum evidence, exactly like the leader's valid state transfer.
+        // A single admissible response is below the K=4 quorum of three, so
+        // admission is verified through the diagnostic evidence map; the
+        // quorum matrices prove the same evidence counts toward completion.
         let accepted = nonce == Nonce::Match
-            && provenance == Provenance::ExactLeader
-            && transfer == Transfer::Valid;
+            && ((provenance == Provenance::ExactLeader && transfer == Transfer::Valid)
+                || (provenance == Provenance::OtherMember && transfer == Transfer::Absent));
         assert!(outputs.is_empty(), "{nonce:?} {provenance:?} {transfer:?}");
         if accepted {
             assert_eq!(replica.status(), Status::Recovering);
+            let mut expected = before.diagnostic().clone();
+            expected.recovery.insert(provenance.from(), (0, state));
+            let after = ReplicaSnapshot::capture(&replica);
+            assert_eq!(
+                after.diagnostic(),
+                &expected,
+                "accepted case {nonce:?} {provenance:?} {transfer:?} adds exactly the \
+                 recovery evidence and mutates nothing else"
+            );
         } else {
             assert_replica_unchanged((nonce, provenance, transfer), &before, &replica);
         }
@@ -371,6 +387,11 @@ fn recovery_quorum_refuses_completion_when_the_maximum_epoch_lacks_its_leader_st
         replica.step(Input::Recover { nonce: NONCE });
         let before = ReplicaSnapshot::capture(&replica);
 
+        // Every response is admissible evidence (`state.is_some() ==
+        // (from == leader_of(epoch))` holds by construction), so the evidence
+        // map fills to exactly quorum size; completion stalls only because
+        // the maximum-epoch leader's state is absent.
+        let mut expected = before.diagnostic().clone();
         for from in responders {
             let epoch = if from == 0 { count as u32 - 1 } else { from };
             let state =
@@ -383,11 +404,12 @@ fn recovery_quorum_refuses_completion_when_the_maximum_epoch_lacks_its_leader_st
                     state.as_ref().map_or(0, |state| state.slot),
                     Body::RecoveryResponse {
                         nonce: NONCE,
-                        state,
+                        state: state.clone(),
                     }
                 ),
             )
             .is_empty());
+            expected.recovery.insert(from, (epoch, state));
         }
         assert_eq!(
             quorum,
@@ -399,6 +421,12 @@ fn recovery_quorum_refuses_completion_when_the_maximum_epoch_lacks_its_leader_st
             Status::Recovering,
             "K={count} maximum leader is absent"
         );
-        assert_replica_unchanged((count, "missing maximum leader state"), &before, &replica);
+        let after = ReplicaSnapshot::capture(&replica);
+        assert_eq!(
+            after.diagnostic(),
+            &expected,
+            "K={count} admits exactly the quorum-sized evidence map and mutates \
+             nothing else while completion is stalled"
+        );
     }
 }

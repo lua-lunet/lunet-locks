@@ -46,7 +46,9 @@ foreground disk write while the crash bound preserves enough volatile replicated
 
 Progress additionally requires eventual delivery of retries, at most `f` simultaneous failures, a
 nonfailed leader able to communicate with `Q - 1` backups, and timers that eventually remain long
-enough for useful work.
+enough for useful work. Recovery progress is deliberately stricter: it needs `Q` distinct other
+`normal` responders — at `K = 3` or `K = 4`, every other member — so one additional unavailable
+member stalls a recovery without weakening any safety guarantee.
 
 ## Ordered state
 
@@ -69,10 +71,10 @@ Each entry stores the complete client envelope:
 `message_id` is unchanged application correlation data. Duplicate suppression uses only
 `(client_id, request_num)`.
 
-Replica state includes membership, node ID, epoch, `normal | epoch-change | recovering` status,
-latest normal epoch, log, all three slot frontiers, the client table, and deterministic service state.
-Only `normal` replicas process normal traffic. Stale epochs are dropped; learning a greater epoch
-stops normal processing until authoritative state is acquired.
+Replica state includes membership, node ID, epoch, `normal | epoch-change | recovering | replaying`
+status, latest normal epoch, log, all three slot frontiers, the client table, and deterministic
+service state. Only `normal` replicas process normal traffic. Stale epochs are dropped; learning a
+greater epoch stops normal processing until authoritative state is acquired.
 
 ## Client table
 
@@ -113,16 +115,22 @@ For a fresh request, the leader selects any required predicted execution value, 
 entry at `last_slot + 1`, updates the client table with no result, and sends `PREPARE` to all backups.
 The append is immediate self-acceptance and counts as one quorum member.
 
-A backup accepts only the next contiguous slot in its current epoch. It obtains every missing entry
-before acknowledging and applies the client-table admission update. Its
-`PREPARE_OK(epoch, slot, node_id)` certifies acceptance of the entire prefix through that slot.
+A backup accepts only the exact next contiguous slot in its current epoch and applies the
+client-table admission update on acceptance. Its `PREPARE_OK(epoch, slot, node_id)` certifies
+acceptance of the entire prefix through that slot.
 
 The leader commits after self-acceptance plus `Q - 1` matching acknowledgements from distinct
 backups. It first advances `commit_slot`, then executes newly committed slots exactly once in
 increasing order, advances `executed_slot`, stores results, and replies. Backups receive commitment
-through `PREPARE` piggybacking or `COMMIT`; they obtain every missing entry through the advertised
-frontier, advance `commit_slot`, and only then execute. No replica executes an uncommitted entry or
-skips a gap.
+through `PREPARE` piggybacking or `COMMIT` and never advance `commit_slot` past their last
+contiguous slot. No replica executes an uncommitted entry or skips a gap.
+
+There is no gap-filling state transfer: the message inventory has no `GET_STATE`/`NEW_STATE`
+exchange, and a backup refuses a `PREPARE` or `COMMIT` that would skip entries it does not hold. A
+gapped backup therefore stalls, neither acknowledging nor advancing commitment, until an epoch
+change installs one authoritative whole log or recovery installs authoritative state. The refusal
+is a liveness limit, not a safety hole: skipped entries never execute, and the stall is resolved
+only by the two implemented whole-log transfers.
 
 ## Two-exchange epoch change
 
@@ -165,9 +173,21 @@ Only the deterministic leader of that response's exact epoch includes leader sta
 The recoverer needs `Q` distinct other normal responders. It determines the exact maximum epoch in
 that collected quorum and requires the leader of exactly that epoch, carrying state, among those
 responses. Thus `Q + 1` replicas communicate including the recoverer. It installs that one
-authoritative log and frontiers, reconstructs accepted request numbers, executes the committed
-prefix in slot order to reconstruct results, sets epoch and latest normal epoch, and only then enters
-`normal`.
+authoritative log and frontiers and reconstructs accepted request numbers. If committed entries
+remain unexecuted, it then enters an explicit `replaying` phase — still fully isolated, with all
+normal and epoch-change processing fenced — in which host-driven completions execute the committed
+prefix in slot order to reconstruct results without emitting client replies. It enters `normal`
+exactly when its executed slot reaches the installed commit slot, setting latest normal epoch; with
+no committed entries pending, activation is immediate.
+
+The `Q`-other responder rule is a deliberate liveness cost, not a safety compromise. Responders must
+be distinct, `normal`, and other than the recoverer, so at `K = 3` (`Q = 2`) and `K = 4` (`Q = 3`)
+every other member must answer: one additional crashed or non-`normal` member stalls recovery until
+that member answers or the host retries the attempt later with a fresh nonce. Safety is unaffected —
+the crash bound `f = 1` still governs which simultaneous failures committed state survives, and the
+stricter responder set guarantees a quorum-intersecting evidence set including the
+exact-maximum-epoch leader — but a recovering replica makes no progress past a second unavailable
+member.
 
 ## Predicted execution values
 
@@ -185,14 +205,18 @@ is that every commit, epoch-change report set, and relevant recovery set has `Q`
 
 Safety does not imply progress in a fully asynchronous run. Liveness requires continued client and
 protocol retries, eventual delivery among enough replicas, a usable deterministic leader, stable
-timing long enough to form quorums, and `Q` other normal responders for recovery.
+timing long enough to form quorums, and, for recovery, `Q` distinct other `normal` responders — at
+`K = 3` or `K = 4`, every other member. These are liveness limits only: an unlucky run stalls, but
+it never executes a skipped entry or installs a merged log.
 
 ## Optimizations and scope
 
 Commit piggybacking, batching, checkpoints, persistence, and compact state transfer may change cost
 but not quorum thresholds, epoch fencing, whole-log selection, execution ordering, client-table
 semantics, or recovery completion. Compact transfer must reconstruct exactly one authoritative log
-and committed prefix before activation.
+and committed prefix before activation. The current core moves every state transfer as one whole log
+within a single datagram, and chunked or checkpointed transfer remains future work; the resulting
+one-datagram ceiling is a liveness limit recorded on the protocol pages, not a correctness boundary.
 
 Dynamic membership and configuration generations are out of scope, as are witnesses, leader leases,
 backup reads, Byzantine faults, and concrete checkpoint or garbage-collection formats. In explicit

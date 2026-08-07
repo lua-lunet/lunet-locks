@@ -64,7 +64,7 @@ pub enum Response {
     },
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Service {
     locks: BTreeMap<u64, Lease>,
 }
@@ -113,7 +113,8 @@ impl Service {
                 ..
             } => {
                 let held = self.live(execution_time, lock_id);
-                let granted = held.is_none_or(|current| current.holder == lease.holder);
+                let granted = held.is_none_or(|current| current.holder == lease.holder)
+                    && lease.expiry > execution_time;
                 if granted {
                     self.locks.insert(lock_id, lease);
                 }
