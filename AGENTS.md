@@ -12,6 +12,11 @@ Local guidance for this repo. Keep it short, factual, and unsurprising.
 
 - Build with [Cyan](https://github.com/teal-language/cyan), not ad-hoc `tl gen` loops.
 - Install Lua deps into the project-local `.rocks/` tree.
+- Format Teal with [Cerulean](https://github.com/efredriksson/cerulean) using its default
+  opinionated conventions (4-space indent, double quotes, sorted requires, 88-char
+  line length). Run `make fmt` to format in place and `make lint` (included in
+  `check`) to reject unformatted code. After clone, run `make hooks` once to enable
+  the pre-commit guard.
 - Runtime target is LuaJIT / Lua 5.1, so `gen_target = "5.1"` and `gen_compat = "off"`.
 
 ## Teal no-surprises recap

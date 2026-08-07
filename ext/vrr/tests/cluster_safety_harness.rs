@@ -20,7 +20,7 @@
 
 mod support;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use proptest::prelude::*;
 use proptest::test_runner::FileFailurePersistence;
@@ -101,6 +101,8 @@ struct Cluster {
     nonce: u64,
     steps: u64,
     actions: BTreeMap<&'static str, u64>,
+    amnesiac: BTreeSet<NodeId>,
+    amnesiac_recovered_nonempty: u64,
 }
 
 impl Cluster {
@@ -116,6 +118,8 @@ impl Cluster {
             nonce: 0,
             steps: 0,
             actions: BTreeMap::new(),
+            amnesiac: BTreeSet::new(),
+            amnesiac_recovered_nonempty: 0,
         }
     }
 
@@ -172,13 +176,24 @@ impl Cluster {
     fn after_step(&mut self) {
         self.steps += 1;
         self.check_safety();
+        let recovered: Vec<_> = self
+            .amnesiac
+            .iter()
+            .copied()
+            .filter(|&node| self.replicas[node as usize].status() == Status::Normal)
+            .collect();
+        for node in recovered {
+            self.amnesiac.remove(&node);
+            if !self.replicas[node as usize].log().is_empty() {
+                self.amnesiac_recovered_nonempty += 1;
+            }
+        }
     }
 
-    /// Committed-slot agreement: no two replicas may execute different
-    /// entries at the same slot. Executed slots are a prefix of the log
-    /// (the core executes strictly in order), so pairwise prefix equality
-    /// over `min(executed)` is exactly the invariant. Also asserts the
-    /// per-replica sanity that only committed entries ever execute.
+    /// Committed-slot agreement: no two replicas may have different entries
+    /// at the same position in their committed prefix. Also asserts the
+    /// per-replica sanity that only committed entries ever execute and that
+    /// the executed prefix does not exceed the log length.
     fn check_safety(&self) {
         for (index, replica) in self.replicas.iter().enumerate() {
             assert!(
@@ -195,11 +210,18 @@ impl Cluster {
                 replica.executed(),
                 replica.log().len()
             );
+            assert!(
+                replica.commit() as usize <= replica.log().len(),
+                "step {}: node {index} committed {} outside its log of {} entries",
+                self.steps,
+                replica.commit(),
+                replica.log().len()
+            );
         }
         for left in 0..self.replicas.len() {
             for right in (left + 1)..self.replicas.len() {
                 let (a, b) = (&self.replicas[left], &self.replicas[right]);
-                let common = a.executed().min(b.executed()) as usize;
+                let common = a.commit().min(b.commit()) as usize;
                 for (index, (entry_a, entry_b)) in
                     a.log().iter().zip(b.log().iter()).take(common).enumerate()
                 {
@@ -207,7 +229,7 @@ impl Cluster {
                     assert_eq!(
                         entry_a, entry_b,
                         "step {}: committed-slot disagreement: node {left} and node {right} \
-                         executed different entries at slot {slot}",
+                         have different entries at slot {slot}",
                         self.steps
                     );
                 }
@@ -390,7 +412,8 @@ impl Cluster {
         self.count("recover");
         let node = rng.below(self.replicas.len()) as NodeId;
         let another_recovering = self.replicas.iter().enumerate().any(|(index, replica)| {
-            index != node as usize && replica.status() == Status::Recovering
+            index != node as usize
+                && matches!(replica.status(), Status::Recovering | Status::Replaying)
         });
         if another_recovering {
             self.after_step();
@@ -398,6 +421,30 @@ impl Cluster {
         }
         self.nonce += 1;
         self.step_replica(node, Input::Recover { nonce: self.nonce });
+    }
+
+    /// Replaces a schedule-chosen replica with a fresh amnesiac one (empty
+    /// log, epoch 0, executed 0), drops its in-flight execution, then
+    /// drives `Input::Recover` with a fresh nonce.  The guard is the same
+    /// as `recover()`: refuse if any other replica is `Recovering` or
+    /// `Replaying`, keeping us within the `f = 1` crash bound for K=3/K=4.
+    fn crash_restart(&mut self, rng: &mut Rng) {
+        let target = rng.below(self.replicas.len()) as NodeId;
+        let other_guarded = self.replicas.iter().enumerate().any(|(index, replica)| {
+            index != target as usize
+                && matches!(replica.status(), Status::Recovering | Status::Replaying)
+        });
+        if other_guarded || !self.amnesiac.is_empty() {
+            self.after_step();
+            return;
+        }
+        self.count("crash");
+        let k = self.replicas.len();
+        self.replicas[target as usize] = node(k, target as usize);
+        self.pending.remove(&target);
+        self.amnesiac.insert(target);
+        self.nonce += 1;
+        self.step_replica(target, Input::Recover { nonce: self.nonce });
     }
 
     /// Cuts a simple split-point partition, or heals the existing one.
@@ -596,16 +643,17 @@ impl Cluster {
         );
         for _ in 0..steps {
             match rng.below(100) {
-                0..=44 => self.deliver(&mut rng),
-                45..=59 => self.complete(&mut rng),
-                60..=67 => self.request(&mut rng, max_requests),
-                68..=72 => self.idle(&mut rng),
-                73..=76 => self.drop_envelope(&mut rng),
-                77..=80 => self.duplicate_envelope(&mut rng),
-                81..=84 => self.reorder_bus(&mut rng),
-                85..=88 => self.timeout(&mut rng),
-                89..=90 => self.recover(&mut rng),
-                91..=96 => self.partition_or_heal(&mut rng),
+                0..=42 => self.deliver(&mut rng),
+                43..=57 => self.complete(&mut rng),
+                58..=65 => self.request(&mut rng, max_requests),
+                66..=70 => self.idle(&mut rng),
+                71..=74 => self.drop_envelope(&mut rng),
+                75..=78 => self.duplicate_envelope(&mut rng),
+                79..=82 => self.reorder_bus(&mut rng),
+                83..=86 => self.timeout(&mut rng),
+                87..=88 => self.recover(&mut rng),
+                89..=91 => self.crash_restart(&mut rng),
+                92..=97 => self.partition_or_heal(&mut rng),
                 _ => self.deliver(&mut rng),
             }
         }
@@ -683,6 +731,7 @@ fn seeded_campaign_case(k: usize) {
     let mut executions = 0;
     let mut stabilized = 0;
     let mut seeds_with_progress = 0;
+    let mut amnesiac_recovered_nonempty = 0;
     for seed in 0..SEEDED_SEEDS {
         let mut cluster = Cluster::new(k);
         if cluster.run_seeded(seed, SEEDED_STEPS, SEEDED_MAX_REQUESTS) {
@@ -692,6 +741,7 @@ fn seeded_campaign_case(k: usize) {
         if !cluster.transcript.executions.is_empty() {
             seeds_with_progress += 1;
         }
+        amnesiac_recovered_nonempty += cluster.amnesiac_recovered_nonempty;
         for (action, count) in cluster.actions {
             *totals.entry(action).or_insert(0) += count;
         }
@@ -708,6 +758,10 @@ fn seeded_campaign_case(k: usize) {
         executions >= SEEDED_SEEDS as usize * 2,
         "seeded campaign was nearly vacuous: only {executions} executions across {SEEDED_SEEDS} seeds"
     );
+    assert!(
+        amnesiac_recovered_nonempty > 0,
+        "no amnesiac replica returned to Normal with a nonempty recovered log"
+    );
     for action in [
         "deliver",
         "drop",
@@ -720,6 +774,7 @@ fn seeded_campaign_case(k: usize) {
         "idle",
         "timeout",
         "recover",
+        "crash",
     ] {
         assert!(
             totals.get(action).copied().unwrap_or(0) > 0,
@@ -789,6 +844,7 @@ enum ScheduleAction {
     Reorder,
     Timeout,
     Recover,
+    CrashRestart,
     PartitionOrHeal,
 }
 
@@ -803,6 +859,7 @@ fn schedule_action() -> impl Strategy<Value = ScheduleAction> {
         3  => Just(ScheduleAction::Reorder),
         3  => Just(ScheduleAction::Timeout),
         2  => Just(ScheduleAction::Recover),
+        2  => Just(ScheduleAction::CrashRestart),
         5  => Just(ScheduleAction::PartitionOrHeal),
     ]
 }
@@ -823,6 +880,7 @@ fn run_proptest_schedule(cluster: &mut Cluster, actions: &[ScheduleAction], rng:
             ScheduleAction::Reorder => cluster.reorder_bus(rng),
             ScheduleAction::Timeout => cluster.timeout(rng),
             ScheduleAction::Recover => cluster.recover(rng),
+            ScheduleAction::CrashRestart => cluster.crash_restart(rng),
             ScheduleAction::PartitionOrHeal => cluster.partition_or_heal(rng),
         }
     }

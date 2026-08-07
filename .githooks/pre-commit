@@ -1,0 +1,4 @@
+#!/bin/sh
+# Reject commits with unformatted Teal files.
+# Run `make hooks` once after clone to enable.
+make lint

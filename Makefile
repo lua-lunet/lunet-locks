@@ -4,11 +4,12 @@ LUAJIT_DIR ?= $(shell brew --prefix luajit 2>/dev/null || echo /usr/local)
 LUAROCKS   ?= luarocks --lua-version=5.1 --lua-dir=$(LUAJIT_DIR) --tree=.rocks
 CYAN       ?= .rocks/bin/cyan
 TESTED     ?= .rocks/bin/tested
+CERU       ?= .rocks/bin/ceru
 # Teal outside source_dir, which `cyan build` does not reach.
 CHECK_SOURCES = tests/teal_learning_test.tl \
                 tests/vrr_ffi_test.tl
 
-.PHONY: init deps build check test docs clean ext ext-check ext-test
+.PHONY: init deps build check test docs clean ext ext-check ext-test fmt lint hooks
 
 init:
 	@command -v mise >/dev/null 2>&1 || { echo "ERROR: mise is not on PATH. Install it from https://mise.jdx.dev and try again."; exit 1; }
@@ -18,11 +19,21 @@ init:
 deps:
 	$(LUAROCKS) install cyan
 	$(LUAROCKS) install tested
+	$(LUAROCKS) install cerulean
+
+fmt:
+	$(CERU) src tests
+
+lint:
+	$(CERU) --check src tests
+
+hooks:
+	git config core.hooksPath .githooks
 
 build: ext
 	$(CYAN) build --prune
 
-check: build
+check: build lint
 	$(CYAN) check $(CHECK_SOURCES)
 
 test: check
