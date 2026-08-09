@@ -1,89 +1,65 @@
-# Build and Tests
+# Build and tests
 
-## One ordered entrypoint
+Install the project tools into their local locations:
 
-`make` owns orchestration. Rust finishes before Cyan, and Cyan finishes before `tested`:
-
-```mermaid
-sequenceDiagram
-    actor Developer
-    participant Make
-    participant Cargo
-    participant Cyan
-    participant Tested as tested on LuaJIT
-
-    Developer->>Make: make test
-    Make->>Cargo: cargo fmt --check
-    Make->>Cargo: cargo clippy --all-targets -- -D warnings
-    Make->>Cargo: cargo test
-    Make->>Cargo: cargo build --release
-    Cargo-->>Make: libvrr.dylib / libvrr.so
-    Make->>Cyan: cyan build --prune
-    Cyan-->>Make: build/vrr.lua
-    Make->>Cyan: cyan check tests
-    Make->>Tested: tested tests
-    Tested-->>Developer: Rust/Teal/FFI result
+```console
+make init       # mise tools, then Cyan, Cerulean, and tested in .rocks/
+make hooks      # enable the formatting pre-commit hook once after clone
 ```
 
-The dependency chain is:
+The native adapter requires Rust 1.85 or newer. It depends on the exact pinned
+`vrr-core` Git revision while the upstream crate remains private. CI supplies a
+read-only `VRR_CORE_DEPLOY_KEY` deploy key only to Cargo's SSH fetch.
 
-```text
-test -> check -> build -> ext -> ext-test -> ext-check
+## Commands
+
+```console
+make fmt             # format Teal with Cerulean
+make lint            # reject unformatted Teal
+make build           # Rust checks/tests/release cdylib, then Cyan output
+make check           # build plus all Teal type checks
+make test            # check plus tested
+make lunet-runtime   # fetch and verify Lunet v0.7.2 locally
+make smoke           # build and run the three-process service smoke test
+make simulation      # 30s TCP-NDJSON three-datacenter lease failover demo
+make simulation-test # focused std-Rust simulator unit tests
+make docs            # render the Zensical site
 ```
 
-This means the Teal wrapper is never built against a missing or stale native release artifact.
+`make lunet-runtime` downloads the host-specific official Lunet `v0.7.2`
+archive, verifies its SHA-256, and extracts it into `.lunet/v0.7.2/`. The
+service and smoke test always use `.lunet/v0.7.2/lunet-run`; they do not use a
+runtime from `PATH`. The shipped LuaCATS/Teal runtime documentation is at
+`.lunet/v0.7.2/types/`.
 
-## Rust tests
+`make smoke` starts three local nodes, connects through a nonleader, and
+covers acquire, GET, contention, RELEASE, reacquisition, expiry takeover, and
+one-replica restart while a quorum remains live. Temporary logs and process
+state live under `.tmp/`; the downloaded runtime does not.
 
-- serde JSON client round-trip;
-- free/live/expired SET behavior;
-- fixed 16-byte header and membership validation;
-- normal PREPARE/PREPARE_OK/execute and duplicate reply;
-- qualified new-leader report during epoch change.
+`make simulation` starts the same fixed three-node topology using only
+`.lunet/v0.7.2/lunet-run`, then drives it through the TCP NDJSON client API for
+30 seconds. The std-Rust harness starts `DC1-0001`, `DC2-0001`, and
+`DC3-0001` with durable logical IDs 10001, 20001, and 30001, respectively.
+They GET before SET, renew their 1,000 ms lease every 900 ms, and contend for
+sentinel lock `0x0DDBA11`. Every three seconds it stops the observed holder,
+waits 1.1 seconds, starts the next same-DC singleton, and verifies takeover.
+It logs acquisitions, renewals, stops, and failovers but not ordinary polling.
+The run exits nonzero on a conflicting holder observation or if a replacement
+does not take over within five seconds. Logs and node process state are kept in
+`.tmp/lease-failover-*`; the harness always terminates the node processes. Set
+`SIM_DURATION` to a value from 1 to 30 for a shorter run.
 
-## Teal and LuaJIT tests
-
-`tests/vrr_ffi_test.tl` is type-checked by Cyan, then run by `tested` under the same LuaJIT family
-used by the application. It covers:
-
-- native membership validation;
-- malformed and over-datagram client input rejected before log mutation;
-- three-node request -> PREPARE -> PREPARE_OK -> JSON reply;
-- UUID correlation and duplicate cached reply;
-- exact header metadata at the Teal boundary;
-- embedded-NUL peer bytes passed with their full length and rejected when trailing data is invalid.
-
-Every `tested.test` contains a real assertion because `tested` reports no-assert tests and unhandled
-exceptions as invalid rather than failed.
-
-## Documentation build
-
-`make docs` runs `docs/docs`. It is an executable Python script with uv inline metadata:
-
-```python
-#!/usr/bin/env -S uv run --script
-# /// script
-# requires-python = ">=3.12"
-# dependencies = ["zensical"]
-# ///
-```
-
-No global Python environment or globally installed Zensical is required. Zensical reads
-`docs/zensical.toml`, renders Mermaid diagrams from Markdown, and writes the generated site to
-`docs/site/`.
+`make docs` runs the `uv`-managed Zensical script at `docs/docs` and writes
+generated HTML under `docs/site/`.
 
 ## Relevant files
 
 | File | Responsibility |
 |---|---|
-| `ext/vrr/src/locks.rs` | serde JSON client protocol and lock state |
-| `ext/vrr/src/vrr.rs` | VRR state machine and peer wire codec |
-| `ext/vrr/src/ffi.rs` | combined node facade and C ABI |
-| `src/ffi.d.tl` | typed LuaJIT FFI surface used by Teal |
-| `src/vrr.tl` | typed Teal wrapper and output draining |
-| `tests/vrr_ffi_test.tl` | outer LuaJIT/FFI forward pass |
-| `Makefile` | ordered build and test graph |
-
-Struct and parameter ordering SHOULD follow
-[NOMA Collected Ordering](https://gist.github.com/simbo1905/c969d505ca531a301fea7f24f52ee0c9),
-as summarized in `CONVENTIONS.md`.
+| `ext/advisory_lock/src/locks.rs` | JSON lock protocol and lock state machine |
+| `ext/advisory_lock/src/ffi.rs` | vrr-core adapter, C ABI, wall clock, recovery nonce |
+| `src/advisory_lock.tl` | Teal wrapper and owned output draining |
+| `src/server.tl` | TCP NDJSON server, UDP peers, and leader forwarding |
+| `tests/lunet_smoke.sh` | three-process runtime smoke test |
+| `tools/lease_failover_sim.rs` | std-Rust live TCP lease-failover simulator |
