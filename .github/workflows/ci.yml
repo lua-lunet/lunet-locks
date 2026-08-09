@@ -54,6 +54,16 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes luajit libluajit-5.1-dev luarocks perl
+          # Debian's luarocks package pulls in PUC lua5.1 and then detects it
+          # before luajit, so rock wrappers would exec PUC Lua, which lacks
+          # LuaJIT's built-in `bit` module the tests require. A shim prefix
+          # whose only interpreter is luajit pins wrappers and headers to
+          # LuaJIT; pass LUAJIT_DIR=/opt/luajit-shim to every make invocation.
+          sudo mkdir -p /opt/luajit-shim/bin
+          sudo ln -sf /usr/bin/luajit /opt/luajit-shim/bin/lua
+          sudo ln -sf /usr/bin/luajit /opt/luajit-shim/bin/luajit
+          sudo ln -sfn /usr/include /opt/luajit-shim/include
+          sudo ln -sfn /usr/lib /opt/luajit-shim/lib
       - name: Install system dependencies (macOS)
         if: runner.os == 'macOS'
         run: brew install luajit luarocks
@@ -64,22 +74,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.85
         with:
           components: rustfmt, clippy
-      - name: Configure read-only vrr-core access
-        shell: bash
-        env:
-          VRR_CORE_DEPLOY_KEY: ${{ secrets.VRR_CORE_DEPLOY_KEY }}
-        run: |
-          test -n "$VRR_CORE_DEPLOY_KEY"
-          install -d -m 700 ~/.ssh
-          printf '%s\n' "$VRR_CORE_DEPLOY_KEY" > ~/.ssh/id_ed25519
-          chmod 600 ~/.ssh/id_ed25519
-          ssh-keyscan github.com >> ~/.ssh/known_hosts
       - name: Install project Lua tools
         if: runner.os != 'Windows'
         shell: bash
         run: |
           if [ "${{ runner.os }}" = "Linux" ]; then
-            make deps LUAJIT_DIR=/usr
+            make deps LUAJIT_DIR=/opt/luajit-shim
           else
             make deps
           fi
@@ -91,7 +91,7 @@ jobs:
         shell: bash
         run: |
           if [ "${{ runner.os }}" = "Linux" ]; then
-            make test LUAJIT_DIR=/usr
+            make test LUAJIT_DIR=/opt/luajit-shim
           else
             make test
           fi
@@ -100,7 +100,7 @@ jobs:
         shell: bash
         run: |
           if [ "${{ runner.os }}" = "Linux" ]; then
-            make smoke LUAJIT_DIR=/usr
+            make smoke LUAJIT_DIR=/opt/luajit-shim
           else
             make smoke
           fi
@@ -140,20 +140,19 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes luajit libluajit-5.1-dev luarocks perl
+          # LuaJIT shim prefix; see the test job for why this exists.
+          sudo mkdir -p /opt/luajit-shim/bin
+          sudo ln -sf /usr/bin/luajit /opt/luajit-shim/bin/lua
+          sudo ln -sf /usr/bin/luajit /opt/luajit-shim/bin/luajit
+          sudo ln -sfn /usr/include /opt/luajit-shim/include
+          sudo ln -sfn /usr/lib /opt/luajit-shim/lib
       - uses: jdx/mise-action@v2
       # rustfmt + clippy are required by make ext-check (cargo fmt --check,
       # cargo clippy); the default rust-toolchain profile omits them.
       - uses: dtolnay/rust-toolchain@1.85
         with:
           components: rustfmt, clippy
-      - name: Configure read-only vrr-core access
-        run: |
-          test -n "${{ secrets.VRR_CORE_DEPLOY_KEY }}"
-          install -d -m 700 ~/.ssh
-          printf '%s\n' "${{ secrets.VRR_CORE_DEPLOY_KEY }}" > ~/.ssh/id_ed25519
-          chmod 600 ~/.ssh/id_ed25519
-          ssh-keyscan github.com >> ~/.ssh/known_hosts
       - name: Install project Lua tools
-        run: make deps LUAJIT_DIR=/usr
+        run: make deps LUAJIT_DIR=/opt/luajit-shim
       - name: Docker build and three-container simulation
-        run: make docker-simulation LUAJIT_DIR=/usr
+        run: make docker-simulation LUAJIT_DIR=/opt/luajit-shim

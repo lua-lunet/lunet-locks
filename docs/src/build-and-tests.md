@@ -8,8 +8,8 @@ make hooks      # enable the formatting pre-commit hook once after clone
 ```
 
 The native adapter requires Rust 1.85 or newer. It depends on the exact pinned
-`vrr-core` Git revision while the upstream crate remains private. CI supplies a
-read-only `VRR_CORE_DEPLOY_KEY` deploy key only to Cargo's SSH fetch.
+`vrr-core` Git revision, fetched over HTTPS from the public upstream repository,
+so neither local builds nor CI need any credential setup.
 
 ## Commands
 
