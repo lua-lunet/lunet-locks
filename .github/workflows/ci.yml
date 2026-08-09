@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes luajit libluajit-5.1-dev luarocks perl
+      - uses: jdx/mise-action@v2
+      - uses: dtolnay/rust-toolchain@1.85
+      - name: Configure read-only vrr-core access
+        env:
+          VRR_CORE_DEPLOY_KEY: ${{ secrets.VRR_CORE_DEPLOY_KEY }}
+        run: |
+          test -n "$VRR_CORE_DEPLOY_KEY"
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$VRR_CORE_DEPLOY_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+      - name: Install project Lua tools
+        run: make deps LUAJIT_DIR=/usr
+      - name: Format and lint
+        run: make fmt && git diff --exit-code && make lint
+      - name: Rust, Cyan, and advisory tests
+        run: make test LUAJIT_DIR=/usr
+      - name: Three-replica Lunet smoke test
+        run: make smoke LUAJIT_DIR=/usr
+      - name: Build documentation
+        run: make docs

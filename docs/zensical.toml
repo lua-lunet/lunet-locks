@@ -7,10 +7,7 @@ site_author = "Simon Massey"
 nav = [
   { "Overview" = "index.md" },
   { "Architecture" = "architecture.md" },
-  { "Corrected formalism" = "corrected-formalism.md" },
-  { "Glossary" = "glossary.md" },
   { "External client protocol" = "client-protocol.md" },
-  { "Internal VRR protocol" = "internal-protocol.md" },
   { "Build and tests" = "build-and-tests.md" },
 ]
 

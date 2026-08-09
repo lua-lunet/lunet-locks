@@ -1,42 +1,36 @@
-# lunet-locks
+# Lunet advisory lock
 
-`lunet-locks` is a lightweight locking service. Its locks are advisory and represented by expiring
-leases. Requests are ordered by Viewstamped Replication Revisited (VRR). Teal and lunet own runtime
-orchestration. A Rust `cdylib` owns the replication state machine and lock state. LuaJIT connects the
-two through a deliberately small FFI.
+`lunet-advisory-lock` is a fixed-membership service for expiring, advisory
+leases. Lunet and Teal provide the TCP/UDP process; a small Rust adapter owns
+lock execution and delegates replication to
+[vrr-core](https://github.com/lua-lunet/vrr-core).
 
-## Read this first
+## Service topology
 
-- [Architecture](architecture.md) explains the combined node facade, ownership, FFI boundary, and
-  state flow.
-- [Corrected formalism](corrected-formalism.md) gives a reviewer-oriented statement of the protocol
-  model, quorum rules, and safety obligations.
-- [Glossary](glossary.md) defines the project terminology and its limited mapping to the paper.
-- [External client protocol](client-protocol.md) specifies the JSON GET/SET messages and lease
-  rules.
-- [Internal VRR protocol](internal-protocol.md) specifies the 16-byte header and replica messages.
-- [Build and tests](build-and-tests.md) records the ordered Rust, Cyan, LuaJIT, and documentation
-  pipeline.
-
-## Current scope
-
-The fixed-membership protocol covers normal operation, epoch change, replica recovery, and
-deterministic predicted execution values corresponding to paper Sections 4.1 through 4.4. The
-formalism pages specify required behavior; [Build and tests](build-and-tests.md) separately records
-the behavior currently exercised by tests.
-
-The current core does not implement state transfer, checkpoints, reconfiguration (including the
-paper's configuration generation, called its reconfiguration epoch-number), witnesses, batching,
-or network encryption.
-
-## Commands
+Start every member with the same lexically sorted membership list. Each member
+has one UDP peer endpoint and one TCP client endpoint:
 
 ```console
-make build   # Rust checks/tests/release build, then Cyan
-make check   # build plus all Teal type checks
-make test    # check plus tested under LuaJIT
-make docs    # build this Zensical site through uv
+lunet-run build/server.lua \
+  --node n1 --client 127.0.0.1:8001 --state /var/lib/lunet-lock/n1.nonce \
+  --member n1=127.0.0.1:7001 \
+  --member n2=127.0.0.1:7002 \
+  --member n3=127.0.0.1:7003
 ```
 
-Source of truth remains the code. Generated Lua under `build/` and generated HTML under
-`docs/site/` are artifacts.
+At least three uniquely named members are required. Member names must be
+lexically sorted, endpoints must be literal IPv4 `host:port` values, and
+`--node` must occur exactly once. The supplied `lunet-run` is the
+project-local official `v0.7.2` runtime from `.lunet/v0.7.2/`, not a binary
+from `PATH`.
+
+- [Architecture](architecture.md) describes client forwarding, recovery, and
+  operational boundaries.
+- [External client protocol](client-protocol.md) specifies GET, SET, and
+  RELEASE.
+- [Build and tests](build-and-tests.md) describes the pinned runtime and
+  project commands.
+
+Replication mechanics, wire behavior, and safety proofs belong to
+[vrr-core](https://github.com/lua-lunet/vrr-core). This repository deliberately
+does not duplicate them.

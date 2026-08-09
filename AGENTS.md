@@ -19,6 +19,19 @@ Local guidance for this repo. Keep it short, factual, and unsurprising.
   the pre-commit guard.
 - Runtime target is LuaJIT / Lua 5.1, so `gen_target = "5.1"` and `gen_compat = "off"`.
 
+## Runtime and upstream boundaries
+
+- The only service/smoke runtime is the project-local official Lunet `v0.7.2`
+  release. Run `make lunet-runtime` or `make smoke`; do not use a `lunet-run`
+  from `PATH`. Its authoritative shipped LuaCATS/Teal docs are under
+  `.lunet/v0.7.2/types/`.
+- Treat the local `vrr-core` checkout at the pinned revision as authoritative.
+  Do not revalidate or change it unless a concrete adapter API need requires it.
+  A serious correctness, safety, or replication bug is a stop-and-report issue.
+  A small focused additive ergonomic change may be staged locally (never
+  committed or pushed) only with a corresponding upstream GitHub issue; report
+  it to the coordinator.
+
 ## Teal no-surprises recap
 
 Do not trust memory on Teal syntax. If unsure, check the learning tests first:

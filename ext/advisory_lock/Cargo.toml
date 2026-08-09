@@ -1,0 +1,18 @@
+[package]
+name = "lunet-advisory-lock"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+
+[lib]
+name = "lunet_advisory_lock"
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["serde"] }
+vrr = { package = "vrr-core", git = "ssh://git@github.com/lua-lunet/vrr-core.git", rev = "26a183ca7fed09aab22e8a6ba4f04557e186fa4f" }
+
+[dev-dependencies]
+proptest = "1.11.0"
