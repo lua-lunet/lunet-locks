@@ -1,10 +1,10 @@
 #!/bin/sh
 # End-to-end advisory-lock service smoke. `make smoke` supplies the exact,
-# project-local Lunet v0.7.2 release; it is deliberately never resolved from PATH.
+# project-local Lunet v0.8.0 release; it is deliberately never resolved from PATH.
 set -eu
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-run=${LUNET_RUN:-"$root/.lunet/v0.7.2/lunet-run"}
+run=${LUNET_RUN:-"$root/.lunet/v0.8.0/lunet-run"}
 cyan=${CYAN:-"$root/.rocks/bin/cyan"}
 work=$(mktemp -d "$root/.tmp/lunet-smoke.XXXXXX")
 pids=""
@@ -35,7 +35,7 @@ cleanup() {
 trap cleanup EXIT INT TERM HUP
 
 test -x "$run" || {
-    echo "lunet smoke: missing project-local Lunet v0.7.2 runtime at $run; run make lunet-runtime" >&2
+    echo "lunet smoke: missing project-local Lunet v0.8.0 runtime at $run; run make lunet-runtime" >&2
     exit 127
 }
 test -x "$cyan" || {

@@ -21,10 +21,10 @@ Local guidance for this repo. Keep it short, factual, and unsurprising.
 
 ## Runtime and upstream boundaries
 
-- The only service/smoke runtime is the project-local official Lunet `v0.7.2`
+- The only service/smoke runtime is the project-local official Lunet `v0.8.0`
   release. Run `make lunet-runtime` or `make smoke`; do not use a `lunet-run`
   from `PATH`. Its authoritative shipped LuaCATS/Teal docs are under
-  `.lunet/v0.7.2/types/`.
+  `.lunet/v0.8.0/types/`.
 - Treat the local `vrr-core` checkout at the pinned revision as authoritative.
   Do not revalidate or change it unless a concrete adapter API need requires it.
   A serious correctness, safety, or replication bug is a stop-and-report issue.

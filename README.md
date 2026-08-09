@@ -11,8 +11,8 @@ Run a three-replica smoke test with the project-local Lunet runtime:
 make smoke
 ```
 
-The command fetches the official Lunet `v0.7.2` release into
-`.lunet/v0.7.2/`; it never uses a host `lunet-run` from `PATH`. See the
+The command fetches the official Lunet `v0.8.0` release into
+`.lunet/v0.8.0/`; it never uses a host `lunet-run` from `PATH`. See the
 [documentation](docs/src/index.md) for configuration, the client protocol, and
 operational limits.
 

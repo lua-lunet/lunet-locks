@@ -1,25 +1,67 @@
 name: CI
 
+# Lane split modeled on the upstream lua-lunet/lunet build workflow: a
+# setup-matrix job decides the matrix per event. Regular builds (PRs, pushes
+# to main) run the fast Linux-only lane; tagged builds (v*) run the full
+# platform matrix and then the Docker simulation.
+
 on:
   pull_request:
+    branches: [main]
   push:
     branches: [main]
+    tags:
+      - 'v*'
 
 permissions:
   contents: read
 
+# Cancel previous runs when a new commit is pushed to the same PR/branch.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  test:
+  setup-matrix:
+    name: Setup build matrix
     runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - id: set-matrix
+        run: |
+          # Regular lane: Linux amd64 + arm64 only (the fast stuff).
+          LINUX='{"include":[{"os":"ubuntu-24.04","arch":"amd64","platform":"linux","target_key":"linux-amd64"},{"os":"blacksmith-4vcpu-ubuntu-2404-arm","arch":"arm64","platform":"linux","target_key":"linux-arm64"}]}'
+          # Tagged lane: everything, adding macOS and Windows.
+          ALL='{"include":[{"os":"ubuntu-24.04","arch":"amd64","platform":"linux","target_key":"linux-amd64"},{"os":"blacksmith-4vcpu-ubuntu-2404-arm","arch":"arm64","platform":"linux","target_key":"linux-arm64"},{"os":"macos-latest","arch":"arm64","platform":"macos","target_key":"macos"},{"os":"blacksmith-4vcpu-windows-2025","arch":"amd64","platform":"windows","target_key":"windows"}]}'
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            echo "matrix=$ALL" >> "$GITHUB_OUTPUT"
+          else
+            echo "matrix=$LINUX" >> "$GITHUB_OUTPUT"
+          fi
+
+  test:
+    name: ${{ matrix.target_key }}
+    needs: setup-matrix
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v4
-      - name: Install system dependencies
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install --yes luajit libluajit-5.1-dev luarocks perl
+      - name: Install system dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install luajit luarocks
       - uses: jdx/mise-action@v2
+        if: runner.os != 'Windows'
       - uses: dtolnay/rust-toolchain@1.85
       - name: Configure read-only vrr-core access
+        shell: bash
         env:
           VRR_CORE_DEPLOY_KEY: ${{ secrets.VRR_CORE_DEPLOY_KEY }}
         run: |
@@ -29,12 +71,81 @@ jobs:
           chmod 600 ~/.ssh/id_ed25519
           ssh-keyscan github.com >> ~/.ssh/known_hosts
       - name: Install project Lua tools
-        run: make deps LUAJIT_DIR=/usr
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            make deps LUAJIT_DIR=/usr
+          else
+            make deps
+          fi
       - name: Format and lint
+        if: runner.os != 'Windows'
         run: make fmt && git diff --exit-code && make lint
       - name: Rust, Cyan, and advisory tests
-        run: make test LUAJIT_DIR=/usr
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            make test LUAJIT_DIR=/usr
+          else
+            make test
+          fi
       - name: Three-replica Lunet smoke test
-        run: make smoke LUAJIT_DIR=/usr
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            make smoke LUAJIT_DIR=/usr
+          else
+            make smoke
+          fi
       - name: Build documentation
+        if: matrix.target_key == 'linux-amd64'
         run: make docs
+      # Windows lane, tagged builds only: reduced scope. The Teal/Cyan
+      # toolchain, the shell smoke harness, and the Docker simulation are
+      # POSIX-only today; validate the Rust extension crate natively.
+      - name: Rust extension tests (Windows)
+        if: runner.os == 'Windows'
+        run: cargo test --manifest-path ext/advisory_lock/Cargo.toml
+
+  # Tagged builds only: the docker/* simulation against a release build of
+  # the native adapter, on both Linux architectures.
+  docker-simulation:
+    name: Docker simulation (${{ matrix.target_key }})
+    if: github.ref_type == 'tag'
+    needs: [setup-matrix, test]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            arch: amd64
+            platform: linux
+            target_key: linux-amd64
+          - os: blacksmith-4vcpu-ubuntu-2404-arm
+            arch: arm64
+            platform: linux
+            target_key: linux-arm64
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes luajit libluajit-5.1-dev luarocks perl
+      - uses: jdx/mise-action@v2
+      - uses: dtolnay/rust-toolchain@1.85
+      - name: Configure read-only vrr-core access
+        run: |
+          test -n "${{ secrets.VRR_CORE_DEPLOY_KEY }}"
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "${{ secrets.VRR_CORE_DEPLOY_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+      - name: Install project Lua tools
+        run: make deps LUAJIT_DIR=/usr
+      - name: Docker build and three-container simulation
+        run: make docker-simulation LUAJIT_DIR=/usr

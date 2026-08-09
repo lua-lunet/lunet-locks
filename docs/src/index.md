@@ -21,7 +21,7 @@ lunet-run build/server.lua \
 At least three uniquely named members are required. Member names must be
 lexically sorted, endpoints must be literal IPv4 `host:port` values, and
 `--node` must occur exactly once. The supplied `lunet-run` is the
-project-local official `v0.7.2` runtime from `.lunet/v0.7.2/`, not a binary
+project-local official `v0.8.0` runtime from `.lunet/v0.8.0/`, not a binary
 from `PATH`.
 
 - [Architecture](architecture.md) describes client forwarding, recovery, and
