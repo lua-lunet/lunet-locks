@@ -30,6 +30,14 @@ cleanup() {
         rm -rf "$work"
     else
         echo "lunet smoke: retained failure logs in $work" >&2
+        # The runner (local or CI) is torn down with the job; the CI log is
+        # the only place these survive, so print them rather than pointing at
+        # a path nobody can read afterward.
+        for log in "$work"/*.out "$work"/*.err; do
+            test -f "$log" || continue
+            echo "--- $log ---" >&2
+            cat "$log" >&2
+        done
     fi
 }
 trap cleanup EXIT INT TERM HUP

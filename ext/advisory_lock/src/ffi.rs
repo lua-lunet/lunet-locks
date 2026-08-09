@@ -233,7 +233,26 @@ fn next_nonce(path: &Path) -> std::io::Result<u64> {
 }
 
 fn sync_parent(path: &Path) -> std::io::Result<()> {
-    File::open(path.parent().unwrap_or_else(|| Path::new(".")))?.sync_all()
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    sync_dir(parent)
+}
+
+// Fsyncing the containing directory after create/rename is a POSIX crash-
+// consistency idiom (persist the new directory entry, not just the file's
+// data). Windows has no equivalent: `File::open` on a directory fails with
+// ERROR_ACCESS_DENIED (std does not set FILE_FLAG_BACKUP_SEMANTICS), and NTFS
+// does not require or support an explicit directory fsync for this guarantee
+// the way POSIX filesystems do. Other Rust crates with the same durability
+// pattern (e.g. `atomicwrites`) no-op this step on Windows for the same
+// reason; do the same here rather than fail every nonce write on Windows.
+#[cfg(unix)]
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    File::open(dir)?.sync_all()
+}
+
+#[cfg(windows)]
+fn sync_dir(_dir: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 fn guarded(run: impl FnOnce() -> i32) -> i32 {
