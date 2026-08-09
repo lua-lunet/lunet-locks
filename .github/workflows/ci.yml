@@ -59,7 +59,11 @@ jobs:
         run: brew install luajit luarocks
       - uses: jdx/mise-action@v2
         if: runner.os != 'Windows'
+      # rustfmt + clippy are required by make ext-check (cargo fmt --check,
+      # cargo clippy); the default rust-toolchain profile omits them.
       - uses: dtolnay/rust-toolchain@1.85
+        with:
+          components: rustfmt, clippy
       - name: Configure read-only vrr-core access
         shell: bash
         env:
@@ -137,7 +141,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes luajit libluajit-5.1-dev luarocks perl
       - uses: jdx/mise-action@v2
+      # rustfmt + clippy are required by make ext-check (cargo fmt --check,
+      # cargo clippy); the default rust-toolchain profile omits them.
       - uses: dtolnay/rust-toolchain@1.85
+        with:
+          components: rustfmt, clippy
       - name: Configure read-only vrr-core access
         run: |
           test -n "${{ secrets.VRR_CORE_DEPLOY_KEY }}"
