@@ -25,3 +25,7 @@ make simulation
 It drives the service over TCP NDJSON, stores logs under `.tmp/`, and always
 stops its three local node processes. Use `make simulation SIM_DURATION=10`
 for a shorter development run (the maximum is 30 seconds).
+
+On a local Colima Docker daemon, run the same dynamic-client simulation against
+three stable containers with `make docker-simulation`. It uses a plain Docker
+build and named Docker volumes—never BuildKit or bind mounts.

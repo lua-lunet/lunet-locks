@@ -66,10 +66,11 @@ struct Worker {
     owns: bool,
     last_renewal: Instant,
     connection: Option<TcpStream>,
+    port: u16,
 }
 
 impl Worker {
-    fn new(dc: u64, serial: u64) -> Self {
+    fn new(dc: u64, serial: u64, port: u16) -> Self {
         let client_id = dc * 10_000 + serial;
         Self {
             dc,
@@ -82,6 +83,7 @@ impl Worker {
             owns: false,
             last_renewal: Instant::now() - RENEW_EVERY,
             connection: None,
+            port,
         }
     }
 
@@ -95,12 +97,11 @@ impl Worker {
         let tail = (self.client_id << 32) | request_num;
         (
             request_num,
-            format!("00000000-{:04x}-4000-8000-{tail:012x}", self.client_id >> 16),
+            format!(
+                "00000000-{:04x}-4000-8000-{tail:012x}",
+                self.client_id >> 16
+            ),
         )
-    }
-
-    fn port(&self) -> u16 {
-        29_100 + self.dc as u16
     }
 
     fn stop(&mut self) {
@@ -152,7 +153,10 @@ fn exchange_once(worker: &mut Worker, port: u16, json: &str) -> io::Result<Strin
         stream.set_write_timeout(Some(Duration::from_secs(2)))?;
         worker.connection = Some(stream);
     }
-    let stream = worker.connection.as_mut().expect("connection was initialized");
+    let stream = worker
+        .connection
+        .as_mut()
+        .expect("connection was initialized");
     stream.write_all(json.as_bytes())?;
     stream.write_all(b"\n")?;
     stream.flush()?;
@@ -167,7 +171,10 @@ fn exchange_once(worker: &mut Worker, port: u16, json: &str) -> io::Result<Strin
     }
     if reply.is_empty() {
         worker.connection = None;
-        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "server closed before reply"));
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "server closed before reply",
+        ));
     }
     Ok(reply)
 }
@@ -203,14 +210,26 @@ fn holder_in(reply: &str, known_holders: &[String]) -> Option<usize> {
 
 fn start_cluster(root: &Path, runtime: &Path, work: &Path) -> io::Result<Cluster> {
     let mut children = Vec::new();
-    for (name, client_port, peer_port) in [("n1", 29101, 29111), ("n2", 29102, 29112), ("n3", 29103, 29113)] {
+    for (name, client_port, peer_port) in [
+        ("n1", 29101, 29111),
+        ("n2", 29102, 29112),
+        ("n3", 29103, 29113),
+    ] {
         let stdout = File::create(work.join(format!("{name}.out")))?;
         let stderr = File::create(work.join(format!("{name}.err")))?;
         let child = Command::new(runtime)
             .current_dir(root)
             .arg("build/server.lua")
-            .args(["--node", name, "--client", &format!("127.0.0.1:{client_port}")])
-            .args(["--state", &work.join(format!("{name}.nonce")).display().to_string()])
+            .args([
+                "--node",
+                name,
+                "--client",
+                &format!("127.0.0.1:{client_port}"),
+            ])
+            .args([
+                "--state",
+                &work.join(format!("{name}.nonce")).display().to_string(),
+            ])
             .args(["--member", "n1=127.0.0.1:29111"])
             .args(["--member", "n2=127.0.0.1:29112"])
             .args(["--member", "n3=127.0.0.1:29113"])
@@ -224,67 +243,131 @@ fn start_cluster(root: &Path, runtime: &Path, work: &Path) -> io::Result<Cluster
 }
 
 fn usage() -> ! {
-    eprintln!("usage: lease_failover_sim [--duration SECONDS]");
+    eprintln!("usage: lease_failover_sim [--duration SECONDS] [--external-ports P1,P2,P3]");
     std::process::exit(2)
 }
 
 fn main() -> io::Result<()> {
     let mut duration = 30_u64;
+    let mut external_ports: Option<[u16; 3]> = None;
     let args: Vec<String> = env::args().skip(1).collect();
-    if !args.is_empty() {
-        if args.len() != 2 || args[0] != "--duration" {
-            usage();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--duration" => {
+                index += 1;
+                duration = args
+                    .get(index)
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or_else(|| usage());
+                if duration == 0 || duration > 30 {
+                    usage();
+                }
+            }
+            "--external-ports" => {
+                index += 1;
+                let values: Vec<u16> = args
+                    .get(index)
+                    .map(String::as_str)
+                    .unwrap_or("")
+                    .split(',')
+                    .map(str::parse)
+                    .collect::<Result<_, _>>()
+                    .unwrap_or_else(|_| usage());
+                external_ports = values.try_into().ok();
+                if external_ports.is_none() || external_ports == Some([0, 0, 0]) {
+                    usage();
+                }
+            }
+            _ => usage(),
         }
-        duration = args[1].parse().unwrap_or_else(|_| usage());
-        if duration == 0 || duration > 30 {
-            usage();
-        }
+        index += 1;
     }
     let root = PathBuf::from(env::var("SIM_ROOT").expect("SIM_ROOT is required"));
-    let runtime = PathBuf::from(env::var("LUNET_RUN").expect("LUNET_RUN is required"));
-    if !runtime.is_file() {
-        return Err(io::Error::new(io::ErrorKind::NotFound, "project-local lunet-run missing"));
+    let runtime = external_ports
+        .is_none()
+        .then(|| PathBuf::from(env::var("LUNET_RUN").expect("LUNET_RUN is required")));
+    if let Some(runtime) = &runtime {
+        if !runtime.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "project-local lunet-run missing",
+            ));
+        }
     }
-    let work = root.join(".tmp").join(format!("lease-failover-{}", now_ms()));
+    let work = root
+        .join(".tmp")
+        .join(format!("lease-failover-{}", now_ms()));
     fs::create_dir_all(&work)?;
-    let mut log = Logger { file: File::create(work.join("simulation.log"))? };
-    log.line(format!("simulation start duration={duration}s work={}", work.display()));
-    let mut cluster = start_cluster(&root, &runtime, &work)?;
-    log.line("cluster start n1,n2,n3; client endpoints 29101,29102,29103");
-    thread::sleep(Duration::from_millis(2_600));
+    let mut log = Logger {
+        file: File::create(work.join("simulation.log"))?,
+    };
+    log.line(format!(
+        "simulation start duration={duration}s work={}",
+        work.display()
+    ));
+    let mut cluster = if let Some(runtime) = &runtime {
+        Some(start_cluster(&root, runtime, &work)?)
+    } else {
+        None
+    };
+    let ports = external_ports.unwrap_or([29_101, 29_102, 29_103]);
+    if cluster.is_some() {
+        log.line("cluster start n1,n2,n3; client endpoints 29101,29102,29103");
+        thread::sleep(Duration::from_millis(2_600));
+    } else {
+        log.line(format!(
+            "external stable cluster; client endpoints {},{},{}",
+            ports[0], ports[1], ports[2]
+        ));
+    }
 
-    let mut workers = vec![Worker::new(1, 1), Worker::new(2, 1), Worker::new(3, 1)];
+    let mut workers = vec![
+        Worker::new(1, 1, ports[0]),
+        Worker::new(2, 1, ports[1]),
+        Worker::new(3, 1, ports[2]),
+    ];
     for worker in &workers {
-        log.line(format!("client start {} logical_id={}", worker.name(), worker.client_id));
+        log.line(format!(
+            "client start {} logical_id={}",
+            worker.name(),
+            worker.client_id
+        ));
     }
     let started = Instant::now();
     let end = started + Duration::from_secs(duration);
     let mut next_kill = started + KILL_EVERY;
     let mut replacement: Option<PendingReplacement> = None;
     let mut observed_holder: Option<usize> = None;
+    let mut observed_live_holder = false;
     let mut failure: Option<String> = None;
 
     while Instant::now() < end && failure.is_none() {
-        let holder_names: Vec<String> = workers.iter().map(|worker| worker.holder.clone()).collect();
+        let holder_names: Vec<String> =
+            workers.iter().map(|worker| worker.holder.clone()).collect();
         for index in 0..workers.len() {
             if !workers[index].active {
                 continue;
             }
             let get = request_get(&mut workers[index]);
-            let port = workers[index].port();
+            let port = workers[index].port;
             match exchange(&mut workers[index], port, &get) {
                 Ok(reply) => {
                     let seen = holder_in(&reply, &holder_names);
                     if reply.matches(r#""holder":"#).count() > 1 {
-                        failure = Some(format!("conflicting live holders in one observation: {reply}"));
+                        failure = Some(format!(
+                            "conflicting live holders in one observation: {reply}"
+                        ));
                         break;
                     }
                     if let Some(holder) = seen {
                         observed_holder = Some(holder);
+                        observed_live_holder = true;
                     } else if reply.contains("\"lease\":null") {
                         observed_holder = None;
                     }
-                    let should_set = seen != Some(index) || workers[index].last_renewal.elapsed() >= RENEW_EVERY;
+                    let should_set =
+                        seen != Some(index) || workers[index].last_renewal.elapsed() >= RENEW_EVERY;
                     if should_set {
                         let was_owner = workers[index].owns;
                         let set = request_set(&mut workers[index]);
@@ -293,18 +376,33 @@ fn main() -> io::Result<()> {
                                 workers[index].owns = true;
                                 workers[index].last_renewal = Instant::now();
                                 observed_holder = Some(index);
+                                observed_live_holder = true;
                                 if was_owner {
-                                    log.line(format!("renew {} lease_id={}", workers[index].name(), workers[index].lease_id));
+                                    log.line(format!(
+                                        "renew {} lease_id={}",
+                                        workers[index].name(),
+                                        workers[index].lease_id
+                                    ));
                                 } else {
-                                    log.line(format!("acquire {} lease_id={}", workers[index].name(), workers[index].lease_id));
+                                    log.line(format!(
+                                        "acquire {} lease_id={}",
+                                        workers[index].name(),
+                                        workers[index].lease_id
+                                    ));
                                 }
                             }
                             Ok(_) => workers[index].owns = false,
-                            Err(error) => log.line(format!("no-leader/unavailable {}: {error}", workers[index].name())),
+                            Err(error) => log.line(format!(
+                                "no-leader/unavailable {}: {error}",
+                                workers[index].name()
+                            )),
                         }
                     }
                 }
-                Err(error) => log.line(format!("no-leader/unavailable {}: {error}", workers[index].name())),
+                Err(error) => log.line(format!(
+                    "no-leader/unavailable {}: {error}",
+                    workers[index].name()
+                )),
             }
         }
 
@@ -315,13 +413,20 @@ fn main() -> io::Result<()> {
             let deadline = pending.deadline;
             let killed_client_id = pending.killed_client_id;
             if Instant::now() >= due {
-                let worker = Worker::new(dc, serial);
-                log.line(format!("client start {} logical_id={} after lease expiry", worker.name(), worker.client_id));
+                let worker = Worker::new(dc, serial, ports[(dc - 1) as usize]);
+                log.line(format!(
+                    "client start {} logical_id={} after lease expiry",
+                    worker.name(),
+                    worker.client_id
+                ));
                 workers.push(worker);
                 replacement.as_mut().unwrap().due = end + Duration::from_secs(1);
             }
             if Instant::now() > deadline {
-                failure = Some(format!("no replacement holder appeared within {:?}", TAKEOVER_DEADLINE));
+                failure = Some(format!(
+                    "no replacement holder appeared within {:?}",
+                    TAKEOVER_DEADLINE
+                ));
             }
             if let Some(holder) = observed_holder {
                 if workers[holder].client_id != killed_client_id && workers[holder].active {
@@ -336,7 +441,11 @@ fn main() -> io::Result<()> {
                 if workers[holder].active {
                     let killed = &mut workers[holder];
                     killed.stop();
-                    log.line(format!("client kill {} logical_id={}", killed.name(), killed.client_id));
+                    log.line(format!(
+                        "client kill {} logical_id={}",
+                        killed.name(),
+                        killed.client_id
+                    ));
                     replacement = Some(PendingReplacement {
                         dc: killed.dc,
                         serial: killed.serial + 1,
@@ -351,7 +460,12 @@ fn main() -> io::Result<()> {
         thread::sleep(Duration::from_millis(80));
     }
 
-    cluster.stop();
+    if !observed_live_holder && failure.is_none() {
+        failure = Some("no live holder was observed before simulation deadline".to_owned());
+    }
+    if let Some(cluster) = &mut cluster {
+        cluster.stop();
+    }
     if let Some(message) = failure {
         log.line(format!("simulation FAILED: {message}"));
         return Err(io::Error::other(message));
@@ -366,7 +480,7 @@ mod tests {
 
     #[test]
     fn worker_identity_is_durable_and_names_are_human_readable() {
-        let worker = Worker::new(2, 17);
+        let worker = Worker::new(2, 17, 29_102);
         assert_eq!(worker.client_id, 20_017);
         assert_eq!(worker.name(), "DC2-0017");
     }
@@ -374,6 +488,9 @@ mod tests {
     #[test]
     fn holder_parser_recognizes_one_known_holder() {
         let holders = vec!["first".to_owned(), "second".to_owned()];
-        assert_eq!(holder_in(r#"{"lease":{"holder":"second"}}"#, &holders), Some(1));
+        assert_eq!(
+            holder_in(r#"{"lease":{"holder":"second"}}"#, &holders),
+            Some(1)
+        );
     }
 }

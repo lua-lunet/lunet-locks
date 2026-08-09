@@ -405,9 +405,10 @@ pub unsafe extern "C" fn lunet_lock_node_status(
     node: *mut c_void,
     out_status: *mut u32,
     out_leader: *mut u32,
+    out_epoch: *mut u32,
 ) -> i32 {
     guarded(|| {
-        if node.is_null() || out_status.is_null() || out_leader.is_null() {
+        if node.is_null() || out_status.is_null() || out_leader.is_null() || out_epoch.is_null() {
             return INVALID;
         }
         let node = unsafe { &mut *node.cast::<Node>() };
@@ -419,8 +420,26 @@ pub unsafe extern "C" fn lunet_lock_node_status(
         };
         unsafe {
             *out_status = status;
-            *out_leader = node.replica.leader_of(node.replica.epoch());
+            let epoch = node.replica.epoch();
+            *out_leader = node.replica.leader_of(epoch);
+            *out_epoch = epoch;
         }
+        OK
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lunet_lock_node_leader_for_epoch(
+    node: *mut c_void,
+    epoch: u32,
+    out_leader: *mut u32,
+) -> i32 {
+    guarded(|| {
+        if node.is_null() || out_leader.is_null() {
+            return INVALID;
+        }
+        let node = unsafe { &mut *node.cast::<Node>() };
+        unsafe { *out_leader = node.replica.leader_of(epoch) };
         OK
     })
 }

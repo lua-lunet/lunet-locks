@@ -14,7 +14,10 @@ ffi.cdef(
     int32_t lunet_lock_node_idle(void* node);
     int32_t lunet_lock_node_leader_timeout(void* node);
     int32_t lunet_lock_node_recover(void* node);
-    int32_t lunet_lock_node_status(void* node, uint32_t* status, uint32_t* leader);
+    int32_t lunet_lock_node_status(
+        void* node, uint32_t* status, uint32_t* leader, uint32_t* epoch);
+    int32_t lunet_lock_node_leader_for_epoch(
+        void* node, uint32_t epoch, uint32_t* leader);
     int32_t lunet_lock_node_next(
         void* node,
         uint32_t* kind, uint32_t* to,
@@ -48,7 +51,8 @@ local record Native
     lunet_lock_node_idle: function(any): number
     lunet_lock_node_leader_timeout: function(any): number
     lunet_lock_node_recover: function(any): number
-    lunet_lock_node_status: function(any, {number}, {number}): number
+    lunet_lock_node_status: function(any, {number}, {number}, {number}): number
+    lunet_lock_node_leader_for_epoch: function(any, integer, {number}): number
     lunet_lock_node_next: function(
         any,
         {number},
@@ -101,6 +105,7 @@ end
 local record Status
     state: string
     leader: integer
+    epoch: integer
 end
 
 local record Node
@@ -116,6 +121,7 @@ local record Node
     _buffer: any
     _status: {number}
     _leader: {number}
+    _current_epoch: {number}
 
     request: function(Node, string): {Output}
     receive: function(Node, integer, string): {Output}
@@ -123,6 +129,7 @@ local record Node
     leader_timeout: function(Node): {Output}
     recover: function(Node): {Output}
     status: function(Node): Status
+    leader_for_epoch: function(Node, integer): integer
     close: function(Node): boolean
 end
 
@@ -229,7 +236,9 @@ function Node:status(): Status
     check(
         (
             tonumber(
-                native.lunet_lock_node_status(self._handle, self._status, self._leader)
+                native.lunet_lock_node_status(
+                    self._handle, self._status, self._leader, self._current_epoch
+                )
             ) or -127
         ) as integer
     )
@@ -246,7 +255,25 @@ function Node:status(): Status
     else
         error("advisory_lock: invalid native status " .. tostring(state_number), 2)
     end
-    return {state = state, leader = (tonumber(self._leader[0]) or 0) as integer}
+    return {
+        state = state,
+        leader = (tonumber(self._leader[0]) or 0) as integer,
+        epoch = (tonumber(self._current_epoch[0]) or 0) as integer,
+    }
+end
+
+function Node:leader_for_epoch(epoch: integer): integer
+    assert(epoch >= 0, "advisory_lock: epoch must be non-negative")
+    check(
+        (
+            tonumber(
+                native.lunet_lock_node_leader_for_epoch(
+                    self._handle, epoch, self._leader
+                )
+            ) or -127
+        ) as integer
+    )
+    return (tonumber(self._leader[0]) or -1) as integer
 end
 
 function Node:close(): boolean
@@ -301,12 +328,14 @@ function M.new(members: {string}, own: string, state_path: string): Node
         _buffer = ffi.new("uint8_t[?]", MAX_DATAGRAM),
         _status = ffi.new("uint32_t[1]") as {number},
         _leader = ffi.new("uint32_t[1]") as {number},
+        _current_epoch = ffi.new("uint32_t[1]") as {number},
         request = Node.request,
         receive = Node.receive,
         idle = Node.idle,
         leader_timeout = Node.leader_timeout,
         recover = Node.recover,
         status = Node.status,
+        leader_for_epoch = Node.leader_for_epoch,
         close = Node.close,
     }
 end

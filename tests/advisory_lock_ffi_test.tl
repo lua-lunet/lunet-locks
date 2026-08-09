@@ -10,6 +10,7 @@ tested.test(
         os.remove(state_path)
         local node = advisory_lock.new(members, "n1", state_path)
         local status = node:status()
+        local mapped_leader = node:leader_for_epoch(status.epoch)
         local outputs = node:request(
             '{"op":"get","message_id":"00000000-0000-0000-0000-000000000001","client_id":1,"request_num":1,"lock_id":9001}'
         )
@@ -21,10 +22,14 @@ tested.test(
             {
                 given = "a fresh three-member node and a byte-counted GET envelope",
                 should = "surface native status, opaque peer bytes, and idempotent close",
-                expected = "normal:0:broadcast:true:true",
+                expected = "normal:0:0:true:broadcast:true:true",
                 actual = status.state
                     .. ":"
                     .. tostring(status.leader)
+                    .. ":"
+                    .. tostring(status.epoch)
+                    .. ":"
+                    .. tostring(mapped_leader == status.leader)
                     .. ":"
                     .. output.kind
                     .. ":"

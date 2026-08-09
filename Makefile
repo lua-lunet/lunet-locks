@@ -31,7 +31,7 @@ CHECK_SOURCES = tests/teal_learning_test.tl \
                 tests/advisory_lock_ffi_test.tl \
                 tests/advisory_lock_pure_test.tl
 
-.PHONY: init deps build check test smoke simulation simulation-test lunet-runtime docs clean ext ext-check ext-test fmt lint hooks
+.PHONY: init deps build check test smoke simulation simulation-test lunet-runtime docs clean ext ext-check ext-test fmt lint hooks docker-build docker-simulation
 
 init:
 	@command -v mise >/dev/null 2>&1 || { echo "ERROR: mise is not on PATH. Install it from https://mise.jdx.dev and try again."; exit 1; }
@@ -94,6 +94,27 @@ simulation-test: tools/lease_failover_sim.rs
 
 simulation: lunet-runtime build $(SIM_BIN)
 	SIM_ROOT=$(CURDIR) LUNET_RUN=$(abspath $(LUNET_RUN)) $(SIM_BIN) --duration $(SIM_DURATION)
+
+# Follow vrr-core's conventional plain multi-stage `docker build` model. A
+# disposable vendored context avoids BuildKit SSH mounts while retaining the
+# exact private dependency revision.
+DOCKER_IMAGE ?= lunet-advisory-lock
+DOCKER_PLATFORM ?= linux/arm64
+docker-build: build lunet-runtime
+	@context=$$(mktemp -d "$(CURDIR)/.tmp/docker-context.XXXXXX"); \
+	tools/docker_prepare_context.sh "$$context"; \
+	server=$$(docker version --format '{{.Server.Os}}/{{.Server.Arch}}'); \
+	[ "$$server" = "$(DOCKER_PLATFORM)" ] || { \
+		echo "ERROR: docker daemon is $$server; native $(DOCKER_PLATFORM) is required (no emulation)" >&2; exit 1; \
+	}; \
+	docker build --platform $(DOCKER_PLATFORM) -f "$$context/docker/Dockerfile" -t $(DOCKER_IMAGE) "$$context"; \
+	image=$$(docker image inspect --format '{{.Os}}/{{.Architecture}}' $(DOCKER_IMAGE)); \
+	[ "$$image" = "$(DOCKER_PLATFORM)" ] || { \
+		echo "ERROR: built image is $$image, expected native $(DOCKER_PLATFORM)" >&2; exit 1; \
+	}
+
+docker-simulation: docker-build $(SIM_BIN)
+	SIM_BIN=$(abspath $(SIM_BIN)) DOCKER_IMAGE=$(DOCKER_IMAGE) DOCKER_PLATFORM=$(DOCKER_PLATFORM) SIM_DURATION=$(SIM_DURATION) tests/docker_simulation.sh
 
 # Native extensions: one Rust crate per directory under ext/.
 ext: ext-test

@@ -1,5 +1,14 @@
 local MAX_DATAGRAM = 65507
-local FORWARD_MAGIC = "\0LUNET_ADVISORY_LOCK_FORWARD\0"
+local PEER_MAGIC = "\0LUNET_ADVISORY_LOCK_PEER\0"
+local PEER_VRR = "\1"
+local PEER_APPLICATION = "\2"
+local FORWARD_REQUEST = "\1"
+local FORWARD_RESPONSE = "\2"
+local FORWARD_NOT_LEADER = "\3"
+local MESSAGE_ID_BYTES = 16
+local MAX_U32 = 4294967295
+local MEMBERSHIP_FINGERPRINT_HEX_BYTES = 16
+local PEER_HEADER_BYTES = #PEER_MAGIC + 1 + MEMBERSHIP_FINGERPRINT_HEX_BYTES
 
 local function endpoint_key(host: string, port: integer): string
     return host .. ":" .. tostring(port)
@@ -16,19 +25,84 @@ local function source_is_member(host: string, port: integer, members: {string}):
     return false
 end
 
-local function encode_forward(payload: string): string
-    assert(
-        #payload + #FORWARD_MAGIC <= MAX_DATAGRAM,
-        "transport: forwarding payload exceeds UDP limit"
-    )
-    return FORWARD_MAGIC .. payload
+local function valid_fingerprint(fingerprint: string): boolean
+    return #fingerprint == MEMBERSHIP_FINGERPRINT_HEX_BYTES
+        and fingerprint:find("[^0-9a-f]") == nil
 end
 
-local function decode_forward(packet: string): (boolean, string)
-    if packet:sub(1, #FORWARD_MAGIC) == FORWARD_MAGIC then
-        return true, packet:sub(#FORWARD_MAGIC + 1)
+local function encode_peer(kind: string, fingerprint: string, payload: string): string
+    assert(
+        kind == PEER_VRR or kind == PEER_APPLICATION,
+        "transport: invalid peer packet kind"
+    )
+    assert(valid_fingerprint(fingerprint), "transport: invalid membership fingerprint")
+    assert(
+        #payload + PEER_HEADER_BYTES <= MAX_DATAGRAM,
+        "transport: peer payload exceeds UDP limit"
+    )
+    return PEER_MAGIC .. kind .. fingerprint .. payload
+end
+
+local function decode_peer(packet: string): (boolean, string, string, string)
+    if #packet < PEER_HEADER_BYTES or packet:sub(1, #PEER_MAGIC) ~= PEER_MAGIC then
+        return false, "", "", ""
     end
-    return false, packet
+    local kind = packet:sub(#PEER_MAGIC + 1, #PEER_MAGIC + 1)
+    local fingerprint = packet:sub(
+        #PEER_MAGIC + 2, #PEER_MAGIC + 1 + MEMBERSHIP_FINGERPRINT_HEX_BYTES
+    )
+    if
+        (kind ~= PEER_VRR and kind ~= PEER_APPLICATION)
+        or not valid_fingerprint(fingerprint)
+    then
+        return false, "", "", ""
+    end
+    return true, kind, fingerprint, packet:sub(PEER_HEADER_BYTES + 1)
+end
+
+-- A redirect is deliberately a small fixed-size application packet. It carries
+-- no leader index: every fixed ordered membership maps the supplied epoch to
+-- its leader through the local replica adapter.
+local function u32_bytes(value: integer): string
+    return string.char(
+        math.floor(value / 16777216) % 256,
+        math.floor(value / 65536) % 256,
+        math.floor(value / 256) % 256,
+        value % 256
+    )
+end
+
+local function parse_u32(bytes: string): integer
+    return (
+        (bytes:byte(1) or 0) * 16777216 + (bytes:byte(2) or 0) * 65536 + (
+            bytes:byte(3) or 0
+        ) * 256 + (bytes:byte(4) or 0)
+    ) as integer
+end
+
+local function encode_not_leader(message_id: string, epoch: integer): string
+    assert(#message_id == MESSAGE_ID_BYTES, "transport: invalid redirect message ID")
+    assert(
+        epoch >= 0 and epoch <= MAX_U32 and epoch == math.floor(epoch),
+        "transport: invalid redirect epoch"
+    )
+    return FORWARD_NOT_LEADER .. message_id .. u32_bytes(epoch)
+end
+
+local function decode_not_leader(payload: string): (boolean, string, integer)
+    if
+        #payload ~= 1 + MESSAGE_ID_BYTES + 4 or payload:sub(1, 1) ~= FORWARD_NOT_LEADER
+    then
+        return false, "", 0
+    end
+    local epoch = parse_u32(payload:sub(2 + MESSAGE_ID_BYTES, 1 + MESSAGE_ID_BYTES + 4))
+    return true, payload:sub(2, 1 + MESSAGE_ID_BYTES), epoch
+end
+
+local function valid_not_leader(
+    expected_source: integer, actual_source: integer
+): boolean
+    return expected_source >= 0 and actual_source == expected_source
 end
 
 local function feed_ndjson(
@@ -62,9 +136,20 @@ end
 
 return {
     MAX_DATAGRAM = MAX_DATAGRAM,
-    FORWARD_MAGIC = FORWARD_MAGIC,
+    PEER_MAGIC = PEER_MAGIC,
+    PEER_VRR = PEER_VRR,
+    PEER_APPLICATION = PEER_APPLICATION,
+    PEER_HEADER_BYTES = PEER_HEADER_BYTES,
+    FORWARD_REQUEST = FORWARD_REQUEST,
+    FORWARD_RESPONSE = FORWARD_RESPONSE,
+    FORWARD_NOT_LEADER = FORWARD_NOT_LEADER,
+    MESSAGE_ID_BYTES = MESSAGE_ID_BYTES,
+    MEMBERSHIP_FINGERPRINT_HEX_BYTES = MEMBERSHIP_FINGERPRINT_HEX_BYTES,
     source_is_member = source_is_member,
-    encode_forward = encode_forward,
-    decode_forward = decode_forward,
+    encode_peer = encode_peer,
+    decode_peer = decode_peer,
+    encode_not_leader = encode_not_leader,
+    decode_not_leader = decode_not_leader,
+    valid_not_leader = valid_not_leader,
     feed_ndjson = feed_ndjson,
 }

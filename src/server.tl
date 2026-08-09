@@ -17,16 +17,18 @@ package.path = directory .. "/?.lua;" .. package.path
 local advisory_lock = require("advisory_lock")
 local config = require("config")
 local lunet = require("lunet")
+local membership_guard = require("membership_guard")
 local socket = require("lunet.socket")
 local udp = require("lunet.udp")
 local transport = require("transport")
 
-local FORWARD_REQUEST = "\1"
-local FORWARD_RESPONSE = "\2"
-local MESSAGE_ID_BYTES = 16
+local FORWARD_REQUEST = transport.FORWARD_REQUEST
+local FORWARD_RESPONSE = transport.FORWARD_RESPONSE
+local FORWARD_NOT_LEADER = transport.FORWARD_NOT_LEADER
+local MESSAGE_ID_BYTES = transport.MESSAGE_ID_BYTES
 local CLIENT_DEADLINE_MS = 30000
 local POLL_MS = 10
-local MAX_CLIENT_REQUEST = transport.MAX_DATAGRAM - #transport.FORWARD_MAGIC - 1 - MESSAGE_ID_BYTES
+local MAX_CLIENT_REQUEST = transport.MAX_DATAGRAM - transport.PEER_HEADER_BYTES - 1 - MESSAGE_ID_BYTES
 
 local record Options
     node: string
@@ -40,8 +42,11 @@ end
 
 local record Pending
     client: any
+    json: string
     result: string
     done: boolean
+    forwarded_to: integer
+    redirect_epoch: integer
 end
 
 local record Output
@@ -140,6 +145,13 @@ local function split_endpoint(value: string): (string, integer)
     return parsed.host, parsed.port
 end
 
+local function log_membership(message: string)
+    io.stdout:write(message .. "\n")
+    io.stdout:flush()
+    io.stderr:write(message .. "\n")
+    io.stderr:flush()
+end
+
 local function main(options: Options)
     local client_host, client_port = split_endpoint(options.client)
     local members = config.members(options.node, options.members)
@@ -163,6 +175,11 @@ local function main(options: Options)
     assert(own_index >= 0, "server: own member missing")
 
     local node = advisory_lock.new(member_names, options.node, options.state)
+    local fingerprint = config.membership_fingerprint(members)
+    local membership_log = "advisory-lock membership fingerprint="
+        .. fingerprint
+        .. " encoding=lunet-advisory-lock/membership/v1"
+    log_membership(membership_log)
     local peer, peer_error = udp.bind(udp_host, udp_port)
     assert(peer ~= nil, "server: UDP bind failed: " .. (peer_error or "unknown"))
     local listener, listen_error = socket.listen("tcp", client_host, client_port)
@@ -172,7 +189,38 @@ local function main(options: Options)
 
     local pending: {string: Pending} = {}
     local forwarded_from: {string: string} = {}
+    local active_clients: {string: any} = {}
     local leader_elapsed_ms = 0
+    local guard = membership_guard.new(fingerprint)
+    local listener_open = true
+
+    local function close_client(client: any)
+        pcall(function() socket.close(client) end)
+    end
+
+    local function quarantine(received_fingerprint: string)
+        if guard.dirty then
+            return
+        end
+        guard.dirty = true
+        local message = "advisory-lock dirty membership configured="
+            .. fingerprint
+            .. " received="
+            .. received_fingerprint
+            .. "; closing client listener"
+        log_membership(message)
+        if listener_open then
+            listener_open = false
+            close_client(listener)
+        end
+        for _, client in pairs(active_clients) do
+            close_client(client)
+        end
+        for message_id, waiter in pairs(pending) do
+            close_client(waiter.client)
+            pending[message_id] = nil
+        end
+    end
 
     local function send_endpoint(endpoint: string, payload: string)
         local host, port = split_endpoint(endpoint)
@@ -180,10 +228,25 @@ local function main(options: Options)
         assert(ok ~= nil, "server: UDP send failed: " .. (send_error or "unknown"))
     end
 
-    local function send_peer(index: integer, payload: string)
+    local function send_vrr(index: integer, payload: string)
         local endpoint = endpoint_by_index[index]
         assert(endpoint ~= nil, "server: native output has unknown replica")
-        send_endpoint(endpoint, payload)
+        send_endpoint(
+            endpoint, transport.encode_peer(transport.PEER_VRR, fingerprint, payload)
+        )
+    end
+
+    local function send_application(endpoint: string, payload: string)
+        send_endpoint(
+            endpoint,
+            transport.encode_peer(transport.PEER_APPLICATION, fingerprint, payload)
+        )
+    end
+
+    local function send_application_peer(index: integer, payload: string)
+        local endpoint = endpoint_by_index[index]
+        assert(endpoint ~= nil, "server: application output has unknown replica")
+        send_application(endpoint, payload)
     end
 
     local function flush(outputs: {Output})
@@ -191,20 +254,17 @@ local function main(options: Options)
             if output.kind == "broadcast" then
                 for index = 0, #members - 1 do
                     if index ~= own_index then
-                        send_peer(index, output.bytes)
+                        send_vrr(index, output.bytes)
                     end
                 end
             elseif output.kind == "send" then
-                send_peer(output.replica, output.bytes)
+                send_vrr(output.replica, output.bytes)
             elseif output.kind == "reply" then
                 local origin = forwarded_from[output.message_id]
                 if origin ~= nil then
                     forwarded_from[output.message_id] = nil
-                    send_endpoint(
-                        origin,
-                        transport.encode_forward(
-                            FORWARD_RESPONSE .. output.message_id .. output.bytes
-                        )
+                    send_application(
+                        origin, FORWARD_RESPONSE .. output.message_id .. output.bytes
                     )
                 else
                     local waiter = pending[output.message_id]
@@ -217,19 +277,23 @@ local function main(options: Options)
         end
     end
 
-    local function submit(json: string, message_id: string)
+    local function forward_to(waiter: Pending, leader: integer, message_id: string)
+        assert(leader >= 0 and leader < #members, "server: no current leader")
+        waiter.forwarded_to = leader
+        send_application_peer(leader, FORWARD_REQUEST .. message_id .. waiter.json)
+    end
+
+    local function submit(waiter: Pending, message_id: string)
+        assert(
+            guard:allows_client_operation(), "server: membership configuration is dirty"
+        )
         local status = node:status()
         if status.leader == own_index then
-            flush(node:request(json) as {Output})
+            waiter.forwarded_to = -1
+            flush(node:request(waiter.json) as {Output})
             return
         end
-        assert(
-            status.leader >= 0 and status.leader < #members, "server: no current leader"
-        )
-        send_peer(
-            status.leader,
-            transport.encode_forward(FORWARD_REQUEST .. message_id .. json)
-        )
+        forward_to(waiter, status.leader, message_id)
     end
 
     local function receive_loop()
@@ -238,8 +302,12 @@ local function main(options: Options)
             if packet ~= nil and host ~= nil and port ~= nil then
                 local source_endpoint = host .. ":" .. tostring(port)
                 if transport.source_is_member(host, port, options.members) then
-                    local forwarded, payload = transport.decode_forward(packet)
-                    if forwarded then
+                    local valid, kind, received_fingerprint, payload = transport.decode_peer(
+                        packet
+                    )
+                    if valid and not guard:accept_fingerprint(received_fingerprint) then
+                        quarantine(received_fingerprint)
+                    elseif valid and kind == transport.PEER_APPLICATION then
                         local direction = payload:sub(1, 1)
                         if
                             direction == FORWARD_REQUEST
@@ -248,7 +316,10 @@ local function main(options: Options)
                             local message_id = payload:sub(2, 1 + MESSAGE_ID_BYTES)
                             local json = payload:sub(2 + MESSAGE_ID_BYTES)
                             local status = node:status()
-                            if status.leader == own_index then
+                            if
+                                guard:allows_client_operation()
+                                and status.leader == own_index
+                            then
                                 forwarded_from[message_id] = source_endpoint
                                 local ok = pcall(
                                     function() flush(node:request(json) as {Output}) end
@@ -256,6 +327,13 @@ local function main(options: Options)
                                 if not ok then
                                     forwarded_from[message_id] = nil
                                 end
+                            elseif guard:allows_client_operation() then
+                                send_application(
+                                    source_endpoint,
+                                    transport.encode_not_leader(
+                                        message_id, status.epoch
+                                    )
+                                )
                             end
                         elseif
                             direction == FORWARD_RESPONSE
@@ -263,12 +341,42 @@ local function main(options: Options)
                         then
                             local message_id = payload:sub(2, 1 + MESSAGE_ID_BYTES)
                             local waiter = pending[message_id]
-                            if waiter ~= nil then
+                            local source_index = index_by_endpoint[source_endpoint]
+                            if
+                                waiter ~= nil and source_index == waiter.forwarded_to
+                            then
                                 waiter.result = payload:sub(2 + MESSAGE_ID_BYTES)
                                 waiter.done = true
                             end
+                        elseif direction == FORWARD_NOT_LEADER then
+                            local redirect_valid, message_id, epoch = transport.decode_not_leader(
+                                payload
+                            )
+                            local waiter = pending[message_id]
+                            local source_index = index_by_endpoint[source_endpoint]
+                            if
+                                redirect_valid
+                                and waiter ~= nil
+                                and source_index ~= nil
+                                and transport.valid_not_leader(
+                                    waiter.forwarded_to, source_index
+                                )
+                            then
+                                if guard:allows_client_operation() then
+                                    waiter.redirect_epoch = epoch
+                                    local leader = node:leader_for_epoch(epoch)
+                                    local ok = pcall(
+                                        function()
+                                            forward_to(waiter, leader, message_id)
+                                        end
+                                    )
+                                    if not ok then
+                                        -- A concurrent leader change is retried by the deadline loop.
+                                    end
+                                end
+                            end
                         end
-                    else
+                    elseif valid and kind == transport.PEER_VRR then
                         local replica = index_by_endpoint[source_endpoint]
                         if replica ~= nil then
                             if node:status().leader == replica then
@@ -276,7 +384,7 @@ local function main(options: Options)
                             end
                             local ok = pcall(
                                 function()
-                                    flush(node:receive(replica, packet) as {Output})
+                                    flush(node:receive(replica, payload) as {Output})
                                 end
                             )
                             if not ok then
@@ -324,25 +432,41 @@ local function main(options: Options)
     end
 
     local function wait_for_reply(client: any, json: string): boolean
+        if not guard:allows_client_operation() then
+            return false
+        end
         local message_id = uuid_bytes(json)
         local waiter = pending[message_id]
         local submit_request = waiter == nil
         if waiter == nil then
-            waiter = {client = client, result = "", done = false}
+            waiter = {
+                client = client,
+                json = json,
+                result = "",
+                done = false,
+                forwarded_to = -1,
+                redirect_epoch = 0,
+            }
             pending[message_id] = waiter
         end
         local attempts = 0
         while
-            not waiter.done and attempts < CLIENT_DEADLINE_MS / options.heartbeat_ms
+            guard:allows_client_operation()
+            and not waiter.done
+            and attempts < CLIENT_DEADLINE_MS / options.heartbeat_ms
         do
             if submit_request then
-                local ok = pcall(function() submit(json, message_id) end)
+                local ok = pcall(function() submit(waiter, message_id) end)
                 if not ok then
                     -- A leader may be unavailable while an election/recovery progresses.
                 end
             end
             local slept = 0
-            while not waiter.done and slept < options.heartbeat_ms do
+            while
+                guard:allows_client_operation()
+                and not waiter.done
+                and slept < options.heartbeat_ms
+            do
                 lunet.sleep(POLL_MS)
                 slept = slept + POLL_MS
             end
@@ -351,7 +475,7 @@ local function main(options: Options)
         if pending[message_id] == waiter then
             pending[message_id] = nil
         end
-        if waiter.done then
+        if guard:allows_client_operation() and waiter.done then
             local write_error = socket.write(client, waiter.result .. "\n")
             return write_error == nil
         end
@@ -359,11 +483,14 @@ local function main(options: Options)
     end
 
     local function serve_client(client: any)
+        local client_key = tostring(client)
+        active_clients[client_key] = client
         local buffer = ""
         while true do
             local chunk = socket.read(client)
             if chunk == nil then
-                socket.close(client)
+                active_clients[client_key] = nil
+                close_client(client)
                 return
             end
             local ok, messages, tail = pcall(
@@ -372,7 +499,8 @@ local function main(options: Options)
                 end
             )
             if not ok then
-                socket.close(client)
+                active_clients[client_key] = nil
+                close_client(client)
                 return
             end
             buffer = tail as string
@@ -380,7 +508,8 @@ local function main(options: Options)
                 local sent = false
                 local waited = pcall(function() sent = wait_for_reply(client, json) end)
                 if not waited or not sent then
-                    socket.close(client)
+                    active_clients[client_key] = nil
+                    close_client(client)
                     return
                 end
             end
@@ -392,9 +521,13 @@ local function main(options: Options)
     lunet.spawn(election_loop)
     lunet.spawn(recovery_loop)
     while true do
-        local client = socket.accept(listener)
-        if client ~= nil then
-            lunet.spawn(function() serve_client(client) end)
+        if not guard:allows_client_operation() or not listener_open then
+            lunet.sleep(1000)
+        else
+            local client = socket.accept(listener)
+            if client ~= nil then
+                lunet.spawn(function() serve_client(client) end)
+            end
         end
     end
 end

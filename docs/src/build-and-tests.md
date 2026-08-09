@@ -23,6 +23,8 @@ make lunet-runtime   # fetch and verify Lunet v0.7.2 locally
 make smoke           # build and run the three-process service smoke test
 make simulation      # 30s TCP-NDJSON three-datacenter lease failover demo
 make simulation-test # focused std-Rust simulator unit tests
+make docker-build    # plain Docker image, including Linux Lunet v0.7.2
+make docker-simulation # the same 30s simulation against a stable Docker cluster
 make docs            # render the Zensical site
 ```
 
@@ -49,6 +51,24 @@ The run exits nonzero on a conflicting holder observation or if a replacement
 does not take over within five seconds. Logs and node process state are kept in
 `.tmp/lease-failover-*`; the harness always terminates the node processes. Set
 `SIM_DURATION` to a value from 1 to 30 for a shorter run.
+
+## Docker / Colima demonstration
+
+`make docker-simulation` first assembles a disposable Cargo-vendored context,
+then invokes a conventional multi-stage `docker build`. This matches the
+upstream `vrr-core` Docker strategy and deliberately uses neither BuildKit
+features nor source/bind mounts. The image downloads and SHA-256 verifies its
+own Linux Lunet v0.7.2 runtime, compiles the native adapter for ARM64, and
+contains Cyan output. These local Docker targets explicitly require an ARM64
+Linux daemon and image (`linux/arm64`); they refuse an emulated AMD64 build.
+
+The command creates an isolated Docker bridge with fixed internal addresses
+for n1/n2/n3, one named Docker volume per container for its recovery nonce,
+and three host TCP ports 31101–31103. The containers are stable throughout;
+the standard-library host simulator uses those ports and is the only dynamic
+participant. It captures simulator and container logs under
+`.tmp/docker-lease-failover-*`, has bounded Docker calls, and removes the
+containers, bridge, and demonstration volumes on exit.
 
 `make docs` runs the `uv`-managed Zensical script at `docs/docs` and writes
 generated HTML under `docs/site/`.
