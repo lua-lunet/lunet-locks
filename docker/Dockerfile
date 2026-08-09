@@ -2,7 +2,7 @@
 # builder: it uses no BuildKit-only mounts, secrets, or cache directives.
 # `tools/docker_prepare_context.sh` supplies a Cargo-vendored build context so
 # the private vrr-core revision is never fetched from inside Docker.
-FROM --platform=linux/arm64 rust:1.85-slim AS native
+FROM rust:1.85-slim AS native
 
 WORKDIR /app/ext/advisory_lock
 COPY .cargo/config.toml /usr/local/cargo/config.toml
@@ -10,7 +10,7 @@ COPY vendor /app/vendor
 COPY ext/advisory_lock /app/ext/advisory_lock
 RUN cargo build --release --locked
 
-FROM --platform=linux/arm64 debian:bookworm-slim
+FROM debian:bookworm-slim
 
 ARG LUNET_VERSION=v0.7.2
 WORKDIR /app

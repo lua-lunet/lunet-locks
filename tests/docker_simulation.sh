@@ -6,7 +6,7 @@ set -eu
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 sim=${SIM_BIN:-"$root/.tmp/lease-failover-sim"}
 image=${DOCKER_IMAGE:-lunet-advisory-lock}
-platform=${DOCKER_PLATFORM:-linux/arm64}
+platform=${DOCKER_PLATFORM:-native}
 duration=${SIM_DURATION:-30}
 work=$(mktemp -d "$root/.tmp/docker-lease-failover.XXXXXX")
 suffix=$(basename "$work" | tr -cd '[:alnum:]')
@@ -48,8 +48,11 @@ test -x "$sim" || {
 }
 run_docker info >/dev/null
 daemon_platform=$(docker version --format '{{.Server.Os}}/{{.Server.Arch}}')
+if test "$platform" = native; then
+    platform=$daemon_platform
+fi
 test "$daemon_platform" = "$platform" || {
-    echo "docker simulation: daemon is $daemon_platform; native $platform is required" >&2
+    echo "docker simulation: daemon is $daemon_platform; cross-platform runs are not supported" >&2
     exit 1
 }
 image_platform=$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$image")

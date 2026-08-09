@@ -58,9 +58,10 @@ does not take over within five seconds. Logs and node process state are kept in
 then invokes a conventional multi-stage `docker build`. This matches the
 upstream `vrr-core` Docker strategy and deliberately uses neither BuildKit
 features nor source/bind mounts. The image downloads and SHA-256 verifies its
-own Linux Lunet v0.7.2 runtime, compiles the native adapter for ARM64, and
-contains Cyan output. These local Docker targets explicitly require an ARM64
-Linux daemon and image (`linux/arm64`); they refuse an emulated AMD64 build.
+own Linux Lunet v0.7.2 runtime, compiles the native adapter for the Docker
+daemon's architecture, and contains Cyan output. The target builds and runs
+only for that native daemon platform, then verifies that the image matches it;
+it does not request cross-platform emulation.
 
 The command creates an isolated Docker bridge with fixed internal addresses
 for n1/n2/n3, one named Docker volume per container for its recovery nonce,

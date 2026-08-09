@@ -99,18 +99,18 @@ simulation: lunet-runtime build $(SIM_BIN)
 # disposable vendored context avoids BuildKit SSH mounts while retaining the
 # exact private dependency revision.
 DOCKER_IMAGE ?= lunet-advisory-lock
-DOCKER_PLATFORM ?= linux/arm64
+DOCKER_PLATFORM ?= native
 docker-build: build lunet-runtime
 	@context=$$(mktemp -d "$(CURDIR)/.tmp/docker-context.XXXXXX"); \
 	tools/docker_prepare_context.sh "$$context"; \
 	server=$$(docker version --format '{{.Server.Os}}/{{.Server.Arch}}'); \
-	[ "$$server" = "$(DOCKER_PLATFORM)" ] || { \
-		echo "ERROR: docker daemon is $$server; native $(DOCKER_PLATFORM) is required (no emulation)" >&2; exit 1; \
+	[ "$(DOCKER_PLATFORM)" = native ] || [ "$$server" = "$(DOCKER_PLATFORM)" ] || { \
+		echo "ERROR: docker daemon is $$server; cross-platform builds are not supported" >&2; exit 1; \
 	}; \
-	docker build --platform $(DOCKER_PLATFORM) -f "$$context/docker/Dockerfile" -t $(DOCKER_IMAGE) "$$context"; \
+	docker build --platform "$$server" -f "$$context/docker/Dockerfile" -t $(DOCKER_IMAGE) "$$context"; \
 	image=$$(docker image inspect --format '{{.Os}}/{{.Architecture}}' $(DOCKER_IMAGE)); \
-	[ "$$image" = "$(DOCKER_PLATFORM)" ] || { \
-		echo "ERROR: built image is $$image, expected native $(DOCKER_PLATFORM)" >&2; exit 1; \
+	[ "$$image" = "$$server" ] || { \
+		echo "ERROR: built image is $$image, expected native $$server" >&2; exit 1; \
 	}
 
 docker-simulation: docker-build $(SIM_BIN)
