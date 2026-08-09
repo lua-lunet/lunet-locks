@@ -64,16 +64,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.85
         with:
           components: rustfmt, clippy
-      - name: Configure read-only vrr-core access
-        shell: bash
-        env:
-          VRR_CORE_DEPLOY_KEY: ${{ secrets.VRR_CORE_DEPLOY_KEY }}
-        run: |
-          test -n "$VRR_CORE_DEPLOY_KEY"
-          install -d -m 700 ~/.ssh
-          printf '%s\n' "$VRR_CORE_DEPLOY_KEY" > ~/.ssh/id_ed25519
-          chmod 600 ~/.ssh/id_ed25519
-          ssh-keyscan github.com >> ~/.ssh/known_hosts
       - name: Install project Lua tools
         if: runner.os != 'Windows'
         shell: bash
@@ -146,13 +136,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.85
         with:
           components: rustfmt, clippy
-      - name: Configure read-only vrr-core access
-        run: |
-          test -n "${{ secrets.VRR_CORE_DEPLOY_KEY }}"
-          install -d -m 700 ~/.ssh
-          printf '%s\n' "${{ secrets.VRR_CORE_DEPLOY_KEY }}" > ~/.ssh/id_ed25519
-          chmod 600 ~/.ssh/id_ed25519
-          ssh-keyscan github.com >> ~/.ssh/known_hosts
       - name: Install project Lua tools
         run: make deps LUAJIT_DIR=/usr
       - name: Docker build and three-container simulation
