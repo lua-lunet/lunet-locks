@@ -66,7 +66,12 @@ jobs:
           sudo ln -sfn /usr/lib /opt/luajit-shim/lib
       - name: Install system dependencies (macOS)
         if: runner.os == 'macOS'
-        run: brew install luajit luarocks
+        # zlib: the official lunet-run macOS release binary is dynamically
+        # linked against Homebrew's libz (dyld: "Library not loaded:
+        # /opt/homebrew/opt/zlib/lib/libz.1.dylib") on the runner it was
+        # built on; GitHub's macos-latest image does not have the zlib
+        # formula installed by default.
+        run: brew install luajit luarocks zlib
       - uses: jdx/mise-action@v2
         if: runner.os != 'Windows'
       # rustfmt + clippy are required by make ext-check (cargo fmt --check,
