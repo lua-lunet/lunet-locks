@@ -1,0 +1,262 @@
+-- Pure lock-state reducer over telemetry records (console/openresty/lualib).
+--
+-- Plain LuaJIT, no `ngx`: unit-testable with the system luajit. The ngx
+-- adapters live in handlers.lua; this module only turns records into the
+-- API's Lock/Event shapes.
+--
+-- KNOWN GAP (item27a candidate): the binary record format
+-- (src/telemetry_log.tl) carries kind/ts/lock_id/fencing_token/renew_count/
+-- held_gauge/name only. There is NO holder UUID, NO expiry/lease, and NO
+-- labels in the log, so:
+--   * lock.holder     is always null
+--   * lock.expiresAtMs is always null (and no lazy-expiry state check or
+--     synthesized `expire` events are possible — synthesis is skipped)
+--   * lock.leaseMs    is served as 0 (schema-required, unknowable)
+--   * lock.labels     is served as [] (so `tag:` queries never match)
+-- Recovering any of these requires a record-format change, which is a spec
+-- change and deliberately NOT done here.
+
+local lock_log = require("lock_log")
+
+local lock_state = {}
+
+lock_state.KIND_NAMES = {
+    [1] = "acquire",
+    [2] = "renew",
+    [3] = "release",
+    [4] = "cas",
+    [5] = "expire",
+    [6] = "break",
+    [7] = "deny",
+}
+local NAME_KINDS = {}
+for k, v in pairs(lock_state.KIND_NAMES) do
+    NAME_KINDS[v] = k
+end
+lock_state.NAME_KINDS = NAME_KINDS
+
+-- Brief per-kind detail text, mirroring the mock's detailFor but limited to
+-- what the record actually carries (fencing token only).
+local function detail_for(kind_name, rec)
+    if kind_name == "acquire" then
+        return "fence " .. rec.fencing_token
+    elseif kind_name == "renew" then
+        return "fence " .. rec.fencing_token
+    elseif kind_name == "release" then
+        return "clean release"
+    elseif kind_name == "cas" then
+        return "fence " .. rec.fencing_token
+    elseif kind_name == "expire" then
+        return "lease lapsed"
+    elseif kind_name == "break" then
+        return "admin force-release, fence " .. rec.fencing_token
+    elseif kind_name == "deny" then
+        return "contended"
+    end
+    return ""
+end
+lock_state.detail_for = detail_for
+
+-- Held iff the latest fencing event says so. deny does not change state.
+local HELD_AFTER = { [1] = true, [2] = true, [4] = true } -- acquire/renew/cas
+local FREE_AFTER = { [3] = true, [5] = true, [6] = true } -- release/expire/break
+
+-- reduce(records, now_ms) → { locks = {lock_id → lock}, events = [...] }.
+-- records must be in ts order (lock_log.scan already is). Events keep the
+-- mock shape {seq, tsMs, kind, lockId, name, actor, detail}; actor is null
+-- because the record format carries no holder (see header).
+function lock_state.reduce(records, now_ms)
+    local locks = {}
+    local events = {}
+    for _, rec in ipairs(records) do
+        local id = rec.lock_id
+        local lock = locks[id]
+        if lock == nil then
+            lock = {
+                id = id,
+                name = "",
+                labels = {},
+                state = "free",
+                holder = nil,
+                fencingToken = 0,
+                leaseMs = 0,
+                expiresAtMs = nil,
+                takenAtMs = nil,
+                renewCount = 0,
+            }
+            locks[id] = lock
+        end
+        if rec.name ~= "" then
+            lock.name = rec.name
+        end
+        if HELD_AFTER[rec.kind] then
+            local became_held = lock.state ~= "held"
+            lock.state = "held"
+            if rec.kind == 1 or rec.kind == 4 then -- acquire or cas: new holder
+                lock.takenAtMs = rec.ts_ms
+            elseif became_held then
+                lock.takenAtMs = rec.ts_ms
+            end
+            lock.fencingToken = rec.fencing_token
+            lock.renewCount = rec.renew_count
+        elseif FREE_AFTER[rec.kind] then
+            lock.state = "free"
+            lock.fencingToken = rec.fencing_token
+            lock.renewCount = 0
+            lock.takenAtMs = nil
+        end
+        -- kind 7 (deny): event only, no state change.
+        events[#events + 1] = {
+            seq = #events + 1,
+            tsMs = rec.ts_ms,
+            kind = lock_state.KIND_NAMES[rec.kind] or "unknown",
+            lockId = id,
+            name = lock.name,
+            actor = nil, -- no holder in the record format (see header)
+            detail = detail_for(lock_state.KIND_NAMES[rec.kind] or "", rec),
+        }
+    end
+    return { locks = locks, events = events }
+end
+
+-- matchQ: mirrors the mock exactly — space-separated terms; `tag:x` matches
+-- a label prefix, `holder:x` a holder substring, else a name substring.
+function lock_state.match_q(lock, q)
+    if q == nil or q == "" then
+        return true
+    end
+    for term in q:gmatch("%S+") do
+        local t = term:lower()
+        if t:sub(1, 4) == "tag:" then
+            local prefix = t:sub(5)
+            local hit = false
+            for _, label in ipairs(lock.labels or {}) do
+                if label:sub(1, #prefix) == prefix then
+                    hit = true
+                    break
+                end
+            end
+            if not hit then
+                return false
+            end
+        elseif t:sub(1, 7) == "holder:" then
+            if not (lock.holder or ""):find(t:sub(8), 1, true) then
+                return false
+            end
+        elseif not lock.name:lower():find(t, 1, true) then
+            return false
+        end
+    end
+    return true
+end
+
+-- Bucketed series over records. buckets: {tsMs, held, acquire..deny}; held
+-- from held_gauge samples (last in bucket wins). Empty range → empty
+-- buckets (the mock's fixed guard — do not regress it).
+function lock_state.series(records, from_ms, to_ms, bucket_ms)
+    local buckets = {}
+    local start = from_ms - (from_ms % bucket_ms)
+    local ts = start
+    while ts < to_ms do
+        buckets[#buckets + 1] = {
+            tsMs = ts,
+            held = 0,
+            acquire = 0,
+            renew = 0,
+            release = 0,
+            cas = 0,
+            expire = 0,
+            ["break"] = 0,
+            deny = 0,
+        }
+        ts = ts + bucket_ms
+    end
+    if #buckets == 0 then
+        return buckets
+    end
+    local function index_of(ts_ms)
+        return math.floor((ts_ms - buckets[1].tsMs) / bucket_ms) + 1
+    end
+    for _, rec in ipairs(records) do
+        if rec.ts_ms >= from_ms and rec.ts_ms < to_ms then
+            local b = buckets[index_of(rec.ts_ms)]
+            if b ~= nil then
+                local kind_name = lock_state.KIND_NAMES[rec.kind]
+                if kind_name ~= nil then
+                    b[kind_name] = b[kind_name] + 1
+                end
+                b.held = rec.held_gauge -- last sample in the bucket wins
+            end
+        end
+    end
+    return buckets
+end
+
+-- Per-node stats for /cluster, derived from one node's segment dir.
+-- Returns segmentCount, segmentBytes, locksHeld (latest held_gauge),
+-- per-kind rates over the trailing `window_ms` ending at now_ms, and
+-- lastRecordMs (nil when the node has no records).
+function lock_state.node_stats(dir, now_ms, window_ms, listdir)
+    local segs = lock_log.list_segments(dir, listdir)
+    local bytes = 0
+    for _, seg in ipairs(segs) do
+        bytes = bytes + seg.size
+    end
+    local records = lock_log.scan(dir, listdir)
+    local cutoff = now_ms - window_ms
+    local counts = { acquire = 0, renew = 0, release = 0, cas = 0, expire = 0, ["break"] = 0, deny = 0 }
+    local held = 0
+    local last_ms = nil
+    for _, rec in ipairs(records) do
+        held = rec.held_gauge
+        last_ms = rec.ts_ms
+        if rec.ts_ms >= cutoff then
+            local kind_name = lock_state.KIND_NAMES[rec.kind]
+            if kind_name ~= nil then
+                counts[kind_name] = counts[kind_name] + 1
+            end
+        end
+    end
+    local secs = window_ms / 1000
+    local function rate(n)
+        return math.floor((n / secs) * 100 + 0.5) / 100
+    end
+    return {
+        locksHeld = held,
+        acquirePerSec = rate(counts.acquire),
+        renewPerSec = rate(counts.renew),
+        releasePerSec = rate(counts.release),
+        casPerSec = rate(counts.cas),
+        breakPerSec = rate(counts["break"]),
+        denyPerSec = rate(counts.deny),
+        expirePerSec = rate(counts.expire),
+        segmentCount = #segs,
+        segmentBytes = bytes,
+        lastRecordMs = last_ms,
+    }
+end
+
+-- Scan all configured dirs and return records merged in ts order (stable),
+-- plus the per-dir segment inventory {count, bytes} for the shared-dict
+-- gauges.
+function lock_state.scan_all(dirs_by_node, listdir)
+    local all = {}
+    local seg_count = 0
+    local seg_bytes = 0
+    for _, dir in pairs(dirs_by_node or {}) do
+        for _, seg in ipairs(lock_log.list_segments(dir, listdir)) do
+            seg_count = seg_count + 1
+            seg_bytes = seg_bytes + seg.size
+        end
+        local records = lock_log.scan(dir, listdir)
+        for _, r in ipairs(records) do
+            all[#all + 1] = r
+        end
+    end
+    table.sort(all, function(a, b)
+        return a.ts_ms < b.ts_ms
+    end)
+    return all, seg_count, seg_bytes
+end
+
+return lock_state
