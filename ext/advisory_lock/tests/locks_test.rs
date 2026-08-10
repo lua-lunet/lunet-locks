@@ -16,6 +16,8 @@ fn set(message: u8, client: u64, request_num: u64, holder: u8, expiry: u64) -> R
             holder: id(holder),
             expiry,
         },
+        name: None,
+        labels: None,
     }
 }
 

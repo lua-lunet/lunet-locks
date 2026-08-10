@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use lunet_advisory_lock::locks::{Lease, Request, Response, Service};
+use lunet_advisory_lock::locks::{Event, ExtendedLease, Lease, Request, Response, Service};
 use uuid::Uuid;
 
 const EXECUTION_TIME: u64 = 100;
@@ -127,6 +127,8 @@ fn request(operation: Operation, holder: Uuid, expiry: u64) -> Request {
                 holder,
                 expiry,
             },
+            name: None,
+            labels: None,
         },
     }
 }
@@ -151,15 +153,21 @@ fn install(service: &mut Service, lease: Lease) {
         request_num: 9,
         lock_id: LOCK_ID,
         lease,
+        name: None,
+        labels: None,
     };
     assert!(execute(service, &request).is_ok(), "incumbent installs");
 }
 
-fn observed_lease(service: &mut Service, lock_id: u64) -> Option<Lease> {
+fn observed_lease(service: &mut Service, lock_id: u64) -> Option<ExtendedLease> {
     observed_lease_at(service, lock_id, EXECUTION_TIME)
 }
 
-fn observed_lease_at(service: &mut Service, lock_id: u64, execution_time: u64) -> Option<Lease> {
+fn observed_lease_at(
+    service: &mut Service,
+    lock_id: u64,
+    execution_time: u64,
+) -> Option<ExtendedLease> {
     let request = Request::Get {
         message_id: id(10),
         client_id: 10,
@@ -181,10 +189,20 @@ fn observed_lease_at(service: &mut Service, lock_id: u64, execution_time: u64) -
     .unwrap();
     match response {
         Response::Get { lease, .. } => lease,
-        Response::Set { .. } | Response::Release { .. } => {
+        Response::Set { .. } | Response::Release { .. } | Response::Break { .. } => {
             unreachable!("GET must produce a GET response")
         }
     }
+}
+
+/// Compare only the lease triple; metadata (name/labels/lease-age counters)
+/// is covered by the dedicated metadata tests, not this matrix.
+fn core(lease: Option<ExtendedLease>) -> Option<(u64, Uuid, u64)> {
+    lease.and_then(|lease| Some((lease.lease_id, lease.holder?, lease.expiry?)))
+}
+
+fn lease_core(lease: Option<Lease>) -> Option<(u64, Uuid, u64)> {
+    lease.map(|lease| (lease.lease_id, lease.holder, lease.expiry))
 }
 
 #[test]
@@ -244,6 +262,7 @@ fn release_requires_the_exact_live_lease_and_is_idempotent_after_expiry() {
             request_num: 1,
             lock_id: LOCK_ID,
             released: false,
+            event: None,
             lease: Some(incumbent),
         }
     );
@@ -254,6 +273,7 @@ fn release_requires_the_exact_live_lease_and_is_idempotent_after_expiry() {
             request_num: 2,
             lock_id: LOCK_ID,
             released: true,
+            event: Some(Event::Release),
             lease: None,
         }
     );
@@ -264,6 +284,7 @@ fn release_requires_the_exact_live_lease_and_is_idempotent_after_expiry() {
             request_num: 3,
             lock_id: LOCK_ID,
             released: true,
+            event: None,
             lease: None,
         }
     );
@@ -301,7 +322,7 @@ fn service_matrix_is_complete_correlated_and_deterministic() {
                         let candidate_lease = match request {
                             Request::Set { lease, .. } => Some(lease),
                             Request::Get { .. } => None,
-                            Request::Release { .. } => {
+                            Request::Release { .. } | Request::Break { .. } => {
                                 unreachable!("matrix only creates GET and SET")
                             }
                         };
@@ -344,8 +365,8 @@ fn service_matrix_is_complete_correlated_and_deterministic() {
                         if envelope != Envelope::Exact {
                             assert!(first_result.is_err(), "mismatch accepted for {case:?}");
                             assert_eq!(
-                                observed_lease(&mut first, LOCK_ID),
-                                expected_live,
+                                core(observed_lease(&mut first, LOCK_ID)),
+                                lease_core(expected_live),
                                 "mismatch mutated lock state for {case:?}"
                             );
                             continue;
@@ -369,7 +390,8 @@ fn service_matrix_is_complete_correlated_and_deterministic() {
                                     "GET correlation failed for {case:?}"
                                 );
                                 assert_eq!(
-                                    lease, expected_live,
+                                    core(lease),
+                                    lease_core(expected_live),
                                     "GET liveness failed for {case:?}"
                                 );
                             }
@@ -381,6 +403,7 @@ fn service_matrix_is_complete_correlated_and_deterministic() {
                                     lock_id,
                                     granted,
                                     lease,
+                                    ..
                                 },
                             ) => {
                                 let granted_expected = expected_live
@@ -396,22 +419,22 @@ fn service_matrix_is_complete_correlated_and_deterministic() {
                                     "SET grant failed for {case:?}"
                                 );
                                 assert_eq!(
-                                    lease,
-                                    if granted {
+                                    core(lease),
+                                    lease_core(if granted {
                                         candidate_lease
                                     } else {
                                         expected_live
-                                    },
+                                    }),
                                     "SET response lease failed for {case:?}"
                                 );
                                 assert_eq!(
-                                    observed_lease(&mut first, LOCK_ID),
-                                    if granted {
+                                    core(observed_lease(&mut first, LOCK_ID)),
+                                    lease_core(if granted {
                                         candidate_lease
                                             .filter(|lease| lease.expiry > EXECUTION_TIME)
                                     } else {
                                         expected_live
-                                    },
+                                    }),
                                     "SET state failed for {case:?}"
                                 );
                             }
@@ -450,6 +473,8 @@ fn lock_isolation_and_u64_extrema_are_preserved() {
             request_num: value,
             lock_id: value,
             lease,
+            name: None,
+            labels: None,
         };
         let (message_id, client_id, request_num) = set.ids();
         let response: Response = serde_json::from_slice(
@@ -464,19 +489,30 @@ fn lock_isolation_and_u64_extrema_are_preserved() {
                 .unwrap(),
         )
         .unwrap();
+        let granted = value == u64::MIN;
+        let expected_lease = granted.then_some(ExtendedLease {
+            lease_id: lease.lease_id,
+            holder: Some(lease.holder),
+            expiry: Some(lease.expiry),
+            name: None,
+            labels: Vec::new(),
+            taken_at_ms: Some(value),
+            renew_count: 0,
+        });
         assert_eq!(
             response,
             Response::Set {
                 message_id: id(13),
                 request_num: value,
                 lock_id: value,
-                granted: value == u64::MIN,
-                lease: if value == u64::MIN { Some(lease) } else { None },
+                granted,
+                event: if granted { Event::Acquire } else { Event::Deny },
+                lease: expected_lease.clone(),
             }
         );
         assert_eq!(
             observed_lease_at(&mut service, value, value),
-            if value == u64::MIN { Some(lease) } else { None }
+            expected_lease
         );
         assert_eq!(
             observed_lease_at(&mut service, value ^ 1, value),
