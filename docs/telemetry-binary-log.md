@@ -18,14 +18,15 @@ without any cross-node calls.
 - Off by default. Reclaiming old segments is an explicit admin task, not
   automatic log-rolling logic.
 
-## Feature flag
+## Server flags
 
-`telemetry.enabled` (default `false`), `telemetry.log_dir`,
-`telemetry.rotate_min_bytes` (dev default: 64 KiB; prod default: 256 MiB).
+The writer is enabled with the `--telemetry-log DIR` server flag and rotates
+segments per `--telemetry-min-bytes N` (dev default: 64 KiB; prod default:
+256 MiB). Without `--telemetry-log` the node writes no telemetry.
 
 The env-var overrides `LUNET_LOCKS_TELEMETRY_LOG` and
-`LUNET_LOCKS_TELEMETRY_MIN_BYTES` take precedence over the config file and
-are the convenient knob for local testing.
+`LUNET_LOCKS_TELEMETRY_MIN_BYTES` take precedence over the corresponding
+flags and are the convenient knob for local testing.
 
 Recommended default posture: on for whichever node is co-located with the
 admin console (so there's something to read), off elsewhere. In production,
@@ -35,7 +36,7 @@ read a different node's log. In local testing, turn it on everywhere.
 ## Binary record format
 
 Fixed-size where possible; ints, not JSON, so the reader never parses text
-to draw a chart.
+to draw a chart. All multi-byte integer fields are big-endian.
 
 **File header** (24 bytes, once per segment file):
 
@@ -50,14 +51,14 @@ to draw a chart.
 
 | field         | type | bytes | notes |
 |---------------|------|-------|-------|
-| record_magic  | u8   | 1     | `0xLL` sentinel, lets a reader resync after a torn write |
+| record_magic  | u8   | 1     | single byte `0x4C` (`L`) sentinel, lets a reader resync after a torn write |
 | record_len    | u16  | 2     | total record length including this header |
 | kind          | u8   | 1     | acquire=1, renew=2, release=3, cas=4, expire=5, break=6, deny=7 |
 | ts_ms         | u64  | 8     | epoch ms |
 | lock_id       | u32  | 4     | matches the `Lock.id` in openapi.yaml |
 | fencing_token | u64  | 8     | mirrors §2's `fencingToken` |
 | renew_count   | u32  | 4     | mirrors §2's u32 `renewCount` mutation rule |
-| held_gauge    | u32  | 4     | cluster-wide held-lock count at this instant, for the chart |
+| held_gauge    | u32  | 4     | the writing node's own observed held-lock count at this instant, for the chart |
 | name_len      | u8   | 1     | ≤128 per the `name` field's max length (see openapi.yaml) |
 | name          | bytes| name_len | UTF-8, not NUL-terminated |
 | crc32c        | u32  | 4     | trailer, covers everything from `record_magic` |
@@ -68,7 +69,7 @@ worst case; most records are well under 60 bytes).
 ## Segments and rotation
 
 `telemetry-<nodeId>-<epochMsAtOpen>-<seq6>.bin`. A segment rotates only
-after it has reached `telemetry.rotate_min_bytes` (a *minimum*, not a
+after it has reached `--telemetry-min-bytes` (a *minimum*, not a
 maximum) — this avoids the segment-count explosion you'd get from rotating
 on every small size overshoot. Rotation is atomic: write to
 `<name>.bin.tmp`, `fsync`, then `rename` into place.

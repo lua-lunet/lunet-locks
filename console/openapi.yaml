@@ -58,10 +58,15 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [term, leaderId, nowMs, nodes]
+                required: [nowMs, nodes]
+                description: |-
+                  The edge cannot observe replication internals, so there is
+                  no cluster `term` or `leaderId` here. Each node entry is
+                  derived from that node's on-disk telemetry segment files:
+                  segment count/bytes, the latest held gauge (the writing
+                  node's own observed held-lock count), per-kind event rates
+                  over a trailing window, and the last record timestamp.
                 properties:
-                  term: { type: integer }
-                  leaderId: { type: string }
                   nowMs: { type: integer, format: int64 }
                   nodes:
                     type: array
@@ -218,19 +223,26 @@ components:
         error: { type: string }
     Node:
       type: object
-      required: [id, role, locksHeld, acquirePerSec, renewPerSec, releasePerSec, casPerSec, appliedIndex]
+      required: [id, locksHeld, acquirePerSec, renewPerSec, releasePerSec, casPerSec, breakPerSec, denyPerSec, expirePerSec, segmentCount, segmentBytes, lastRecordMs]
+      description: Telemetry-derived per-node stats, read from the node's local binary log segments.
       properties:
         id: { type: string }
-        role: { type: string, enum: [leader, follower] }
-        locksHeld: { type: integer }
+        locksHeld:
+          type: integer
+          description: Latest held_gauge record — the node's own observed held-lock count.
         acquirePerSec: { type: number }
         renewPerSec: { type: number }
         releasePerSec: { type: number }
         casPerSec: { type: number }
-        appliedIndex: { type: integer, format: int64 }
+        breakPerSec: { type: number }
+        denyPerSec: { type: number }
+        expirePerSec: { type: number }
+        segmentCount: { type: integer }
+        segmentBytes: { type: integer, format: int64 }
+        lastRecordMs: { type: integer, format: int64, nullable: true }
     Lock:
       type: object
-      required: [id, name, labels, state, fencingToken, leaseMs, renewCount, holderChanges]
+      required: [id, name, labels, state, fencingToken, leaseMs, renewCount]
       properties:
         id: { type: integer }
         name:
@@ -250,22 +262,22 @@ components:
           description: 'Lowercase/digit/hyphen tags, CSV-safe, ≤8 per lock, ≤32 bytes each.'
         state: { type: string, enum: [held, free] }
         holder: { type: string, maxLength: 64, nullable: true }
-        session: { type: string, maxLength: 64, nullable: true }
-        fencingToken: { type: integer, format: int64 }
+        fencingToken:
+          type: integer
+          format: int64
+          description: The protocol's lease_id, u64 on the wire. BREAK bumps it, so a broken holder's stored token is stale.
         leaseMs: { type: integer, format: int64 }
         expiresAtMs: { type: integer, format: int64, nullable: true }
         takenAtMs:
           type: integer
           format: int64
           nullable: true
-          description: Epoch ms the current holder took the lock (u64 on the wire). Set on a holder-changing CAS, unchanged on renewal, cleared to null on release/expire/break.
-        lastHolderChangeMs: { type: integer, format: int64 }
+          description: Epoch ms the current holder took the lock (u64 on the wire). Set on a holder-changing take (acquire or CAS) with a 1 ms collision bump to keep it strictly increasing, unchanged on renewal, null in replies while no holder is recorded.
         renewCount:
           type: integer
           format: int32
           minimum: 0
           description: u32 on the wire. Incremented on a same-holder renewal, reset to 0 on a holder-changing CAS or on release/expire/break.
-        holderChanges: { type: integer, description: Holder transitions since boot }
     Event:
       type: object
       required: [seq, tsMs, kind, lockId, name, actor, detail]
