@@ -1,5 +1,5 @@
-// Lock rows: icon, path, holder, TTL bar, renew counter, held-for, labels.
-// In expiry mode the TTL column shows the signed delta from the target time.
+// Lock rows: icon, path, holder, expires, held-for, labels.
+// In expiry mode the expires column shows the signed delta from the target time.
 
 import { store, config } from "../lib/state.mjs";
 import { esc, fmtDur, parseClock, ICONS } from "../lib/util.mjs";
@@ -7,7 +7,7 @@ import { esc, fmtDur, parseClock, ICONS } from "../lib/util.mjs";
 class LaLockTable extends HTMLElement {
   connectedCallback() {
     this.innerHTML = `
-      <div class="grid-head"><div></div><div>lock</div><div>holder</div><div>expires</div><div>ext</div><div>held</div><div>labels</div></div>
+      <div class="grid-head"><div></div><div>lock</div><div>holder</div><div>expires</div><div>held</div><div>labels</div></div>
       <div class="rows"></div>`;
     this._rowsEl = this.querySelector(".rows");
     this._unsub = store.subscribe(() => this.render());
@@ -32,16 +32,14 @@ class LaLockTable extends HTMLElement {
       const leaf = l.name.slice(cut + 1);
       const hot = watched.has(l.id) && held && rem < config.watchWarnMs;
 
-      let ttlText, ttlColor, pct = 0;
+      let ttlText, ttlColor;
       if (held && mode === "expiry" && atMs != null) {
         const d = (l.expiresAtMs - atMs) / 1000;
         ttlText = (d >= 0 ? "+" : "") + d.toFixed(1) + "s";
         ttlColor = Math.abs(d) < tolSec / 2 ? "var(--color-accent)" : "var(--color-neutral-400)";
-        pct = Math.max(2, Math.min(100, (rem / l.leaseMs) * 100));
       } else if (held) {
         ttlText = fmtDur(rem);
         ttlColor = urgent ? "var(--color-accent)" : "var(--color-neutral-400)";
-        pct = Math.max(2, Math.min(100, (rem / l.leaseMs) * 100));
       } else {
         ttlText = "free";
         ttlColor = "var(--color-accent-600)";
@@ -59,12 +57,8 @@ class LaLockTable extends HTMLElement {
           ${watched.has(l.id) ? `<span style="color:var(--color-accent);flex:none">${ICONS.bell}</span>` : ""}
         </div>
         <div class="cell" style="color:${held ? "var(--color-text)" : "var(--color-neutral-600)"}">${esc(held ? l.holder : "—")}</div>
-        <div class="ttl">
-          <span class="cell" style="color:${ttlColor}">${ttlText}</span>
-          <span class="bar"><i style="background:${ttlColor};width:${pct}%"></i></span>
-        </div>
-        <div class="cell" style="color:var(--color-neutral-400)">${held ? l.renewCount : "—"}</div>
-        <div class="cell" style="color:var(--color-neutral-500)">${held ? fmtDur(now - l.holderSinceMs) : "—"}</div>
+        <div class="cell" style="color:${ttlColor}">${ttlText}</div>
+        <div class="cell" style="color:var(--color-neutral-500)">${held ? fmtDur(now - l.takenAtMs) : "—"}</div>
         <div class="labels">${l.labels.map((t) => `<span class="tag">${esc(t)}</span>`).join("")}</div>
       </div>`;
     }).join("");

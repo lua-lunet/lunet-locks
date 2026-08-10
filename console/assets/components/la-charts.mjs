@@ -1,18 +1,8 @@
-// Telemetry view: per-node counter cards plus three echarts plots fed by
-// /metrics/series (merged with the IndexedDB history cache).
+// Telemetry view: a one-line cluster summary plus a single held-locks chart
+// fed by /metrics/series (merged with the IndexedDB history cache).
 
 import { store } from "../lib/state.mjs";
 import { esc, fmtClock } from "../lib/util.mjs";
-
-const KIND_COLORS = {
-  acquire: "#9184d9",
-  renew: "#75798c",
-  release: "#a7a1db",
-  cas: "#b5abfc",
-  expire: "#e0b46a",
-  break: "#c96f7e",
-  deny: "#8a6f3c",
-};
 
 const AXIS = {
   axisLabel: { color: "#9397ab", fontFamily: "JetBrains Mono, monospace", fontSize: 10 },
@@ -29,12 +19,10 @@ const TOOLTIP = {
 class LaCharts extends HTMLElement {
   connectedCallback() {
     this.innerHTML = `
-      <div style="flex:1;overflow:auto;min-height:0">
-        <div class="node-cards"></div>
+      <div style="flex:1;display:flex;flex-direction:column;min-height:0">
+        <div class="cluster-summary"></div>
         <div class="charts">
           <div class="chart-card"><div class="kicker">gauge</div><div class="title">Held locks</div><div class="plot" data-plot="held"></div></div>
-          <div class="chart-card"><div class="kicker">events</div><div class="title">Taken / renewed / released / CAS</div><div class="plot" data-plot="kinds"></div></div>
-          <div class="chart-card wide"><div class="kicker">nodes</div><div class="title">Per-node lock rates (per second)</div><div class="plot" data-plot="nodes"></div></div>
         </div>
       </div>`;
     this._charts = {};
@@ -64,15 +52,15 @@ class LaCharts extends HTMLElement {
   update() {
     const { cluster, series } = store.state;
 
-    this.querySelector(".node-cards").innerHTML = (cluster?.nodes ?? []).map((n) => `
-      <div class="node-card">
-        <div class="nid">${esc(n.id)} <span class="role">${esc(n.role)}</span></div>
-        <div class="m"><span>held</span><b>${n.locksHeld}</b></div>
-        <div class="m"><span>acquire/s</span><b>${n.acquirePerSec}</b></div>
-        <div class="m"><span>renew/s</span><b>${n.renewPerSec}</b></div>
-        <div class="m"><span>cas/s</span><b>${n.casPerSec}</b></div>
-        <div class="m"><span>applied</span><b>${n.appliedIndex}</b></div>
-      </div>`).join("");
+    if (cluster) {
+      const held = (cluster.nodes ?? []).reduce((n, x) => n + x.locksHeld, 0);
+      const acquirePerSec = (cluster.nodes ?? []).reduce((n, x) => n + x.acquirePerSec, 0);
+      this.querySelector(".cluster-summary").innerHTML =
+        `<span>leader <b>${esc(cluster.leaderId)}</b></span>` +
+        `<span>term <b>${cluster.term}</b></span>` +
+        `<span>held <b>${held}</b></span>` +
+        `<span>acquire/s <b>${acquirePerSec.toFixed(2)}</b></span>`;
+    }
 
     if (!window.echarts) {
       for (const el of this.querySelectorAll(".plot")) {
@@ -90,47 +78,17 @@ class LaCharts extends HTMLElement {
       const xAxis = { type: "category", data: labels, ...AXIS, axisLabel: { ...AXIS.axisLabel, interval: tick } };
 
       this._chart("held")?.setOption({
+        animation: false,
         grid: { left: 36, right: 14, top: 16, bottom: 24 },
-        tooltip: TOOLTIP,
+        tooltip: { ...TOOLTIP, formatter: (p) => `${p[0].axisValue}<br/>held: ${p[0].value}` },
         xAxis,
         yAxis: { type: "value", minInterval: 1, ...AXIS },
         series: [{
           name: "held", type: "line", smooth: true, symbol: "none",
           data: series.buckets.map((b) => b.held),
-          lineStyle: { color: "#9184d9", width: 2 },
-          areaStyle: { color: "rgba(145,132,217,0.18)" },
+          lineStyle: { color: "#7b74b8", width: 2 },
+          areaStyle: { color: "rgba(123,116,184,0.18)" },
         }],
-      }, { notMerge: true });
-
-      const kinds = ["acquire", "renew", "release", "cas", "expire", "break"];
-      this._chart("kinds")?.setOption({
-        grid: { left: 36, right: 14, top: 30, bottom: 24 },
-        tooltip: TOOLTIP,
-        legend: { top: 0, textStyle: { color: "#9397ab", fontSize: 10 }, itemWidth: 10, itemHeight: 8 },
-        xAxis,
-        yAxis: { type: "value", minInterval: 1, ...AXIS },
-        series: kinds.map((k) => ({
-          name: k, type: "bar", stack: "kinds", barMaxWidth: 14,
-          itemStyle: { color: KIND_COLORS[k] },
-          data: series.buckets.map((b) => b[k]),
-        })),
-      }, { notMerge: true });
-    }
-
-    if (cluster?.nodes?.length) {
-      const rates = ["acquirePerSec", "renewPerSec", "releasePerSec", "casPerSec"];
-      const colors = ["#9184d9", "#75798c", "#a7a1db", "#b5abfc"];
-      this._chart("nodes")?.setOption({
-        grid: { left: 40, right: 14, top: 30, bottom: 24 },
-        tooltip: TOOLTIP,
-        legend: { top: 0, textStyle: { color: "#9397ab", fontSize: 10 }, itemWidth: 10, itemHeight: 8 },
-        xAxis: { type: "category", data: cluster.nodes.map((n) => n.id), ...AXIS },
-        yAxis: { type: "value", ...AXIS },
-        series: rates.map((r, i) => ({
-          name: r.replace("PerSec", "/s"), type: "bar", barMaxWidth: 22,
-          itemStyle: { color: colors[i] },
-          data: cluster.nodes.map((n) => n[r]),
-        })),
       }, { notMerge: true });
     }
   }

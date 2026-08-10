@@ -11,11 +11,16 @@ info:
     auth as a demo seatbelt only.
 
     Conventions: all times are epoch milliseconds. `name` is a non-unique
-    display path (zookeeper-style, e.g. `/cluster/members/0000001`);
-    `labels` is a bag of tags. Search terms in `q` are space-separated;
-    `tag:x` matches a label prefix, `holder:x` matches a holder substring,
-    anything else matches a name substring. The event log is append-only
-    (a follower-side journal; the leader never writes it).
+    display path (zookeeper-style, e.g. `/cluster/members/0000001`, max 128
+    bytes — deliberately far below ZooKeeper's ~1MB znode limit, because this
+    field is replicated in every WAL/CAS entry across the SMR cluster and a
+    large name directly costs write-amplification and slows follower
+    catch-up). `labels` is a bag of at most 8 tags, each
+    `^[a-z0-9](-?[a-z0-9])*$` up to 32 bytes, for the same reason. Search
+    terms in `q` are space-separated; `tag:x` matches a label prefix,
+    `holder:x` matches a holder substring, anything else matches a name
+    substring. The event log is append-only (a follower-side journal; the
+    leader never writes it).
 servers:
   - url: /api/v1
 security:
@@ -228,19 +233,38 @@ components:
       required: [id, name, labels, state, fencingToken, leaseMs, renewCount, holderChanges]
       properties:
         id: { type: integer }
-        name: { type: string, example: /cluster/members/0000001 }
+        name:
+          type: string
+          maxLength: 128
+          example: /cluster/members/0000001
+          description: Non-unique display path. Kept short (well below ZooKeeper's ~1MB znode limit) because it is replicated in every WAL/CAS entry.
         labels:
           type: array
-          items: { type: string }
+          maxItems: 8
+          uniqueItems: true
+          items:
+            type: string
+            minLength: 1
+            maxLength: 32
+            pattern: '^[a-z0-9](?:[-a-z0-9]{0,30}[a-z0-9])?$'
+          description: 'Lowercase/digit/hyphen tags, CSV-safe, ≤8 per lock, ≤32 bytes each.'
         state: { type: string, enum: [held, free] }
-        holder: { type: string, nullable: true }
-        session: { type: string, nullable: true }
+        holder: { type: string, maxLength: 64, nullable: true }
+        session: { type: string, maxLength: 64, nullable: true }
         fencingToken: { type: integer, format: int64 }
         leaseMs: { type: integer, format: int64 }
         expiresAtMs: { type: integer, format: int64, nullable: true }
-        holderSinceMs: { type: integer, format: int64, nullable: true }
+        takenAtMs:
+          type: integer
+          format: int64
+          nullable: true
+          description: Epoch ms the current holder took the lock (u64 on the wire). Set on a holder-changing CAS, unchanged on renewal, cleared to null on release/expire/break.
         lastHolderChangeMs: { type: integer, format: int64 }
-        renewCount: { type: integer, description: Times the current holder extended the lease }
+        renewCount:
+          type: integer
+          format: int32
+          minimum: 0
+          description: u32 on the wire. Incremented on a same-holder renewal, reset to 0 on a holder-changing CAS or on release/expire/break.
         holderChanges: { type: integer, description: Holder transitions since boot }
     Event:
       type: object

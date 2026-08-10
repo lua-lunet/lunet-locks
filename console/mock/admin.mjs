@@ -53,7 +53,7 @@ const locks = paths.map((name, i) => {
     fencingToken: 4000 + Math.floor(rnd() * 90000),
     leaseMs,
     expiresAtMs: free ? null : Date.now() + Math.floor(rnd() * leaseMs),
-    holderSinceMs: free ? null : Date.now() - Math.floor(rnd() * 3600e3) - 20000,
+    takenAtMs: free ? null : Date.now() - Math.floor(rnd() * 3600e3) - 20000,
     lastHolderChangeMs: Date.now() - Math.floor(rnd() * 7200e3),
     renewCount: Math.floor(rnd() * 40),
     holderChanges: Math.floor(rnd() * 6),
@@ -114,6 +114,8 @@ setInterval(() => {
       l.state = "free";
       l.holder = null;
       l.session = null;
+      l.renewCount = 0;
+      l.takenAtMs = null;
       logEvent(now, "expire", l, "cluster", detailFor("expire", l));
     }
   }
@@ -139,7 +141,7 @@ setInterval(() => {
       l.session = "s-" + (0x10000 + Math.floor(rnd() * 0xefff)).toString(16);
       l.fencingToken++;
       l.renewCount = 0;
-      l.holderSinceMs = now;
+      l.takenAtMs = now;
       l.lastHolderChangeMs = now;
       l.holderChanges++;
       l.expiresAtMs = now + l.leaseMs;
@@ -155,6 +157,9 @@ setInterval(() => {
       logEvent(now, "release", l, l.holder + " " + l.session, detailFor("release", l));
       l.holder = null;
       l.session = null;
+      l.renewCount = 0;
+      l.expiresAtMs = null;
+      l.takenAtMs = null;
     }
   }
   // CAS (compare-and-swap metadata on a held lock bumps the fence)
@@ -282,7 +287,7 @@ Bun.serve({
         lock.session = null;
         lock.renewCount = 0;
         lock.expiresAtMs = null;
-        lock.holderSinceMs = null;
+        lock.takenAtMs = null;
         return json(200, { lock: pub(lock), event: events[events.length - 1] });
       }
       const recentEvents = events.filter((e) => e.lockId === lock.id).slice(-8).reverse();

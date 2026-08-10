@@ -35,9 +35,9 @@ class LaDetail extends HTMLElement {
       ["fence", String(l.fencingToken), ""],
       ["expires", held ? `${fmtClock(l.expiresAtMs)} (in ${fmtDur(l.expiresAtMs - now)})` : "free",
         held && l.expiresAtMs - now < 12000 ? "var(--color-accent)" : ""],
-      ["extends", held ? `${l.renewCount} × ${Math.round(l.leaseMs / 1000)}s` : "—", ""],
-      ["holder since", held ? `${fmtClock(l.holderSinceMs)} (${fmtDur(now - l.holderSinceMs)})` : "—", ""],
-      ["changes", `${l.holderChanges} since boot`, ""],
+      ["taken at", held ? `${fmtClock(l.takenAtMs)} (${fmtDur(now - l.takenAtMs)} ago)` : "—", ""],
+      ["renewals", held ? `${l.renewCount} × ${Math.round(l.leaseMs / 1000)}s` : "—", ""],
+      ["holder changes", `${l.holderChanges} since boot`, ""],
     ].map(([k, v, c]) => `<span class="k">${k}</span><span${c ? ` style="color:${c}"` : ""}>${v}</span>`).join("");
 
     const events = (detail.recentEvents ?? []).map((e) =>

@@ -27,7 +27,7 @@ class LaBreakDialog extends HTMLElement {
       <div class="dialog-backdrop">
         <div class="dialog">
           <div class="path">${esc(l.name)}</div>
-          <div class="warn">Held by ${esc(l.holder ?? "—")} for ${fmtDur(now - (l.holderSinceMs ?? now))},
+          <div class="warn">Held by ${esc(l.holder ?? "—")} for ${fmtDur(now - (l.takenAtMs ?? now))},
             extended ${l.renewCount} times. Breaking bumps the fence token to
             <b>${l.fencingToken + 1}</b>; the current holder's next write is rejected.
             Type the leaf name to confirm.</div>
