@@ -3,7 +3,7 @@
 -- (JSONL) so the file diffs and greps like a log, not a blob.
 --
 -- Scope note (see AGENTS.md "vrr-core" boundary): this module is additive
--- and local-only. Today `config.tl`'s `members()` derives each replica's
+-- and local-only. `config.tl`'s `members()` derives each replica's
 -- protocol-level index from its *position in a lexically-sorted name list*,
 -- and that index is threaded straight through the vrr-core FFI boundary
 -- (see `server.tl`'s `index_by_endpoint`/`endpoint_by_index` and the
@@ -11,9 +11,9 @@
 -- the ids defined here (sparse, admin-chosen, never recycled) the *actual*
 -- replica addressing scheme would require vrr-core to accept non-positional
 -- node identifiers -- a protocol change to the pinned, authoritative
--- vrr-core dependency. That is out of scope here: per AGENTS, any such
--- change must be staged locally only, never committed or pushed, backed by
--- a corresponding upstream GitHub issue, and reported to the coordinator.
+-- vrr-core dependency; per AGENTS, any such change is staged locally only,
+-- never committed or pushed, backed by a corresponding upstream GitHub
+-- issue, and reported to the coordinator.
 -- This module only reads/writes the deployment descriptor file; it does not
 -- feed `config.members()` or `server.tl`.
 

@@ -49,6 +49,15 @@ The currently pinned surprises are:
 - Re-declaring the same-looking record in two modules creates distinct nominal types.
 - `tested` marks no-assert tests and unhandled-exception tests as `invalid`.
 
+## Docs
+
+- Markdown Driven Development: every doc on `main` is written as-at the
+  release cut from `main`. Docs state what the system is and does as fact —
+  no "status" banners, no "not yet implemented", no WIP/design-note framing,
+  no contemporaneous commentary. Where code has not landed yet, the doc is
+  the spec that drives the implementation, written in the same factual
+  voice. History belongs in git log and release notes, never in the docs.
+
 ## Testing split
 
 - Pure modules stay free of `require("lunet")` and are testable in `tests/`.

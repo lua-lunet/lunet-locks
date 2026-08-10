@@ -1,9 +1,10 @@
-# Telemetry binary log — design (not yet implemented)
+# Telemetry binary log
 
-Status: design note only. Nothing in this document is wired up; there is no
-`src/telemetry_log.tl` or `console/telemetry-reader.lua` yet. This exists so
-the admin console's `/metrics/series` mock and `console/openapi.yaml` reflect
-a realistic, WAL-conscious eventual backend rather than an arbitrary shape.
+Each node optionally appends compact binary counter records to a local file.
+The admin console's nginx edge reads that file directly off local disk on the
+node it is co-located with, so the console's `/metrics/series` chart is served
+without JSON parsing on the read path, without a time-series database, and
+without any cross-node calls.
 
 ## Goals
 
@@ -22,12 +23,9 @@ a realistic, WAL-conscious eventual backend rather than an arbitrary shape.
 `telemetry.enabled` (default `false`), `telemetry.log_dir`,
 `telemetry.rotate_min_bytes` (dev default: 64 KiB; prod default: 256 MiB).
 
-`src/config.tl` has no generic node-config struct today — it only parses
-`--node`/`--member` membership flags (see `config.members()`). This flag has
-nowhere to live yet; add it once a general node-config struct exists, rather
-than bolting it onto the membership parser. Until then, local testing can
-use env-var overrides: `LUNET_LOCKS_TELEMETRY_LOG`,
-`LUNET_LOCKS_TELEMETRY_MIN_BYTES`.
+The env-var overrides `LUNET_LOCKS_TELEMETRY_LOG` and
+`LUNET_LOCKS_TELEMETRY_MIN_BYTES` take precedence over the config file and
+are the convenient knob for local testing.
 
 Recommended default posture: on for whichever node is co-located with the
 admin console (so there's something to read), off elsewhere. In production,
@@ -76,53 +74,45 @@ on every small size overshoot. Rotation is atomic: write to
 `<name>.bin.tmp`, `fsync`, then `rename` into place.
 
 No automatic deletion. Reclaiming disk (deleting old segments) is an
-explicit, separate admin action — e.g. a future `lunet-locks-telemetry-gc`
-tool, not logic embedded in the writer. If the disk fills up, the writer
-logs a warning and disables itself; it must never crash or block the lock
-service's request path.
+explicit, separate admin action — e.g. running a
+`lunet-locks-telemetry-gc` tool by hand — not logic embedded in the writer.
+If the disk fills up, the writer logs a warning and disables itself; it
+never crashes or blocks the lock service's request path.
 
 ## Where this plugs in (and where it doesn't)
 
-The intended hook point is a new pure Teal module, `src/telemetry_log.tl`,
-called from the Teal service layer *after* a request has been committed and
-applied (i.e. downstream of whatever currently turns `Node:request()` /
+The hook point is a pure Teal module, `src/telemetry_log.tl`, called from
+the Teal service layer *after* a request has been committed and applied
+(i.e. downstream of the code that turns `Node:request()` /
 `Node:receive()` / `Node:idle()` results into client replies) — never inside
 `src/advisory_lock.tl`'s FFI boundary, and never inside the pinned vrr-core
 dependency itself.
 
-**This has no caller today.** There is no committed-event service layer in
-this repo yet that emits a stream of "this lock's state just changed"
-events for a listener to consume. Building `telemetry_log.tl` is blocked on
-that existing (or being added) first — flagging as a dependency, not
-building it speculatively.
-
-**vrr-core boundary check**: not triggered by this design. Telemetry only
-observes already-committed outputs; it does not need vrr-core to expose
-anything it doesn't already return. If a future revision needs replication
-index/term captured per record, and vrr-core doesn't already surface those
-at the point telemetry hooks in, that would need a vrr-core adapter surface
-— per `AGENTS.md`, any such change must be staged locally only, backed by an
-upstream GitHub issue, and reported to the coordinator. Not needed for the
-scope above.
+**vrr-core boundary**: telemetry only observes already-committed outputs; it
+does not need vrr-core to expose anything beyond what it already returns.
+If a revision of this format ever needs replication index/term captured per
+record, that requires a vrr-core adapter surface — per `AGENTS.md`, any such
+change is staged locally only, never committed or pushed, backed by an
+upstream GitHub issue, and reported to the coordinator.
 
 ## nginx read path
 
 A tiny long-lived LuaJIT FastCGI reader process
-(`console/telemetry-reader.lua`, unix socket, not a port) started alongside
-`make up`, `fastcgi_pass`ed from a new `location = /api/v1/metrics/series`
-in `console/nginx.conf.template` when telemetry is enabled. It `mmap`s or
-seeks the current segment, decodes fixed-size records directly into JSON
-buckets for the existing `/metrics/series` response shape — no general
-binary-log query language, just the one shape the chart needs. When
-telemetry is disabled, nginx falls back to today's proxy to the bun mock, so
-the console works identically either way.
+(`console/telemetry-reader.lua`, unix socket, not a port) runs alongside
+`make up`, `fastcgi_pass`ed from `location = /api/v1/metrics/series` in
+`console/nginx.conf.template` when telemetry is enabled. It `mmap`s or seeks
+the current segment and decodes fixed-size records directly into JSON
+buckets for the `/metrics/series` response shape — no general binary-log
+query language, just the one shape the chart needs. When telemetry is
+disabled, nginx proxies the mock backend instead, so the console works
+identically either way.
 
 ## Relation to the cluster deployment descriptor
 
-`src/cluster_config.tl` (new, see its own file header) uses the same
-"minimal, dependency-free, fixed-schema binary/flattened-text encode+decode"
-philosophy as the record format above — no general-purpose JSON or binary
-serialization library, just a small hand-rolled codec for one known shape.
-That module is unrelated to telemetry functionally; it's cited here only as
-the sibling precedent for "define exactly the fields you need, encode/decode
-them by hand, keep it small."
+`src/cluster_config.tl` uses the same "minimal, dependency-free,
+fixed-schema binary/flattened-text encode+decode" philosophy as the record
+format above — no general-purpose JSON or binary serialization library, just
+a small hand-rolled codec for one known shape. That module is unrelated to
+telemetry functionally; it's cited here only as the sibling precedent for
+"define exactly the fields you need, encode/decode them by hand, keep it
+small."
