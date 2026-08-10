@@ -1,0 +1,268 @@
+openapi: 3.0.3
+info:
+  title: lunet-locks admin API
+  version: 0.1.0
+  description: |-
+    Admin surface for the lunet-locks advisory-lock cluster.
+
+    SECURITY: this API can force-release ("break") any advisory lock. It must
+    be served loopback-only or behind TLS with client certificates. The
+    reference edge (console/nginx.conf.template) binds 127.0.0.1 with basic
+    auth as a demo seatbelt only.
+
+    Conventions: all times are epoch milliseconds. `name` is a non-unique
+    display path (zookeeper-style, e.g. `/cluster/members/0000001`);
+    `labels` is a bag of tags. Search terms in `q` are space-separated;
+    `tag:x` matches a label prefix, `holder:x` matches a holder substring,
+    anything else matches a name substring. The event log is append-only
+    (a follower-side journal; the leader never writes it).
+servers:
+  - url: /api/v1
+security:
+  - basicAuth: []
+tags:
+  - name: cluster
+  - name: locks
+  - name: events
+  - name: metrics
+paths:
+  /health:
+    get:
+      summary: Liveness probe
+      operationId: getHealth
+      responses:
+        '200':
+          description: Service is up
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, nowMs]
+                properties:
+                  status: { type: string, enum: [ok] }
+                  nowMs: { type: integer, format: int64 }
+  /cluster:
+    get:
+      summary: Cluster membership and per-node lock counters
+      operationId: getCluster
+      tags: [cluster]
+      responses:
+        '200':
+          description: Current cluster view
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [term, leaderId, nowMs, nodes]
+                properties:
+                  term: { type: integer }
+                  leaderId: { type: string }
+                  nowMs: { type: integer, format: int64 }
+                  nodes:
+                    type: array
+                    items: { $ref: '#/components/schemas/Node' }
+  /locks:
+    get:
+      summary: Search locks
+      operationId: listLocks
+      tags: [locks]
+      parameters:
+        - { name: q, in: query, schema: { type: string }, description: 'Space-separated terms: tag:, holder:, or name substring' }
+        - { name: state, in: query, schema: { type: string, enum: [held, free] } }
+        - { name: expiringAtMs, in: query, schema: { type: integer, format: int64 }, description: Point in time; returns held locks expiring within toleranceMs of it, nearest first }
+        - { name: toleranceMs, in: query, schema: { type: integer, format: int64, default: 5000 } }
+      responses:
+        '200':
+          description: Matching locks
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [nowMs, locks]
+                properties:
+                  nowMs: { type: integer, format: int64 }
+                  locks:
+                    type: array
+                    items: { $ref: '#/components/schemas/Lock' }
+  /locks/{id}:
+    get:
+      summary: One lock with its recent events
+      operationId: getLock
+      tags: [locks]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer } }
+      responses:
+        '200':
+          description: Lock detail
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [lock, recentEvents]
+                properties:
+                  lock: { $ref: '#/components/schemas/Lock' }
+                  recentEvents:
+                    type: array
+                    items: { $ref: '#/components/schemas/Event' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /locks/{id}/break:
+    post:
+      summary: Force-release a held lock (bumps the fencing token)
+      operationId: breakLock
+      tags: [locks]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer } }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                actor: { type: string, default: admin@console }
+      responses:
+        '200':
+          description: Lock was broken; fence token bumped
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [lock, event]
+                properties:
+                  lock: { $ref: '#/components/schemas/Lock' }
+                  event: { $ref: '#/components/schemas/Event' }
+        '401':
+          description: Missing or invalid credentials
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '405':
+          description: Non-POST method on this endpoint
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: Lock is not held
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+  /events:
+    get:
+      summary: Search the append-only event log by time range
+      operationId: listEvents
+      tags: [events]
+      parameters:
+        - { name: fromMs, in: query, schema: { type: integer, format: int64 } }
+        - { name: toMs, in: query, schema: { type: integer, format: int64 } }
+        - { name: lockId, in: query, schema: { type: integer } }
+        - { name: kind, in: query, schema: { type: string, enum: [acquire, renew, release, cas, expire, break, deny] } }
+        - { name: q, in: query, schema: { type: string }, description: Name substring filter }
+        - { name: limit, in: query, schema: { type: integer, default: 300, maximum: 1000 } }
+      responses:
+        '200':
+          description: Events, newest first
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [events]
+                properties:
+                  events:
+                    type: array
+                    items: { $ref: '#/components/schemas/Event' }
+  /metrics/series:
+    get:
+      summary: Bucketed lock telemetry (held gauge + event-kind counts)
+      operationId: getSeries
+      tags: [metrics]
+      parameters:
+        - { name: fromMs, in: query, schema: { type: integer, format: int64 }, description: 'Start of window; defaults to now − 1h' }
+        - { name: toMs, in: query, schema: { type: integer, format: int64 }, description: 'End of window; defaults to now' }
+        - { name: bucketMs, in: query, schema: { type: integer, format: int64, default: 5000 } }
+      responses:
+        '200':
+          description: Time-ordered buckets
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [bucketMs, buckets]
+                properties:
+                  bucketMs: { type: integer, format: int64 }
+                  buckets:
+                    type: array
+                    items: { $ref: '#/components/schemas/Bucket' }
+components:
+  securitySchemes:
+    basicAuth:
+      type: http
+      scheme: basic
+      description: Loopback demo seatbelt enforced by the nginx edge. Production deployments terminate TLS with client certificates; this scheme documents intent, not adequacy.
+  responses:
+    NotFound:
+      description: No such lock
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error: { type: string }
+    Node:
+      type: object
+      required: [id, role, locksHeld, acquirePerSec, renewPerSec, releasePerSec, casPerSec, appliedIndex]
+      properties:
+        id: { type: string }
+        role: { type: string, enum: [leader, follower] }
+        locksHeld: { type: integer }
+        acquirePerSec: { type: number }
+        renewPerSec: { type: number }
+        releasePerSec: { type: number }
+        casPerSec: { type: number }
+        appliedIndex: { type: integer, format: int64 }
+    Lock:
+      type: object
+      required: [id, name, labels, state, fencingToken, leaseMs, renewCount, holderChanges]
+      properties:
+        id: { type: integer }
+        name: { type: string, example: /cluster/members/0000001 }
+        labels:
+          type: array
+          items: { type: string }
+        state: { type: string, enum: [held, free] }
+        holder: { type: string, nullable: true }
+        session: { type: string, nullable: true }
+        fencingToken: { type: integer, format: int64 }
+        leaseMs: { type: integer, format: int64 }
+        expiresAtMs: { type: integer, format: int64, nullable: true }
+        holderSinceMs: { type: integer, format: int64, nullable: true }
+        lastHolderChangeMs: { type: integer, format: int64 }
+        renewCount: { type: integer, description: Times the current holder extended the lease }
+        holderChanges: { type: integer, description: Holder transitions since boot }
+    Event:
+      type: object
+      required: [seq, tsMs, kind, lockId, name, actor, detail]
+      properties:
+        seq: { type: integer, format: int64 }
+        tsMs: { type: integer, format: int64 }
+        kind: { type: string, enum: [acquire, renew, release, cas, expire, break, deny] }
+        lockId: { type: integer }
+        name: { type: string }
+        actor: { type: string }
+        detail: { type: string }
+    Bucket:
+      type: object
+      required: [tsMs, held, acquire, renew, release, cas, expire, break, deny]
+      properties:
+        tsMs: { type: integer, format: int64 }
+        held: { type: integer }
+        acquire: { type: integer }
+        renew: { type: integer }
+        release: { type: integer }
+        cas: { type: integer }
+        expire: { type: integer }
+        break: { type: integer }
+        deny: { type: integer }

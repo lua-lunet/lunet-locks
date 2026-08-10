@@ -1,0 +1,67 @@
+# Lock Admin — loopback-only demo edge.
+#
+# SECURITY POSTURE
+# ----------------
+# This server fronts an API that can BREAK ADVISORY LOCKS. It must never be
+# reachable from a routable interface. This template:
+#   * binds to 127.0.0.1 only
+#   * requires HTTP basic auth (a seatbelt, not a door)
+#   * serves plain HTTP, which is ONLY acceptable on loopback
+# A real deployment terminates TLS with client certificates (mTLS) here, or
+# moves this API onto a unix socket / dedicated admin port. Do not ship this
+# configuration beyond localhost.
+#
+# Rendered by tooling/lib/consolectl.tl — do not hand-edit the tmp/ output.
+
+pid @TMP@/nginx.pid;
+error_log @TMP@/nginx-error.log warn;
+worker_processes 1;
+
+events {
+  worker_connections 128;
+}
+
+http {
+  access_log @TMP@/nginx-access.log;
+  client_body_temp_path @TMP@/nginx-body;
+  proxy_temp_path @TMP@/nginx-proxy;
+  fastcgi_temp_path @TMP@/nginx-fastcgi;
+  uwsgi_temp_path @TMP@/nginx-uwsgi;
+  scgi_temp_path @TMP@/nginx-scgi;
+
+  types {
+    text/html html;
+    text/css css;
+    text/javascript js mjs;
+    application/json json map;
+    image/svg+xml svg;
+    font/woff2 woff2;
+  }
+  default_type application/octet-stream;
+
+  server {
+    listen 127.0.0.1:@PORT@;
+
+    auth_basic "lock-admin loopback demo (needs TLS+mTLS off-loopback)";
+    auth_basic_user_file @TMP@/htpasswd;
+
+    root @ASSETS@;
+    index index.html;
+
+    add_header X-Lock-Admin-Warning "loopback demo only; TLS+mTLS required off-loopback" always;
+    # Scripts may come only from this origin or the SRI-pinned CDN; styles need
+    # 'unsafe-inline' because the SPA sets inline style attributes.
+    add_header Content-Security-Policy "default-src 'self'; script-src 'self' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; connect-src 'self'; img-src 'self' data:" always;
+
+    location / {
+      try_files $uri $uri/ /index.html;
+    }
+
+    location /api/v1/ {
+      proxy_pass http://127.0.0.1:@MOCK_PORT@;
+      proxy_http_version 1.1;
+      proxy_set_header Host $host;
+      proxy_set_header X-Forwarded-For $remote_addr;
+    }
+  }
+}
