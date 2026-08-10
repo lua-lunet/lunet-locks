@@ -31,7 +31,7 @@ CHECK_SOURCES = tests/teal_learning_test.tl \
                 tests/advisory_lock_ffi_test.tl \
                 tests/advisory_lock_pure_test.tl
 
-.PHONY: init deps build check test smoke simulation simulation-test lunet-runtime docs clean ext ext-check ext-test fmt lint hooks docker-build docker-simulation
+.PHONY: init deps build check test smoke simulation simulation-test lunet-runtime docs clean ext ext-check ext-test fmt lint hooks docker-build docker-simulation package package-verify
 
 init:
 	@command -v mise >/dev/null 2>&1 || { echo "ERROR: mise is not on PATH. Install it from https://mise.jdx.dev and try again."; exit 1; }
@@ -126,6 +126,20 @@ ext-check:
 
 ext-test: ext-check
 	cargo test --manifest-path ext/advisory_lock/Cargo.toml
+
+# Release packaging (tagged CI builds). Target keys match the CI matrix;
+# the archive layout is documented in tests/package_release.sh.
+PACKAGE_TARGET := $(shell if [ "$(LUNET_OS)" = Darwin ]; then echo macos; \
+	elif [ "$(LUNET_OS)-$(LUNET_ARCH)" = Linux-x86_64 ]; then echo linux-amd64; \
+	elif [ "$(LUNET_OS)-$(LUNET_ARCH)" = Linux-aarch64 ]; then echo linux-arm64; \
+	else echo unknown; fi)
+PACKAGE_ARCHIVE ?= lunet-locks-$(PACKAGE_TARGET).tar.gz
+
+package: build
+	tests/package_release.sh $(PACKAGE_TARGET) $(PACKAGE_ARCHIVE)
+
+package-verify: lunet-runtime
+	LUNET_RUN=$(abspath $(LUNET_RUN)) tests/package_verify.sh $(PACKAGE_ARCHIVE)
 
 docs:
 	docs/docs
