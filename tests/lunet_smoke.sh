@@ -59,12 +59,14 @@ start() {
     name=$1
     client_port=$2
     peer_port=$3
+    mkdir -p "$work/tel/$name"
     "$run" build/server.lua \
         --node "$name" --client "127.0.0.1:$client_port" \
         --state "$work/$name.nonce" \
         --member n1=127.0.0.1:27101 \
         --member n2=127.0.0.1:27102 \
         --member n3=127.0.0.1:27103 \
+        --telemetry-log "$work/tel/$name" \
         >"$work/$name.out" 2>"$work/$name.err" &
     pid=$!
     pids="$pids $pid"
@@ -152,4 +154,34 @@ sleep 3
 request_lines 28102 "{\"op\":\"get\",\"message_id\":\"00000000-0000-0000-0000-000000000009\",\"client_id\":4,\"request_num\":2,\"lock_id\":9001}" '"op":"get"|33333333-3333-3333-3333-333333333333'
 
 completed=true
+
+# Telemetry evidence: every telemetry-*.bin segment must open with the
+# 8-byte LLOCKTEL magic, and the leader (n1, which commits every write in
+# this run) must have produced at least one segment. Replicas only record
+# when they happen to lead, so empty replica dirs are acceptable.
+check_segments() {
+    name=$1
+    found=""
+    for segment in "$work/tel/$name"/telemetry-*.bin; do
+        test -f "$segment" || continue
+        magic=$(dd if="$segment" bs=8 count=1 2>/dev/null)
+        test "$magic" = "LLOCKTEL" || {
+            echo "lunet smoke: bad telemetry magic in $segment" >&2
+            exit 1
+        }
+        found=$segment
+    done
+    printf '%s\n' "$found"
+}
+
+for name in n1 n2 n3; do
+    segment=$(check_segments "$name")
+    if test -n "$segment"; then
+        echo "lunet smoke: telemetry segment ok: $segment"
+    fi
+done
+test -n "$(check_segments n1)" || {
+    echo "lunet smoke: leader n1 produced no telemetry segment" >&2
+    exit 1
+}
 echo "lunet smoke: passed"

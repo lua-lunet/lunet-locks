@@ -20,6 +20,7 @@ local lunet = require("lunet")
 local membership_guard = require("membership_guard")
 local socket = require("lunet.socket")
 local udp = require("lunet.udp")
+local telemetry_log = require("telemetry_log")
 local transport = require("transport")
 
 local FORWARD_REQUEST = transport.FORWARD_REQUEST
@@ -38,6 +39,8 @@ local record Options
     heartbeat_ms: integer
     election_ms: integer
     recovery_ms: integer
+    telemetry_log: string
+    telemetry_min_bytes: integer
 end
 
 local record Pending
@@ -59,7 +62,8 @@ end
 local function usage(): string
     return "usage: lunet-run build/server.lua --node NAME --client IPv4:PORT "
         .. "--state PATH --member NAME=IPv4:PORT (at least three) "
-        .. "[--heartbeat-ms N] [--election-ms N] [--recovery-ms N]"
+        .. "[--heartbeat-ms N] [--election-ms N] [--recovery-ms N] "
+        .. "[--telemetry-log DIR] [--telemetry-min-bytes N]"
 end
 
 local function positive(value: string, name: string): integer
@@ -79,6 +83,8 @@ local function parse_options(argv: {string}): Options
     local heartbeat_ms: integer = 200
     local election_ms: integer = 1200
     local recovery_ms: integer = 2500
+    local telemetry_dir: string = ""
+    local telemetry_min_bytes: integer = 65536
     local index = 1
     while index <= #argv do
         local flag = argv[index]
@@ -101,6 +107,11 @@ local function parse_options(argv: {string}): Options
             election_ms = positive(value, "server: --election-ms")
         elseif flag == "--recovery-ms" then
             recovery_ms = positive(value, "server: --recovery-ms")
+        elseif flag == "--telemetry-log" then
+            assert(telemetry_dir == "", "server: --telemetry-log may appear once")
+            telemetry_dir = value
+        elseif flag == "--telemetry-min-bytes" then
+            telemetry_min_bytes = positive(value, "server: --telemetry-min-bytes")
         else
             error("server: unknown option " .. flag)
         end
@@ -109,6 +120,18 @@ local function parse_options(argv: {string}): Options
     assert(
         node ~= "" and client ~= "" and state ~= "", "server: required options missing"
     )
+    -- Environment overrides take precedence over the flags. With neither
+    -- set, telemetry stays disabled.
+    local env_dir = os.getenv("LUNET_LOCKS_TELEMETRY_LOG")
+    if env_dir ~= nil and env_dir ~= "" then
+        telemetry_dir = env_dir
+    end
+    local env_min = os.getenv("LUNET_LOCKS_TELEMETRY_MIN_BYTES")
+    if env_min ~= nil and env_min ~= "" then
+        telemetry_min_bytes = positive(
+            env_min, "server: LUNET_LOCKS_TELEMETRY_MIN_BYTES"
+        )
+    end
     config.endpoint(client)
     config.members(node, members)
     assert(
@@ -123,6 +146,8 @@ local function parse_options(argv: {string}): Options
         heartbeat_ms = heartbeat_ms,
         election_ms = election_ms,
         recovery_ms = recovery_ms,
+        telemetry_log = telemetry_dir,
+        telemetry_min_bytes = telemetry_min_bytes,
     }
 end
 
@@ -189,10 +214,126 @@ local function main(options: Options)
 
     local pending: {string: Pending} = {}
     local forwarded_from: {string: string} = {}
+    local forwarded_json: {string: string} = {}
     local active_clients: {string: any} = {}
     local leader_elapsed_ms = 0
     local guard = membership_guard.new(fingerprint)
     local listener_open = true
+
+    -- Telemetry writer (disabled unless --telemetry-log/env is set). The
+    -- writer self-disables on I/O error; classify+record is additionally
+    -- wrapped in pcall so telemetry can never crash the request path.
+    local record TelemetryWriter
+        disabled: boolean
+        record: function(
+            TelemetryWriter,
+            integer,
+            number,
+            number,
+            number,
+            integer,
+            integer,
+            string | nil
+        )
+    end
+    local telemetry: TelemetryWriter = nil
+    if options.telemetry_log ~= "" then
+        telemetry = telemetry_log.new(
+            options.telemetry_log, options.node, own_index, options.telemetry_min_bytes
+        ) as TelemetryWriter
+    end
+
+    -- Node-observed held-lock set (NOT authoritative): lock_ids this node's
+    -- committed writes have taken, pruned by observed expiry. Its size is
+    -- the held_gauge column.
+    local held: {number: number} = {}
+
+    local EVENT_KINDS: {string: integer} = {
+        acquire = 1,
+        renew = 2,
+        release = 3,
+        cas = 4,
+        expire = 5,
+        ["break"] = 6,
+        deny = 7,
+    }
+
+    local function json_string(text: string, key: string): string
+        return text:match('"' .. key .. '"%s*:%s*"([^"]*)"')
+    end
+
+    local function json_number(text: string, key: string): number
+        local matched = text:match('"' .. key .. '"%s*:%s*(%-?%d+)')
+        if matched == nil then
+            return nil
+        end
+        return tonumber(matched)
+    end
+
+    local function held_size(now_ms: number): integer
+        local count = 0
+        for lock_id, expiry in pairs(held) do
+            if expiry <= now_ms then
+                held[lock_id] = nil
+            else
+                count = count + 1
+            end
+        end
+        return count
+    end
+
+    -- Record one committed client-visible result. Called only where a reply
+    -- output exists; GET replies carry no event and are skipped. The pinned
+    -- lunet runtime exposes no wall-clock ms, so ts_ms falls back to
+    -- os.time()*1000.
+    local function record_reply(request_json: string, reply_json: string)
+        if telemetry == nil or telemetry.disabled then
+            return
+        end
+        local ok = pcall(
+            function()
+                local event = json_string(reply_json, "event")
+                if event == nil then
+                    return
+                end
+                local kind = EVENT_KINDS[event]
+                if kind == nil then
+                    return
+                end
+                local lock_id = json_number(reply_json, "lock_id") or 0
+                local now_ms = math.floor(os.time() * 1000)
+                local fencing_token: number = 0
+                local renew_count: integer = 0
+                if event ~= "deny" then
+                    fencing_token = json_number(reply_json, "lease_id") or 0
+                    renew_count = math.floor(
+                        json_number(reply_json, "renew_count") or 0
+                    )
+                end
+                local name = json_string(reply_json, "name")
+                if name == nil then
+                    name = json_string(request_json, "name")
+                end
+                if event == "acquire" or event == "renew" or event == "cas" then
+                    held[lock_id] = json_number(reply_json, "expiry") or now_ms + 1
+                elseif event == "release" or event == "break" then
+                    held[lock_id] = nil
+                end
+                telemetry:record(
+                    kind,
+                    now_ms,
+                    lock_id,
+                    fencing_token,
+                    renew_count,
+                    held_size(now_ms),
+                    name
+                )
+            end
+        )
+        if not ok then
+            -- Telemetry is best-effort: drop the record, never the request.
+        end
+    end
 
     local function close_client(client: any)
         pcall(function() socket.close(client) end)
@@ -263,6 +404,9 @@ local function main(options: Options)
                 local origin = forwarded_from[output.message_id]
                 if origin ~= nil then
                     forwarded_from[output.message_id] = nil
+                    local request_json = forwarded_json[output.message_id]
+                    forwarded_json[output.message_id] = nil
+                    record_reply(request_json or "", output.bytes)
                     send_application(
                         origin, FORWARD_RESPONSE .. output.message_id .. output.bytes
                     )
@@ -271,6 +415,7 @@ local function main(options: Options)
                     if waiter ~= nil then
                         waiter.result = output.bytes
                         waiter.done = true
+                        record_reply(waiter.json, output.bytes)
                     end
                 end
             end
@@ -321,11 +466,13 @@ local function main(options: Options)
                                 and status.leader == own_index
                             then
                                 forwarded_from[message_id] = source_endpoint
+                                forwarded_json[message_id] = json
                                 local ok = pcall(
                                     function() flush(node:request(json) as {Output}) end
                                 )
                                 if not ok then
                                     forwarded_from[message_id] = nil
+                                    forwarded_json[message_id] = nil
                                 end
                             elseif guard:allows_client_operation() then
                                 send_application(
