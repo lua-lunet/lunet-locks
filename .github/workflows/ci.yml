@@ -3,7 +3,8 @@ name: CI
 # Lane split modeled on the upstream lua-lunet/lunet build workflow: a
 # setup-matrix job decides the matrix per event. Regular builds (PRs, pushes
 # to main) run the fast Linux-only lane; tagged builds (v*) run the full
-# platform matrix and then the Docker simulation.
+# platform matrix, package per-platform release archives, and then run the
+# Docker simulation before publish-release creates the GitHub release.
 
 on:
   pull_request:
@@ -14,7 +15,7 @@ on:
       - 'v*'
 
 permissions:
-  contents: read
+  contents: write # publish-release creates GitHub releases on v* tags
 
 # Cancel previous runs when a new commit is pushed to the same PR/branch.
 concurrency:
@@ -112,6 +113,22 @@ jobs:
       - name: Build documentation
         if: matrix.target_key == 'linux-amd64'
         run: make docs
+      # Tagged builds only: package the per-platform release archive from the
+      # tree that just passed test + smoke, for publish-release to attach.
+      # Windows is excluded: the Lua loader has no .dll suffix handling, so
+      # there is no loadable Windows artifact to ship (see the reduced-scope
+      # Windows step below).
+      - name: Package release archive
+        if: github.ref_type == 'tag' && matrix.platform != 'windows'
+        shell: bash
+        run: tests/package_release.sh ${{ matrix.target_key }} lunet-locks-${{ matrix.target_key }}.tar.gz
+      - name: Upload release archive
+        if: github.ref_type == 'tag' && matrix.platform != 'windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target_key }}
+          path: lunet-locks-${{ matrix.target_key }}.tar.gz
+          retention-days: 5
       # Windows lane, tagged builds only: reduced scope. The Teal/Cyan
       # toolchain, the shell smoke harness, and the Docker simulation are
       # POSIX-only today; validate the Rust extension crate natively.
@@ -161,3 +178,39 @@ jobs:
         run: make deps LUAJIT_DIR=/opt/luajit-shim
       - name: Docker build and three-container simulation
         run: make docker-simulation LUAJIT_DIR=/opt/luajit-shim
+
+  # Tagged builds only, modeled on upstream lua-lunet/lunet's publish-release:
+  # runs after every verification lane passed, downloads the packaged
+  # release-* artifacts, and creates the GitHub release with all three
+  # platform archives attached.
+  publish-release:
+    name: Publish release
+    if: github.ref_type == 'tag'
+    needs: [test, docker-simulation]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download release archives
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: release-assets
+      - name: Verify expected archives
+        run: |
+          set -euo pipefail
+          ls -la release-assets
+          for target in linux-amd64 linux-arm64 macos; do
+            test -f "release-assets/lunet-locks-$target.tar.gz" || {
+              echo "missing release asset: lunet-locks-$target.tar.gz" >&2
+              exit 1
+            }
+          done
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            release-assets/lunet-locks-linux-amd64.tar.gz
+            release-assets/lunet-locks-linux-arm64.tar.gz
+            release-assets/lunet-locks-macos.tar.gz
