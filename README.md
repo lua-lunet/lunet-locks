@@ -1,9 +1,12 @@
-# lunet-advisory-lock
+# lunet-locks
 
-`lunet-advisory-lock` is a runnable, fixed-membership advisory-lock service. It
+`lunet-locks` is a runnable, fixed-membership advisory-lock service. It
 orders lock requests with [vrr-core](https://github.com/lua-lunet/vrr-core),
 serves newline-delimited JSON over TCP, and uses expiring leases rather than
-mandatory locking.
+mandatory locking. VRR Core is viewstamped replication revisited Sans-IO library 
+written in Rust with a C API. This service uses Luajit and libuv to create a 
+service that runs viewstamped replication VSR were state is made durable at 
+each node. 
 
 Run a three-replica smoke test with the project-local Lunet runtime:
 
@@ -12,7 +15,7 @@ make smoke
 ```
 
 The command fetches the official Lunet `v0.8.0` release into
-`.lunet/v0.8.0/`; it never uses a host `lunet-run` from `PATH`. See the
+`.lunet/v0.8.0/`. See the
 [documentation](docs/src/index.md) for configuration, the client protocol, and
 operational limits.
 
