@@ -67,6 +67,7 @@ function handlers.setup(config)
         dict = config.dict or new_null_dict(),
         now_ms = config.now_ms or default_now_ms,
         listdir = config.listdir,
+        break_exec = config.break_exec, -- (state, lock_id, now_ms) → status, body
         cache = nil,
     }
 end
@@ -214,12 +215,19 @@ function handlers.handle(state, req)
     if lock_id ~= nil then
         lock_id = tonumber(lock_id)
         if break_suffix then
-            -- The privileged break op is item28; only the 405 semantics of
-            -- the mock are pinned down here.
+            -- SECURITY: the core performs NO authorization on BREAK (see
+            -- docs/src/client-protocol.md); this edge owns it. Loopback bind
+            -- + `auth_basic` are the current bar; production deployments must
+            -- put mTLS/RBAC in front, and this route must never be served
+            -- without `auth_basic` (or stronger).
             if req.method ~= "POST" then
                 return 405, { error = "POST required" }
             end
-            return 501, { error = "break not implemented (item28)" }
+            if state.break_exec == nil then
+                return 501, { error = "break not implemented (item28)" }
+            end
+            dict:incr("req:break", 1, 0)
+            return state.break_exec(state, lock_id, now_ms)
         end
         dict:incr("req:lock", 1, 0)
         local records = refresh_scan(state, now_ms)
@@ -284,6 +292,88 @@ function handlers.handle(state, req)
 end
 
 -- ---- ngx adapter -------------------------------------------------------------
+
+-- Break executor for the ngx edge: reads cluster.json (item30; missing or
+-- unparseable → 502 cluster unavailable), issues BREAK via the cosocket
+-- client, and maps the reply to the mock's contract:
+--   broken:true  → 200 {lock, event}
+--   broken:false → 409 {error="lock is not held"} (the core treats break on
+--                  a missing/expired lock as idempotent broken:false — that
+--                  is NOT a 404)
+--   transport/leaderless/malformed → 502
+-- For the 200 `lock` we rescan telemetry (cache invalidated) so the console
+-- shows the reduced post-break row. Eventual-consistency caveat: the break
+-- record lands on the leader's log first and the co-located node's segments
+-- may lag behind it, so the rescan may not show the break yet; in that case
+-- we fall back to the break reply's own lease data (fencing token bumped,
+-- holder/expiry cleared) so the response is still truthful.
+function handlers.ngx_break_exec()
+    local break_client = require("break_client")
+    return function(state, lock_id, now_ms)
+        local cluster
+        local fh = state.cluster_json_path ~= nil
+            and io.open(state.cluster_json_path, "rb")
+            or nil
+        if fh ~= nil then
+            local text = fh:read("*a")
+            fh:close()
+            local members = break_client.parse_cluster(text)
+            if members ~= nil then
+                cluster = { members = members }
+            end
+        end
+        if cluster == nil then
+            return 502, { error = "cluster unavailable" }
+        end
+        local reply, err = break_client.break_lock(lock_id, cluster, { dict = state.dict })
+        if reply == nil then
+            return err.status, { error = err.error }
+        end
+        if not reply.broken then
+            -- Mirror the mock: unknown lock → 404, known-but-free → 409.
+            state.cache = nil
+            local records = refresh_scan(state, now_ms)
+            if lock_state.reduce(records, now_ms).locks[lock_id] == nil then
+                return 404, { error = "no such lock" }
+            end
+            return 409, { error = "lock is not held" }
+        end
+        state.cache = nil -- force rescan so the break is reflected if visible
+        local records = refresh_scan(state, now_ms)
+        local lock = lock_state.reduce(records, now_ms).locks[lock_id]
+        if lock == nil or lock.state == "held" then
+            -- Rescan lags the leader; synthesize from the break reply.
+            local prior = lock or {
+                id = lock_id,
+                name = "",
+                labels = {},
+                leaseMs = 0,
+                takenAtMs = nil,
+            }
+            lock = {
+                id = lock_id,
+                name = prior.name,
+                labels = prior.labels,
+                state = "free",
+                holder = nil,
+                fencingToken = reply.lease_id or prior.fencingToken or 0,
+                leaseMs = prior.leaseMs or 0,
+                expiresAtMs = nil,
+                takenAtMs = nil,
+                renewCount = 0,
+            }
+        end
+        local event = {
+            tsMs = now_ms,
+            kind = "break",
+            lockId = lock_id,
+            name = lock.name,
+            actor = "admin@console",
+            detail = "admin force-release, fence " .. tostring(lock.fencingToken),
+        }
+        return 200, { lock = lock, event = event }
+    end
+end
 
 -- Minimal JSON encoder fallback would be a liability; inside OpenResty we
 -- always have cjson, so the adapter requires it lazily (the pure core and
