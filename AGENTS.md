@@ -56,9 +56,10 @@ The currently pinned surprises are:
 ## Releases
 
 - Pushing a `v*` tag runs the full CI matrix, packages per-platform archives
-  (`tests/package_release.sh`; `build/` + the native cdylib + `src/` + docs),
-  runs the Docker simulation, and then the `publish-release` job creates the
-  GitHub release with `lunet-locks-{linux-amd64,linux-arm64,macos}.tar.gz`.
+  (`tests/package_release.sh`; `build/` + the native cdylib + `src/` + docs +
+  `LICENSE`), runs the Docker simulation, and then the `publish-release` job
+  creates the GitHub release with
+  `lunet-locks-{linux-amd64,linux-arm64,macos}.tar.gz`.
 - No Windows asset: the Lua native loader has no `.dll` suffix handling.
 - Verify an archive with `make package-verify` (extracts it and runs the full
   three-replica smoke against the packaged tree using the pinned runtime).

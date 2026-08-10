@@ -12,6 +12,7 @@
 #   src/      Teal sources, for Teal-toolchain consumers
 #   docs/     rendered-site markdown sources
 #   README.md
+#   LICENSE
 set -eu
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
@@ -58,7 +59,7 @@ cp -R build "$stage/build"
 cp "$lib" "$stage/lib/"
 cp -R src "$stage/src"
 cp -R docs/src "$stage/docs"
-cp README.md "$stage/"
+cp README.md LICENSE "$stage/"
 
 tar -C "$stage" -czf "$output" .
 echo "package release: wrote $output"
