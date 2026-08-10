@@ -22,9 +22,14 @@
 local bit = require("bit")
 
 local RECORD_MAGIC = 0x4C
-local VERSION = 1
+local VERSION = 2
 local HEADER_SIZE = 24
-local RECORD_FIXED_SIZE = 37 -- everything except the variable-length name
+-- Fixed envelope: everything except the variable-length name and labels
+-- payloads: magic(1)+len(2)+kind(1)+ts(8)+lock(4)+token(8)+renew(4)
+-- +held(4)+expiry(8)+holder(16)+name_len(1)+labels_len(2)+crc(4).
+local RECORD_FIXED_SIZE = 63
+-- Byte offset (1-based, relative to record start) of name_len.
+local NAME_LEN_OFF = 57
 
 -- CRC-32C table (reflected Castagnoli). Identical constants to the writer.
 local crc_table = {}
@@ -138,6 +143,40 @@ function lock_log.list_segments(dir, listdir)
     return segs
 end
 
+-- Formats 16 raw bytes as a canonical dashed UUID string; returns nil for
+-- the all-zero "no holder" encoding.
+local function holder_string(bytes)
+    if bytes == string.rep("\0", 16) then
+        return nil
+    end
+    local hex = (bytes:gsub(".", function(c)
+        return string.format("%02x", c:byte())
+    end))
+    return hex:sub(1, 8)
+        .. "-"
+        .. hex:sub(9, 12)
+        .. "-"
+        .. hex:sub(13, 16)
+        .. "-"
+        .. hex:sub(17, 20)
+        .. "-"
+        .. hex:sub(21, 32)
+end
+
+-- Splits a labels CSV payload into an array (empty payload → empty array).
+-- Labels are CSV-safe by grammar (lowercase/digit/hyphen, no commas), so a
+-- plain split is exact.
+local function labels_array(csv)
+    local out = {}
+    if csv == "" then
+        return out
+    end
+    for label in csv:gmatch("[^,]+") do
+        out[#out + 1] = label
+    end
+    return out
+end
+
 -- Attempts to decode one record at byte offset `pos` (1-based) in `data`.
 -- Returns record, next_pos on success; nil, "torn" when the record is
 -- truncated by end-of-data; nil, "corrupt" on any validity failure.
@@ -152,13 +191,17 @@ local function try_record(data, pos)
     if record_len < RECORD_FIXED_SIZE or record_len > 65535 then
         return nil, "corrupt"
     end
-    local NAME_LEN_OFF = 33 -- magic(1)+len(2)+kind(1)+ts(8)+lock(4)+token(8)+renew(4)+held(4)
     local name_len_off = pos + NAME_LEN_OFF - 1
     if name_len_off > #data then
         return nil, "torn"
     end
     local name_len = data:byte(name_len_off)
-    if record_len ~= RECORD_FIXED_SIZE + name_len then
+    local labels_len_off = name_len_off + name_len + 1
+    if labels_len_off + 1 > #data then
+        return nil, "torn"
+    end
+    local labels_len = u16be(data, labels_len_off)
+    if record_len ~= RECORD_FIXED_SIZE + name_len + labels_len then
         return nil, "corrupt"
     end
     local rec_end = pos + record_len - 1
@@ -177,7 +220,10 @@ local function try_record(data, pos)
         fencing_token = u64be(data, pos + 16),
         renew_count = u32be(data, pos + 24),
         held_gauge = u32be(data, pos + 28),
-        name = data:sub(pos + NAME_LEN_OFF, rec_end - 4),
+        expiry_ms = u64be(data, pos + 32),
+        holder = holder_string(data:sub(pos + 40, pos + 55)),
+        name = data:sub(pos + NAME_LEN_OFF, pos + NAME_LEN_OFF + name_len - 1),
+        labels = labels_array(data:sub(labels_len_off + 2, rec_end - 4)),
     }
     return record, rec_end + 1
 end
@@ -205,7 +251,14 @@ function lock_log.read_segment(path)
         node_id = u32be(data, 11),
     }
     if header.version ~= VERSION then
-        warnings[#warnings + 1] = path .. ": unsupported version " .. header.version
+        -- Pre-release format: no v1 compatibility. Reject the segment.
+        warnings[#warnings + 1] = path
+            .. ": unsupported version "
+            .. header.version
+            .. " (expected "
+            .. VERSION
+            .. "); segment ignored"
+        return header, records, warnings
     end
     local pos = HEADER_SIZE + 1
     while pos <= #data do

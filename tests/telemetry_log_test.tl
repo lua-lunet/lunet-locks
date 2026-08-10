@@ -79,16 +79,20 @@ local record Rec
     fencing_token: number
     renew_count: integer
     held_gauge: integer
+    expiry_ms: number
+    holder: string
     name: string
+    labels_csv: string
 end
 
--- Decodes one segment; returns the records, or nil + error on any format or
--- CRC violation (the CRC check is what the corruption test relies on).
+-- Decodes one v2 segment; returns the records, or nil + error on any
+-- format or CRC violation (the CRC check is what the corruption test
+-- relies on).
 local function decode_segment(data: string): ({Rec}, string)
     if #data < 24 or data:sub(1, 8) ~= "LLOCKTEL" then
         return nil, "bad header"
     end
-    if u16(data, 9) ~= 1 then
+    if u16(data, 9) ~= 2 then
         return nil, "bad version"
     end
     if data:sub(15, 24) ~= string.rep("\0", 10) then
@@ -101,7 +105,7 @@ local function decode_segment(data: string): ({Rec}, string)
             return nil, "bad record_magic at " .. tostring(p)
         end
         local len = u16(data, p + 1)
-        if len < 37 or p + len - 1 > #data then
+        if len < 63 or p + len - 1 > #data then
             return nil, "bad record_len at " .. tostring(p)
         end
         local body = data:sub(p, p + len - 5)
@@ -109,7 +113,11 @@ local function decode_segment(data: string): ({Rec}, string)
         if crc32c_check(body) ~= want_crc then
             return nil, "crc mismatch at " .. tostring(p)
         end
-        local name_len = data:byte(p + 32)
+        local name_len = data:byte(p + 56)
+        local labels_len = u16(data, p + 57 + name_len)
+        if len ~= 63 + name_len + labels_len then
+            return nil, "record_len mismatch at " .. tostring(p)
+        end
         table.insert(
             records,
             {
@@ -119,7 +127,10 @@ local function decode_segment(data: string): ({Rec}, string)
                 fencing_token = u64(data, p + 16),
                 renew_count = u32(data, p + 24) as integer,
                 held_gauge = u32(data, p + 28) as integer,
-                name = data:sub(p + 33, p + 32 + name_len),
+                expiry_ms = u64(data, p + 32),
+                holder = data:sub(p + 40, p + 55),
+                name = data:sub(p + 57, p + 56 + name_len),
+                labels_csv = data:sub(p + 59 + name_len, p + len - 5),
             }
         )
         p = p + len
@@ -128,6 +139,16 @@ local function decode_segment(data: string): ({Rec}, string)
 end
 
 local K = telemetry_log.KINDS
+
+-- Deterministic 16-byte holder for fixture record n: 15 zero bytes + n.
+local function fixture_holder(n: integer): string
+    return string.rep("\0", 15) .. string.char(n)
+end
+
+-- Deterministic labels CSV for fixture record n (canonical sorted).
+local function fixture_labels(n: integer): string
+    return "group-" .. tostring(n % 3) .. ",lock"
+end
 
 shell_ok("mkdir -p .tmp")
 
@@ -138,10 +159,63 @@ tested.test(
         shell_ok("rm -rf " .. dir .. " && mkdir -p " .. dir)
         local w = telemetry_log.new(dir, "n0", 42, 65536)
         local long_name = string.rep("x", 128)
-        w:record(K.acquire, 1700000000123, 7, 99, 0, 1, "alpha")
-        w:record(K.renew, 1700000000456, 7, 99, 3, 1, nil)
-        w:record(K.release, 1700000000789, 7, 99, 3, 0, long_name)
-        w:record(K.deny, 9007199254740991, 4294967295, 9007199254740000, 0, 0, "edge")
+        -- Max-size label set: 8 labels x 32 bytes + 7 commas = 263 bytes.
+        local label32 = string.rep("a", 31)
+        local big_csv = label32 .. "1"
+        for i = 2, 8 do
+            big_csv = big_csv .. "," .. label32 .. tostring(i)
+        end
+        local holder16 = ""
+        for i = 0, 15 do
+            holder16 = holder16 .. string.char(i * 16 + i)
+        end
+        w:record(
+            {
+                kind = K.acquire,
+                ts_ms = 1700000000123,
+                lock_id = 7,
+                fencing_token = 99,
+                renew_count = 0,
+                held_gauge = 1,
+                expiry_ms = 1700000060123,
+                holder16 = holder16,
+                name = "alpha",
+                labels_csv = "db,us-east",
+            }
+        )
+        w:record(
+            {
+                kind = K.renew,
+                ts_ms = 1700000000456,
+                lock_id = 7,
+                fencing_token = 99,
+                renew_count = 3,
+                held_gauge = 1,
+            }
+        )
+        w:record(
+            {
+                kind = K.release,
+                ts_ms = 1700000000789,
+                lock_id = 7,
+                fencing_token = 99,
+                renew_count = 3,
+                held_gauge = 0,
+                name = long_name,
+            }
+        )
+        w:record(
+            {
+                kind = K.deny,
+                ts_ms = 9007199254740991,
+                lock_id = 4294967295,
+                fencing_token = 9007199254740000,
+                renew_count = 0,
+                held_gauge = 0,
+                name = "edge",
+                labels_csv = big_csv,
+            }
+        )
         w:close()
         local names = list_segments(dir)
         local records: {Rec} = {}
@@ -150,6 +224,12 @@ tested.test(
             records, err = decode_segment(read_file(dir .. "/" .. names[1]))
         end
         local r = records[4]
+        local hex = ""
+        if records[1] ~= nil then
+            for i = 1, #records[1].holder do
+                hex = hex .. string.format("%02x", records[1].holder:byte(i))
+            end
+        end
         local actual = tostring(#names)
             .. "|"
             .. tostring(#records)
@@ -167,12 +247,24 @@ tested.test(
             .. tostring(records[1].held_gauge)
             .. ","
             .. records[1].name
+            .. ","
+            .. string.format("%.0f", records[1].expiry_ms)
+            .. ","
+            .. hex
+            .. ","
+            .. records[1].labels_csv
             .. "|"
             .. tostring(records[2].kind)
             .. ","
             .. tostring(records[2].renew_count)
             .. ","
             .. tostring(#records[2].name)
+            .. ","
+            .. string.format("%.0f", records[2].expiry_ms)
+            .. ","
+            .. tostring(records[2].holder == string.rep("\0", 16))
+            .. ","
+            .. tostring(#records[2].labels_csv)
             .. "|"
             .. tostring(#records[3].name)
             .. "|"
@@ -181,13 +273,15 @@ tested.test(
             .. tostring(r.lock_id)
             .. ","
             .. string.format("%.0f", r.fencing_token)
+            .. ","
+            .. tostring(#r.labels_csv)
             .. "|"
             .. err
         tested.assert(
             {
-                given = "four records (incl. nil name, 128-byte name, and 2^53-edge u64 values)",
+                given = "four records (incl. defaults, 128-byte name, max 8-label CSV, 2^53-edge u64 values)",
                 should = "decode byte-for-byte with every field intact and CRCs valid",
-                expected = "1|4|1,1700000000123,7,99,0,1,alpha|2,3,0|128|9007199254740991,4294967295,9007199254740000|",
+                expected = "1|4|1,1700000000123,7,99,0,1,alpha,1700000060123,00112233445566778899aabbccddeeff,db,us-east|2,3,0,0,true,0|128|9007199254740991,4294967295,9007199254740000,263|",
                 actual = actual,
             }
         )
@@ -199,11 +293,19 @@ tested.test(
     function()
         local dir = ".tmp/telemetry-test-rotate"
         shell_ok("rm -rf " .. dir .. " && mkdir -p " .. dir)
-        local min_bytes = 256
+        local min_bytes = 512
         local w = telemetry_log.new(dir, "n1", 1, min_bytes)
         for i = 1, 60 do
             w:record(
-                K.acquire, 1700000000000 + i, i, i * 10, 0, 1, "lock-" .. tostring(i)
+                {
+                    kind = K.acquire,
+                    ts_ms = 1700000000000 + i,
+                    lock_id = i,
+                    fencing_token = i * 10,
+                    renew_count = 0,
+                    held_gauge = 1,
+                    name = "lock-" .. tostring(i),
+                }
             )
         end
         w:close()
@@ -229,7 +331,7 @@ tested.test(
         local tmp_left = shell_ok("ls " .. dir .. "/*.tmp >/dev/null 2>&1")
         tested.assert(
             {
-                given = "60 records with min_bytes=256",
+                given = "60 records with min_bytes=512",
                 should = "produce >=3 sequentially-named .bin segments, each non-final >= min_bytes, no .tmp left",
                 expected = "true|true|true|false",
                 actual = tostring(pattern_ok)
@@ -250,7 +352,17 @@ tested.test(
         local dir = ".tmp/telemetry-test-crc"
         shell_ok("rm -rf " .. dir .. " && mkdir -p " .. dir)
         local w = telemetry_log.new(dir, "n2", 3, 65536)
-        w:record(K.cas, 1700000001000, 5, 42, 0, 1, "victim")
+        w:record(
+            {
+                kind = K.cas,
+                ts_ms = 1700000001000,
+                lock_id = 5,
+                fencing_token = 42,
+                renew_count = 0,
+                held_gauge = 1,
+                name = "victim",
+            }
+        )
         w:close()
         local name = list_segments(dir)[1]
         local path = dir .. "/" .. name
@@ -284,9 +396,29 @@ tested.test(
         local blocker = ".tmp/telemetry-test-blocker"
         shell_ok("rm -rf " .. blocker .. " && touch " .. blocker)
         local w = telemetry_log.new(blocker, "n3", 4, 256)
-        w:record(K.acquire, 1700000002000, 1, 1, 0, 1, "x")
+        w:record(
+            {
+                kind = K.acquire,
+                ts_ms = 1700000002000,
+                lock_id = 1,
+                fencing_token = 1,
+                renew_count = 0,
+                held_gauge = 1,
+                name = "x",
+            }
+        )
         local after_first = w.disabled
-        w:record(K.renew, 1700000002001, 1, 1, 1, 1, "x")
+        w:record(
+            {
+                kind = K.renew,
+                ts_ms = 1700000002001,
+                lock_id = 1,
+                fencing_token = 1,
+                renew_count = 1,
+                held_gauge = 1,
+                name = "x",
+            }
+        )
         w:close()
         tested.assert(
             {
@@ -314,18 +446,37 @@ tested.test(
         for _ = 1, 3 do
             for _, kind in ipairs(kinds) do
                 n = n + 1
+                local ts = 1700000000000 + n * 1000
+                -- Held-kind records carry a lease: expiry 90 s out, a
+                -- deterministic holder UUID, and a small canonical label
+                -- set. Free/deny records echo none (zeros/empty).
+                local leased = kind == K.acquire or kind == K.renew or kind == K.cas
                 w:record(
-                    kind,
-                    1700000000000 + n * 1000,
-                    100 + n,
-                    5000 + n,
-                    n % 4,
-                    (n % 5) + 1,
-                    "fixture-lock-" .. tostring(n)
+                    {
+                        kind = kind,
+                        ts_ms = ts,
+                        lock_id = 100 + n,
+                        fencing_token = 5000 + n,
+                        renew_count = n % 4,
+                        held_gauge = (n % 5) + 1,
+                        expiry_ms = leased and ts + 90000 or 0,
+                        holder16 = leased and fixture_holder(n) or nil,
+                        name = "fixture-lock-" .. tostring(n),
+                        labels_csv = leased and fixture_labels(n) or "",
+                    }
                 )
             end
         end
-        w:record(K.release, 1700000099999, 999, 9999, 0, 0, nil)
+        w:record(
+            {
+                kind = K.release,
+                ts_ms = 1700000099999,
+                lock_id = 999,
+                fencing_token = 9999,
+                renew_count = 0,
+                held_gauge = 0,
+            }
+        )
         w:close()
         local names = list_segments(dir)
         local total = 0
@@ -341,7 +492,7 @@ tested.test(
         tested.assert(
             {
                 given = "the .tmp/telemetry-fixture segment set (node t0, 3 records x 7 kinds + nil-name)",
-                should = "be present and decode cleanly for item26 to copy",
+                should = "be present and decode cleanly for the console tests to copy",
                 expected = "true|22|true",
                 actual = tostring(ok)
                     .. "|"

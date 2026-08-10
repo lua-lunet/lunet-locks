@@ -225,16 +225,7 @@ local function main(options: Options)
     -- wrapped in pcall so telemetry can never crash the request path.
     local record TelemetryWriter
         disabled: boolean
-        record: function(
-            TelemetryWriter,
-            integer,
-            number,
-            number,
-            number,
-            integer,
-            integer,
-            string | nil
-        )
+        record: function(TelemetryWriter, telemetry_log.RecordArgs)
     end
     local telemetry: TelemetryWriter = nil
     if options.telemetry_log ~= "" then
@@ -268,6 +259,34 @@ local function main(options: Options)
             return nil
         end
         return tonumber(matched)
+    end
+
+    -- Hex-decodes a dashed UUID string into 16 raw bytes; any parse failure
+    -- yields sixteen zero bytes (the "no holder" encoding).
+    local function holder_bytes(uuid: string): string
+        local hex = uuid ~= nil and uuid:gsub("-", "") or ""
+        if #hex ~= 32 or hex:find("[^0-9a-fA-F]") ~= nil then
+            return string.rep("\0", 16)
+        end
+        local bytes = ""
+        for index = 1, #hex, 2 do
+            bytes = bytes .. string.char(tonumber(hex:sub(index, index + 1), 16))
+        end
+        return bytes
+    end
+
+    -- Flattens a `"labels":[...]` JSON array into a CSV string (the adapter
+    -- already dedupes and canonically sorts); empty/absent → "".
+    local function labels_csv(text: string): string
+        local array = text:match('"labels"%s*:%s*%[(.-)%]')
+        if array == nil then
+            return ""
+        end
+        local out: {string} = {}
+        for label in array:gmatch('"([^"]*)"') do
+            table.insert(out, label)
+        end
+        return table.concat(out, ",")
     end
 
     local function held_size(now_ms: number): integer
@@ -304,29 +323,42 @@ local function main(options: Options)
                 local now_ms = math.floor(os.time() * 1000)
                 local fencing_token: number = 0
                 local renew_count: integer = 0
+                local expiry_ms: number = 0
+                local holder16 = string.rep("\0", 16)
+                local labels = ""
                 if event ~= "deny" then
                     fencing_token = json_number(reply_json, "lease_id") or 0
                     renew_count = math.floor(
                         json_number(reply_json, "renew_count") or 0
                     )
                 end
+                if event == "acquire" or event == "renew" or event == "cas" then
+                    expiry_ms = json_number(reply_json, "expiry") or 0
+                    holder16 = holder_bytes(json_string(reply_json, "holder"))
+                    labels = labels_csv(reply_json)
+                end
                 local name = json_string(reply_json, "name")
                 if name == nil then
                     name = json_string(request_json, "name")
                 end
                 if event == "acquire" or event == "renew" or event == "cas" then
-                    held[lock_id] = json_number(reply_json, "expiry") or now_ms + 1
+                    held[lock_id] = expiry_ms > 0 and expiry_ms or now_ms + 1
                 elseif event == "release" or event == "break" then
                     held[lock_id] = nil
                 end
                 telemetry:record(
-                    kind,
-                    now_ms,
-                    lock_id,
-                    fencing_token,
-                    renew_count,
-                    held_size(now_ms),
-                    name
+                    {
+                        kind = kind,
+                        ts_ms = now_ms,
+                        lock_id = lock_id,
+                        fencing_token = fencing_token,
+                        renew_count = renew_count,
+                        held_gauge = held_size(now_ms),
+                        expiry_ms = expiry_ms,
+                        holder16 = holder16,
+                        name = name,
+                        labels_csv = labels,
+                    }
                 )
             end
         )

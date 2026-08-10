@@ -15,6 +15,21 @@
 
 local bit = require("bit")
 
+-- One record's worth of fields (v2). expiry_ms/holder16/name/labels_csv
+-- are optional and default to 0 / sixteen zero bytes / nil / "".
+local record RecordArgs
+    kind: integer
+    ts_ms: number
+    lock_id: number
+    fencing_token: number
+    renew_count: integer
+    held_gauge: integer
+    expiry_ms: number
+    holder16: string
+    name: string
+    labels_csv: string
+end
+
 local record Writer
     dir: string
     node_name: string
@@ -26,18 +41,20 @@ local record Writer
     size: integer
     fh: FILE
 
-    record: function(
-        Writer, integer, number, number, number, integer, integer, string | nil
-    )
+    record: function(Writer, RecordArgs)
     close: function(Writer)
 end
 
 local Writer_mt: metatable<Writer> = {__index = Writer}
 
 local RECORD_MAGIC = 0x4C
-local VERSION = 1
+local VERSION = 2
 local HEADER_SIZE = 24
-local RECORD_FIXED_SIZE = 37 -- everything except the variable-length name
+-- Everything except the variable-length name and labels payload:
+-- magic(1)+len(2)+kind(1)+ts(8)+lock(4)+token(8)+renew(4)+held(4)
+-- +expiry(8)+holder(16)+name_len(1)+labels_len(2)+crc(4).
+local RECORD_FIXED_SIZE = 63
+local ZERO_HOLDER = string.rep("\0", 16)
 
 local KINDS: {string: integer} = {
     acquire = 1,
@@ -203,18 +220,12 @@ function Writer.new(
     return self
 end
 
--- Appends one record. `name` may be nil (name_len 0). Min-size rotation:
--- once the open segment has reached min_bytes, the NEXT record rotates it;
--- a segment is never smaller than min_bytes unless the writer closes early.
-function Writer:record(
-    kind: integer,
-    ts_ms: number,
-    lock_id: number,
-    fencing_token: number,
-    renew_count: integer,
-    held_gauge: integer,
-    name: string | nil
-)
+-- Appends one record. `args.name` may be nil (name_len 0); `args.holder16`
+-- is normalized to exactly 16 bytes (zero-padded/truncated, nil → all-zero).
+-- Min-size rotation: once the open segment has reached min_bytes, the NEXT
+-- record rotates it; a segment is never smaller than min_bytes unless the
+-- writer closes early.
+function Writer:record(args: RecordArgs)
     if self.disabled then
         return
     end
@@ -231,18 +242,32 @@ function Writer:record(
             return
         end
     end
-    local nm = name or ""
-    local record_len = RECORD_FIXED_SIZE + #nm
+    local nm = args.name or ""
+    if #nm > 128 then
+        nm = nm:sub(1, 128)
+    end
+    local labels = args.labels_csv or ""
+    local holder = args.holder16 or ZERO_HOLDER
+    if #holder < 16 then
+        holder = holder .. string.rep("\0", 16 - #holder)
+    elseif #holder > 16 then
+        holder = holder:sub(1, 16)
+    end
+    local record_len = RECORD_FIXED_SIZE + #nm + #labels
     local body = u8(RECORD_MAGIC)
         .. u16be(record_len)
-        .. u8(kind)
-        .. u64be(ts_ms)
-        .. u32be(lock_id)
-        .. u64be(fencing_token)
-        .. u32be(renew_count)
-        .. u32be(held_gauge)
+        .. u8(args.kind)
+        .. u64be(args.ts_ms)
+        .. u32be(args.lock_id)
+        .. u64be(args.fencing_token)
+        .. u32be(args.renew_count)
+        .. u32be(args.held_gauge)
+        .. u64be(args.expiry_ms or 0)
+        .. holder
         .. u8(#nm)
         .. nm
+        .. u16be(#labels)
+        .. labels
     local bytes = body .. u32be(crc32c(body))
     local ok, werr = self.fh:write(bytes)
     if ok == nil then
@@ -268,6 +293,7 @@ end
 return {
     Writer = Writer,
     new = Writer.new,
+    RecordArgs = RecordArgs,
     KINDS = KINDS,
     crc32c = crc32c,
 }

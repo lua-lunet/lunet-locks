@@ -47,24 +47,36 @@ to draw a chart. All multi-byte integer fields are big-endian.
 | node_id   | u32       | 4     |
 | reserved  | -         | 10    |
 
-**Per-record** (fixed 37-byte prefix + variable-length name):
+**Per-record** (fixed 63-byte envelope + variable-length name and labels):
 
 | field         | type | bytes | notes |
 |---------------|------|-------|-------|
 | record_magic  | u8   | 1     | single byte `0x4C` (`L`) sentinel, lets a reader resync after a torn write |
-| record_len    | u16  | 2     | total record length including this header |
+| record_len    | u16  | 2     | total record length including this header and the CRC |
 | kind          | u8   | 1     | acquire=1, renew=2, release=3, cas=4, expire=5, break=6, deny=7 |
 | ts_ms         | u64  | 8     | epoch ms |
 | lock_id       | u32  | 4     | matches the `Lock.id` in openapi.yaml |
-| fencing_token | u64  | 8     | mirrors §2's `fencingToken` |
+| fencing_token | u64  | 8     | mirrors §2's `fencingToken`; 0 on deny |
 | renew_count   | u32  | 4     | mirrors §2's u32 `renewCount` mutation rule |
 | held_gauge    | u32  | 4     | the writing node's own observed held-lock count at this instant, for the chart |
+| expiry_ms     | u64  | 8     | lease expiry epoch ms; 0 = none (deny, release echo, break echo) |
+| holder        | 16 bytes | 16 | binary UUID (dashes stripped); all-zero = none |
 | name_len      | u8   | 1     | ≤128 per the `name` field's max length (see openapi.yaml) |
 | name          | bytes| name_len | UTF-8, not NUL-terminated |
-| crc32c        | u32  | 4     | trailer, covers everything from `record_magic` |
+| labels_len    | u16  | 2     | byte length of the CSV payload (≤263: 8 labels × 32 bytes + 7 commas) |
+| labels        | bytes| labels_len | CSV of the canonical sorted label set; empty = none |
+| crc32c        | u32  | 4     | trailer, covers everything from `record_magic` through `labels` |
 
-Total: 37 + name_len + 4 = up to ~169 bytes/record (128-byte name is the
-worst case; most records are well under 60 bytes).
+Total: 63 + name_len + labels_len = up to ~454 bytes/record (128-byte name
+plus a max-size label set is the worst case; most records are well under
+100 bytes).
+
+The format version is 2. Readers reject any segment whose header version is
+not 2 (with a warning); there is no v1 compatibility on this pre-release
+branch. `expire` events are synthesized by readers from `expiry_ms` (a lock
+recorded held whose expiry passes without a release or break before the
+next event or stream end); kind 5 remains reserved for a possible future
+explicit expire record.
 
 ## Segments and rotation
 

@@ -180,9 +180,8 @@ function handlers.handle(state, req)
             end
         end
         if expiring_at > 0 then
-            -- expiresAtMs is null in the telemetry-derived state (record
-            -- format carries no expiry), so this filter currently matches
-            -- nothing; semantics mirror the mock for when it is available.
+            -- Mirror the mock: held locks within toleranceMs of the target
+            -- instant, sorted by closeness to it.
             local near = {}
             for _, lock in ipairs(out) do
                 if lock.state == "held"

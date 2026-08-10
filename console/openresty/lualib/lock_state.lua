@@ -4,17 +4,20 @@
 -- adapters live in handlers.lua; this module only turns records into the
 -- API's Lock/Event shapes.
 --
--- KNOWN GAP (item27a candidate): the binary record format
--- (src/telemetry_log.tl) carries kind/ts/lock_id/fencing_token/renew_count/
--- held_gauge/name only. There is NO holder UUID, NO expiry/lease, and NO
--- labels in the log, so:
---   * lock.holder     is always null
---   * lock.expiresAtMs is always null (and no lazy-expiry state check or
---     synthesized `expire` events are possible — synthesis is skipped)
---   * lock.leaseMs    is served as 0 (schema-required, unknowable)
---   * lock.labels     is served as [] (so `tag:` queries never match)
--- Recovering any of these requires a record-format change, which is a spec
--- change and deliberately NOT done here.
+-- Record format v2 (src/telemetry_log.tl) carries expiry_ms, a 16-byte
+-- holder UUID, and a labels CSV, so the reducer serves real state:
+--   * a lock is held iff its latest fencing event is acquire/renew/cas AND
+--     its expiry_ms is still in the future; release/break free it
+--     immediately, a passed expiry frees it lazily
+--   * `expire` events are synthesized at expiry_ms: a lock recorded held
+--     whose expiry passes without a release/break before the next event or
+--     stream end gets one (kind 5 stays reserved for a future explicit
+--     expire record written by the service)
+--   * lock.holder / lock.expiresAtMs / lock.labels come straight from the
+--     record; event.actor is the holder UUID when known (null for break —
+--     the core does not record the breaker)
+--   * lock.leaseMs is served as 0 (schema-required, not derivable: a lease
+--     duration is a client choice, not a lock-table fact)
 
 local lock_log = require("lock_log")
 
@@ -61,13 +64,31 @@ lock_state.detail_for = detail_for
 local HELD_AFTER = { [1] = true, [2] = true, [4] = true } -- acquire/renew/cas
 local FREE_AFTER = { [3] = true, [5] = true, [6] = true } -- release/expire/break
 
+local function free_lock(lock)
+    lock.state = "free"
+    lock.holder = nil
+    lock.expiresAtMs = nil
+    lock.renewCount = 0
+    lock.takenAtMs = nil
+end
+
 -- reduce(records, now_ms) → { locks = {lock_id → lock}, events = [...] }.
 -- records must be in ts order (lock_log.scan already is). Events keep the
--- mock shape {seq, tsMs, kind, lockId, name, actor, detail}; actor is null
--- because the record format carries no holder (see header).
+-- mock shape {seq, tsMs, kind, lockId, name, actor, detail}.
 function lock_state.reduce(records, now_ms)
     local locks = {}
     local events = {}
+    local function emit(ts_ms, kind_name, id, name, actor, fencing_token)
+        events[#events + 1] = {
+            seq = #events + 1,
+            tsMs = ts_ms,
+            kind = kind_name,
+            lockId = id,
+            name = name,
+            actor = actor,
+            detail = detail_for(kind_name, { fencing_token = fencing_token or 0 }),
+        }
+    end
     for _, rec in ipairs(records) do
         local id = rec.lock_id
         local lock = locks[id]
@@ -86,12 +107,30 @@ function lock_state.reduce(records, now_ms)
             }
             locks[id] = lock
         end
-        if rec.name ~= "" then
+        -- Lazy expiry: the previous lease lapsed before this event — the
+        -- lock went free at expiry_ms, so synthesize the expire event first.
+        if
+            lock.state == "held"
+            and lock.expiresAtMs ~= nil
+            and lock.expiresAtMs <= rec.ts_ms
+        then
+            emit(lock.expiresAtMs, "expire", id, lock.name, lock.holder, lock.fencingToken)
+            free_lock(lock)
+        end
+        if rec.name ~= nil and rec.name ~= "" then
             lock.name = rec.name
         end
+        if rec.labels ~= nil and #rec.labels > 0 then
+            lock.labels = rec.labels
+        end
+        local prior_holder = lock.holder
         if HELD_AFTER[rec.kind] then
             local became_held = lock.state ~= "held"
             lock.state = "held"
+            lock.holder = rec.holder
+            lock.expiresAtMs = rec.expiry_ms ~= nil and rec.expiry_ms > 0
+                    and rec.expiry_ms
+                or nil
             if rec.kind == 1 or rec.kind == 4 then -- acquire or cas: new holder
                 lock.takenAtMs = rec.ts_ms
             elseif became_held then
@@ -100,21 +139,47 @@ function lock_state.reduce(records, now_ms)
             lock.fencingToken = rec.fencing_token
             lock.renewCount = rec.renew_count
         elseif FREE_AFTER[rec.kind] then
-            lock.state = "free"
             lock.fencingToken = rec.fencing_token
-            lock.renewCount = 0
-            lock.takenAtMs = nil
+            free_lock(lock)
         end
-        -- kind 7 (deny): event only, no state change.
-        events[#events + 1] = {
-            seq = #events + 1,
-            tsMs = rec.ts_ms,
-            kind = lock_state.KIND_NAMES[rec.kind] or "unknown",
-            lockId = id,
-            name = lock.name,
-            actor = nil, -- no holder in the record format (see header)
-            detail = detail_for(lock_state.KIND_NAMES[rec.kind] or "", rec),
-        }
+        -- kind 7 (deny): event only, no state change. break records no
+        -- breaker in the core, so its actor is always null; release echoes
+        -- no holder in the record, so fall back to the incumbent.
+        local actor = rec.holder
+        if rec.kind == 6 then
+            actor = nil
+        elseif actor == nil and rec.kind == 3 then
+            actor = prior_holder
+        end
+        emit(
+            rec.ts_ms,
+            lock_state.KIND_NAMES[rec.kind] or "unknown",
+            id,
+            lock.name,
+            actor,
+            rec.fencing_token
+        )
+    end
+    -- Stream-end expiry synthesis, in expiry order for determinism.
+    local lapsed = {}
+    for id, lock in pairs(locks) do
+        if
+            lock.state == "held"
+            and lock.expiresAtMs ~= nil
+            and lock.expiresAtMs <= now_ms
+        then
+            lapsed[#lapsed + 1] = lock
+        end
+    end
+    table.sort(lapsed, function(a, b)
+        if a.expiresAtMs ~= b.expiresAtMs then
+            return a.expiresAtMs < b.expiresAtMs
+        end
+        return a.id < b.id
+    end)
+    for _, lock in ipairs(lapsed) do
+        emit(lock.expiresAtMs, "expire", lock.id, lock.name, lock.holder, lock.fencingToken)
+        free_lock(lock)
     end
     return { locks = locks, events = events }
 end
