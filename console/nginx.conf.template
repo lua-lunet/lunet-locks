@@ -1,4 +1,4 @@
-# Lock Admin — loopback-only demo edge.
+# Lock Admin — loopback-only demo edge (OpenResty).
 #
 # SECURITY POSTURE
 # ----------------
@@ -29,6 +29,54 @@ http {
   uwsgi_temp_path @TMP@/nginx-uwsgi;
   scgi_temp_path @TMP@/nginx-scgi;
 
+  lua_shared_dict lockadmin 1m;
+  lua_package_path "@ROOT@/openresty/lualib/?.lua;;";
+
+  # Handler setup happens once here (init_by_lua runs in the master before
+  # fork; workers inherit the globals). content_by_lua_block is per-request
+  # and must NOT redo setup. State is per-worker, which is fine for the
+  # console: the shared dict carries cross-worker counters/gauges.
+  init_by_lua_block {
+    local handlers = require("handlers")
+
+    console_config = {
+      cluster_json_path = "@TMP@/cluster.json",
+      telemetry_base = "@TMP@/telemetry",
+      workload = "@WORKLOAD@" == "on",
+    }
+
+    -- telemetry_dirs_by_node: node name → segment dir, derived from
+    -- cluster.json so the template stays topology-agnostic.
+    local dirs = {}
+    local fh = io.open(console_config.cluster_json_path, "rb")
+    if fh then
+      local text = fh:read("*a")
+      fh:close()
+      for name in text:gmatch('"name"%s*:%s*"([^"]+)"') do
+        dirs[name] = console_config.telemetry_base .. "/" .. name
+      end
+    end
+
+    console_state = handlers.setup({
+      cluster_json_path = console_config.cluster_json_path,
+      telemetry_dirs_by_node = dirs,
+      dict = ngx.shared.lockadmin,
+      now_ms = function() return math.floor(ngx.now() * 1000) end,
+      break_exec = handlers.ngx_break_exec(),
+    })
+    console_api = handlers.ngx_handler(console_state)
+  }
+
+  init_worker_by_lua_block {
+    if console_config.workload then
+      require("workload").start({
+        enabled = true,
+        cluster_path = console_config.cluster_json_path,
+        dict = ngx.shared.lockadmin,
+      })
+    end
+  }
+
   types {
     text/html html;
     text/css css;
@@ -58,10 +106,9 @@ http {
     }
 
     location /api/v1/ {
-      proxy_pass http://127.0.0.1:@MOCK_PORT@;
-      proxy_http_version 1.1;
-      proxy_set_header Host $host;
-      proxy_set_header X-Forwarded-For $remote_addr;
+      content_by_lua_block {
+        console_api()
+      }
     }
   }
 }

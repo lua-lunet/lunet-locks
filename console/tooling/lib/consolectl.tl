@@ -1,23 +1,46 @@
--- Lock Admin console lifecycle: render the nginx conf, mint loopback
--- credentials, spawn the bun mock and nginx, and babysit their pidfiles.
+-- Lock Admin console lifecycle: render the OpenResty conf, mint loopback
+-- credentials, spawn the 3-node lock cluster (pinned Lunet runtime,
+-- telemetry on) and OpenResty, and babysit their pidfiles.
 -- All paths live under console/tmp; the only logic-free shell is in bin/.
+
+local record Node
+   name: string
+   peer: string
+   client: string
+end
 
 local record Paths
    root: string
+   repo: string
    assets: string
    tmp: string
    conf: string
    template: string
    htpasswd: string
    credentials: string
-   mockPid: string
    nginxPid: string
-   mockLog: string
+   clusterJson: string
+   telemetryBase: string
+   serverLua: string
+   lunetRun: string
 end
 
 local record Ctl
    main: function(cmd: string, toolingDir: string): integer
 end
+
+-- Smoke topology (tests/lunet_smoke.sh): peers 27101-27103, clients
+-- 28101-28103, members n1/n2/n3.
+local NODES: {Node} = {
+   { name = "n1", peer = "127.0.0.1:27101", client = "127.0.0.1:28101" },
+   { name = "n2", peer = "127.0.0.1:27102", client = "127.0.0.1:28102" },
+   { name = "n3", peer = "127.0.0.1:27103", client = "127.0.0.1:28103" },
+}
+
+-- Records are buffered until rotation/close (src/telemetry_log.tl flushes on
+-- rotate), so a small min-bytes is what makes telemetry visible within
+-- seconds: ~5 records per segment at the workload's ~1 op/s.
+local TELEMETRY_MIN_BYTES = 512
 
 local function sh(cmd: string): string
    local p = io.popen(cmd, "r")
@@ -45,18 +68,30 @@ end
 
 local function paths(root: string): Paths
    local tmp = root .. "/tmp"
+   local repo = root .. "/.."
    return {
       root = root,
+      repo = repo,
       assets = root .. "/assets",
       tmp = tmp,
       conf = tmp .. "/nginx.conf",
       template = root .. "/nginx.conf.template",
       htpasswd = tmp .. "/htpasswd",
       credentials = tmp .. "/credentials",
-      mockPid = tmp .. "/mock.pid",
       nginxPid = tmp .. "/nginx.pid",
-      mockLog = tmp .. "/mock.log",
+      clusterJson = tmp .. "/cluster.json",
+      telemetryBase = tmp .. "/telemetry",
+      serverLua = repo .. "/build/server.lua",
+      lunetRun = repo .. "/.lunet/v0.8.0/lunet-run",
    }
+end
+
+local function nodePidfile(p: Paths, name: string): string
+   return p.tmp .. "/" .. name .. ".pid"
+end
+
+local function nodeLogfile(p: Paths, name: string): string
+   return p.tmp .. "/" .. name .. ".log"
 end
 
 local function pidOf(pidfile: string): string
@@ -118,37 +153,109 @@ local function ensureCredentials(p: Paths): string, string, boolean
    return "admin", pw, true
 end
 
-local function startMock(p: Paths, mockPort: string)
-   if alive(p.mockPid) then return end
-   local cmd = string.format(
-      '(cd "%s/mock" && MOCK_PORT=%s exec bun admin.mjs) >> "%s" 2>&1 & echo $!',
-      p.root, mockPort, p.mockLog)
-   local pid = sh(cmd)
-   if pid == "" then
-      io.stderr:write("ERROR: failed to spawn bun mock (is bun on PATH?)\n")
-      os.exit(1)
+local function checkPreconditions(p: Paths): boolean
+   local ok = true
+   local f = io.open(p.serverLua, "r")
+   if f then
+      f:close()
+   else
+      io.stderr:write("ERROR: " .. p.serverLua .. " missing; run `make -C .. build`\n")
+      ok = false
    end
-   writeFile(p.mockPid, pid .. "\n")
+   if os.execute('test -x "' .. p.lunetRun .. '"') ~= true then
+      io.stderr:write("ERROR: pinned runtime " .. p.lunetRun
+         .. " missing; run `make -C .. lunet-runtime`\n")
+      ok = false
+   end
+   if sh("command -v openresty") == "" then
+      io.stderr:write("ERROR: openresty not on PATH\n")
+      ok = false
+   end
+   return ok
 end
 
-local function startNginx(p: Paths)
+local function startNode(p: Paths, node: Node)
+   local pidfile = nodePidfile(p, node.name)
+   if alive(pidfile) then return end
+   -- Stale nonce state from a previous cluster leaves the client path
+   -- brain-dead (accepts connections, never replies); always start fresh.
+   os.remove(p.tmp .. "/" .. node.name .. ".nonce")
+   local telemetryDir = p.telemetryBase .. "/" .. node.name
+   os.execute('mkdir -p "' .. telemetryDir .. '"')
+   local members: {string} = {}
+   for _, n in ipairs(NODES) do
+      members[#members + 1] = "--member " .. n.name .. "=" .. n.peer
+   end
+   local cmd = string.format(
+      '"%s" "%s" --node %s --client %s --state "%s" %s '
+         .. '--telemetry-log "%s" --telemetry-min-bytes %d '
+         .. '>> "%s" 2>&1 & echo $!',
+      p.lunetRun, p.serverLua, node.name, node.client,
+      p.tmp .. "/" .. node.name .. ".nonce",
+      table.concat(members, " "),
+      telemetryDir, TELEMETRY_MIN_BYTES,
+      nodeLogfile(p, node.name))
+   local pid = sh(cmd)
+   if pid == "" then
+      io.stderr:write("ERROR: failed to spawn node " .. node.name
+         .. "; see " .. nodeLogfile(p, node.name) .. "\n")
+      os.exit(1)
+   end
+   writeFile(pidfile, pid .. "\n")
+end
+
+local function writeClusterJson(p: Paths, workload: string): boolean
+   local members: {string} = {}
+   for _, n in ipairs(NODES) do
+      members[#members + 1] = string.format(
+         '{"id":"%s","name":"%s","peer":"%s","client":"%s"}',
+         n.name, n.name, n.peer, n.client)
+   end
+   local json = string.format(
+      '{"members":[%s],"telemetry":{"base":"%s","min_bytes":%d},"workload":"%s"}\n',
+      table.concat(members, ","), p.telemetryBase, TELEMETRY_MIN_BYTES, workload)
+   return writeFile(p.clusterJson, json)
+end
+
+local function startOpenresty(p: Paths)
    if alive(p.nginxPid) then return end
-   if os.execute(string.format('nginx -t -q -c "%s"', p.conf)) ~= true then
-      io.stderr:write("ERROR: nginx config test failed; see " .. p.tmp .. "/nginx-error.log\n")
+   if os.execute(string.format('openresty -t -q -c "%s"', p.conf)) ~= true then
+      io.stderr:write("ERROR: openresty config test failed; see " .. p.tmp .. "/nginx-error.log\n")
       os.exit(1)
    end
-   if os.execute(string.format('nginx -c "%s"', p.conf)) ~= true then
-      io.stderr:write("ERROR: nginx failed to start; see " .. p.tmp .. "/nginx-error.log\n")
+   if os.execute(string.format('openresty -c "%s"', p.conf)) ~= true then
+      io.stderr:write("ERROR: openresty failed to start; see " .. p.tmp .. "/nginx-error.log\n")
       os.exit(1)
    end
+end
+
+-- Single `get` probe against a node client port (consolectl runs under the
+-- system luajit without a socket library; perl is already a project tool).
+local function probeNode(port: string): boolean
+   local cmd = "perl -MIO::Select -MIO::Socket::INET -e '"
+      .. 'my $s = IO::Socket::INET->new(PeerAddr=>"127.0.0.1",PeerPort=>shift,'
+      .. 'Proto=>"tcp",Timeout=>1) or exit 1; $s->autoflush(1); print $s '
+      .. 'qq({"op":"get","message_id":"00000000-0000-0000-0000-0000000000aa",'
+      .. '"client_id":9,"request_num":1,"lock_id":1}\\n); '
+      .. "IO::Select->new($s)->can_read(2) or exit 1; "
+      .. "my $line = <$s>; exit($line ? 0 : 1);' " .. port .. " 2>/dev/null"
+   return os.execute(cmd) == true
+end
+
+local function anyNodeUp(): boolean
+   for _, n in ipairs(NODES) do
+      local port = n.client:match(":(%d+)$")
+      if port and probeNode(port) then return true end
+   end
+   return false
 end
 
 local function waitHealthy(port: string, user: string, pw: string): boolean
-   for _ = 1, 40 do
+   for _ = 1, 60 do
       local code = sh(string.format(
          'curl -s -o /dev/null -w "%%{http_code}" --max-time 1 -u "%s:%s" "http://127.0.0.1:%s/api/v1/health"',
          user, pw, port))
-      if code == "200" then return true end
+      if code == "200" and anyNodeUp() then return true end
       os.execute("sleep 0.25")
    end
    return false
@@ -157,14 +264,26 @@ end
 local function up(root: string): integer
    local p = paths(root)
    local port = os.getenv("PORT") or "8480"
-   local mockPort = os.getenv("MOCK_PORT") or "8481"
+   local workload = os.getenv("WORKLOAD") or "on"
+   if workload ~= "on" and workload ~= "off" then
+      io.stderr:write("ERROR: WORKLOAD must be on|off (got '" .. workload .. "')\n")
+      return 2
+   end
    os.execute('mkdir -p "' .. p.tmp .. '"')
 
+   if not checkPreconditions(p) then return 1 end
+
+   if not writeClusterJson(p, workload) then
+      io.stderr:write("ERROR: cannot write " .. p.clusterJson .. "\n")
+      return 1
+   end
+
    local conf = render(readFile(p.template), {
+      ROOT = p.root,
       TMP = p.tmp,
       ASSETS = p.assets,
       PORT = port,
-      MOCK_PORT = mockPort,
+      WORKLOAD = workload,
    })
    if not writeFile(p.conf, conf) then
       io.stderr:write("ERROR: cannot write " .. p.conf .. "\n")
@@ -172,8 +291,10 @@ local function up(root: string): integer
    end
 
    local user, pw = ensureCredentials(p)
-   startMock(p, mockPort)
-   startNginx(p)
+   for _, n in ipairs(NODES) do
+      startNode(p, n)
+   end
+   startOpenresty(p)
 
    if not waitHealthy(port, user, pw) then
       io.stderr:write("ERROR: console did not become healthy; run `make logs`\n")
@@ -182,6 +303,9 @@ local function up(root: string): integer
 
    io.write("Lock Admin console is up\n")
    io.write("  url:      http://127.0.0.1:" .. port .. "/\n")
+   io.write("  cluster:  n1 " .. NODES[1].client .. ", n2 " .. NODES[2].client
+      .. ", n3 " .. NODES[3].client .. "\n")
+   io.write("  workload: " .. workload .. "\n")
    io.write("  user:     " .. user .. "\n")
    io.write("  password: " .. pw .. "\n")
    io.write("  warning:  loopback demo only — plain HTTP + basic auth; TLS+mTLS required off-loopback\n")
@@ -204,12 +328,14 @@ local function down(root: string): integer
    local p = paths(root)
    local stopped = false
    if killPidfile(p.nginxPid) then
-      io.write("nginx stopped\n")
+      io.write("openresty stopped\n")
       stopped = true
    end
-   if killPidfile(p.mockPid) then
-      io.write("mock stopped\n")
-      stopped = true
+   for _, n in ipairs(NODES) do
+      if killPidfile(nodePidfile(p, n.name)) then
+         io.write(n.name .. " stopped\n")
+         stopped = true
+      end
    end
    if not stopped then io.write("nothing running\n") end
    return 0
@@ -218,13 +344,17 @@ end
 local function status(root: string): integer
    local p = paths(root)
    local port = os.getenv("PORT") or "8480"
-   local mockUp = alive(p.mockPid)
    local nginxUp = alive(p.nginxPid)
-   io.write("mock:   " .. (mockUp and "running (pid " .. pidOf(p.mockPid) .. ")" or "stopped") .. "\n")
-   io.write("nginx:  " .. (nginxUp and "running (pid " .. pidOf(p.nginxPid) .. ")" or "stopped") .. "\n")
-   if mockUp and nginxUp then
+   local allUp = nginxUp
+   for _, n in ipairs(NODES) do
+      local up = alive(nodePidfile(p, n.name))
+      io.write(n.name .. ":      " .. (up and "running (pid " .. pidOf(nodePidfile(p, n.name)) .. ")" or "stopped") .. "\n")
+      allUp = allUp and up
+   end
+   io.write("openresty: " .. (nginxUp and "running (pid " .. pidOf(p.nginxPid) .. ")" or "stopped") .. "\n")
+   if allUp then
       local creds = readFile(p.credentials):gsub("%s+$", "")
-      io.write("url:    http://127.0.0.1:" .. port .. "/  (" .. creds .. ")\n")
+      io.write("url:       http://127.0.0.1:" .. port .. "/  (" .. creds .. ")\n")
       return 0
    end
    return 1

@@ -351,7 +351,8 @@ local function send_request(state, request_line)
     return nil, "cluster unavailable"
 end
 
-local function tick(state, premature)
+-- ngx timer callbacks receive (premature, ...user-args): premature first.
+local function tick(premature, state)
     if premature then
         return
     end
