@@ -5,11 +5,13 @@
 
 import { store, config } from "../lib/state.mjs";
 import { fmtClock, parseClock, debounce, ICONS } from "../lib/util.mjs";
+import { resizableColumns } from "../lib/resizable.mjs";
 
 /** @typedef {import("../lib/types.mjs").ClusterNode} ClusterNode */
 /** @typedef {import("../lib/types.mjs").Lock} Lock */
 /** @typedef {import("../lib/types.mjs").StoreState} StoreState */
 /** @typedef {import("../lib/types.mjs").ViewMode} ViewMode */
+/** @typedef {import("../lib/resizable.mjs").ResizableColumns} ResizableColumns */
 
 /** @type {[ViewMode, string][]} */
 const MODES = [
@@ -27,6 +29,10 @@ class LaApp extends HTMLElement {
   _unsub;
   /** @type {ViewMode | null} */
   _mode = null;
+  /** @type {ResizableColumns | undefined} */
+  _panes;
+  /** @type {boolean | null} */
+  _hadSelection = null;
   /** Skeleton nodes, memoised by id on first lookup. @type {Map<string, HTMLElement>} */
   _refs = new Map();
 
@@ -64,6 +70,7 @@ class LaApp extends HTMLElement {
       </header>
       <div class="shell" id="la-shell">
         <la-tree></la-tree>
+        <div class="pane-divider" id="la-div-left" data-col="0"></div>
         <div class="main">
           <div id="la-view" style="display:flex;flex-direction:column;flex:1;min-height:0"></div>
           <div class="statusbar">
@@ -73,6 +80,7 @@ class LaApp extends HTMLElement {
             <span id="la-hint"></span>
           </div>
         </div>
+        <div class="pane-divider" id="la-div-right" data-col="1"></div>
         <la-detail id="la-detail" style="display:none"></la-detail>
       </div>
       <la-break-dialog></la-break-dialog>
@@ -82,6 +90,20 @@ class LaApp extends HTMLElement {
     // programming error, not a runtime condition — $() throws rather than
     // silently no-oping the way `querySelector(...)?.textContent =` would.
     this._refs.clear();
+
+    // The two shell panes resize through the same helper as the data grids.
+    // widths = [tree, detail]; the 6px divider tracks and the collapsible
+    // detail pane live in the template, not in the persisted numbers. The
+    // side panes are clamped so they cannot be dragged shut.
+    this._panes = resizableColumns({
+      host: this.$("la-shell"), headEl: this.$("la-shell"),
+      cssVar: "--shell-cols", key: "paneWidths",
+      defaults: [196, 320], min: [140, 240],
+      selector: ".pane-divider",
+      template: (w) => store.state.selectedId !== null
+        ? `${w[0]}px 6px 1fr 6px ${w[1]}px`
+        : `${w[0]}px 6px 1fr`,
+    });
 
     // control wiring (values come from persisted state)
     const search = /** @type {HTMLInputElement} */ (this.$("la-search"));
@@ -120,10 +142,11 @@ class LaApp extends HTMLElement {
     to.onchange = () => store.set({ toText: to.value });
 
     this._mode = null;
+    this._hadSelection = null;
     this._unsub = store.subscribe((st) => this.update(st));
     this.update(s);
   }
-  disconnectedCallback() { this._unsub?.(); }
+  disconnectedCallback() { this._unsub?.(); this._panes?.dispose(); }
 
   /**
    * Look up one of this component's own skeleton nodes by id, memoising the
@@ -170,8 +193,16 @@ class LaApp extends HTMLElement {
       ? `${st.watched.size} watched${hot ? ` <span class="hot">· ${hot} expiring</span>` : ""}`
       : "";
 
-    this.$("la-shell").style.gridTemplateColumns = st.selectedId !== null ? "196px 1fr 320px" : "196px 1fr";
-    this.$("la-detail").style.display = st.selectedId !== null ? "" : "none";
+    // The grid template only changes shape when the detail pane appears or
+    // disappears; re-applying on every tick would clobber a drag in progress,
+    // because the drag writes --shell-cols before it reaches the store.
+    const hasSelection = st.selectedId !== null;
+    if (hasSelection !== this._hadSelection) {
+      this._hadSelection = hasSelection;
+      this._panes?.apply();
+    }
+    this.$("la-detail").style.display = hasSelection ? "" : "none";
+    this.$("la-div-right").style.display = hasSelection ? "" : "none";
 
     this.$("la-count").textContent = st.mode === "log"
       ? `${st.events.length} events`

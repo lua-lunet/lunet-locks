@@ -40,9 +40,11 @@ class LaDetail extends HTMLElement {
     const held = l.state === "held";
     const timed = held && l.expiresAtMs != null;
 
-    /** @type {[string, string, string][]} */
+    /** @type {[string, string, string][]} [key, raw value, color] — the raw
+     * value is escaped at render time and reused as the title so a truncated
+     * cell still exposes the full string on hover. */
     const rows = [
-      ["holder", held ? esc(l.holder) : "—", held ? "var(--color-text)" : "var(--color-neutral-600)"],
+      ["holder", held ? (l.holder ?? "—") : "—", held ? "var(--color-text)" : "var(--color-neutral-600)"],
       ["fence", String(l.fencingToken), ""],
       ["expires", timed ? `${fmtClock(/** @type {number} */ (l.expiresAtMs))} (in ${fmtDur(/** @type {number} */ (l.expiresAtMs) - now)})` : "free",
         timed && /** @type {number} */ (l.expiresAtMs) - now < 12000 ? "var(--color-accent)" : ""],
@@ -50,11 +52,11 @@ class LaDetail extends HTMLElement {
       ["renewals", held ? `${l.renewCount} × ${Math.round(l.leaseMs / 1000)}s` : "—", ""],
     ];
     const kv = rows
-      .map(([k, v, c]) => `<span class="k">${k}</span><span${c ? ` style="color:${c}"` : ""}>${v}</span>`)
+      .map(([k, v, c]) => `<span class="k">${k}</span><span title="${esc(v)}"${c ? ` style="color:${c}"` : ""}>${esc(v)}</span>`)
       .join("");
 
     const events = (detail.recentEvents ?? []).map((e) =>
-      `<div class="ev"><span class="t">${fmtClock(e.tsMs)}</span><span class="ev-${esc(e.kind)}">${esc(e.kind)}</span><span class="a">${esc(e.actor)}</span></div>`
+      `<div class="ev"><span class="t">${fmtClock(e.tsMs)}</span><span class="ev-${esc(e.kind)}">${esc(e.kind)}</span><span class="a" title="${esc(e.actor)}">${esc(e.actor)}</span></div>`
     ).join("");
 
     // Preserve the detail-body scroll position across the 1s rebuilds.

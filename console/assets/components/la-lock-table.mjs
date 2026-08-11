@@ -3,18 +3,23 @@
 
 import { store, config } from "../lib/state.mjs";
 import { esc, fmtDur, parseClock, ICONS } from "../lib/util.mjs";
+import { resizableColumns } from "../lib/resizable.mjs";
 
 /** @typedef {import("../lib/types.mjs").Lock} Lock */
+/** @typedef {import("../lib/resizable.mjs").ResizableColumns} ResizableColumns */
 
 // Column widths in px: icon, lock, holder, expires, held. Labels take the
-// remaining width. Defaults are sized to the real data: a holder UUID is 36
-// chars (~270px at 12px mono), the longest demo path ~36 chars (~280px).
+// remaining width (the trailing minmax() in styles.css). Defaults are sized
+// to the real data: a holder UUID is 36 chars (~270px at 12px mono), the
+// longest demo path ~36 chars (~280px).
 const DEFAULT_COLS = [20, 280, 270, 104, 68];
 const MIN_COL_PX = 48;
 
 class LaLockTable extends HTMLElement {
   /** @type {(() => void) | undefined} */
   _unsub;
+  /** @type {ResizableColumns | undefined} */
+  _cols;
   /** Skeleton nodes, memoised by selector on first lookup. @type {Map<string, HTMLElement>} */
   _refs = new Map();
 
@@ -32,8 +37,11 @@ class LaLockTable extends HTMLElement {
         <div class="body"></div>
       </div>`;
     // Own markup, so every $() lookup below resolves; results are memoised.
-    this._applyCols(store.state.colWidths ?? DEFAULT_COLS);
-    this.$(".grid-head").onmousedown = (e) => this._startResize(e);
+    this._cols = resizableColumns({
+      host: this, headEl: this.$(".grid-head"),
+      cssVar: "--cols", key: "colWidths",
+      defaults: DEFAULT_COLS, min: MIN_COL_PX,
+    });
     this._unsub = store.subscribe(() => this.render());
     this.onclick = (e) => {
       const row = e.target instanceof Element ? e.target.closest(".lock-row") : null;
@@ -41,7 +49,7 @@ class LaLockTable extends HTMLElement {
     };
     this.render();
   }
-  disconnectedCallback() { this._unsub?.(); }
+  disconnectedCallback() { this._unsub?.(); this._cols?.dispose(); }
 
   /**
    * Look up one of this component's own skeleton nodes, memoising the result
@@ -56,42 +64,6 @@ class LaLockTable extends HTMLElement {
     if (!(el instanceof HTMLElement)) throw new Error(`la-lock-table: missing ${selector}`);
     this._refs.set(selector, el);
     return el;
-  }
-
-  /**
-   * @param {number[]} widths
-   * @returns {void}
-   */
-  _applyCols(widths) {
-    this.style.setProperty("--cols", widths.map((px) => px + "px").join(" ") + " minmax(120px, 1fr)");
-  }
-
-  /**
-   * @param {MouseEvent} e
-   * @returns {void}
-   */
-  _startResize(e) {
-    const handle = e.target instanceof Element ? e.target.closest(".col-resize") : null;
-    if (!(handle instanceof HTMLElement)) return;
-    e.preventDefault();
-    const col = Number(handle.dataset.col);
-    const startX = e.clientX;
-    const widths = [...(store.state.colWidths ?? DEFAULT_COLS)];
-    const startW = widths[col];
-    /** @param {MouseEvent} ev */
-    const onMove = (ev) => {
-      widths[col] = Math.max(MIN_COL_PX, Math.round(startW + ev.clientX - startX));
-      this._applyCols(widths);
-    };
-    const onUp = () => {
-      document.removeEventListener("mousemove", onMove);
-      document.removeEventListener("mouseup", onUp);
-      document.body.style.userSelect = "";
-      store.set({ colWidths: widths }); // persists to sessionStorage
-    };
-    document.body.style.userSelect = "none";
-    document.addEventListener("mousemove", onMove);
-    document.addEventListener("mouseup", onUp);
   }
 
   /** @returns {void} */

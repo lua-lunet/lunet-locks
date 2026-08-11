@@ -193,6 +193,7 @@
  * @property {Set<string>} collapsed
  * @property {number[] | null} colWidths Lock-table px widths; null = defaults.
  * @property {number[] | null} logColWidths Log-view px widths; null = defaults.
+ * @property {number[] | null} paneWidths Shell [tree, detail] px widths; null = defaults.
  * @property {number | null} confirmId Lock id pending a break confirmation.
  * @property {Event[]} events Log view rows.
  * @property {SeriesResponse | null} series
@@ -218,6 +219,7 @@
  * @property {string[]} [collapsed]
  * @property {number[] | null} [colWidths]
  * @property {number[] | null} [logColWidths]
+ * @property {number[] | null} [paneWidths]
  */
 
 export {};

@@ -3,16 +3,21 @@
 
 import { store } from "../lib/state.mjs";
 import { esc, fmtClock } from "../lib/util.mjs";
+import { resizableColumns } from "../lib/resizable.mjs";
+
+/** @typedef {import("../lib/resizable.mjs").ResizableColumns} ResizableColumns */
 
 // Column widths in px: time, event, lock, actor. Detail takes the remaining
-// width. The actor default matches the lock table's holder column (a UUID is
-// 36 chars, ~270px at 12px mono).
+// width (the trailing minmax() in styles.css). The actor default matches the
+// lock table's holder column (a UUID is 36 chars, ~270px at 12px mono).
 const DEFAULT_LOG_COLS = [104, 74, 280, 270];
 const MIN_COL_PX = 48;
 
 class LaLogView extends HTMLElement {
   /** @type {(() => void) | undefined} */
   _unsub;
+  /** @type {ResizableColumns | undefined} */
+  _cols;
   /** Skeleton nodes, memoised by selector on first lookup. @type {Map<string, HTMLElement>} */
   _refs = new Map();
 
@@ -29,12 +34,15 @@ class LaLogView extends HTMLElement {
         <div class="log-body"></div>
       </div>`;
     // Own markup, so every $() lookup below resolves; results are memoised.
-    this._applyCols(store.state.logColWidths ?? DEFAULT_LOG_COLS);
-    this.$(".log-head").onmousedown = (e) => this._startResize(e);
+    this._cols = resizableColumns({
+      host: this, headEl: this.$(".log-head"),
+      cssVar: "--log-cols", key: "logColWidths",
+      defaults: DEFAULT_LOG_COLS, min: MIN_COL_PX,
+    });
     this._unsub = store.subscribe(() => this.render());
     this.render();
   }
-  disconnectedCallback() { this._unsub?.(); }
+  disconnectedCallback() { this._unsub?.(); this._cols?.dispose(); }
 
   /**
    * Look up one of this component's own skeleton nodes, memoising the result
@@ -49,42 +57,6 @@ class LaLogView extends HTMLElement {
     if (!(el instanceof HTMLElement)) throw new Error(`la-log-view: missing ${selector}`);
     this._refs.set(selector, el);
     return el;
-  }
-
-  /**
-   * @param {number[]} widths
-   * @returns {void}
-   */
-  _applyCols(widths) {
-    this.style.setProperty("--log-cols", widths.map((px) => px + "px").join(" ") + " minmax(160px, 1fr)");
-  }
-
-  /**
-   * @param {MouseEvent} e
-   * @returns {void}
-   */
-  _startResize(e) {
-    const handle = e.target instanceof Element ? e.target.closest(".col-resize") : null;
-    if (!(handle instanceof HTMLElement)) return;
-    e.preventDefault();
-    const col = Number(handle.dataset.col);
-    const startX = e.clientX;
-    const widths = [...(store.state.logColWidths ?? DEFAULT_LOG_COLS)];
-    const startW = widths[col];
-    /** @param {MouseEvent} ev */
-    const onMove = (ev) => {
-      widths[col] = Math.max(MIN_COL_PX, Math.round(startW + ev.clientX - startX));
-      this._applyCols(widths);
-    };
-    const onUp = () => {
-      document.removeEventListener("mousemove", onMove);
-      document.removeEventListener("mouseup", onUp);
-      document.body.style.userSelect = "";
-      store.set({ logColWidths: widths });
-    };
-    document.body.style.userSelect = "none";
-    document.addEventListener("mousemove", onMove);
-    document.addEventListener("mouseup", onUp);
   }
 
   /** @returns {void} */

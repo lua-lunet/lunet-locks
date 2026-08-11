@@ -37,6 +37,7 @@ function persist(state) {
     collapsed: [...state.collapsed],
     colWidths: state.colWidths,
     logColWidths: state.logColWidths,
+    paneWidths: state.paneWidths,
   }));
 }
 
@@ -60,6 +61,7 @@ export const store = {
     collapsed: new Set(saved.collapsed ?? ["/tenants", "/jobs", "/index"]),
     colWidths: saved.colWidths ?? null, // lock-table px widths; null = defaults
     logColWidths: saved.logColWidths ?? null, // log-view px widths; null = defaults
+    paneWidths: saved.paneWidths ?? null, // shell [tree, detail] px widths; null = defaults
     confirmId: null,    // lock id pending a break confirmation
     events: [],         // log view rows
     series: null,       // {bucketMs, buckets}
