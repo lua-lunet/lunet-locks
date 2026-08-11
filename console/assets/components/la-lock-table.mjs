@@ -4,12 +4,30 @@
 import { store, config } from "../lib/state.mjs";
 import { esc, fmtDur, parseClock, ICONS } from "../lib/util.mjs";
 
+// Column widths in px: icon, lock, holder, expires, held. Labels take the
+// remaining width. Defaults are sized to the real data: a holder UUID is 36
+// chars (~270px at 12px mono), the longest demo path ~36 chars (~280px).
+const DEFAULT_COLS = [20, 280, 270, 104, 68];
+const MIN_COL_PX = 48;
+
 class LaLockTable extends HTMLElement {
   connectedCallback() {
     this.innerHTML = `
-      <div class="grid-head"><div></div><div>lock</div><div>holder</div><div>expires</div><div>held</div><div>labels</div></div>
-      <div class="rows"></div>`;
+      <div class="rows">
+        <div class="grid-head">
+          <div></div>
+          <div class="hcell">lock<span class="col-resize" data-col="1"></span></div>
+          <div class="hcell">holder<span class="col-resize" data-col="2"></span></div>
+          <div class="hcell">expires<span class="col-resize" data-col="3"></span></div>
+          <div class="hcell">held<span class="col-resize" data-col="4"></span></div>
+          <div>labels</div>
+        </div>
+        <div class="body"></div>
+      </div>`;
     this._rowsEl = this.querySelector(".rows");
+    this._bodyEl = this.querySelector(".body");
+    this._applyCols(store.state.colWidths ?? DEFAULT_COLS);
+    this.querySelector(".grid-head").onmousedown = (e) => this._startResize(e);
     this._unsub = store.subscribe(() => this.render());
     this.onclick = (e) => {
       const row = e.target.closest(".lock-row");
@@ -18,6 +36,33 @@ class LaLockTable extends HTMLElement {
     this.render();
   }
   disconnectedCallback() { this._unsub?.(); }
+
+  _applyCols(widths) {
+    this.style.setProperty("--cols", widths.map((px) => px + "px").join(" ") + " minmax(120px, 1fr)");
+  }
+
+  _startResize(e) {
+    const handle = e.target.closest(".col-resize");
+    if (!handle) return;
+    e.preventDefault();
+    const col = Number(handle.dataset.col);
+    const startX = e.clientX;
+    const widths = [...(store.state.colWidths ?? DEFAULT_COLS)];
+    const startW = widths[col];
+    const onMove = (ev) => {
+      widths[col] = Math.max(MIN_COL_PX, Math.round(startW + ev.clientX - startX));
+      this._applyCols(widths);
+    };
+    const onUp = () => {
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+      document.body.style.userSelect = "";
+      store.set({ colWidths: widths }); // persists to sessionStorage
+    };
+    document.body.style.userSelect = "none";
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp);
+  }
 
   render() {
     const { locks, now, selectedId, watched, mode, atText, tolSec } = store.state;
@@ -63,10 +108,11 @@ class LaLockTable extends HTMLElement {
       </div>`;
     }).join("");
 
-    // Only the row markup is replaced; the scroll container is stable across
-    // the 1s ticks, and scrollTop is restored in case the browser resets it.
+    // Only the row markup is replaced; the header, scroll container, and any
+    // in-progress column drag survive the 1s ticks, and scrollTop is restored
+    // in case the browser resets it.
     const scrollTop = this._rowsEl.scrollTop;
-    this._rowsEl.innerHTML = rows || '<div style="padding:24px;color:var(--color-neutral-500);font-family:var(--font-mono);font-size:12px">no locks match</div>';
+    this._bodyEl.innerHTML = rows || '<div style="padding:24px;color:var(--color-neutral-500);font-family:var(--font-mono);font-size:12px">no locks match</div>';
     this._rowsEl.scrollTop = scrollTop;
   }
 }

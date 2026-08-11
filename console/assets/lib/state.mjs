@@ -18,6 +18,7 @@ function persist(state) {
     toText: state.toText,
     watched: [...state.watched],
     collapsed: [...state.collapsed],
+    colWidths: state.colWidths,
   }));
 }
 
@@ -38,6 +39,7 @@ export const store = {
     detail: null,       // {lock, recentEvents}
     watched: new Set(saved.watched ?? []),
     collapsed: new Set(saved.collapsed ?? ["/tenants", "/jobs", "/index"]),
+    colWidths: saved.colWidths ?? null, // lock-table px widths; null = defaults
     confirmId: null,    // lock id pending a break confirmation
     events: [],         // log view rows
     series: null,       // {bucketMs, buckets}
