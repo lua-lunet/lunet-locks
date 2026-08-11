@@ -38,9 +38,13 @@ local NODES: {Node} = {
 }
 
 -- Records are buffered until rotation/close (src/telemetry_log.tl flushes on
--- rotate), so a small min-bytes is what makes telemetry visible within
--- seconds: ~5 records per segment at the workload's ~1 op/s.
-local TELEMETRY_MIN_BYTES = 512
+-- rotate). 64 KiB keeps telemetry seconds-fresh at the workload's op rate
+-- while producing ~100x fewer segment files than the original 512 (item47:
+-- an ordinary session grew 4000+ segments and every console scan re-read
+-- them all). This one constant feeds both the node command line
+-- (--telemetry-min-bytes, ~line 191) and the telemetry.min_bytes echo in
+-- cluster.json (~line 215), keeping the two consistent by construction.
+local TELEMETRY_MIN_BYTES = 65536
 
 local function sh(cmd: string): string
    local p = io.popen(cmd, "r")

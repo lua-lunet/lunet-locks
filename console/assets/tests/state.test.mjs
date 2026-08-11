@@ -72,6 +72,46 @@ export const suite = {
         restoreSession();
       }
     },
+    "key-scoped subscribers fire only when one of their keys changes"() {
+      const restoreSession = preserveSession("lock-admin");
+      const restoreStore = preserveStore("query", "now");
+      try {
+        let scoped = 0;
+        let all = 0;
+        const offScoped = store.subscribe(() => { scoped++; }, ["query"]);
+        const offAll = store.subscribe(() => { all++; });
+        store.set({ now: Date.now() });
+        assertEqual(scoped, 0, "a now-only patch does not reach a query-scoped listener");
+        assertEqual(all, 1, "an unscoped listener still hears every patch");
+        store.set({ query: "scoped-marker" });
+        assertEqual(scoped, 1, "the scoped listener fires on its own key");
+        offScoped();
+        offAll();
+      } finally {
+        restoreStore();
+        restoreSession();
+      }
+    },
+    "a patch without persisted keys skips the sessionStorage write"() {
+      const restoreSession = preserveSession("lock-admin");
+      const restoreStore = preserveStore("query", "now");
+      const realSetItem = sessionStorage.setItem.bind(sessionStorage);
+      let writes = 0;
+      sessionStorage.setItem = (k, v) => {
+        if (k === "lock-admin") writes++;
+        else realSetItem(k, v);
+      };
+      try {
+        store.set({ now: Date.now() });
+        assertEqual(writes, 0, "the 1s now tick does not persist");
+        store.set({ query: "persist-marker" });
+        assertEqual(writes, 1, "a persisted key persists exactly once");
+      } finally {
+        sessionStorage.setItem = realSetItem;
+        restoreStore();
+        restoreSession();
+      }
+    },
     "persistence round-trip writes the saved blob"() {
       const restoreSession = preserveSession("lock-admin");
       const restoreStore = preserveStore("query", "logRangePinned");

@@ -13,7 +13,9 @@ class LaBreakDialog extends HTMLElement {
 
   connectedCallback() {
     this._rendered = undefined;
-    this._unsub = store.subscribe(() => this.render());
+    // Only confirmId can change what renders (locksAll/detail/now are read
+    // fresh at that moment); the _rendered guard keeps it that cheap.
+    this._unsub = store.subscribe(() => this.render(), ["confirmId"]);
     this.render();
   }
   disconnectedCallback() { this._unsub?.(); }

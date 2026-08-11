@@ -7,9 +7,14 @@ import { esc, fmtClock, fmtDur, ICONS } from "../lib/util.mjs";
 class LaDetail extends HTMLElement {
   /** @type {(() => void) | undefined} */
   _unsub;
+  /** @type {(() => void) | undefined} */
+  _unsubTick;
 
   connectedCallback() {
-    this._unsub = store.subscribe(() => this.render());
+    // Rebuilds only on a new detail payload or watch toggle; the 1s `now`
+    // tick rewrites just the "expires"/"taken at" value spans.
+    this._unsub = store.subscribe(() => this.render(), ["detail", "watched"]);
+    this._unsubTick = store.subscribe(() => this.tick(), ["now"]);
     this.onclick = (e) => {
       const target = e.target instanceof Element ? e.target : null;
       if (!target) return;
@@ -30,7 +35,39 @@ class LaDetail extends HTMLElement {
     };
     this.render();
   }
-  disconnectedCallback() { this._unsub?.(); }
+  disconnectedCallback() { this._unsub?.(); this._unsubTick?.(); }
+
+  /**
+   * The 1s clock tick: refresh the two clock-relative kv values in place,
+   * leaving the rest of the panel (and its scroll position) untouched.
+   * @returns {void}
+   */
+  tick() {
+    const { detail, now } = store.state;
+    if (!detail) return;
+    const l = detail.lock;
+    const held = l.state === "held";
+    const timed = held && l.expiresAtMs != null;
+    /**
+     * @param {string} k
+     * @param {string} v
+     * @param {string} [color]
+     * @returns {void}
+     */
+    const setKv = (k, v, color = "") => {
+      const el = this.querySelector(`[data-kv="${k}"]`);
+      if (el instanceof HTMLElement) {
+        el.textContent = v;
+        el.title = v;
+        el.style.color = color;
+      }
+    };
+    setKv("expires",
+      timed ? `${fmtClock(/** @type {number} */ (l.expiresAtMs))} (in ${fmtDur(/** @type {number} */ (l.expiresAtMs) - now)})` : "free",
+      timed && /** @type {number} */ (l.expiresAtMs) - now < 12000 ? "var(--color-accent)" : "");
+    setKv("taken at",
+      held && l.takenAtMs != null ? `${fmtClock(l.takenAtMs)} (${fmtDur(now - l.takenAtMs)} ago)` : "—");
+  }
 
   /** @returns {void} */
   render() {
@@ -52,7 +89,7 @@ class LaDetail extends HTMLElement {
       ["renewals", held ? `${l.renewCount} × ${Math.round(l.leaseMs / 1000)}s` : "—", ""],
     ];
     const kv = rows
-      .map(([k, v, c]) => `<span class="k">${k}</span><span title="${esc(v)}"${c ? ` style="color:${c}"` : ""}>${esc(v)}</span>`)
+      .map(([k, v, c]) => `<span class="k">${k}</span><span data-kv="${k}" title="${esc(v)}"${c ? ` style="color:${c}"` : ""}>${esc(v)}</span>`)
       .join("");
 
     const events = (detail.recentEvents ?? []).map((e) =>

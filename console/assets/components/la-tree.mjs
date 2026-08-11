@@ -10,7 +10,7 @@ class LaTree extends HTMLElement {
   _unsub;
 
   connectedCallback() {
-    this._unsub = store.subscribe(() => this.render());
+    this._unsub = store.subscribe(() => this.render(), ["locksAll", "query", "collapsed"]);
     this.onclick = (e) => {
       const target = e.target instanceof Element ? e.target : null;
       const row = target?.closest(".tree-row");

@@ -525,6 +525,133 @@ status, body = handlers.handle(state, { method = "GET", path = "/api/v1/nope" })
 check(status == 404 and body.error == "not found", "handler: unknown path → 404 like the mock")
 check(state.dict.store["req:health"] == 1 and state.dict.store["req:locks"] ~= nil, "handler: dict counters bumped")
 check(state.dict.store["scan:segments"] == 4 and state.dict.store["scan:segment_bytes"] > 0, "handler: scan gauges refreshed")
+check(
+    state.dict.store["scan:segments_read"] == 4 and state.dict.store["scan:segments_skipped"] == 0,
+    "handler: incremental scan counters bumped (one cold scan, then TTL hits)"
+)
+
+-- ---- node_stats is pure (item47) -------------------------------------------------------
+--
+-- Same inputs the old per-dir scan produced, but supplied as a record slice
+-- plus the segment inventory — no IO. Expectations mirror the /cluster
+-- handler test above.
+local nstats = lock_state.node_stats(fixture_records, 4, 1234, 1700000022000, 10000)
+check(
+    nstats.segmentCount == 4
+        and nstats.segmentBytes == 1234
+        and nstats.lastRecordMs == 1700000099999
+        and nstats.locksHeld == 0
+        and nstats.acquirePerSec == 0.1
+        and nstats.renewPerSec == 0.1
+        and nstats.releasePerSec == 0.2,
+    "node_stats: pure derivation matches the old per-dir scan results"
+)
+
+-- ---- incremental scan_all (item47) ------------------------------------------------------
+--
+-- Grown tail, new file, unchanged-sealed skip, the shrink/removal/in-place
+-- rewrite full-rescan fallbacks, and the retention bound — against a
+-- writable tmp dir seeded from the fixture segments.
+
+local ITMP = script_dir .. "/../.tmp-lock-state-inc-test"
+os.execute("rm -rf " .. ITMP .. " && mkdir -p " .. ITMP)
+local fsegs = lock_log.list_segments(FIXTURES)
+local function seg_bytes(i)
+    local fh = assert(io.open(fsegs[i].path, "rb"))
+    local d = fh:read("*a")
+    fh:close()
+    return d
+end
+local function write_file(path, data)
+    local fh = assert(io.open(path, "wb"))
+    fh:write(data)
+    fh:close()
+end
+local seg1 = seg_bytes(1) -- header + records n=1..6
+local seg2 = seg_bytes(2) -- header + records n=7..12
+local p1 = ITMP .. "/telemetry-n1-1700000000000-000001.bin"
+write_file(p1, seg1)
+
+local idirs = { n1 = ITMP }
+local INOW = 1700000100000
+local irecs, _, _, iscan, istats = lock_state.scan_all(idirs, nil, INOW, nil)
+check(
+    #irecs == 6 and istats.read == 1 and istats.skipped == 0 and not istats.rescan,
+    "incremental: cold scan reads the one segment"
+)
+check(
+    irecs[1].node == "n1" and irecs[6].node == "n1",
+    "incremental: records tagged with their owning node"
+)
+
+irecs, _, _, iscan, istats = lock_state.scan_all(idirs, nil, INOW, iscan)
+check(
+    istats.read == 0 and istats.skipped == 1 and #irecs == 6,
+    "incremental: unchanged sealed segment skipped, not re-read"
+)
+
+-- Grown tail: append seg2's record region (drop its 24-byte header) to p1.
+local afh = assert(io.open(p1, "ab"))
+afh:write(seg2:sub(25))
+afh:close()
+irecs, _, _, iscan, istats = lock_state.scan_all(idirs, nil, INOW, iscan)
+check(
+    istats.read == 1 and istats.skipped == 0 and not istats.rescan and #irecs == 12,
+    "incremental: grown tail re-read from the remembered offset (12 records, got " .. #irecs .. ")"
+)
+check(
+    irecs[12].ts_ms == 1700000012000 and irecs[7].name == "fixture-lock-7",
+    "incremental: tail records decoded in order"
+)
+
+-- New file: a second segment appears.
+local p2 = ITMP .. "/telemetry-n1-1700000001000-000002.bin"
+write_file(p2, seg_bytes(3)) -- records n=13..18
+irecs, _, _, iscan, istats = lock_state.scan_all(idirs, nil, INOW, iscan)
+check(
+    istats.read == 1 and istats.skipped == 1 and #irecs == 18,
+    "incremental: new segment read, sealed one skipped"
+)
+
+-- Shrink: p2 truncated to header + first record → clean full rescan.
+-- record_len is the u16 at record bytes 2-3, i.e. file bytes 26-27 here.
+local p2bytes = seg_bytes(3)
+local first_len = p2bytes:byte(26) * 256 + p2bytes:byte(27)
+write_file(p2, p2bytes:sub(1, 24 + first_len))
+irecs, _, _, iscan, istats = lock_state.scan_all(idirs, nil, INOW, iscan)
+check(
+    istats.rescan and istats.read == 2 and istats.skipped == 0,
+    "incremental: shrunk file forces a clean full rescan"
+)
+check(#irecs == 13, "incremental: rescan reflects the truncated file (12 + 1 records, got " .. #irecs .. ")")
+
+-- Removal: delete p2 → clean full rescan again.
+os.remove(p2)
+irecs, _, _, iscan, istats = lock_state.scan_all(idirs, nil, INOW, iscan)
+check(
+    istats.rescan and #irecs == 12,
+    "incremental: removed file forces a clean full rescan"
+)
+
+-- Garbage at the resume offset (in-place rewrite) → clean full rescan.
+local gfh = assert(io.open(p1, "ab"))
+gfh:write(string.rep("\0", 10))
+gfh:close()
+irecs, _, _, iscan, istats = lock_state.scan_all(idirs, nil, INOW, iscan)
+check(
+    istats.rescan and #irecs == 12,
+    "incremental: invalid bytes at the resume offset force a clean full rescan"
+)
+
+-- Retention bound: records older than the widest queried window (1h) drop.
+local cutoff_now = 1700000005000 + lock_state.RETENTION_MS
+local precs = lock_state.scan_all(idirs, nil, cutoff_now, nil)
+check(
+    #precs == 8,
+    "incremental: retention bound drops records older than 1h (n=5..12 kept, got " .. #precs .. ")"
+)
+
+os.execute("rm -rf " .. ITMP)
 
 if failures > 0 then
     print(failures .. " failure(s)")

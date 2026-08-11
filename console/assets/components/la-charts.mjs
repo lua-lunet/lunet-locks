@@ -43,7 +43,7 @@ class LaCharts extends HTMLElement {
         </div>
       </div>`;
     this._charts = {};
-    this._unsub = store.subscribe(() => this.update());
+    this._unsub = store.subscribe(() => this.update(), ["cluster", "series"]);
     this._ro = new ResizeObserver(() => {
       for (const c of Object.values(this._charts)) c.resize();
     });

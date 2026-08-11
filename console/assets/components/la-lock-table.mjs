@@ -18,6 +18,8 @@ const MIN_COL_PX = 48;
 class LaLockTable extends HTMLElement {
   /** @type {(() => void) | undefined} */
   _unsub;
+  /** @type {(() => void) | undefined} */
+  _unsubTick;
   /** @type {ResizableColumns | undefined} */
   _cols;
   /** Skeleton nodes, memoised by selector on first lookup. @type {Map<string, HTMLElement>} */
@@ -42,14 +44,18 @@ class LaLockTable extends HTMLElement {
       cssVar: "--cols", key: "colWidths",
       defaults: DEFAULT_COLS, min: MIN_COL_PX,
     });
-    this._unsub = store.subscribe(() => this.render());
+    // Full row rebuilds only when the data or the render inputs change; the
+    // 1s `now` tick just refreshes the TTL/held-for text in place.
+    this._unsub = store.subscribe(() => this.render(),
+      ["locks", "selectedId", "watched", "mode", "atText", "tolSec"]);
+    this._unsubTick = store.subscribe(() => this.tick(), ["now"]);
     this.onclick = (e) => {
       const row = e.target instanceof Element ? e.target.closest(".lock-row") : null;
       if (row instanceof HTMLElement) store.set({ selectedId: Number(row.dataset.id) });
     };
     this.render();
   }
-  disconnectedCallback() { this._unsub?.(); this._cols?.dispose(); }
+  disconnectedCallback() { this._unsub?.(); this._unsubTick?.(); this._cols?.dispose(); }
 
   /**
    * Look up one of this component's own skeleton nodes, memoising the result
@@ -66,55 +72,102 @@ class LaLockTable extends HTMLElement {
     return el;
   }
 
+  /**
+   * The `now`-dependent display values for one row, shared by render() and
+   * the 1s tick() so the two never drift.
+   * @param {Lock} l
+   * @param {number} now
+   * @param {number | null} atMs Expiry-mode target, null in other modes.
+   * @returns {{ ttlText: string, ttlColor: string, heldText: string, iconColor: string, urgent: boolean, hot: boolean }}
+   */
+  _timing(l, now, atMs) {
+    const { watched, tolSec } = store.state;
+    // A lock the cluster reports as held but with no expiry recorded has no
+    // remaining lease to render: treat it like the free case for the numeric
+    // columns rather than printing "NaNs".
+    const held = l.state === "held";
+    const timed = held && l.expiresAtMs != null;
+    const rem = timed ? /** @type {number} */ (l.expiresAtMs) - now : 0;
+    const urgent = timed && rem < 12000;
+    const hot = watched.has(l.id) && timed && rem < config.watchWarnMs;
+
+    let ttlText, ttlColor;
+    if (timed && atMs != null) {
+      const d = (/** @type {number} */ (l.expiresAtMs) - atMs) / 1000;
+      ttlText = (d >= 0 ? "+" : "") + d.toFixed(1) + "s";
+      ttlColor = Math.abs(d) < tolSec / 2 ? "var(--color-accent)" : "var(--color-neutral-400)";
+    } else if (timed) {
+      ttlText = fmtDur(rem);
+      ttlColor = urgent ? "var(--color-accent)" : "var(--color-neutral-400)";
+    } else if (held) {
+      ttlText = "—";
+      ttlColor = "var(--color-neutral-400)";
+    } else {
+      ttlText = "free";
+      ttlColor = "var(--color-accent-600)";
+    }
+
+    return {
+      ttlText,
+      ttlColor,
+      heldText: held && l.takenAtMs != null ? fmtDur(now - l.takenAtMs) : "—",
+      iconColor: held ? (urgent ? "var(--color-accent)" : "var(--color-neutral-500)") : "var(--color-accent)",
+      urgent,
+      hot,
+    };
+  }
+
+  /**
+   * The 1s clock tick: update only the time-dependent cells of the existing
+   * rows (TTL, held-for, urgency tint) — the row markup itself is untouched.
+   * @returns {void}
+   */
+  tick() {
+    const { locks, now, mode, atText } = store.state;
+    const atMs = mode === "expiry" ? parseClock(atText, now) : null;
+    const byId = new Map(locks.map((l) => [l.id, l]));
+    for (const row of this.$(".body").children) {
+      if (!(row instanceof HTMLElement) || row.dataset.id === undefined) continue;
+      const l = byId.get(Number(row.dataset.id));
+      if (!l) continue;
+      const t = this._timing(l, now, atMs);
+      const icon = /** @type {HTMLElement} */ (row.children[0]);
+      const ttl = /** @type {HTMLElement} */ (row.children[3]);
+      const heldFor = /** @type {HTMLElement} */ (row.children[4]);
+      icon.style.color = t.iconColor;
+      ttl.textContent = t.ttlText;
+      ttl.style.color = t.ttlColor;
+      heldFor.textContent = t.heldText;
+      row.classList.toggle("watched-hot", t.hot);
+    }
+  }
+
   /** @returns {void} */
   render() {
-    const { locks, now, selectedId, watched, mode, atText, tolSec } = store.state;
+    const { locks, now, selectedId, watched, mode, atText } = store.state;
     const atMs = mode === "expiry" ? parseClock(atText, now) : null;
 
     const rows = locks.map((l) => {
-      // A lock the cluster reports as held but with no expiry recorded has no
-      // remaining lease to render: treat it like the free case for the numeric
-      // columns rather than printing "NaNs".
       const held = l.state === "held";
-      const timed = held && l.expiresAtMs != null;
-      const rem = timed ? /** @type {number} */ (l.expiresAtMs) - now : 0;
-      const urgent = timed && rem < 12000;
+      const t = this._timing(l, now, atMs);
       const cut = l.name.lastIndexOf("/");
       const dir = l.name.slice(0, cut + 1);
       const leaf = l.name.slice(cut + 1);
-      const hot = watched.has(l.id) && timed && rem < config.watchWarnMs;
 
-      let ttlText, ttlColor;
-      if (timed && mode === "expiry" && atMs != null) {
-        const d = (/** @type {number} */ (l.expiresAtMs) - atMs) / 1000;
-        ttlText = (d >= 0 ? "+" : "") + d.toFixed(1) + "s";
-        ttlColor = Math.abs(d) < tolSec / 2 ? "var(--color-accent)" : "var(--color-neutral-400)";
-      } else if (timed) {
-        ttlText = fmtDur(rem);
-        ttlColor = urgent ? "var(--color-accent)" : "var(--color-neutral-400)";
-      } else if (held) {
-        ttlText = "—";
-        ttlColor = "var(--color-neutral-400)";
-      } else {
-        ttlText = "free";
-        ttlColor = "var(--color-accent-600)";
-      }
-
-      const iconColor = held ? (urgent ? "var(--color-accent)" : "var(--color-neutral-500)") : "var(--color-accent)";
       const classes = ["lock-row",
         selectedId === l.id ? "selected" : "",
-        hot ? "watched-hot" : ""].filter(Boolean).join(" ");
+        t.hot ? "watched-hot" : ""].filter(Boolean).join(" ");
 
       return `<div class="${classes}" data-id="${l.id}">
-        <div class="icon" style="color:${iconColor}">${held ? ICONS.lock : ICONS.lockOpen}</div>
+        <div class="icon" style="color:${t.iconColor}">${held ? ICONS.lock : ICONS.lockOpen}</div>
         <div class="name">
           <span class="dir">${esc(dir)}</span><span class="leaf">${esc(leaf)}</span>
           ${watched.has(l.id) ? `<span style="color:var(--color-accent);flex:none">${ICONS.bell}</span>` : ""}
         </div>
         <div class="cell" style="color:${held ? "var(--color-text)" : "var(--color-neutral-600)"}">${esc(held ? l.holder : "—")}</div>
-        <div class="cell" style="color:${ttlColor}">${ttlText}</div>
-        <div class="cell" style="color:var(--color-neutral-500)">${held && l.takenAtMs != null ? fmtDur(now - l.takenAtMs) : "—"}</div>
-        <div class="labels">${l.labels.map((t) => `<span class="tag">${esc(t)}</span>`).join("")}</div>
+        <div class="cell" style="color:${t.ttlColor}">${t.ttlText}</div>
+        <div class="cell" style="color:var(--color-neutral-500)">${t.heldText}</div>
+        <div class="labels">${l.labels.map((x) => `<span class="tag">${esc(x)}</span>`).join("")}</div>
       </div>`;
     }).join("");
 

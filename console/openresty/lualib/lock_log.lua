@@ -228,50 +228,79 @@ local function try_record(data, pos)
     return record, rec_end + 1
 end
 
--- lock_log.read_segment(path) → header, records, warnings.
--- header is { version=, node_id= } or nil when the magic is bad/missing;
--- warnings is an array of human-readable strings (possibly empty).
-function lock_log.read_segment(path)
+-- lock_log.read_segment(path [, offset]) → header, records, warnings,
+-- consumed, status.
+--
+-- offset is the absolute byte count already consumed by a previous read of
+-- the same file (nil/0 = full read, header validated). With offset > 0 the
+-- file is read from that point and the header is not re-checked — sealed
+-- prefixes are immutable, so only the appended tail needs decoding.
+-- consumed is the absolute byte count validly decoded after this call
+-- (header + complete records; a torn tail does not advance it). status is
+-- "ok", or "resume_corrupt" when the byte at offset does not begin a valid
+-- record — the file was rewritten in place and the caller must fall back
+-- to a clean full rescan.
+function lock_log.read_segment(path, offset)
+    offset = offset or 0
     local warnings = {}
     local header = nil
     local records = {}
     local fh, err = io.open(path, "rb")
     if fh == nil then
         warnings[#warnings + 1] = "cannot open " .. path .. ": " .. tostring(err)
-        return header, records, warnings
+        return header, records, warnings, offset, "ok"
+    end
+    if offset > 0 then
+        fh:seek("set", offset)
     end
     local data = fh:read("*a")
     fh:close()
-    if #data < HEADER_SIZE or data:sub(1, 8) ~= "LLOCKTEL" then
-        warnings[#warnings + 1] = path .. ": bad or missing header magic; segment ignored"
-        return header, records, warnings
+    local pos
+    if offset == 0 then
+        if #data < HEADER_SIZE or data:sub(1, 8) ~= "LLOCKTEL" then
+            warnings[#warnings + 1] = path .. ": bad or missing header magic; segment ignored"
+            return header, records, warnings, 0, "ok"
+        end
+        header = {
+            version = u16be(data, 9),
+            node_id = u32be(data, 11),
+        }
+        if header.version ~= VERSION then
+            -- Pre-release format: no v1 compatibility. Reject the segment.
+            warnings[#warnings + 1] = path
+                .. ": unsupported version "
+                .. header.version
+                .. " (expected "
+                .. VERSION
+                .. "); segment ignored"
+            return header, records, warnings, 0, "ok"
+        end
+        pos = HEADER_SIZE + 1
+    else
+        pos = 1
     end
-    header = {
-        version = u16be(data, 9),
-        node_id = u32be(data, 11),
-    }
-    if header.version ~= VERSION then
-        -- Pre-release format: no v1 compatibility. Reject the segment.
-        warnings[#warnings + 1] = path
-            .. ": unsupported version "
-            .. header.version
-            .. " (expected "
-            .. VERSION
-            .. "); segment ignored"
-        return header, records, warnings
-    end
-    local pos = HEADER_SIZE + 1
+    local first = true
     while pos <= #data do
         local record, next_or_why = try_record(data, pos)
         if record ~= nil then
             records[#records + 1] = record
             pos = next_or_why
+            first = false
         elseif next_or_why == "torn" then
             -- Truncated final record (torn tail) is normal: stop quietly.
             break
         else
+            if offset > 0 and first then
+                -- The resume point is not a record boundary: the file was
+                -- rewritten in place, so the retained prefix is suspect.
+                warnings[#warnings + 1] = path
+                    .. ": no valid record at resume offset "
+                    .. offset
+                    .. "; segment needs a full re-read"
+                return header, records, warnings, offset, "resume_corrupt"
+            end
             warnings[#warnings + 1] = string.format(
-                "%s: corrupt record at offset %d; resyncing", path, pos - 1
+                "%s: corrupt record at offset %d; resyncing", path, offset + pos - 1
             )
             -- Scan forward for the next 0x4C that begins a valid record.
             local resumed = false
@@ -286,7 +315,7 @@ function lock_log.read_segment(path)
                         break
                     elseif np == "torn" then
                         -- 0x4C near the end with an incomplete record: torn tail.
-                        return header, records, warnings
+                        return header, records, warnings, offset + scan - 1, "ok"
                     end
                 end
                 scan = scan + 1
@@ -294,9 +323,10 @@ function lock_log.read_segment(path)
             if not resumed then
                 break
             end
+            first = false
         end
     end
-    return header, records, warnings
+    return header, records, warnings, offset + pos - 1, "ok"
 end
 
 -- lock_log.scan(dir [, listdir]) → records concatenated across segments in

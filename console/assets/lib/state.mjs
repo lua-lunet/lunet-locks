@@ -45,6 +45,15 @@ function persist(state) {
   }));
 }
 
+// Keys persist() writes. A patch that touches none of them (the 1s `now`
+// tick, poll payloads like locks/events/cluster/series) skips the
+// JSON.stringify + sessionStorage write entirely (item47).
+/** @type {Set<keyof StoreState>} */
+const PERSISTED_KEYS = new Set([
+  "mode", "query", "tolSec", "atText", "fromText", "toText", "logRangePinned",
+  "watched", "collapsed", "colWidths", "logColWidths", "paneWidths",
+]);
+
 export const store = {
   /** @type {StoreState} */
   state: {
@@ -78,27 +87,39 @@ export const store = {
     toast: "",          // transient status text
     error: "",
   },
-  /** @type {Set<(state: StoreState) => void>} */
-  _listeners: new Set(),
+  /** @type {Map<(state: StoreState) => void, Set<keyof StoreState> | null>} */
+  _listeners: new Map(),
   /**
-   * Merge a patch into the state, persist, then notify every subscriber.
+   * Merge a patch into the state, persist (only when a persisted key
+   * changed), then notify the subscribers whose declared keys intersect the
+   * patch. A `now`-only patch therefore reaches only the components that
+   * subscribed to `now` (TTL countdowns) and never rebuilds a table body.
    * @param {Partial<StoreState>} patch
    * @returns {void}
    */
   set(patch) {
     Object.assign(this.state, patch);
+    const changed = Object.keys(patch);
     // Key names only — the `now` tick fires 1/s and set() runs ~5×/s, so
     // dumping values here would flood the channel.
-    log.finest(`set: ${Object.keys(patch).join(", ")}`, { keys: Object.keys(patch) });
-    persist(this.state);
-    for (const fn of this._listeners) fn(this.state);
+    log.finest(`set: ${changed.join(", ")}`, { keys: changed });
+    if (changed.some((k) => PERSISTED_KEYS.has(/** @type {keyof StoreState} */ (k)))) {
+      persist(this.state);
+    }
+    for (const [fn, keys] of this._listeners) {
+      if (keys === null || changed.some((k) => keys.has(/** @type {keyof StoreState} */ (k)))) {
+        fn(this.state);
+      }
+    }
   },
   /**
    * @param {(state: StoreState) => void} fn
+   * @param {(keyof StoreState)[]} [keys] When given, fn fires only for patches
+   *   touching one of these keys; omitted = every patch (legacy behaviour).
    * @returns {() => void} unsubscribe
    */
-  subscribe(fn) {
-    this._listeners.add(fn);
+  subscribe(fn, keys) {
+    this._listeners.set(fn, keys === undefined ? null : new Set(keys));
     return () => this._listeners.delete(fn);
   },
 };

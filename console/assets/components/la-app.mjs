@@ -181,7 +181,13 @@ class LaApp extends HTMLElement {
 
     this._mode = null;
     this._hadSelection = null;
-    this._unsub = store.subscribe((st) => this.update(st));
+    // Everything update() reads; `now` drives only the clock text and the
+    // watched-hot count, so the 1s tick stays a textContent touch.
+    this._unsub = store.subscribe((st) => this.update(st), [
+      "mode", "cluster", "locksAll", "locks", "events", "now",
+      "logRangePinned", "fromText", "toText", "watched", "selectedId",
+      "error", "toast",
+    ]);
     this.update(s);
   }
   disconnectedCallback() { this._unsub?.(); this._panes?.dispose(); }

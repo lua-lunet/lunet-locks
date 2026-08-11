@@ -39,7 +39,7 @@ class LaLogView extends HTMLElement {
       cssVar: "--log-cols", key: "logColWidths",
       defaults: DEFAULT_LOG_COLS, min: MIN_COL_PX,
     });
-    this._unsub = store.subscribe(() => this.render());
+    this._unsub = store.subscribe(() => this.render(), ["events"]);
     this.render();
   }
   disconnectedCallback() { this._unsub?.(); this._cols?.dispose(); }

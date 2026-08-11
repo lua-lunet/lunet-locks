@@ -10,11 +10,15 @@
 --
 -- Caching: scan results are cached module-level per state with a ~1s TTL
 -- (state.cache = {ms, records, seg_count, seg_bytes}); simpler than
--- serializing into ngx.shared and plenty for a console. The shared dict
--- itself is only used for counters/gauges, behind a tiny interface
--- (dict:incr(key, delta, init), dict:set(key, value)) so tests inject a
--- plain-table fake. Counters: req:<route> per endpoint; gauges:
--- scan:last_ms, scan:segments, scan:segment_bytes.
+-- serializing into ngx.shared and plenty for a console. The scan itself is
+-- incremental (item47): lock_state.scan_all retains {path → {size, offset}}
+-- plus the merged node-tagged records in state.scan, so a refresh decodes
+-- only new segments and grown tails — a shrink/removal forces a clean full
+-- rescan. The shared dict itself is only used for counters/gauges, behind a
+-- tiny interface (dict:incr(key, delta, init), dict:set(key, value)) so
+-- tests inject a plain-table fake. Counters: req:<route> per endpoint;
+-- scan:segments_read / scan:segments_skipped / scan:full_rescans per
+-- refresh. Gauges: scan:last_ms, scan:segments, scan:segment_bytes.
 --
 -- setup(config): config = {
 --   cluster_json_path      = path to cluster.json (item30 writes it; a
@@ -69,6 +73,7 @@ function handlers.setup(config)
         listdir = config.listdir,
         break_exec = config.break_exec, -- (state, lock_id, now_ms) → status, body
         cache = nil,
+        scan = nil, -- incremental scan state (item47), owned by lock_state.scan_all
     }
 end
 
@@ -106,13 +111,27 @@ local function refresh_scan(state, now_ms)
     if cache ~= nil and now_ms - cache.ms < CACHE_TTL_MS then
         return cache.records
     end
-    local records, seg_count, seg_bytes =
-        lock_state.scan_all(state.telemetry_dirs_by_node, state.listdir)
+    local records, seg_count, seg_bytes, scan, stats =
+        lock_state.scan_all(state.telemetry_dirs_by_node, state.listdir, now_ms, state.scan)
+    state.scan = scan
     state.cache = { ms = now_ms, records = records, seg_count = seg_count, seg_bytes = seg_bytes }
     state.dict:set("scan:last_ms", now_ms)
     state.dict:set("scan:segments", seg_count)
     state.dict:set("scan:segment_bytes", seg_bytes)
+    -- Incremental-scan observability: steady state reads ~1 grown tail and
+    -- skips the sealed rest, so read should stay ≪ skipped.
+    state.dict:incr("scan:segments_read", stats.read, 0)
+    state.dict:incr("scan:segments_skipped", stats.skipped, 0)
+    state.dict:incr("scan:full_rescans", stats.rescan and 1 or 0, 0)
     return records
+end
+
+-- Force a scan past the TTL (break). With the incremental scan state
+-- retained in state.scan this costs a tail re-read of the grown
+-- segment(s), never a full re-decode.
+local function force_scan(state, now_ms)
+    state.cache = nil
+    return refresh_scan(state, now_ms)
 end
 
 local function num(v, default)
@@ -137,12 +156,24 @@ function handlers.handle(state, req)
 
     if path == "/api/v1/cluster" then
         dict:incr("req:cluster", 1, 0)
+        -- One shared scan for the whole cluster (item47): records are
+        -- tagged with their owning node by scan_all, so per-node stats are
+        -- derived here instead of re-scanning each node's dir.
+        local records = refresh_scan(state, now_ms)
+        local segs = state.scan.segs
         local nodes = {}
         for _, id in ipairs(read_cluster_nodes(state.cluster_json_path)) do
             local dir = state.telemetry_dirs_by_node[id]
             local stats
             if dir ~= nil then
-                stats = lock_state.node_stats(dir, now_ms, RATE_WINDOW_MS, state.listdir)
+                local mine = {}
+                for _, r in ipairs(records) do
+                    if r.node == id then
+                        mine[#mine + 1] = r
+                    end
+                end
+                local inv = segs[id] or { count = 0, bytes = 0 }
+                stats = lock_state.node_stats(mine, inv.count, inv.bytes, now_ms, RATE_WINDOW_MS)
             else
                 stats = {
                     locksHeld = 0,
@@ -331,15 +362,15 @@ function handlers.ngx_break_exec()
         end
         if not reply.broken then
             -- Mirror the mock: unknown lock → 404, known-but-free → 409.
-            state.cache = nil
-            local records = refresh_scan(state, now_ms)
+            local records = force_scan(state, now_ms)
             if lock_state.reduce(records, now_ms).locks[lock_id] == nil then
                 return 404, { error = "no such lock" }
             end
             return 409, { error = "lock is not held" }
         end
-        state.cache = nil -- force rescan so the break is reflected if visible
-        local records = refresh_scan(state, now_ms)
+        -- Force the break to be reflected if visible; incremental scan
+        -- state makes this a tail re-read, not a full rescan.
+        local records = force_scan(state, now_ms)
         local lock = lock_state.reduce(records, now_ms).locks[lock_id]
         if lock == nil or lock.state == "held" then
             -- Rescan lags the leader; synthesize from the break reply.
@@ -364,6 +395,7 @@ function handlers.ngx_break_exec()
             }
         end
         local event = {
+            seq = 0,
             tsMs = now_ms,
             kind = "break",
             lockId = lock_id,
@@ -380,6 +412,22 @@ end
 -- the tests never load it).
 local function encode_json(body)
     local cjson = require("cjson.safe")
+    local function normalize_event_actor(event)
+        if event ~= nil and event.actor == nil then
+            event.actor = cjson.null
+        end
+    end
+    normalize_event_actor(body.event)
+    if body.events ~= nil then
+        for _, event in ipairs(body.events) do
+            normalize_event_actor(event)
+        end
+    end
+    if body.recentEvents ~= nil then
+        for _, event in ipairs(body.recentEvents) do
+            normalize_event_actor(event)
+        end
+    end
     return cjson.encode(body)
 end
 

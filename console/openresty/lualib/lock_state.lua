@@ -143,8 +143,10 @@ function lock_state.reduce(records, now_ms)
             free_lock(lock)
         end
         -- kind 7 (deny): event only, no state change. break records no
-        -- breaker in the core, so its actor is always null; release echoes
+        -- breaker in the core, so its actor is always nil; release echoes
         -- no holder in the record, so fall back to the incumbent.
+        -- nil actor values are converted to cjson.null by the handlers
+        -- encoder so the field is always present in JSON output.
         local actor = rec.holder
         if rec.kind == 6 then
             actor = nil
@@ -257,17 +259,14 @@ function lock_state.series(records, from_ms, to_ms, bucket_ms)
     return buckets
 end
 
--- Per-node stats for /cluster, derived from one node's segment dir.
--- Returns segmentCount, segmentBytes, locksHeld (latest held_gauge),
--- per-kind rates over the trailing `window_ms` ending at now_ms, and
--- lastRecordMs (nil when the node has no records).
-function lock_state.node_stats(dir, now_ms, window_ms, listdir)
-    local segs = lock_log.list_segments(dir, listdir)
-    local bytes = 0
-    for _, seg in ipairs(segs) do
-        bytes = bytes + seg.size
-    end
-    local records = lock_log.scan(dir, listdir)
+-- Per-node stats for /cluster, derived from one node's slice of the single
+-- shared scan (item47: /cluster must not re-scan per node). `records` holds
+-- only this node's records (tagged r.node by scan_all); seg_count/seg_bytes
+-- come from scan_all's per-node inventory. Returns segmentCount,
+-- segmentBytes, locksHeld (latest held_gauge), per-kind rates over the
+-- trailing `window_ms` ending at now_ms, and lastRecordMs (nil when the
+-- node has no records).
+function lock_state.node_stats(records, seg_count, seg_bytes, now_ms, window_ms)
     local cutoff = now_ms - window_ms
     local counts = { acquire = 0, renew = 0, release = 0, cas = 0, expire = 0, ["break"] = 0, deny = 0 }
     local held = 0
@@ -295,33 +294,152 @@ function lock_state.node_stats(dir, now_ms, window_ms, listdir)
         breakPerSec = rate(counts["break"]),
         denyPerSec = rate(counts.deny),
         expirePerSec = rate(counts.expire),
-        segmentCount = #segs,
-        segmentBytes = bytes,
+        segmentCount = seg_count,
+        segmentBytes = seg_bytes,
         lastRecordMs = last_ms,
     }
 end
 
--- Scan all configured dirs and return records merged in ts order (stable),
--- plus the per-dir segment inventory {count, bytes} for the shared-dict
--- gauges.
-function lock_state.scan_all(dirs_by_node, listdir)
-    local all = {}
+-- How long scan_all retains decoded records. The widest window any endpoint
+-- queries is /metrics/series' trailing hour (fromMs defaults to
+-- now-3600000, matched by the frontend's historyWindowMs), so records older
+-- than that cannot appear in any response; dropping them on refresh bounds
+-- memory. /events is limit-capped to the newest 1000 and /locks reflects
+-- live leases (constantly renewed), so neither needs older history.
+lock_state.RETENTION_MS = 3600000
+
+-- scan_all(dirs_by_node, listdir, now_ms, scan) → records, seg_count,
+-- seg_bytes, scan, stats.
+--
+-- Incremental (item47): `scan` — pass nil on the first call, the returned
+-- value after — remembers
+--   files   = path → { size, offset, node }   (offset = bytes consumed)
+--   records = retained, ts-sorted, node-tagged record set
+--   segs    = node → { count, bytes }         (recomputed every call)
+-- Sealed segments are immutable, so a segment whose size is unchanged is
+-- skipped without being opened; only new files and grown tails are decoded,
+-- and a grown tail is read from the remembered offset, not from byte 0.
+-- Invalidation: a file that shrank or vanished (history reclamation is an
+-- admin task), or a grown tail whose resume offset does not begin a valid
+-- record (in-place rewrite), invalidates the whole snapshot — stats.rescan
+-- is true and every segment is cleanly re-read, never silently corrupted.
+-- stats = { read=, skipped=, rescan= } feeds the ngx.shared counters.
+function lock_state.scan_all(dirs_by_node, listdir, now_ms, scan)
+    scan = scan or {}
+    scan.files = scan.files or {}
+    scan.records = scan.records or {}
+
+    -- Inventory every dir first, so a removal anywhere is detected before
+    -- any incremental decision is made.
+    local present = {} -- path → seg entry, annotated with .owner (dirs key)
+    local segs = {}
     local seg_count = 0
     local seg_bytes = 0
-    for _, dir in pairs(dirs_by_node or {}) do
+    for node, dir in pairs(dirs_by_node or {}) do
+        local inv = { count = 0, bytes = 0 }
         for _, seg in ipairs(lock_log.list_segments(dir, listdir)) do
-            seg_count = seg_count + 1
-            seg_bytes = seg_bytes + seg.size
+            seg.owner = node
+            inv.count = inv.count + 1
+            inv.bytes = inv.bytes + seg.size
+            present[seg.path] = seg
         end
-        local records = lock_log.scan(dir, listdir)
-        for _, r in ipairs(records) do
-            all[#all + 1] = r
+        segs[node] = inv
+        seg_count = seg_count + inv.count
+        seg_bytes = seg_bytes + inv.bytes
+    end
+    scan.segs = segs
+
+    -- A removed or shrunk file invalidates the retained snapshot.
+    local rescan = false
+    for path, f in pairs(scan.files) do
+        local seg = present[path]
+        if seg == nil or seg.size < f.size then
+            rescan = true
+            break
         end
     end
-    table.sort(all, function(a, b)
-        return a.ts_ms < b.ts_ms
-    end)
-    return all, seg_count, seg_bytes
+    if rescan then
+        scan.files = {}
+        scan.records = {}
+    end
+
+    local stats = { read = 0, skipped = 0, rescan = rescan }
+    local function read_full(path, seg, out)
+        stats.read = stats.read + 1
+        local _, records, _, consumed = lock_log.read_segment(path, 0)
+        scan.files[path] = { size = seg.size, offset = consumed, node = seg.owner }
+        for _, r in ipairs(records) do
+            r.node = seg.owner
+            out[#out + 1] = r
+        end
+    end
+
+    local fresh = {}
+    if rescan then
+        for path, seg in pairs(present) do
+            read_full(path, seg, fresh)
+        end
+    else
+        local corrupt = false
+        for path, seg in pairs(present) do
+            local f = scan.files[path]
+            if f ~= nil and f.size == seg.size then
+                stats.skipped = stats.skipped + 1
+            else
+                local offset = f ~= nil and f.offset or 0
+                local _, records, _, consumed, status = lock_log.read_segment(path, offset)
+                if status == "resume_corrupt" then
+                    corrupt = true
+                    break
+                end
+                stats.read = stats.read + 1
+                scan.files[path] = { size = seg.size, offset = consumed, node = seg.owner }
+                for _, r in ipairs(records) do
+                    r.node = seg.owner
+                    fresh[#fresh + 1] = r
+                end
+            end
+        end
+        if corrupt then
+            -- In-place rewrite: wipe and re-read everything cleanly.
+            stats.rescan = true
+            stats.read = 0
+            stats.skipped = 0
+            scan.files = {}
+            scan.records = {}
+            fresh = {}
+            for path, seg in pairs(present) do
+                read_full(path, seg, fresh)
+            end
+        end
+    end
+
+    if #fresh > 0 then
+        local all = scan.records
+        for _, r in ipairs(fresh) do
+            all[#all + 1] = r
+        end
+        table.sort(all, function(a, b)
+            return a.ts_ms < b.ts_ms
+        end)
+    end
+    if now_ms ~= nil then
+        -- Retention bound: drop records older than the widest queried
+        -- window so the retained set does not grow without limit.
+        local cutoff = now_ms - lock_state.RETENTION_MS
+        local all = scan.records
+        local kept = 0
+        for i = 1, #all do
+            if all[i].ts_ms >= cutoff then
+                kept = kept + 1
+                all[kept] = all[i]
+            end
+        end
+        for i = kept + 1, #all do
+            all[i] = nil
+        end
+    end
+    return scan.records, seg_count, seg_bytes, scan, stats
 end
 
 return lock_state
