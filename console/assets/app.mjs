@@ -10,6 +10,7 @@ import "./components/la-detail.mjs";
 import "./components/la-break-dialog.mjs";
 import "./components/la-charts.mjs";
 import "./components/la-log-view.mjs";
+import "./components/la-debug-panel.mjs";
 import "./components/la-app.mjs";
 
 import { store, config } from "./lib/state.mjs";

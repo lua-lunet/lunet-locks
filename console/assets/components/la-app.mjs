@@ -6,6 +6,7 @@
 import { store, config } from "../lib/state.mjs";
 import { fmtClock, parseClock, debounce, ICONS } from "../lib/util.mjs";
 import { resizableColumns } from "../lib/resizable.mjs";
+import { isDebugOpen, setDebugOpen } from "./la-debug-panel.mjs";
 
 /** @typedef {import("../lib/types.mjs").ClusterNode} ClusterNode */
 /** @typedef {import("../lib/types.mjs").Lock} Lock */
@@ -69,6 +70,8 @@ class LaApp extends HTMLElement {
         </div>
         <span class="watch-badge" id="la-watch"></span>
         <span class="clock" id="la-clock"></span>
+        <button class="btn btn-ghost" id="la-debug-toggle"
+                title="Toggle the debug log dock">debug</button>
       </header>
       <div class="shell" id="la-shell">
         <la-tree></la-tree>
@@ -150,6 +153,31 @@ class LaApp extends HTMLElement {
       fromText: fmtClock(Date.now() - config.logDefaultWindowMs),
       toText: fmtClock(Date.now()),
     });
+
+    // Debug dock: a quiet header toggle mounts/unmounts <la-debug-panel>.
+    // The panel is position:fixed (out of flow), so it never participates in
+    // the .shell grid and cannot disturb the pane-divider tracks; mounting it
+    // under .app is safe for the same reason. `?debug=1` (or =0) forces the
+    // initial state, then sessionStorage owns it across F5.
+    const dbgToggle = /** @type {HTMLButtonElement} */ (this.$("la-debug-toggle"));
+    const syncDebug = () => {
+      const open = isDebugOpen();
+      dbgToggle.classList.toggle("active", open);
+      const existing = this.querySelector("la-debug-panel");
+      if (open && !existing) {
+        const app = /** @type {HTMLElement} */ (this.$("la-shell").parentElement);
+        app.appendChild(document.createElement("la-debug-panel"));
+      } else if (!open && existing) {
+        existing.remove(); // disconnectedCallback terminates the worker
+      }
+    };
+    const dbgParam = new URLSearchParams(location.search).get("debug");
+    if (dbgParam !== null) setDebugOpen(dbgParam !== "0" && dbgParam !== "false");
+    dbgToggle.onclick = () => {
+      setDebugOpen(!isDebugOpen());
+      syncDebug();
+    };
+    syncDebug();
 
     this._mode = null;
     this._hadSelection = null;
