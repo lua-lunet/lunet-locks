@@ -53,13 +53,21 @@ class LaCharts extends HTMLElement {
     const { cluster, series } = store.state;
 
     if (cluster) {
-      const held = (cluster.nodes ?? []).reduce((n, x) => n + x.locksHeld, 0);
-      const acquirePerSec = (cluster.nodes ?? []).reduce((n, x) => n + x.acquirePerSec, 0);
+      const nodes = cluster.nodes ?? [];
+      const sum = (k) => nodes.reduce((n, x) => n + (x[k] ?? 0), 0);
+      const segBytes = sum("segmentBytes");
+      const fmtBytes = (b) =>
+        b >= 1048576 ? (b / 1048576).toFixed(1) + " MiB" : b >= 1024 ? (b / 1024).toFixed(1) + " KiB" : b + " B";
+      const perNode = nodes.map((x) =>
+        `<span>${esc(x.id)} <b>${x.locksHeld}</b> held · ${(x.acquirePerSec ?? 0).toFixed(2)}/s acq · ${x.segmentCount ?? 0} seg</span>`
+      ).join("");
       this.querySelector(".cluster-summary").innerHTML =
-        `<span>leader <b>${esc(cluster.leaderId)}</b></span>` +
-        `<span>term <b>${cluster.term}</b></span>` +
-        `<span>held <b>${held}</b></span>` +
-        `<span>acquire/s <b>${acquirePerSec.toFixed(2)}</b></span>`;
+        `<span>nodes <b>${nodes.length}</b></span>` +
+        `<span>held <b>${sum("locksHeld")}</b></span>` +
+        `<span>acquire/s <b>${sum("acquirePerSec").toFixed(2)}</b></span>` +
+        `<span>renew/s <b>${sum("renewPerSec").toFixed(2)}</b></span>` +
+        `<span>segments <b>${sum("segmentCount")} (${fmtBytes(segBytes)})</b></span>` +
+        perNode;
     }
 
     if (!window.echarts) {

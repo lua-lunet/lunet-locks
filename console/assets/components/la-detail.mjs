@@ -31,13 +31,11 @@ class LaDetail extends HTMLElement {
 
     const kv = [
       ["holder", held ? esc(l.holder) : "—", held ? "var(--color-text)" : "var(--color-neutral-600)"],
-      ["session", held ? esc(l.session) : "—", ""],
       ["fence", String(l.fencingToken), ""],
       ["expires", held ? `${fmtClock(l.expiresAtMs)} (in ${fmtDur(l.expiresAtMs - now)})` : "free",
         held && l.expiresAtMs - now < 12000 ? "var(--color-accent)" : ""],
       ["taken at", held ? `${fmtClock(l.takenAtMs)} (${fmtDur(now - l.takenAtMs)} ago)` : "—", ""],
       ["renewals", held ? `${l.renewCount} × ${Math.round(l.leaseMs / 1000)}s` : "—", ""],
-      ["holder changes", `${l.holderChanges} since boot`, ""],
     ].map(([k, v, c]) => `<span class="k">${k}</span><span${c ? ` style="color:${c}"` : ""}>${v}</span>`).join("");
 
     const events = (detail.recentEvents ?? []).map((e) =>

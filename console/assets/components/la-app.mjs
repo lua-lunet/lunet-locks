@@ -112,9 +112,10 @@ class LaApp extends HTMLElement {
 
     const c = st.cluster;
     if (c) {
-      this.$("la-leader").textContent = `${c.leaderId} leader · term ${c.term}`;
+      this.$("la-leader").textContent = `${c.nodes.length} nodes`;
       const held = st.locksAll.filter((l) => l.state === "held").length;
-      this.$("la-quorum").textContent = `· ${c.nodes.length}/${c.nodes.length} · ${held} held`;
+      const segCount = c.nodes.reduce((n, x) => n + (x.segmentCount ?? 0), 0);
+      this.$("la-quorum").textContent = `· ${held} held · ${segCount} segments`;
     }
     this.$("la-clock").textContent = fmtClock(st.now);
 
