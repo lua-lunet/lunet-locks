@@ -10,7 +10,7 @@ WORKLOAD ?= on
 LUALIB_LUA := $(wildcard openresty/lualib/*.lua)
 TEST_LUA   := $(wildcard tests/*.lua)
 
-.PHONY: init up down status logs check clean
+.PHONY: init up down status logs types check clean
 
 init:
 	@ls ../.rocks/share/lua/5.1/tl.lua >/dev/null 2>&1 || { \
@@ -33,7 +33,14 @@ status:
 logs:
 	@tail -n 40 -f tmp/n1.log tmp/n2.log tmp/n3.log tmp/nginx-error.log 2>/dev/null
 
+# Type-check the SPA from its JSDoc. No package.json, no node_modules, no
+# build step: tsc only reads (noEmit) and the .mjs files ship as-is. Fast
+# enough to run on its own as an inner loop.
+types:
+	tsc -p tsconfig.json
+
 check: init
+	tsc -p tsconfig.json
 	shellcheck bin/*.sh
 	@LUA_PATH="../.rocks/share/lua/5.1/?.lua;../.rocks/share/lua/5.1/?/init.lua;;" \
 		../.rocks/bin/tl check tooling/lib/consolectl.tl

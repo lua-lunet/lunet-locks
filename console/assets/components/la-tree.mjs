@@ -6,13 +6,18 @@ import { store } from "../lib/state.mjs";
 import { esc } from "../lib/util.mjs";
 
 class LaTree extends HTMLElement {
+  /** @type {(() => void) | undefined} */
+  _unsub;
+
   connectedCallback() {
     this._unsub = store.subscribe(() => this.render());
     this.onclick = (e) => {
-      const row = e.target.closest(".tree-row");
-      if (!row) return;
+      const target = e.target instanceof Element ? e.target : null;
+      const row = target?.closest(".tree-row");
+      if (!(row instanceof HTMLElement)) return;
       const prefix = row.dataset.prefix;
-      if (e.target.closest(".caret")) {
+      if (prefix === undefined) return;
+      if (target?.closest(".caret")) {
         const collapsed = new Set(store.state.collapsed);
         if (collapsed.has(prefix)) collapsed.delete(prefix); else collapsed.add(prefix);
         store.set({ collapsed });
@@ -25,8 +30,10 @@ class LaTree extends HTMLElement {
   }
   disconnectedCallback() { this._unsub?.(); }
 
+  /** @returns {void} */
   render() {
     const { locksAll, query, collapsed } = store.state;
+    /** @type {Map<string, number>} */
     const counts = new Map(); // dir prefix -> lock count
     for (const l of locksAll) {
       const parts = l.name.split("/").filter(Boolean);
@@ -36,6 +43,7 @@ class LaTree extends HTMLElement {
       }
     }
     const keys = [...counts.keys()].sort();
+    /** @param {string} k */
     const childrenOf = (k) => keys.some((o) => o !== k && o.startsWith(k + "/"));
     const active = query.trim();
 
@@ -50,9 +58,12 @@ class LaTree extends HTMLElement {
       if (hidden) continue;
       const hasKids = childrenOf(k);
       const isActive = active === k;
+      // Keys always start with "/" and are non-empty, so the last segment is
+      // the label; `?? k` keeps the row readable if that ever stops holding.
+      const label = k.split("/").pop() ?? k;
       html += `<div class="tree-row${isActive ? " active" : ""}" data-prefix="${esc(k)}" style="padding-left:${8 + depth * 12}px">
         <span class="caret${collapsed.has(k) ? "" : " open"}">${hasKids ? "▸" : ""}</span>
-        <span class="label">${esc(k.split("/").pop())}</span>
+        <span class="label">${esc(label)}</span>
         <span class="count">${counts.get(k)}</span>
       </div>`;
     }

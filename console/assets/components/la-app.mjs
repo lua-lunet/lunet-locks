@@ -6,6 +6,12 @@
 import { store, config } from "../lib/state.mjs";
 import { fmtClock, parseClock, debounce, ICONS } from "../lib/util.mjs";
 
+/** @typedef {import("../lib/types.mjs").ClusterNode} ClusterNode */
+/** @typedef {import("../lib/types.mjs").Lock} Lock */
+/** @typedef {import("../lib/types.mjs").StoreState} StoreState */
+/** @typedef {import("../lib/types.mjs").ViewMode} ViewMode */
+
+/** @type {[ViewMode, string][]} */
 const MODES = [
   ["locks", "Locks"],
   ["expiry", "Expiry window"],
@@ -13,9 +19,17 @@ const MODES = [
   ["log", "Log"],
 ];
 
+/** @type {Record<ViewMode, string>} */
 const VIEW_TAG = { locks: "la-lock-table", expiry: "la-lock-table", telemetry: "la-charts", log: "la-log-view" };
 
 class LaApp extends HTMLElement {
+  /** @type {(() => void) | undefined} */
+  _unsub;
+  /** @type {ViewMode | null} */
+  _mode = null;
+  /** Skeleton nodes, memoised by id on first lookup. @type {Map<string, HTMLElement>} */
+  _refs = new Map();
+
   connectedCallback() {
     const s = store.state;
     this.innerHTML = `<div class="app">
@@ -64,29 +78,38 @@ class LaApp extends HTMLElement {
       <la-break-dialog></la-break-dialog>
     </div>`;
 
-    this.$ = (id) => this.querySelector("#" + id);
+    // The skeleton above is this component's own markup, so a missing id is a
+    // programming error, not a runtime condition — $() throws rather than
+    // silently no-oping the way `querySelector(...)?.textContent =` would.
+    this._refs.clear();
 
     // control wiring (values come from persisted state)
-    const search = this.$("la-search");
+    const search = /** @type {HTMLInputElement} */ (this.$("la-search"));
     search.value = s.query;
     search.oninput = debounce(() => store.set({ query: search.value }), 250);
 
     for (const radio of this.querySelectorAll("input[name=mode]")) {
-      radio.checked = radio.value === s.mode;
-      radio.onchange = () => {
-        const patch = { mode: radio.value, selectedId: null, detail: null };
+      const input = /** @type {HTMLInputElement} */ (radio);
+      input.checked = input.value === s.mode;
+      input.onchange = () => {
+        const mode = /** @type {ViewMode} */ (input.value);
+        /** @type {Partial<StoreState>} */
+        const patch = { mode, selectedId: null, detail: null };
         // A stale (past) expiry target shows an empty table; re-arm it.
-        if (radio.value === "expiry") {
+        if (mode === "expiry") {
           const atMs = parseClock(store.state.atText, Date.now());
           if (atMs === null || atMs < Date.now()) {
             patch.atText = fmtClock(Date.now() + config.expiryDefaultOffsetMs);
-            this.$("la-at").value = patch.atText;
+            at.value = patch.atText;
           }
         }
         store.set(patch);
       };
     }
-    const at = this.$("la-at"), tol = this.$("la-tol"), from = this.$("la-from"), to = this.$("la-to");
+    const at = /** @type {HTMLInputElement} */ (this.$("la-at"));
+    const tol = /** @type {HTMLSelectElement} */ (this.$("la-tol"));
+    const from = /** @type {HTMLInputElement} */ (this.$("la-from"));
+    const to = /** @type {HTMLInputElement} */ (this.$("la-to"));
     at.value = s.atText;
     at.onchange = () => store.set({ atText: at.value });
     tol.value = String(s.tolSec);
@@ -102,6 +125,25 @@ class LaApp extends HTMLElement {
   }
   disconnectedCallback() { this._unsub?.(); }
 
+  /**
+   * Look up one of this component's own skeleton nodes by id, memoising the
+   * result so the 1s tick does not re-query the DOM.
+   * @param {string} id
+   * @returns {HTMLElement}
+   */
+  $(id) {
+    const cached = this._refs.get(id);
+    if (cached) return cached;
+    const el = this.querySelector("#" + id);
+    if (!(el instanceof HTMLElement)) throw new Error(`la-app: missing #${id}`);
+    this._refs.set(id, el);
+    return el;
+  }
+
+  /**
+   * @param {StoreState} st
+   * @returns {void}
+   */
   update(st) {
     if (st.mode !== this._mode) {
       this._mode = st.mode;
@@ -119,8 +161,11 @@ class LaApp extends HTMLElement {
     }
     this.$("la-clock").textContent = fmtClock(st.now);
 
+    // A held lock with no expiresAtMs cannot be "expiring soon", so it must
+    // not count as hot: NaN comparisons are false, but the intent is explicit.
     const hot = st.locksAll.filter((l) =>
-      st.watched.has(l.id) && l.state === "held" && l.expiresAtMs - st.now < config.watchWarnMs).length;
+      st.watched.has(l.id) && l.state === "held"
+      && l.expiresAtMs != null && l.expiresAtMs - st.now < config.watchWarnMs).length;
     this.$("la-watch").innerHTML = st.watched.size
       ? `${st.watched.size} watched${hot ? ` <span class="hot">· ${hot} expiring</span>` : ""}`
       : "";

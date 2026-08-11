@@ -14,14 +14,25 @@ import { api } from "./lib/api.mjs";
 import { db } from "./lib/db.mjs";
 import { parseClock } from "./lib/util.mjs";
 
+/** @typedef {import("./lib/types.mjs").Bucket} Bucket */
+/** @typedef {import("./lib/types.mjs").HttpError} HttpError */
+/** @typedef {import("./lib/types.mjs").LocksParams} LocksParams */
+
 // Failure bookkeeping: any failing poller surfaces on the status bar, and
 // the message clears once every poller succeeds again.
+/** @type {Set<string>} */
 const failures = new Set();
+/**
+ * @param {string} name Poller name, shown in the status bar.
+ * @param {unknown} err Falsy clears the poller's failure flag.
+ * @returns {void}
+ */
 function report(name, err) {
   if (err) failures.add(name); else failures.delete(name);
   store.set({ error: failures.size ? `api unreachable: ${[...failures].join(", ")}` : "" });
 }
 
+/** @returns {Promise<void>} */
 async function refreshCluster() {
   try {
     const cluster = await api.cluster();
@@ -30,6 +41,7 @@ async function refreshCluster() {
   } catch (e) { report("cluster", e); }
 }
 
+/** @returns {Promise<void>} */
 async function refreshLocksAll() {
   try {
     const r = await api.locks({});
@@ -38,8 +50,10 @@ async function refreshLocksAll() {
   } catch (e) { report("locks", e); }
 }
 
+/** @returns {Promise<void>} */
 async function refreshLocks() {
   const st = store.state;
+  /** @type {LocksParams} */
   const params = { q: st.query };
   if (st.mode === "expiry") {
     const at = parseClock(st.atText, Date.now());
@@ -55,6 +69,7 @@ async function refreshLocks() {
   } catch (e) { report("locks", e); }
 }
 
+/** @returns {Promise<void>} */
 async function refreshDetail() {
   const id = store.state.selectedId;
   if (id === null) return;
@@ -63,10 +78,11 @@ async function refreshDetail() {
     store.set({ detail });
   } catch (e) {
     // Only a genuine 404 drops the selection; transient failures keep it.
-    if (e.status === 404) store.set({ selectedId: null, detail: null });
+    if (/** @type {HttpError} */ (e).status === 404) store.set({ selectedId: null, detail: null });
   }
 }
 
+/** @returns {Promise<void>} */
 async function refreshEvents() {
   const st = store.state;
   if (st.mode !== "log") { report("events", null); return; }
@@ -80,6 +96,7 @@ async function refreshEvents() {
   } catch (e) { report("events", e); }
 }
 
+/** @returns {Promise<void>} */
 async function refreshSeries() {
   const st = store.state;
   if (st.mode !== "telemetry") { report("series", null); return; }
@@ -88,7 +105,9 @@ async function refreshSeries() {
     const r = await api.series({ fromMs, toMs: Date.now(), bucketMs: config.telemetryBucketMs });
     db.cacheBuckets(r.buckets).catch(() => {});
     // Cached history fills any gap before the mock's own memory.
+    /** @type {Bucket[]} */
     const cached = await db.readBuckets(fromMs).catch(() => []);
+    /** @type {Map<number, Bucket>} */
     const merged = new Map(cached.map((b) => [b.tsMs, b]));
     for (const b of r.buckets) merged.set(b.tsMs, b);
     const buckets = [...merged.values()].sort((a, b) => a.tsMs - b.tsMs);
@@ -97,6 +116,7 @@ async function refreshSeries() {
   } catch (e) { report("series", e); }
 }
 
+/** @returns {Promise<void>} */
 async function cacheTail() {
   // Keep the local append-only mirror warm regardless of the current view.
   const r = await api.events({ fromMs: Date.now() - 15 * 60e3, limit: 1000 }).catch(() => null);
@@ -112,7 +132,13 @@ window.addEventListener("la:refresh", () => {
 
 // In-flight guards: a slow tick skips the next one rather than piling up
 // requests that could resolve out of order.
+/** @type {Set<string>} */
 const pending = new Set();
+/**
+ * @param {string} name
+ * @param {() => Promise<void>} fn
+ * @returns {void}
+ */
 function guard(name, fn) {
   if (pending.has(name)) return;
   pending.add(name);
