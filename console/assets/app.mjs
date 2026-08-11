@@ -11,6 +11,9 @@ import "./components/la-break-dialog.mjs";
 import "./components/la-charts.mjs";
 import "./components/la-log-view.mjs";
 import "./components/la-debug-panel.mjs";
+// The test harness registers its "la:run-tests" listener at module scope;
+// importing it here (not from the panel) keeps the panel usable standalone.
+import "./components/la-test-harness.mjs";
 import "./components/la-app.mjs";
 
 import { store, config } from "./lib/state.mjs";

@@ -75,6 +75,8 @@ class LaDebugPanel extends HTMLElement {
   _worker;
   /** @type {HTMLElement | undefined} */
   _stream;
+  /** @type {((e: Event) => void) | undefined} */
+  _onSummary;
   _pinned = true;
 
   connectedCallback() {
@@ -138,10 +140,20 @@ class LaDebugPanel extends HTMLElement {
     };
     // item46 listens for this and preventDefault()s it to claim the run.
     runBtn.onclick = () => {
+      runBtn.textContent = "run tests";
+      runBtn.style.color = "";
       const ev = new CustomEvent("la:run-tests", { cancelable: true });
       const unclaimed = window.dispatchEvent(ev);
       if (unclaimed) log.warning("test harness not loaded", { event: "la:run-tests" });
     };
+    // The harness answers with the run summary; pin it on the button (pass
+    // green / fail red) until the next click.
+    this._onSummary = (e) => {
+      const s = /** @type {CustomEvent<{ passed: number, failed: number, ms: number }>} */ (e).detail;
+      runBtn.textContent = s.failed > 0 ? `${s.failed} failed` : `${s.passed} passed`;
+      runBtn.style.color = s.failed > 0 ? "#e06a6a" : "var(--color-accent)";
+    };
+    window.addEventListener("la:test-summary", this._onSummary);
 
     // Pin bookkeeping: appends only auto-scroll while the user is at the
     // bottom; scrolling up suspends the pin until they return.
@@ -153,6 +165,8 @@ class LaDebugPanel extends HTMLElement {
   disconnectedCallback() {
     this._worker?.terminate();
     this._worker = undefined;
+    if (this._onSummary) window.removeEventListener("la:test-summary", this._onSummary);
+    this._onSummary = undefined;
   }
 
   /**
