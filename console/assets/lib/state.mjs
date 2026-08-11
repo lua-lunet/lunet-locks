@@ -33,6 +33,7 @@ function persist(state) {
     atText: state.atText,
     fromText: state.fromText,
     toText: state.toText,
+    logRangePinned: state.logRangePinned,
     watched: [...state.watched],
     collapsed: [...state.collapsed],
     colWidths: state.colWidths,
@@ -49,8 +50,14 @@ export const store = {
     query: saved.query ?? "",
     atText: saved.atText ?? fmtClock(Date.now() + config.expiryDefaultOffsetMs),
     tolSec: saved.tolSec ?? config.defaultToleranceSec,
-    fromText: saved.fromText ?? fmtClock(Date.now() - config.logDefaultWindowMs),
-    toText: saved.toText ?? fmtClock(Date.now()),
+    logRangePinned: saved.logRangePinned ?? false,
+    // An unpinned range is a trailing window: any persisted from/to is a
+    // frozen instant from an older session (the empty-Logs bug), so ignore
+    // it and seed from the clock. Only a pinned range is restored verbatim.
+    fromText: (saved.logRangePinned ? saved.fromText : null)
+      ?? fmtClock(Date.now() - config.logDefaultWindowMs),
+    toText: (saved.logRangePinned ? saved.toText : null)
+      ?? fmtClock(Date.now()),
     cluster: null,
     locksAll: [],       // unfiltered — drives the path tree
     locks: [],          // filtered per current mode/search

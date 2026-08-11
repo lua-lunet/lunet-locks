@@ -12,7 +12,7 @@ import "./components/la-app.mjs";
 import { store, config } from "./lib/state.mjs";
 import { api } from "./lib/api.mjs";
 import { db } from "./lib/db.mjs";
-import { parseClock } from "./lib/util.mjs";
+import { parseClock, fmtClock } from "./lib/util.mjs";
 
 /** @typedef {import("./lib/types.mjs").Bucket} Bucket */
 /** @typedef {import("./lib/types.mjs").HttpError} HttpError */
@@ -86,8 +86,27 @@ async function refreshDetail() {
 async function refreshEvents() {
   const st = store.state;
   if (st.mode !== "log") { report("events", null); return; }
-  const fromMs = parseClock(st.fromText, Date.now());
-  const toMs = parseClock(st.toText, Date.now());
+  // A pinned range is honoured verbatim. Otherwise the window is a trailing
+  // one re-anchored to the clock on every poll — parseClock anchors HH:MM to
+  // today's date, so re-resolving a fixed string would freeze the window at
+  // first-load time and starve the view of newer events.
+  let fromMs = null;
+  let toMs = null;
+  if (st.logRangePinned) {
+    fromMs = parseClock(st.fromText, Date.now());
+    toMs = parseClock(st.toText, Date.now());
+  }
+  // Unparseable pinned text also lands here: query the trailing window
+  // rather than send NaN to the API (the pinned fields stay untouched).
+  if (fromMs === null || toMs === null) {
+    const now = Date.now();
+    fromMs = now - config.logDefaultWindowMs;
+    toMs = now;
+    if (!st.logRangePinned) {
+      // Trailing: freshen the visible fields so the inputs track the tail.
+      store.set({ fromText: fmtClock(fromMs), toText: fmtClock(toMs) });
+    }
+  }
   try {
     const r = await api.events({ fromMs, toMs, q: st.query, limit: 300 });
     store.set({ events: r.events });

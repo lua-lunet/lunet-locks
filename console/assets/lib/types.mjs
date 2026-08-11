@@ -183,6 +183,7 @@
  * @property {number} tolSec
  * @property {string} fromText Log-mode range start, "HH:MM[:SS]".
  * @property {string} toText Log-mode range end, "HH:MM[:SS]".
+ * @property {boolean} logRangePinned True once the operator edits the log range; false = trailing window that tracks the clock.
  * @property {ClusterResponse | null} cluster
  * @property {Lock[]} locksAll Unfiltered — drives the path tree.
  * @property {Lock[]} locks Filtered per the current mode/search.
@@ -215,6 +216,7 @@
  * @property {string} [atText]
  * @property {string} [fromText]
  * @property {string} [toText]
+ * @property {boolean} [logRangePinned]
  * @property {number[]} [watched]
  * @property {string[]} [collapsed]
  * @property {number[] | null} [colWidths]

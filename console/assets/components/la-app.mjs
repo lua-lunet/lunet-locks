@@ -64,6 +64,8 @@ class LaApp extends HTMLElement {
           <input class="input" id="la-from" spellcheck="false">
           <span class="sep">→</span>
           <input class="input" id="la-to" spellcheck="false">
+          <button class="btn btn-ghost" id="la-range-now"
+                  title="Back to the live trailing window" hidden>now</button>
         </div>
         <span class="watch-badge" id="la-watch"></span>
         <span class="clock" id="la-clock"></span>
@@ -137,9 +139,17 @@ class LaApp extends HTMLElement {
     tol.value = String(s.tolSec);
     tol.onchange = () => store.set({ tolSec: Number(tol.value) });
     from.value = s.fromText;
-    from.onchange = () => store.set({ fromText: from.value });
+    from.onchange = () => store.set({ fromText: from.value, logRangePinned: true });
     to.value = s.toText;
-    to.onchange = () => store.set({ toText: to.value });
+    to.onchange = () => store.set({ toText: to.value, logRangePinned: true });
+    // Reset affordance: drop the pin and re-anchor the trailing window
+    // immediately (the events poller then keeps it fresh every 2s).
+    const rangeNow = /** @type {HTMLButtonElement} */ (this.$("la-range-now"));
+    rangeNow.onclick = () => store.set({
+      logRangePinned: false,
+      fromText: fmtClock(Date.now() - config.logDefaultWindowMs),
+      toText: fmtClock(Date.now()),
+    });
 
     this._mode = null;
     this._hadSelection = null;
@@ -183,6 +193,17 @@ class LaApp extends HTMLElement {
       this.$("la-quorum").textContent = `· ${held} held · ${segCount} segments`;
     }
     this.$("la-clock").textContent = fmtClock(st.now);
+
+    // The "now" button only has meaning against a pinned range. In trailing
+    // mode the poller freshens fromText/toText; mirror them into the inputs,
+    // except the one the operator is mid-edit in (onchange hasn't fired yet).
+    this.$("la-range-now").hidden = !st.logRangePinned;
+    if (!st.logRangePinned) {
+      const fromEl = /** @type {HTMLInputElement} */ (this.$("la-from"));
+      const toEl = /** @type {HTMLInputElement} */ (this.$("la-to"));
+      if (document.activeElement !== fromEl) fromEl.value = st.fromText;
+      if (document.activeElement !== toEl) toEl.value = st.toText;
+    }
 
     // A held lock with no expiresAtMs cannot be "expiring soon", so it must
     // not count as hot: NaN comparisons are false, but the intent is explicit.
