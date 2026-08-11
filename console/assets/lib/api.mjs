@@ -1,6 +1,9 @@
 // Thin fetch client for the admin API (see ../../openapi.yaml).
 
 import { config } from "./state.mjs";
+import { logger } from "./log.mjs";
+
+const log = logger("api");
 
 /** @typedef {import("./types.mjs").BreakResponse} BreakResponse */
 /** @typedef {import("./types.mjs").ClusterResponse} ClusterResponse */
@@ -25,23 +28,36 @@ import { config } from "./state.mjs";
  * @returns {Promise<T>}
  */
 async function call(method, path, params, body) {
+  const t0 = performance.now();
   const url = new URL(config.apiBase + path, location.origin);
   for (const [k, v] of Object.entries(params ?? {})) {
     if (v !== undefined && v !== null && v !== "") url.searchParams.set(k, String(v));
   }
-  const res = await fetch(url, {
-    method,
-    headers: body ? { "content-type": "application/json" } : undefined,
-    body: body ? JSON.stringify(body) : undefined,
-  });
+  /** @type {Response} */
+  let res;
+  try {
+    res = await fetch(url, {
+      method,
+      headers: body ? { "content-type": "application/json" } : undefined,
+      body: body ? JSON.stringify(body) : undefined,
+    });
+  } catch (e) {
+    log.severe(`${method} ${path} network error`, {
+      method, path, elapsedMs: Math.round(performance.now() - t0), error: e,
+    });
+    throw e;
+  }
+  const elapsedMs = Math.round(performance.now() - t0);
   /** @type {any} */
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
+    log.warning(`${method} ${path} -> ${res.status}`, { method, path, status: res.status, elapsedMs });
     /** @type {HttpError} */
     const err = new Error(data.error ?? ("HTTP " + res.status));
     err.status = res.status;
     throw err;
   }
+  log.fine(`${method} ${path} -> ${res.status}`, { method, path, status: res.status, elapsedMs });
   return data;
 }
 

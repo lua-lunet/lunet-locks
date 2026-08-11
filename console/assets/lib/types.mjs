@@ -127,6 +127,19 @@
  */
 
 /**
+ * One record posted to BroadcastChannel("lock-admin-log") by lib/log.mjs.
+ * Flat and structured-clone-safe; meta is already sanitised (Errors reduced
+ * to { name, message, stack, status }, DOM nodes/functions dropped).
+ * @typedef {object} LogRecord
+ * @property {number} ts Epoch ms.
+ * @property {number} level java.util.logging numeric value (SEVERE=1000 … ALL=0).
+ * @property {string} levelName
+ * @property {string} logger Dotted module name, e.g. "api".
+ * @property {string} msg
+ * @property {unknown} [meta] Sanitised, structured-clone-safe; omitted when empty.
+ */
+
+/**
  * An Error carrying the HTTP status that produced it (see lib/api.mjs).
  * @typedef {Error & { status?: number }} HttpError
  */

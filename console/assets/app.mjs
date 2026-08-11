@@ -1,6 +1,9 @@
 // Lock Admin bootstrap: registers the web components, then runs the polling
 // loops that keep the store fresh from /api/v1.
 
+// log.mjs first: its window error / unhandledrejection / console.error fault
+// capture installs at module evaluation, before any component code can throw.
+import "./lib/log.mjs";
 import "./components/la-tree.mjs";
 import "./components/la-lock-table.mjs";
 import "./components/la-detail.mjs";
@@ -12,7 +15,10 @@ import "./components/la-app.mjs";
 import { store, config } from "./lib/state.mjs";
 import { api } from "./lib/api.mjs";
 import { db } from "./lib/db.mjs";
+import { logger } from "./lib/log.mjs";
 import { parseClock, fmtClock } from "./lib/util.mjs";
+
+const log = logger("app");
 
 /** @typedef {import("./lib/types.mjs").Bucket} Bucket */
 /** @typedef {import("./lib/types.mjs").HttpError} HttpError */
@@ -28,7 +34,12 @@ const failures = new Set();
  * @returns {void}
  */
 function report(name, err) {
+  const wasFailing = failures.has(name);
   if (err) failures.add(name); else failures.delete(name);
+  // Transitions only — a poller that stays down logs one WARNING, not one
+  // per tick.
+  if (err && !wasFailing) log.warning(`poller failing: ${name}`, { poller: name, error: err });
+  if (!err && wasFailing) log.info(`poller recovered: ${name}`, { poller: name });
   store.set({ error: failures.size ? `api unreachable: ${[...failures].join(", ")}` : "" });
 }
 
@@ -159,7 +170,10 @@ const pending = new Set();
  * @returns {void}
  */
 function guard(name, fn) {
-  if (pending.has(name)) return;
+  if (pending.has(name)) {
+    log.finer(`tick skipped, previous still in flight: ${name}`, { poller: name });
+    return;
+  }
   pending.add(name);
   Promise.resolve(fn()).finally(() => pending.delete(name));
 }

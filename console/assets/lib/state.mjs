@@ -2,6 +2,9 @@
 // sessionStorage so a refresh restores the console exactly as left.
 
 import { fmtClock } from "./util.mjs";
+import { logger } from "./log.mjs";
+
+const log = logger("store");
 
 /** @typedef {import("./types.mjs").Config} Config */
 /** @typedef {import("./types.mjs").SavedState} SavedState */
@@ -84,6 +87,9 @@ export const store = {
    */
   set(patch) {
     Object.assign(this.state, patch);
+    // Key names only — the `now` tick fires 1/s and set() runs ~5×/s, so
+    // dumping values here would flood the channel.
+    log.finest(`set: ${Object.keys(patch).join(", ")}`, { keys: Object.keys(patch) });
     persist(this.state);
     for (const fn of this._listeners) fn(this.state);
   },
