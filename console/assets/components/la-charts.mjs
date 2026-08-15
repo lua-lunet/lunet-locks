@@ -56,8 +56,9 @@ class LaCharts extends HTMLElement {
       const held = (cluster.nodes ?? []).reduce((n, x) => n + x.locksHeld, 0);
       const acquirePerSec = (cluster.nodes ?? []).reduce((n, x) => n + x.acquirePerSec, 0);
       this.querySelector(".cluster-summary").innerHTML =
-        `<span>leader <b>${esc(cluster.leaderId)}</b></span>` +
-        `<span>term <b>${cluster.term}</b></span>` +
+        `<span>leader <b>${esc(cluster.leader)}</b></span>` +
+        `<span>era <b>${cluster.era}</b></span>` +
+        `<span>view <b>${cluster.view}</b></span>` +
         `<span>held <b>${held}</b></span>` +
         `<span>acquire/s <b>${acquirePerSec.toFixed(2)}</b></span>`;
     }

@@ -112,7 +112,7 @@ class LaApp extends HTMLElement {
 
     const c = st.cluster;
     if (c) {
-      this.$("la-leader").textContent = `${c.leaderId} leader · term ${c.term}`;
+      this.$("la-leader").textContent = `${c.leader} leader · era ${c.era} · view ${c.view}`;
       const held = st.locksAll.filter((l) => l.state === "held").length;
       this.$("la-quorum").textContent = `· ${c.nodes.length}/${c.nodes.length} · ${held} held`;
     }

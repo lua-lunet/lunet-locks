@@ -13,15 +13,16 @@ const pick = (a) => a[Math.floor(rnd() * a.length)];
 // --- fixtures ---------------------------------------------------------------
 const nodes = ["node-1", "node-2", "node-3", "node-4", "node-5"].map((id, i) => ({
   id,
-  role: i === 1 ? "leader" : "follower",
-  appliedIndex: 100000 + i * 137,
+  role: i === 1 ? "leader" : "backup",
+  appliedSlot: 100000 + i * 137,
 }));
-const term = 41;
-const leaderId = "node-2";
+const era = 1;
+const view = 41;
+const leader = "node-2";
 
 const paths = [];
 for (let i = 1; i <= 14; i++) paths.push("/cluster/members/" + String(i).padStart(7, "0"));
-paths.push("/cluster/leader", "/cluster/epoch", "/cluster/config/routing", "/cluster/config/quota");
+paths.push("/cluster/leader", "/cluster/view", "/cluster/config/routing", "/cluster/config/quota");
 for (let i = 0; i < 8; i++) paths.push("/jobs/compact/shard-" + String(i).padStart(2, "0"));
 for (const t of ["acme", "globex", "initech", "hooli"]) {
   paths.push("/tenants/" + t + "/ingest", "/tenants/" + t + "/rollup");
@@ -106,7 +107,7 @@ function detailFor(kind, lock) {
 // --- live simulation ----------------------------------------------------------
 setInterval(() => {
   const now = Date.now();
-  for (const n of nodes) n.appliedIndex += Math.floor(rnd() * 3);
+  for (const n of nodes) n.appliedSlot += Math.floor(rnd() * 3);
 
   // expiries
   for (const l of locks) {
@@ -238,8 +239,9 @@ Bun.serve({
 
     if (p === "/api/v1/cluster") {
       return json(200, {
-        term,
-        leaderId,
+        era,
+        view,
+        leader,
         nowMs: Date.now(),
         nodes: nodes.map((n) => ({
           id: n.id,
@@ -249,7 +251,7 @@ Bun.serve({
           renewPerSec: rate("renew", n.id),
           releasePerSec: rate("release", n.id),
           casPerSec: rate("cas", n.id),
-          appliedIndex: n.appliedIndex,
+          appliedSlot: n.appliedSlot,
         })),
       });
     }
@@ -340,4 +342,4 @@ Bun.serve({
   },
 });
 
-console.log(`lock-admin mock listening on http://127.0.0.1:${PORT}/api/v1 (${locks.length} locks, leader ${leaderId}, term ${term})`);
+console.log(`lock-admin mock listening on http://127.0.0.1:${PORT}/api/v1 (${locks.length} locks, leader ${leader}, era ${era}, view ${view})`);

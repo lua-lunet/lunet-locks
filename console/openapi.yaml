@@ -14,12 +14,12 @@ info:
     display path (zookeeper-style, e.g. `/cluster/members/0000001`, max 128
     bytes — deliberately far below ZooKeeper's ~1MB znode limit, because this
     field is replicated in every WAL/CAS entry across the SMR cluster and a
-    large name directly costs write-amplification and slows follower
+    large name directly costs write-amplification and slows backup
     catch-up). `labels` is a bag of at most 8 tags, each
     `^[a-z0-9](-?[a-z0-9])*$` up to 32 bytes, for the same reason. Search
     terms in `q` are space-separated; `tag:x` matches a label prefix,
     `holder:x` matches a holder substring, anything else matches a name
-    substring. The event log is append-only (a follower-side journal; the
+    substring. The event log is append-only (a backup-side journal; the
     leader never writes it).
 servers:
   - url: /api/v1
@@ -58,10 +58,11 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [term, leaderId, nowMs, nodes]
+                required: [era, view, leader, nowMs, nodes]
                 properties:
-                  term: { type: integer }
-                  leaderId: { type: string }
+                  era: { type: integer }
+                  view: { type: integer }
+                  leader: { type: string }
                   nowMs: { type: integer, format: int64 }
                   nodes:
                     type: array
@@ -218,16 +219,16 @@ components:
         error: { type: string }
     Node:
       type: object
-      required: [id, role, locksHeld, acquirePerSec, renewPerSec, releasePerSec, casPerSec, appliedIndex]
+      required: [id, role, locksHeld, acquirePerSec, renewPerSec, releasePerSec, casPerSec, appliedSlot]
       properties:
         id: { type: string }
-        role: { type: string, enum: [leader, follower] }
+        role: { type: string, enum: [leader, backup] }
         locksHeld: { type: integer }
         acquirePerSec: { type: number }
         renewPerSec: { type: number }
         releasePerSec: { type: number }
         casPerSec: { type: number }
-        appliedIndex: { type: integer, format: int64 }
+        appliedSlot: { type: integer, format: int64 }
     Lock:
       type: object
       required: [id, name, labels, state, fencingToken, leaseMs, renewCount, holderChanges]
