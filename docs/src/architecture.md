@@ -141,6 +141,36 @@ Default timers are 200 ms leader heartbeat, a 1,200 ms election floor plus a
 200 ms per-node stagger, and 2,500 ms recovery retry. Override them with
 `--heartbeat-ms`, `--election-ms`, and `--recovery-ms`.
 
+## Multi-datagram state transfer
+
+When a replica's committed log is small, the leader transfers the entire state
+in a single UDP datagram during recovery or epoch change. This is the common
+path and the wire format is unchanged from the original VRR protocol.
+
+When the encoded `LogState` exceeds one datagram (65,507 bytes), the leader
+instead emits a run of `StateChunk` datagrams (tag `0x40`). Each chunk carries:
+
+- a transfer identity (UUID, fresh per logical message),
+- the logical message kind (`DoEpochChange`, `StartEpoch`, or `RecoveryResponse`
+  with its embedded payload such as the recovery nonce),
+- the total entry count and the 0-based index of the first entry in this chunk,
+- the chunk's entries and the repeated `state_slot` and `state_commit`.
+
+The receiving replica buffers chunks by `(sender, kind)` until the entries
+contiguously cover `0..total`, then materialises the logical message and enters
+the existing validation and adoption path unchanged.
+
+A new transfer UUID from the same sender and kind supersedes any in-flight
+reassembly. Chunks that disagree on the invariant fields (epoch, header slot,
+total, state slot, state commit, or entry content at a given index) abandon the
+transfer. Chunks are accepted in any order; duplicate ranges are idempotent.
+Stalled transfers are dropped after 100 consecutive `Input::Idle` ticks without
+progress.
+
+This is entirely a transport concern inside `vrr-core`. No safety, validation,
+quorum, or epoch rule is changed. The host drives idle ticks and drains multiple
+outputs per step, which it already does; no new host-side wire code is required.
+
 Membership is fixed for one process lifetime. Peer transport is expected to be
 on a private network; deployment infrastructure supplies encryption or other
 network controls if required. Clients keep a stable `client_id`, use increasing

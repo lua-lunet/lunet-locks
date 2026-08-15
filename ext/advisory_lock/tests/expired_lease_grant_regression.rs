@@ -39,6 +39,8 @@ fn set_request(
             holder,
             expiry,
         },
+        name: None,
+        labels: None,
     }
 }
 

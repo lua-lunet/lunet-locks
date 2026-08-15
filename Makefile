@@ -29,7 +29,9 @@ LUNET_ARCHIVE_PATH := $(LUNET_ROOT)/$(LUNET_ARCHIVE)
 # Teal outside source_dir, which `cyan build` does not reach.
 CHECK_SOURCES = tests/teal_learning_test.tl \
                 tests/advisory_lock_ffi_test.tl \
-                tests/advisory_lock_pure_test.tl
+                tests/advisory_lock_pure_test.tl \
+                tests/cluster_config_test.tl \
+                tests/telemetry_log_test.tl
 
 .PHONY: init deps build check test smoke simulation simulation-test lunet-runtime docs clean ext ext-check ext-test fmt lint hooks docker-build docker-simulation package package-verify
 

@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lock Admin</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="./styles.css">
+<script src="https://cdn.jsdelivr.net/npm/echarts@5.5.1/dist/echarts.min.js"
+        integrity="sha384-Mx5lkUEQPM1pOJCwFtUICyX45KNojXbkWdYhkKUKsbv391mavbfoAmONbzkgYPzR"
+        crossorigin="anonymous" defer></script>
+<script id="la-config" type="application/json">
+{
+  "apiBase": "/api/v1",
+  "refreshMs": 1000,
+  "expiryDefaultOffsetMs": 300000,
+  "toleranceOptionsSec": [1, 5, 15, 60, 300],
+  "defaultToleranceSec": 5,
+  "historyWindowMs": 3600000,
+  "telemetryBucketMs": 5000,
+  "logDefaultWindowMs": 600000,
+  "watchWarnMs": 15000
+}
+</script>
+</head>
+<body>
+<la-app></la-app>
+<script type="module" src="./app.mjs"></script>
+</body>
+</html>

@@ -8,3 +8,6 @@ docs/site/
 target/
 # Native crates are internal FFI components, not independent releases.
 ext/*/Cargo.lock
+
+# Lock Admin console scratch (pids, logs, rendered nginx conf, credentials)
+console/tmp/

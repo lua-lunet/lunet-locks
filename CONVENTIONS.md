@@ -66,8 +66,8 @@ The shipped Teal, FFI ABI, core Rust crate, and default test path use stable Rus
 dependencies. A stable test-only Rust dependency belongs in `[dev-dependencies]` and must not add
 a dependency edge into shipped artifacts.
 
-Experimental model checking and fuzzing are currently deferred. If needed, each harness belongs
-entirely beneath `not_stable_rust/`, with its own explicit toolchain and documented invocation;
+Model checking and fuzzing harnesses are excluded from the default test path. Any such harness
+belongs entirely beneath `not_stable_rust/`, with its own explicit toolchain and documented invocation;
 that isolated package may depend on the core crate, but production code and default targets must
 not depend on it. It is not run by `make test`. Document supported platforms, resource limits,
 corpus ownership, and counterexample reproduction next to any such harness before adding it.

@@ -1,0 +1,19 @@
+// Type-checking gate for the no-framework SPA in assets/. There is no build
+// step and no node_modules: the .mjs files are the shipped artefact and types
+// live in JSDoc only. `tsc` (global) only reads and reports — noEmit is on and
+// nothing here may grow into a bundler.
+{
+  "compilerOptions": {
+    "allowJs": true,
+    "checkJs": true,
+    "noEmit": true,
+    "strict": true,
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "target": "es2022",
+    "lib": ["es2022", "dom", "dom.iterable"],
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true
+  },
+  "include": ["assets/**/*.mjs"]
+}
