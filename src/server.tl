@@ -29,6 +29,9 @@ local MESSAGE_ID_BYTES = transport.MESSAGE_ID_BYTES
 local CLIENT_DEADLINE_MS = 30000
 local POLL_MS = 10
 local MAX_CLIENT_REQUEST = transport.MAX_DATAGRAM - transport.PEER_HEADER_BYTES - 1 - MESSAGE_ID_BYTES
+-- The native adapter reports u32::MAX when no leader is known for an era/view
+-- (booting or recovering cluster, or an era outside the retention window).
+local LEADER_UNKNOWN = 4294967295
 
 local record Options
     node: string
@@ -46,12 +49,14 @@ local record Pending
     result: string
     done: boolean
     forwarded_to: integer
-    redirect_view: integer
 end
 
 local record Output
     kind: string
     replica: integer
+    era: integer
+    view: integer
+    slot: integer
     message_id: string
     bytes: string
 end
@@ -251,13 +256,9 @@ local function main(options: Options)
 
     local function flush(outputs: {Output})
         for _, output in ipairs(outputs) do
-            if output.kind == "broadcast" then
-                for index = 0, #members - 1 do
-                    if index ~= own_index then
-                        send_vrr(index, output.bytes)
-                    end
-                end
-            elseif output.kind == "send" then
+            if output.kind == "send" then
+                -- The core emits one unicast send per destination; route as
+                -- addressed (a self-addressed send is delivered like any other).
                 send_vrr(output.replica, output.bytes)
             elseif output.kind == "reply" then
                 local origin = forwarded_from[output.message_id]
@@ -278,7 +279,11 @@ local function main(options: Options)
     end
 
     local function forward_to(waiter: Pending, leader: integer, message_id: string)
-        assert(leader >= 0 and leader < #members, "server: no current leader")
+        -- A booting/recovering cluster may have no known leader; leave the
+        -- waiter for the deadline loop to retry rather than asserting.
+        if leader < 0 or leader >= #members then
+            return
+        end
         waiter.forwarded_to = leader
         send_application_peer(leader, FORWARD_REQUEST .. message_id .. waiter.json)
     end
@@ -287,13 +292,25 @@ local function main(options: Options)
         assert(
             guard:allows_client_operation(), "server: membership configuration is dirty"
         )
-        local status = node:status()
-        if status.leader == own_index then
+        local accepted, request_error = node:request(waiter.json)
+        flush(node:outputs() as {Output})
+        if accepted then
             waiter.forwarded_to = -1
-            flush(node:request(waiter.json) as {Output})
             return
         end
-        forward_to(waiter, status.leader, message_id)
+        -- NOT_LEADER is non-raising: re-read status and re-forward when a
+        -- valid leader is known; otherwise the deadline loop retries.
+        if request_error ~= "not_leader" then
+            error("server: request failed: " .. (request_error or "unknown"), 2)
+        end
+        local status = node:status()
+        if
+            status.leader ~= own_index
+            and status.leader < #members
+            and status.leader ~= LEADER_UNKNOWN
+        then
+            forward_to(waiter, status.leader, message_id)
+        end
     end
 
     local function receive_loop()
@@ -322,7 +339,10 @@ local function main(options: Options)
                             then
                                 forwarded_from[message_id] = source_endpoint
                                 local ok = pcall(
-                                    function() flush(node:request(json) as {Output}) end
+                                    function()
+                                        node:request(json)
+                                        flush(node:outputs() as {Output})
+                                    end
                                 )
                                 if not ok then
                                     forwarded_from[message_id] = nil
@@ -330,7 +350,9 @@ local function main(options: Options)
                             elseif guard:allows_client_operation() then
                                 send_application(
                                     source_endpoint,
-                                    transport.encode_not_leader(message_id, status.view)
+                                    transport.encode_not_leader(
+                                        message_id, status.era, status.view
+                                    )
                                 )
                             end
                         elseif
@@ -347,7 +369,7 @@ local function main(options: Options)
                                 waiter.done = true
                             end
                         elseif direction == FORWARD_NOT_LEADER then
-                            local redirect_valid, message_id, view = transport.decode_not_leader(
+                            local redirect_valid, message_id, era, view = transport.decode_not_leader(
                                 payload
                             )
                             local waiter = pending[message_id]
@@ -361,15 +383,11 @@ local function main(options: Options)
                                 )
                             then
                                 if guard:allows_client_operation() then
-                                    waiter.redirect_view = view
-                                    local leader = node:leader_for_view(view)
-                                    local ok = pcall(
-                                        function()
-                                            forward_to(waiter, leader, message_id)
-                                        end
-                                    )
-                                    if not ok then
-                                        -- A concurrent leader change is retried by the deadline loop.
+                                    local leader = node:leader_for_view(era, view)
+                                    -- LEADER_UNKNOWN: the era/view maps to no
+                                    -- known leader; the deadline loop retries.
+                                    if leader ~= LEADER_UNKNOWN then
+                                        forward_to(waiter, leader, message_id)
                                     end
                                 end
                             end
@@ -382,7 +400,8 @@ local function main(options: Options)
                             end
                             local ok = pcall(
                                 function()
-                                    flush(node:receive(replica, payload) as {Output})
+                                    node:receive(replica, payload)
+                                    flush(node:outputs() as {Output})
                                 end
                             )
                             if not ok then
@@ -398,7 +417,10 @@ local function main(options: Options)
 
     local function heartbeat_loop()
         while true do
-            flush(node:idle() as {Output})
+            -- The binding drives the core's single liveness input (Input::Tick);
+            -- this loop supplies the heartbeat cadence.
+            node:idle()
+            flush(node:outputs() as {Output})
             lunet.sleep(options.heartbeat_ms)
         end
     end
@@ -414,7 +436,9 @@ local function main(options: Options)
                 leader_elapsed_ms = leader_elapsed_ms + POLL_MS
                 if leader_elapsed_ms >= options.election_ms + stagger then
                     leader_elapsed_ms = 0
-                    flush(node:leader_timeout() as {Output})
+                    -- Leader-silence detection; also drives Input::Tick.
+                    node:leader_timeout()
+                    flush(node:outputs() as {Output})
                 end
             end
         end
@@ -423,8 +447,13 @@ local function main(options: Options)
     local function recovery_loop()
         while true do
             lunet.sleep(options.recovery_ms)
-            if node:status().state ~= "normal" then
-                flush(node:recover() as {Output})
+            -- Drive a recovery attempt only while the replica is recovering:
+            -- every node:recover() consumes one durable nonce (fsync+rename+
+            -- dir-sync) to stamp Input::Recover, so calling it in "normal" or
+            -- "view_change" would burn nonces for no protocol effect.
+            if node:status().state == "recovering" then
+                node:recover()
+                flush(node:outputs() as {Output})
             end
         end
     end
@@ -443,7 +472,6 @@ local function main(options: Options)
                 result = "",
                 done = false,
                 forwarded_to = -1,
-                redirect_view = 0,
             }
             pending[message_id] = waiter
         end

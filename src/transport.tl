@@ -61,8 +61,8 @@ local function decode_peer(packet: string): (boolean, string, string, string)
 end
 
 -- A redirect is deliberately a small fixed-size application packet. It carries
--- no leader index: every fixed ordered membership maps the supplied view to
--- its leader through the local replica adapter.
+-- no leader index: every fixed ordered membership maps the supplied era+view
+-- to its leader through the local replica adapter.
 local function u32_bytes(value: integer): string
     return string.char(
         math.floor(value / 16777216) % 256,
@@ -80,23 +80,33 @@ local function parse_u32(bytes: string): integer
     ) as integer
 end
 
-local function encode_not_leader(message_id: string, view: integer): string
+local function encode_not_leader(
+    message_id: string, era: integer, view: integer
+): string
     assert(#message_id == MESSAGE_ID_BYTES, "transport: invalid redirect message ID")
+    assert(
+        era >= 0 and era <= MAX_U32 and era == math.floor(era),
+        "transport: invalid redirect era"
+    )
     assert(
         view >= 0 and view <= MAX_U32 and view == math.floor(view),
         "transport: invalid redirect view"
     )
-    return FORWARD_NOT_LEADER .. message_id .. u32_bytes(view)
+    return FORWARD_NOT_LEADER .. message_id .. u32_bytes(era) .. u32_bytes(view)
 end
 
-local function decode_not_leader(payload: string): (boolean, string, integer)
+local function decode_not_leader(payload: string): (boolean, string, integer, integer)
     if
-        #payload ~= 1 + MESSAGE_ID_BYTES + 4 or payload:sub(1, 1) ~= FORWARD_NOT_LEADER
+        #payload ~= 1 + MESSAGE_ID_BYTES + 4 + 4
+        or payload:sub(1, 1) ~= FORWARD_NOT_LEADER
     then
-        return false, "", 0
+        return false, "", 0, 0
     end
-    local view = parse_u32(payload:sub(2 + MESSAGE_ID_BYTES, 1 + MESSAGE_ID_BYTES + 4))
-    return true, payload:sub(2, 1 + MESSAGE_ID_BYTES), view
+    local era = parse_u32(payload:sub(2 + MESSAGE_ID_BYTES, 1 + MESSAGE_ID_BYTES + 4))
+    local view = parse_u32(
+        payload:sub(2 + MESSAGE_ID_BYTES + 4, 1 + MESSAGE_ID_BYTES + 4 + 4)
+    )
+    return true, payload:sub(2, 1 + MESSAGE_ID_BYTES), era, view
 end
 
 local function valid_not_leader(

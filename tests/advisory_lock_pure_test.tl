@@ -194,19 +194,21 @@ tested.test(
 )
 
 tested.test(
-    "transport round-trips a correlated view redirect without a leader index",
+    "transport round-trips a correlated era+view redirect without a leader index",
     function()
         local message_id = string.rep("x", transport.MESSAGE_ID_BYTES)
-        local redirect = transport.encode_not_leader(message_id, 4294967295)
-        local valid, received_id, view = transport.decode_not_leader(redirect)
+        local redirect = transport.encode_not_leader(message_id, 7, 4294967295)
+        local valid, received_id, era, view = transport.decode_not_leader(redirect)
         tested.assert(
             {
-                given = "a view redirect inside the fingerprinted application envelope",
+                given = "an era+view redirect inside the fingerprinted application envelope",
                 should = "preserve canonical correlation and omit redundant leader identity",
-                expected = "true:xxx:4294967295:21",
+                expected = "true:xxx:7:4294967295:25",
                 actual = tostring(valid)
                     .. ":"
                     .. received_id:sub(1, 3)
+                    .. ":"
+                    .. tostring(era)
                     .. ":"
                     .. tostring(view)
                     .. ":"
