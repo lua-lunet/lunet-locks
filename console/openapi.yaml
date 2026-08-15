@@ -287,7 +287,7 @@ components:
         kind: { type: string, enum: [acquire, renew, release, cas, expire, break, deny] }
         lockId: { type: integer }
         name: { type: string }
-        actor: { type: string }
+        actor: { type: string, nullable: true }
         detail: { type: string }
     Bucket:
       type: object

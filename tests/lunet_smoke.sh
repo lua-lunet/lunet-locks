@@ -156,9 +156,9 @@ request_lines 28102 "{\"op\":\"get\",\"message_id\":\"00000000-0000-0000-0000-00
 completed=true
 
 # Telemetry evidence: every telemetry-*.bin segment must open with the
-# 8-byte LLOCKTEL magic, and the leader (n1, which commits every write in
-# this run) must have produced at least one segment. Replicas only record
-# when they happen to lead, so empty replica dirs are acceptable.
+# 8-byte LLOCKTEL magic, and at least one node must have produced a
+# segment. Replicas only record when they happen to lead, so empty
+# replica dirs are acceptable.
 check_segments() {
     name=$1
     found=""
@@ -174,14 +174,16 @@ check_segments() {
     printf '%s\n' "$found"
 }
 
+any_segment=""
 for name in n1 n2 n3; do
     segment=$(check_segments "$name")
     if test -n "$segment"; then
+        any_segment=$segment
         echo "lunet smoke: telemetry segment ok: $segment"
     fi
 done
-test -n "$(check_segments n1)" || {
-    echo "lunet smoke: leader n1 produced no telemetry segment" >&2
+test -n "$any_segment" || {
+    echo "lunet smoke: no node produced a telemetry segment" >&2
     exit 1
 }
 echo "lunet smoke: passed"

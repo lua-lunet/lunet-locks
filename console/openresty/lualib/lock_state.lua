@@ -328,6 +328,12 @@ function lock_state.scan_all(dirs_by_node, listdir, now_ms, scan)
     scan = scan or {}
     scan.files = scan.files or {}
     scan.records = scan.records or {}
+    -- Monotonic decode sequence. ts_ms has whole-second resolution, so
+    -- records from the same second tie, and table.sort is not stable — a
+    -- re-sort on a later refresh could permute a tied acquire/release pair
+    -- and flip the derived lock state. The tie-break keeps the retained
+    -- set a total order.
+    scan.seq = scan.seq or 0
 
     -- Inventory every dir first, so a removal anywhere is detected before
     -- any incremental decision is made.
@@ -370,6 +376,8 @@ function lock_state.scan_all(dirs_by_node, listdir, now_ms, scan)
         scan.files[path] = { size = seg.size, offset = consumed, node = seg.owner }
         for _, r in ipairs(records) do
             r.node = seg.owner
+            scan.seq = scan.seq + 1
+            r.seq = scan.seq
             out[#out + 1] = r
         end
     end
@@ -396,6 +404,8 @@ function lock_state.scan_all(dirs_by_node, listdir, now_ms, scan)
                 scan.files[path] = { size = seg.size, offset = consumed, node = seg.owner }
                 for _, r in ipairs(records) do
                     r.node = seg.owner
+                    scan.seq = scan.seq + 1
+                    r.seq = scan.seq
                     fresh[#fresh + 1] = r
                 end
             end
@@ -420,7 +430,14 @@ function lock_state.scan_all(dirs_by_node, listdir, now_ms, scan)
             all[#all + 1] = r
         end
         table.sort(all, function(a, b)
-            return a.ts_ms < b.ts_ms
+            if a.ts_ms ~= b.ts_ms then
+                return a.ts_ms < b.ts_ms
+            end
+            -- Same-second tie: keep decode order so the sort is a total
+            -- order and re-sorts are deterministic. Records retained from
+            -- before this field existed fall back to 0, which only affects
+            -- ties among themselves.
+            return (a.seq or 0) < (b.seq or 0)
         end)
     end
     if now_ms ~= nil then

@@ -653,6 +653,140 @@ check(
 
 os.execute("rm -rf " .. ITMP)
 
+-- ---- same-ts_ms seq tie-breaker in scan_all (item49) ---------------------------
+--
+-- ts_ms has whole-second resolution but every committed fixture spaces
+-- records 1s apart, so the (ts_ms, seq) comparator's tie branch in
+-- scan_all is otherwise never exercised — its removal or reversal would
+-- pass the suite while making re-sorts non-deterministic. Patch copied
+-- fixture bytes to give several records the same ts_ms, then verify
+-- decode-order stability across cold scan, tail merge, full rescan, and
+-- repeated re-sort.
+--
+-- lock_log has no encoder, so same-ts segments are built by patching
+-- bytes: ts_ms is the u64be at record-relative bytes 5-12; the CRC-32C
+-- covers the whole record except its trailing 4 bytes and is stored as
+-- u32be at rec_end-3.
+
+local function u64be_str(v)
+    local b = {}
+    for i = 8, 1, -1 do
+        b[i] = string.char(v % 256)
+        v = math.floor(v / 256)
+    end
+    return table.concat(b)
+end
+local function u32be_str(v)
+    return string.char(
+        math.floor(v / 16777216) % 256,
+        math.floor(v / 65536) % 256,
+        math.floor(v / 256) % 256,
+        v % 256
+    )
+end
+
+-- Rewrite every record's ts_ms to T and recompute its CRC.
+local function patch_same_ts(data, T)
+    local out = { data:sub(1, 24) } -- segment header
+    local pos = 25
+    while pos <= #data do
+        local record_len = data:byte(pos + 1) * 256 + data:byte(pos + 2)
+        local rec_end = pos + record_len - 1
+        if rec_end > #data then
+            break
+        end
+        local body = data:sub(pos, rec_end - 4)
+        body = body:sub(1, 4) .. u64be_str(T) .. body:sub(13)
+        out[#out + 1] = body .. u32be_str(lock_log.crc32c(body))
+        pos = rec_end + 1
+    end
+    return table.concat(out)
+end
+
+-- Byte length of the header + first n records of a segment image.
+local function head_len(data, n)
+    local pos = 25
+    for _ = 1, n do
+        pos = pos + data:byte(pos + 1) * 256 + data:byte(pos + 2)
+    end
+    return pos - 1
+end
+
+local function ids_of(recs)
+    local ids = {}
+    for i, r in ipairs(recs) do
+        ids[i] = tostring(r.lock_id)
+    end
+    return table.concat(ids, ",")
+end
+
+local STMP = script_dir .. "/../.tmp-lock-state-samets-test"
+os.execute("rm -rf " .. STMP .. " && mkdir -p " .. STMP)
+local T = 1700000050000 -- inside INOW's 1h retention window
+local sp1 = STMP .. "/telemetry-n1-1700000000000-000001.bin"
+
+local pts1 = patch_same_ts(seg1, T) -- records n=1..6 (locks 101..106), all ts T
+local head3 = pts1:sub(1, head_len(pts1, 3))
+write_file(sp1, head3)
+
+-- Patcher sanity: the patched segment must decode cleanly with every
+-- ts_ms == T — a broken patcher fails loudly here, not as a bogus sort
+-- failure later.
+local _, srecs, swarns = lock_log.read_segment(sp1, 0)
+local ts_ok = #srecs == 3
+for _, r in ipairs(srecs) do
+    if r.ts_ms ~= T then
+        ts_ok = false
+    end
+end
+check(ts_ok, "same-ts patcher: all 3 records decode with ts_ms == T")
+check(#swarns == 0, "same-ts patcher: zero read_segment warnings (got " .. #swarns .. ")")
+check(ids_of(srecs) == "101,102,103", "same-ts patcher: lock ids survive patching (got " .. ids_of(srecs) .. ")")
+
+-- (1) Cold scan: 3 same-ts records must come back in file/decode order.
+local sdirs = { n1 = STMP }
+local trecs, _, _, tscan, tstats = lock_state.scan_all(sdirs, nil, INOW, nil)
+check(
+    #trecs == 3 and ids_of(trecs) == "101,102,103",
+    "same-ts: cold scan keeps decode order (seq tie-break) (got " .. ids_of(trecs) .. ")"
+)
+
+-- (2) Incremental tail merge: append same-ts records 104,105; the merge
+-- must not scramble the retained prefix.
+local safh = assert(io.open(sp1, "ab"))
+safh:write(pts1:sub(#head3 + 1, head_len(pts1, 5)))
+safh:close()
+trecs, _, _, tscan, tstats = lock_state.scan_all(sdirs, nil, INOW, tscan)
+check(tstats.read == 1 and not tstats.rescan, "same-ts: tail append read incrementally, no rescan")
+check(
+    #trecs == 5 and ids_of(trecs) == "101,102,103,104,105",
+    "same-ts: incremental merge preserves decode order (seq tie-break) (got " .. ids_of(trecs) .. ")"
+)
+
+-- (3) Forced full rescan: shrink to header + first 3 records; the
+-- surviving same-ts records must still be in decode order.
+write_file(sp1, head3)
+trecs, _, _, tscan, tstats = lock_state.scan_all(sdirs, nil, INOW, tscan)
+check(
+    tstats.rescan and #trecs == 3 and ids_of(trecs) == "101,102,103",
+    "same-ts: forced full rescan preserves decode order (seq tie-break) (got " .. ids_of(trecs) .. ")"
+)
+
+-- (4) Repeated re-sort: append an unrelated NEWER record; the retained
+-- same-ts records must keep their relative order — the property that
+-- breaks when the sort is not a total order.
+local pts2 = patch_same_ts(seg2, T + 1000) -- record n=7 → lock 107, newer ts
+local nafh = assert(io.open(sp1, "ab"))
+nafh:write(pts2:sub(25, head_len(pts2, 1)))
+nafh:close()
+trecs, _, _, tscan, tstats = lock_state.scan_all(sdirs, nil, INOW, tscan)
+check(
+    not tstats.rescan and #trecs == 4 and ids_of(trecs) == "101,102,103,107",
+    "same-ts: re-sort with a newer record keeps same-ts decode order (seq tie-break) (got " .. ids_of(trecs) .. ")"
+)
+
+os.execute("rm -rf " .. STMP)
+
 if failures > 0 then
     print(failures .. " failure(s)")
     os.exit(1)

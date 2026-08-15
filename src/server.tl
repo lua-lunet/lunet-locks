@@ -327,7 +327,9 @@ local function main(options: Options)
                 local holder16 = string.rep("\0", 16)
                 local labels = ""
                 if event ~= "deny" then
-                    fencing_token = json_number(reply_json, "lease_id") or 0
+                    fencing_token = json_number(reply_json, "lease_id")
+                        or json_number(request_json, "lease_id")
+                        or 0
                     renew_count = math.floor(
                         json_number(reply_json, "renew_count") or 0
                     )
@@ -602,11 +604,17 @@ local function main(options: Options)
     end
 
     local function recovery_loop()
+        local last_state = node:status().state
         while true do
             lunet.sleep(options.recovery_ms)
             if node:status().state ~= "normal" then
                 flush(node:recover() as {Output})
             end
+            local current = node:status().state
+            if current == "normal" and last_state ~= "normal" then
+                io.stderr:write("advisory-lock recovery reached normal\n")
+            end
+            last_state = current
         end
     end
 
