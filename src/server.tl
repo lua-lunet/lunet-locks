@@ -46,7 +46,7 @@ local record Pending
     result: string
     done: boolean
     forwarded_to: integer
-    redirect_epoch: integer
+    redirect_view: integer
 end
 
 local record Output
@@ -330,9 +330,7 @@ local function main(options: Options)
                             elseif guard:allows_client_operation() then
                                 send_application(
                                     source_endpoint,
-                                    transport.encode_not_leader(
-                                        message_id, status.epoch
-                                    )
+                                    transport.encode_not_leader(message_id, status.view)
                                 )
                             end
                         elseif
@@ -349,7 +347,7 @@ local function main(options: Options)
                                 waiter.done = true
                             end
                         elseif direction == FORWARD_NOT_LEADER then
-                            local redirect_valid, message_id, epoch = transport.decode_not_leader(
+                            local redirect_valid, message_id, view = transport.decode_not_leader(
                                 payload
                             )
                             local waiter = pending[message_id]
@@ -363,8 +361,8 @@ local function main(options: Options)
                                 )
                             then
                                 if guard:allows_client_operation() then
-                                    waiter.redirect_epoch = epoch
-                                    local leader = node:leader_for_epoch(epoch)
+                                    waiter.redirect_view = view
+                                    local leader = node:leader_for_view(view)
                                     local ok = pcall(
                                         function()
                                             forward_to(waiter, leader, message_id)
@@ -445,7 +443,7 @@ local function main(options: Options)
                 result = "",
                 done = false,
                 forwarded_to = -1,
-                redirect_epoch = 0,
+                redirect_view = 0,
             }
             pending[message_id] = waiter
         end

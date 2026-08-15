@@ -23,8 +23,8 @@ It is not a replacement for VRR and it does not define replication state.
 Its two jobs are to guard fixed membership at the transport boundary and to
 carry service-specific forwarding packets alongside opaque VRR datagrams.
 
-The Rust adapter retains the lock state machine, duplicate suppression,
-leader-side clock sampling, and durable recovery nonce. Teal owns sockets,
+The Rust adapter retains the lock state machine, leader-side clock sampling,
+and the durable recovery nonce. Teal owns sockets,
 TCP framing, peer source validation, forwarding, and deterministic draining of
 native output buffers. The Teal wrapper never retains a borrowed Rust pointer;
 `close()` is idempotent and its LuaJIT finalizer is only a fallback.
@@ -99,22 +99,22 @@ Forwarding packets have a distinct application tag inside the peer envelope:
 - `forward-request`: canonical message ID plus the original JSON request;
 - `forward-response`: canonical message ID plus the JSON reply;
 - `not-leader`: canonical message ID plus the responder's current unsigned
-  32-bit VRR epoch.
+  32-bit VRR view.
 
-The fixed ordered membership maps an epoch to its leader. Consequently a
+The fixed ordered membership maps a view to its leader. Consequently a
 `not-leader` reply does not include a separate leader identity: the forwarding
-node asks its local adapter for the leader of that epoch, immediately redirects
+node asks its local adapter for the leader of that view, immediately redirects
 the retained original request when known, and otherwise resumes normal retry.
 
 ```mermaid
 sequenceDiagram
     participant F as forwarding n2
     participant O as old leader n1
-    participant N as leader for epoch E
+    participant N as leader for view E
     F->>O: UDP forward-request (message_id)
     Note over O: Leadership changed
-    O-->>F: UDP not-leader (message_id, epoch E)
-    F->>F: leader_for_epoch(E)
+    O-->>F: UDP not-leader (message_id, view E)
+    F->>F: leader_for_view(E)
     F->>N: UDP forward-request (unchanged JSON)
     N-->>F: UDP forward-response (message_id, reply)
 ```

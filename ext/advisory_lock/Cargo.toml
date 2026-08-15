@@ -12,7 +12,7 @@ crate-type = ["rlib", "cdylib"]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["serde"] }
-vrr = { package = "vrr-core", git = "https://github.com/lua-lunet/vrr-core.git", rev = "26a183ca7fed09aab22e8a6ba4f04557e186fa4f" }
+vrr = { package = "vrr-core", git = "https://github.com/lua-lunet/vrr-core.git", rev = "6cbc1f36fb3a8bfa3aa7a66d12d697d3539b8ff0" } # tag v0.2.0
 
 [dev-dependencies]
 proptest = "1.11.0"

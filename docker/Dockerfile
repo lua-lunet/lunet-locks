@@ -1,7 +1,7 @@
 # Plain multi-stage Docker build, intentionally compatible with Colima's legacy
 # builder: it uses no BuildKit-only mounts, secrets, or cache directives.
-# `tools/docker_prepare_context.sh` supplies a Cargo-vendored build context so
-# the private vrr-core revision is never fetched from inside Docker.
+# `tools/docker_prepare_context.sh` vendors the pinned vrr-core v0.2.0 source
+# into the build context, so no git fetch happens inside Docker.
 FROM rust:1.85-slim AS native
 
 WORKDIR /app/ext/advisory_lock

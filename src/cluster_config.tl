@@ -5,15 +5,12 @@
 -- Scope note (see AGENTS.md "vrr-core" boundary): this module is additive
 -- and local-only. `config.tl`'s `members()` derives each replica's
 -- protocol-level index from its *position in a lexically-sorted name list*,
--- and that index is threaded straight through the vrr-core FFI boundary
--- (see `server.tl`'s `index_by_endpoint`/`endpoint_by_index` and the
--- `leader`/`to`/`replica` fields returned by the native library). Making
--- the ids defined here (sparse, admin-chosen, never recycled) the *actual*
--- replica addressing scheme would require vrr-core to accept non-positional
--- node identifiers -- a protocol change to the pinned, authoritative
--- vrr-core dependency; per AGENTS, any such change is staged locally only,
--- never committed or pushed, backed by a corresponding upstream GitHub
--- issue, and reported to the coordinator.
+-- and that ordered membership maps deployment entries to the host-supplied
+-- `NodeId` each replica presents at the FFI boundary (see `server.tl`'s
+-- `index_by_endpoint`/`endpoint_by_index`). Upstream vrr-core v0.2.0 does not
+-- implement reconfiguration, so the sparse, admin-chosen, never-recycled ids
+-- defined here cannot become the live membership-addressing scheme; the
+-- descriptor remains local-only.
 -- This module only reads/writes the deployment descriptor file; it does not
 -- feed `config.members()` or `server.tl`.
 

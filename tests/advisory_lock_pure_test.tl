@@ -194,21 +194,21 @@ tested.test(
 )
 
 tested.test(
-    "transport round-trips a correlated epoch redirect without a leader index",
+    "transport round-trips a correlated view redirect without a leader index",
     function()
         local message_id = string.rep("x", transport.MESSAGE_ID_BYTES)
         local redirect = transport.encode_not_leader(message_id, 4294967295)
-        local valid, received_id, epoch = transport.decode_not_leader(redirect)
+        local valid, received_id, view = transport.decode_not_leader(redirect)
         tested.assert(
             {
-                given = "an epoch redirect inside the fingerprinted application envelope",
+                given = "a view redirect inside the fingerprinted application envelope",
                 should = "preserve canonical correlation and omit redundant leader identity",
                 expected = "true:xxx:4294967295:21",
                 actual = tostring(valid)
                     .. ":"
                     .. received_id:sub(1, 3)
                     .. ":"
-                    .. tostring(epoch)
+                    .. tostring(view)
                     .. ":"
                     .. tostring(#redirect),
             }
@@ -225,7 +225,7 @@ tested.test(
         tested.assert(
             {
                 given = "redirects from expected and unexpected UDP peers",
-                should = "accept only source-correlated redirects; leader comes from the local epoch map",
+                should = "accept only source-correlated redirects; leader comes from the local view map",
                 expected = "true:false:false",
                 actual = tostring(valid)
                     .. ":"

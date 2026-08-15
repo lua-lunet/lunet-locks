@@ -61,7 +61,7 @@ local function decode_peer(packet: string): (boolean, string, string, string)
 end
 
 -- A redirect is deliberately a small fixed-size application packet. It carries
--- no leader index: every fixed ordered membership maps the supplied epoch to
+-- no leader index: every fixed ordered membership maps the supplied view to
 -- its leader through the local replica adapter.
 local function u32_bytes(value: integer): string
     return string.char(
@@ -80,13 +80,13 @@ local function parse_u32(bytes: string): integer
     ) as integer
 end
 
-local function encode_not_leader(message_id: string, epoch: integer): string
+local function encode_not_leader(message_id: string, view: integer): string
     assert(#message_id == MESSAGE_ID_BYTES, "transport: invalid redirect message ID")
     assert(
-        epoch >= 0 and epoch <= MAX_U32 and epoch == math.floor(epoch),
-        "transport: invalid redirect epoch"
+        view >= 0 and view <= MAX_U32 and view == math.floor(view),
+        "transport: invalid redirect view"
     )
-    return FORWARD_NOT_LEADER .. message_id .. u32_bytes(epoch)
+    return FORWARD_NOT_LEADER .. message_id .. u32_bytes(view)
 end
 
 local function decode_not_leader(payload: string): (boolean, string, integer)
@@ -95,8 +95,8 @@ local function decode_not_leader(payload: string): (boolean, string, integer)
     then
         return false, "", 0
     end
-    local epoch = parse_u32(payload:sub(2 + MESSAGE_ID_BYTES, 1 + MESSAGE_ID_BYTES + 4))
-    return true, payload:sub(2, 1 + MESSAGE_ID_BYTES), epoch
+    local view = parse_u32(payload:sub(2 + MESSAGE_ID_BYTES, 1 + MESSAGE_ID_BYTES + 4))
+    return true, payload:sub(2, 1 + MESSAGE_ID_BYTES), view
 end
 
 local function valid_not_leader(
