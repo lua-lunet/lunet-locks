@@ -90,7 +90,7 @@ dependency itself.
 
 **vrr-core boundary**: telemetry only observes already-committed outputs; it
 does not need vrr-core to expose anything beyond what it already returns.
-If a revision of this format ever needs replication index/term captured per
+If a revision of this format ever needs replication slot/era/view captured per
 record, that requires a vrr-core adapter surface — per `AGENTS.md`, any such
 change is staged locally only, never committed or pushed, backed by an
 upstream GitHub issue, and reported to the coordinator.

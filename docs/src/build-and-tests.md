@@ -79,7 +79,7 @@ generated HTML under `docs/site/`.
 | File | Responsibility |
 |---|---|
 | `ext/advisory_lock/src/locks.rs` | JSON lock protocol and lock state machine |
-| `ext/advisory_lock/src/ffi.rs` | vrr-core adapter, C ABI, wall clock, recovery nonce |
+| `ext/advisory_lock/src/ffi.rs` | vrr-core adapter, C ABI, tick clock, recovery nonce |
 | `src/advisory_lock.tl` | Teal wrapper and owned output draining |
 | `src/server.tl` | TCP NDJSON server, UDP peers, and leader forwarding |
 | `tests/lunet_smoke.sh` | three-process runtime smoke test |

@@ -2,11 +2,12 @@
 
 `lunet-locks` is a runnable, fixed-membership advisory-lock service. It
 orders lock requests with [vrr-core](https://github.com/lua-lunet/vrr-core),
-serves newline-delimited JSON over TCP, and uses expiring leases rather than
-mandatory locking. VRR Core is viewstamped replication revisited Sans-IO library 
-written in Rust with a C API. This service uses Luajit and libuv to create a 
-service that runs viewstamped replication VSR were state is made durable at 
-each node. 
+a sans-IO Viewstamped-Replication-Revisited core written in Rust, serves
+newline-delimited JSON over TCP, and uses expiring leases rather than
+mandatory locking. A small Rust adapter drives the core and owns the lock
+state machine; the service process is LuaJIT and libuv (Lunet). Protocol
+state lives in quorum memory: a restarted node recovers from the surviving
+members, and the only bytes fsynced locally are the recovery nonce file.
 
 Run a three-replica smoke test with the project-local Lunet runtime:
 
