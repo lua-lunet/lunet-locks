@@ -1,0 +1,20 @@
+[package]
+name = "lock-feed"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+
+[[bin]]
+name = "lock-feed"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "fs"] }
+tokio-tungstenite = "0.26"
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+serde_json = "1"
+lunet_advisory_lock = { package = "lunet-advisory-lock", path = "../advisory_lock" }
+
+[dev-dependencies]
+tokio-tungstenite = "0.26"
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }

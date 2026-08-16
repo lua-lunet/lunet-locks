@@ -19,6 +19,7 @@ fn execute(service: &mut Service, request: &Request, execution_time: u64) -> Vec
             &serde_json::to_vec(request).unwrap(),
         )
         .expect("execution succeeds")
+        .0
 }
 
 fn set_request(

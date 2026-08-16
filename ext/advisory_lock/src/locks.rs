@@ -2,6 +2,30 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use uuid::Uuid;
 
+/// Classification of a committed lock transition, returned by
+/// `Service::execute` so the adapter can append a journal event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Transition {
+    Hold {
+        lock_id: u64,
+        lease_id: u64,
+        holder: [u8; 16],
+        expiry: u64,
+    },
+    Renew {
+        lock_id: u64,
+        lease_id: u64,
+        holder: [u8; 16],
+        expiry: u64,
+    },
+    Release {
+        lock_id: u64,
+        lease_id: u64,
+        holder: [u8; 16],
+        expiry: u64,
+    },
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Lease {
     pub lease_id: u64,
@@ -107,25 +131,28 @@ impl Service {
         request_num: u64,
         execution_time: u64,
         payload: &[u8],
-    ) -> Result<Vec<u8>, serde_json::Error> {
+    ) -> Result<(Vec<u8>, Option<Transition>), serde_json::Error> {
         let request = Self::decode(payload)?;
         if request.ids() != (message_id, client_id, request_num) {
             return Err(<serde_json::Error as serde::de::Error>::custom(
                 "replicated envelope does not match lock payload",
             ));
         }
-        let response = match request {
+        let (response, transition) = match request {
             Request::Get {
                 message_id,
                 request_num,
                 lock_id,
                 ..
-            } => Response::Get {
-                message_id,
-                request_num,
-                lock_id,
-                lease: self.live(execution_time, lock_id),
-            },
+            } => (
+                Response::Get {
+                    message_id,
+                    request_num,
+                    lock_id,
+                    lease: self.live(execution_time, lock_id),
+                },
+                None,
+            ),
             Request::Set {
                 message_id,
                 request_num,
@@ -136,16 +163,40 @@ impl Service {
                 let held = self.live(execution_time, lock_id);
                 let granted = held.is_none_or(|current| current.holder == lease.holder)
                     && lease.expiry > execution_time;
+                let transition = if granted {
+                    if held.is_some() {
+                        // Same-holder regrant with a prior live lease → Renew.
+                        Some(Transition::Renew {
+                            lock_id,
+                            lease_id: lease.lease_id,
+                            holder: *lease.holder.as_bytes(),
+                            expiry: lease.expiry,
+                        })
+                    } else {
+                        // No prior live lease → Hold.
+                        Some(Transition::Hold {
+                            lock_id,
+                            lease_id: lease.lease_id,
+                            holder: *lease.holder.as_bytes(),
+                            expiry: lease.expiry,
+                        })
+                    }
+                } else {
+                    None
+                };
                 if granted {
                     self.locks.insert(lock_id, lease);
                 }
-                Response::Set {
-                    message_id,
-                    request_num,
-                    lock_id,
-                    granted,
-                    lease: if granted { Some(lease) } else { held },
-                }
+                (
+                    Response::Set {
+                        message_id,
+                        request_num,
+                        lock_id,
+                        granted,
+                        lease: if granted { Some(lease) } else { held },
+                    },
+                    transition,
+                )
             }
             Request::Release {
                 message_id,
@@ -158,20 +209,35 @@ impl Service {
                 let held = self.live(execution_time, lock_id);
                 let released =
                     held.is_none_or(|lease| lease.holder == holder && lease.lease_id == lease_id);
+                let transition = if released {
+                    // Carry the removed lease's fields (tombstone must be
+                    // self-describing).
+                    held.map(|lease| Transition::Release {
+                        lock_id,
+                        lease_id: lease.lease_id,
+                        holder: *lease.holder.as_bytes(),
+                        expiry: lease.expiry,
+                    })
+                } else {
+                    None
+                };
                 if released {
                     self.locks.remove(&lock_id);
                 }
-                Response::Release {
-                    message_id,
-                    request_num,
-                    lock_id,
-                    released,
-                    lease: if released { None } else { held },
-                }
+                (
+                    Response::Release {
+                        message_id,
+                        request_num,
+                        lock_id,
+                        released,
+                        lease: if released { None } else { held },
+                    },
+                    transition,
+                )
             }
         };
         let bytes = serde_json::to_vec(&response)?;
-        Ok(bytes)
+        Ok((bytes, transition))
     }
 
     pub fn response_message_id(bytes: &[u8]) -> Option<Uuid> {

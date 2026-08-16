@@ -57,12 +57,17 @@ end
 -- A fresh three-node cluster brought to Normal: every node boots fenced and
 -- starts a recovery attempt inside `new`; the genesis primary (member index
 -- 0) self-promotes on a tick and the Recovering backups adopt the view.
-local function boot_cluster(name: string): {advisory_lock.Node}
+-- Pass journal_dir="" and journal_roll_bytes=0 to disable journaling.
+local function boot_cluster(
+    name: string, journal_dir: string, journal_roll_bytes: integer
+): {advisory_lock.Node}
     local nodes: {advisory_lock.Node} = {}
     for index, own in ipairs(members) do
         local path = state_path(name .. tostring(index))
         os.remove(path)
-        nodes[index] = advisory_lock.new(members, own, path)
+        nodes[index] = advisory_lock.new(
+            members, own, path, journal_dir, journal_roll_bytes
+        )
     end
     drain(nodes)
     nodes[1]:idle()
@@ -79,7 +84,7 @@ end
 tested.test(
     "three in-process nodes boot fenced, recover, and agree on the genesis view",
     function()
-        local nodes = boot_cluster("boot")
+        local nodes = boot_cluster("boot", "", 0)
         local summary: {string} = {}
         for index, node in ipairs(nodes) do
             local status = node:status()
@@ -113,7 +118,7 @@ tested.test(
 tested.test(
     "a client request on the leader commits and returns a correlated lock reply",
     function()
-        local nodes = boot_cluster("request")
+        local nodes = boot_cluster("request", "", 0)
         local expected_id = raw_message_id("07070707-0707-0707-0707-070707070707")
         local ok = nodes[1]:request(GET_JSON)
         local replies: {advisory_lock.Output} = {}
@@ -166,7 +171,7 @@ tested.test(
 tested.test(
     "a duplicate request replays the cached reply without re-executing",
     function()
-        local nodes = boot_cluster("duplicate")
+        local nodes = boot_cluster("duplicate", "", 0)
         local ok_first = nodes[1]:request(SET_JSON)
         local first_replies: {advisory_lock.Output} = {}
         for _ = 1, 64 do
@@ -250,7 +255,7 @@ tested.test(
 tested.test(
     "request on a non-leader returns not_leader instead of raising",
     function()
-        local nodes = boot_cluster("notleader")
+        local nodes = boot_cluster("notleader", "", 0)
         local ok, err = nodes[2]:request(GET_JSON)
         local quiet = #nodes[2]:outputs() == 0
         close_cluster(nodes)
@@ -272,7 +277,7 @@ tested.test(
 tested.test(
     "receive with garbage bytes raises the replication-message error",
     function()
-        local nodes = boot_cluster("garbage")
+        local nodes = boot_cluster("garbage", "", 0)
         local raised = pcall(function() nodes[1]:receive(1, string.rep("\255", 64)) end)
         local truncated = pcall(function() nodes[1]:receive(1, "\0\0\0\0") end)
         close_cluster(nodes)
@@ -290,7 +295,7 @@ tested.test(
 tested.test(
     "outputs on a quiet node is an empty array",
     function()
-        local nodes = boot_cluster("quiet")
+        local nodes = boot_cluster("quiet", "", 0)
         local drained = 0
         for _, node in ipairs(nodes) do
             drained = drained + #node:outputs()
@@ -302,6 +307,65 @@ tested.test(
                 should = "report no pending outputs on any node",
                 expected = 0,
                 actual = drained,
+            }
+        )
+    end
+)
+
+tested.test(
+    "journal-enabled boot writes fixed-size event records to the journal dir",
+    function()
+        local journal_dir = ".tmp/advisory-lock-ffi-journal-" .. tostring(os.time())
+        os.execute('mkdir -p "' .. journal_dir .. '"')
+        local nodes = boot_cluster("journal", journal_dir, 250)
+        -- Drive a grant flow so the journal receives at least one hold event.
+        nodes[1]:request(SET_JSON)
+        for _ = 1, 64 do
+            local moved = false
+            for source = 1, #nodes do
+                for _, output in ipairs(nodes[source]:outputs()) do
+                    if output.kind == "send" then
+                        moved = true
+                        nodes[output.replica + 1]:receive(source - 1, output.bytes)
+                    end
+                end
+            end
+            if not moved then
+                break
+            end
+        end
+        close_cluster(nodes)
+        -- Scan the journal dir for any ev-*.bin file (open or rolled).
+        local handle = io.popen('ls -1 "' .. journal_dir .. '" 2>/dev/null')
+        local listing = handle and handle:read("*a") or ""
+        if handle then
+            handle:close()
+        end
+        local found_file: string = ""
+        for line in listing:gmatch("[^\n]+") do
+            if line:match("^ev%-.*%.bin$") then
+                found_file = line
+                break
+            end
+        end
+        local size_ok = false
+        if found_file ~= "" then
+            local full_path = journal_dir .. "/" .. found_file
+            local fh = io.open(full_path, "rb")
+            if fh ~= nil then
+                local data = fh:read("*a")
+                fh:close()
+                size_ok = (#data > 0) and (#data % 61 == 0)
+            end
+        end
+        -- Clean up temp dir.
+        os.execute('rm -rf "' .. journal_dir .. '"')
+        tested.assert(
+            {
+                given = "a cluster booted with journal dir and tiny roll threshold",
+                should = "produce at least one ev-*.bin whose size is a multiple of 61",
+                expected = "true:true",
+                actual = tostring(found_file ~= "") .. ":" .. tostring(size_ok),
             }
         )
     end

@@ -37,6 +37,12 @@
 //!   operation entry (Prepare / DoViewChange / StartView / RecoveryResponse /
 //!   NewState) with `Service` before the message reaches the core — the same
 //!   gate the old adapter called `valid_message_payloads`.
+//! - **Lock-event journal.** An optional append-only binary journal records
+//!   every committed lock transition (Hold/Renew/Release) to rolling files
+//!   under a per-replica directory. Enabled when `lunet_lock_node_new`
+//!   receives a non-empty `journal_dir`; disabled otherwise. Journal errors
+//!   log to stderr and disable journaling for the process; the node keeps
+//!   serving. See `journal.rs` for the record and metafile formats.
 //!
 //! `node_next` output contract (kinds): 1 = send (unicast to `to`; era, view
 //! and slot report the encoded message's wire header), 2 = reply (message_id
@@ -44,8 +50,26 @@
 //! was produced, 0 when the queue is empty, negative on error. When the next
 //! output's bytes exceed `capacity`, the call reports the needed size in
 //! `out_len`, returns TOO_LARGE and does NOT pop the queue.
+//!
+//! # ABI surface
+//!
+//! ```text
+//! lunet_lock_node_new(
+//!     members_len: usize, members_data: *const u8,
+//!     own_len: usize, own_data: *const u8,
+//!     state_len: usize, state_data: *const u8,
+//!     journal_dir_len: usize, journal_dir_data: *const u8,
+//!     roll_bytes: u32,
+//!     out: *mut *mut c_void,
+//! ) -> i32
+//! ```
+//!
+//! Empty `journal_dir` (len=0 or data points to empty string) disables the
+//! journal. `roll_bytes` is the byte threshold at which the current event
+//! file rolls to a final name with an atomic metafile.
 
-use crate::locks::Service;
+use crate::journal::{self, Journal as LockJournal, JournalEvent};
+use crate::locks::{Service, Transition};
 use std::collections::{HashMap, VecDeque};
 use std::ffi::{OsString, c_void};
 use std::fs::{self, File, OpenOptions};
@@ -114,6 +138,9 @@ pub struct Node {
     nonce_path: PathBuf,
     last_tick: u64,
     poisoned: bool,
+    /// Append-only lock-event journal. `None` when journaling is disabled
+    /// (empty journal_dir at construction) or after a journal error.
+    journal: Option<LockJournal>,
 }
 
 impl Node {
@@ -233,10 +260,10 @@ impl Node {
                 payload,
             } => {
                 let message_id = operation_id_bytes(operation_id);
-                let response = if let Some(cached) = self.replies.get(&message_id) {
+                let (response, transition) = if let Some(cached) = self.replies.get(&message_id) {
                     // Duplicate committed operation: replay the cached reply,
-                    // never re-execute (B2).
-                    cached.clone()
+                    // never re-execute (B2). No journal append for duplicates.
+                    (cached.clone(), None)
                 } else {
                     // The committed entry carries only the operation identity
                     // and the opaque payload; the client ids ride inside the
@@ -248,13 +275,69 @@ impl Node {
                         return Err(SERVICE);
                     }
                     let execution_time = unix_millis()?;
-                    let bytes = self
+                    let (bytes, transition) = self
                         .service
                         .execute(id, client_id, request_num, execution_time, &payload)
                         .map_err(|_| SERVICE)?;
                     self.replies.insert(message_id, bytes.clone());
-                    bytes
+                    (bytes, transition)
                 };
+                // Append a journal event for first-execution transitions
+                // only (never on cached duplicate replay). Journal errors
+                // disable journaling for the process; the node keeps serving.
+                if let Some(transition) = transition {
+                    if let Some(journal) = self.journal.as_mut() {
+                        let ts = unix_millis().unwrap_or(0);
+                        let event = match &transition {
+                            Transition::Hold {
+                                lock_id,
+                                lease_id,
+                                holder,
+                                expiry,
+                            } => JournalEvent {
+                                kind: journal::KIND_HOLD,
+                                ts,
+                                lock_id: *lock_id,
+                                lease_id: *lease_id,
+                                holder: *holder,
+                                expiry: *expiry,
+                            },
+                            Transition::Renew {
+                                lock_id,
+                                lease_id,
+                                holder,
+                                expiry,
+                            } => JournalEvent {
+                                kind: journal::KIND_RENEW,
+                                ts,
+                                lock_id: *lock_id,
+                                lease_id: *lease_id,
+                                holder: *holder,
+                                expiry: *expiry,
+                            },
+                            Transition::Release {
+                                lock_id,
+                                lease_id,
+                                holder,
+                                expiry,
+                            } => JournalEvent {
+                                kind: journal::KIND_RELEASE,
+                                ts,
+                                lock_id: *lock_id,
+                                lease_id: *lease_id,
+                                holder: *holder,
+                                expiry: *expiry,
+                            },
+                        };
+                        if let Err(e) = journal.append(&event) {
+                            eprintln!(
+                                "lunet-advisory-lock: journal append failed ({e}); \
+                                 journaling disabled for this process"
+                            );
+                            self.journal = None;
+                        }
+                    }
+                }
                 if let Some(message_id) = self.pending.remove(&operation_id) {
                     if response.len() > MAX_DATAGRAM {
                         return Err(TOO_LARGE);
@@ -494,6 +577,9 @@ pub unsafe extern "C" fn lunet_lock_node_new(
     own_data: *const u8,
     state_len: usize,
     state_data: *const u8,
+    journal_dir_len: usize,
+    journal_dir_data: *const u8,
+    roll_bytes: u32,
     out: *mut *mut c_void,
 ) -> i32 {
     guarded(|| {
@@ -509,6 +595,9 @@ pub unsafe extern "C" fn lunet_lock_node_new(
         let Ok(state_data) = (unsafe { bytes(state_len, state_data) }) else {
             return INVALID;
         };
+        let Ok(journal_dir_data) = (unsafe { bytes(journal_dir_len, journal_dir_data) }) else {
+            return INVALID;
+        };
         let Some(members) = members_data
             .split(|byte| *byte == 0)
             .map(|member| std::str::from_utf8(member).ok().map(str::to_owned))
@@ -521,6 +610,14 @@ pub unsafe extern "C" fn lunet_lock_node_new(
         };
         let Ok(state) = std::str::from_utf8(state_data) else {
             return CONFIG;
+        };
+        let journal_dir = if journal_dir_data.is_empty() {
+            None
+        } else {
+            match std::str::from_utf8(journal_dir_data) {
+                Ok(s) if !s.is_empty() => Some(s),
+                _ => None,
+            }
         };
         if state.is_empty()
             || members.is_empty()
@@ -559,6 +656,20 @@ pub unsafe extern "C" fn lunet_lock_node_new(
         if initialize_nonce(&nonce_path).is_err() {
             return CONFIG;
         }
+        let journal = if let Some(dir) = journal_dir {
+            match LockJournal::open(Path::new(dir), roll_bytes as u64) {
+                Ok(j) => Some(j),
+                Err(e) => {
+                    eprintln!(
+                        "lunet-advisory-lock: journal open failed ({e}); \
+                         journaling disabled for this process"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let mut node = Node {
             replica,
             outputs: VecDeque::new(),
@@ -568,6 +679,7 @@ pub unsafe extern "C" fn lunet_lock_node_new(
             nonce_path,
             last_tick: 0,
             poisoned: false,
+            journal,
         };
         // Every boot enters fenced Recovering (the tag's boot rule); drive a
         // recovery attempt immediately with a durable nonce tick.
@@ -858,6 +970,7 @@ mod tests {
             nonce_path,
             last_tick: 0,
             poisoned: false,
+            journal: None,
         }
     }
 
@@ -1144,6 +1257,9 @@ mod tests {
                     own.as_ptr(),
                     state_bytes.len(),
                     state_bytes.as_ptr(),
+                    0,
+                    ptr::null(),
+                    0,
                     &mut handle,
                 )
             },
@@ -1226,6 +1342,9 @@ mod tests {
                     b"n9".as_ptr(),
                     state_bytes.len(),
                     state_bytes.as_ptr(),
+                    0,
+                    ptr::null(),
+                    0,
                     &mut handle,
                 )
             },
@@ -1241,11 +1360,235 @@ mod tests {
                     b"n1".as_ptr(),
                     state_bytes.len(),
                     state_bytes.as_ptr(),
+                    0,
+                    ptr::null(),
+                    0,
                     &mut handle,
                 )
             },
             CONFIG
         );
         assert!(handle.is_null());
+    }
+
+    #[test]
+    fn journal_records_committed_transitions_with_roll_and_meta() {
+        use crate::journal::{self, Meta, parse_file};
+        use crate::locks::{Lease, Request};
+
+        let journal_dir = state_path("journal-integration");
+        let _ = fs::remove_dir_all(&journal_dir);
+        let members = b"n1\0n2\0n3";
+        let own = b"n1";
+        let state = state_path("journal-node");
+        let state_bytes = state.as_os_str().as_encoded_bytes();
+        let journal_dir_bytes = journal_dir.as_os_str().as_encoded_bytes();
+        // Tiny roll threshold: 3 records = 183 bytes triggers a roll.
+        let roll_bytes: u32 = (journal::RECORD_SIZE * 3) as u32;
+        let mut handle: *mut c_void = ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                lunet_lock_node_new(
+                    members.len(),
+                    members.as_ptr(),
+                    own.len(),
+                    own.as_ptr(),
+                    state_bytes.len(),
+                    state_bytes.as_ptr(),
+                    journal_dir_bytes.len(),
+                    journal_dir_bytes.as_ptr(),
+                    roll_bytes,
+                    &mut handle,
+                )
+            },
+            OK
+        );
+        assert!(!handle.is_null());
+
+        // Build two backup nodes (no journal) to form a quorum.
+        let mut backups = [
+            provision("journal-backup-1", 1, 3),
+            provision("journal-backup-2", 2, 3),
+        ];
+
+        // Drive recovery on all nodes and promote to Normal.
+        let primary = unsafe { &mut *handle.cast::<Node>() };
+        assert_eq!(primary.recover(), OK);
+        primary.outputs.clear();
+        for backup in &mut backups {
+            assert_eq!(backup.recover(), OK);
+            backup.outputs.clear();
+        }
+        assert_eq!(primary.drive(Input::Tick), OK);
+
+        // Route until quiet across all three nodes.
+        let mut all_nodes = vec![primary as *mut Node];
+        for b in &mut backups {
+            all_nodes.push(b as *mut Node);
+        }
+        // Manual route: drain sends from primary to backups and back.
+        loop {
+            let mut moved = false;
+            // Drain primary's sends.
+            let drained: VecDeque<Queued> =
+                std::mem::take(&mut unsafe { &mut *all_nodes[0] }.outputs);
+            let (sends, kept): (Vec<Queued>, Vec<Queued>) =
+                drained.into_iter().partition(|o| o.kind == OUTPUT_SEND);
+            unsafe { &mut *all_nodes[0] }.outputs = kept.into_iter().collect();
+            for send in sends {
+                moved = true;
+                let message = Message::unpack_from(&send.bytes).expect("wire round trip");
+                let to = send.to as usize;
+                assert_eq!(
+                    unsafe { &mut *all_nodes[to] }.drive(Input::Peer {
+                        from: NodeId(0),
+                        message,
+                    }),
+                    OK
+                );
+            }
+            // Drain backups' sends back to primary.
+            for idx in 1..all_nodes.len() {
+                let drained: VecDeque<Queued> =
+                    std::mem::take(&mut unsafe { &mut *all_nodes[idx] }.outputs);
+                let (sends, kept): (Vec<Queued>, Vec<Queued>) =
+                    drained.into_iter().partition(|o| o.kind == OUTPUT_SEND);
+                unsafe { &mut *all_nodes[idx] }.outputs = kept.into_iter().collect();
+                for send in sends {
+                    moved = true;
+                    let message = Message::unpack_from(&send.bytes).expect("wire round trip");
+                    let to = send.to as usize;
+                    assert_eq!(
+                        unsafe { &mut *all_nodes[to] }.drive(Input::Peer {
+                            from: NodeId(idx as u32),
+                            message,
+                        }),
+                        OK
+                    );
+                }
+            }
+            if !moved {
+                break;
+            }
+        }
+        // Clear all outputs.
+        for ptr in &all_nodes {
+            unsafe { &mut **ptr }.outputs.clear();
+        }
+
+        // Helper to propose a Set request on the primary and route until
+        // committed.
+        let propose_set = |primary: &mut Node,
+                           backups: &mut [Node; 2],
+                           msg_id: Uuid,
+                           lock_id: u64,
+                           lease_id: u64| {
+            let holder = Uuid::from_bytes([0xBB; 16]);
+            let payload = serde_json::to_vec(&Request::Set {
+                message_id: msg_id,
+                client_id: 1,
+                request_num: 1,
+                lock_id,
+                lease: Lease {
+                    lease_id,
+                    holder,
+                    expiry: unix_millis().unwrap() + 60_000,
+                },
+            })
+            .unwrap();
+            assert_eq!(
+                unsafe {
+                    lunet_lock_node_request(
+                        (&raw mut *primary).cast(),
+                        payload.len(),
+                        payload.as_ptr(),
+                    )
+                },
+                OK
+            );
+            // Route until quiet across all nodes.
+            let mut all: Vec<&mut Node> = vec![primary];
+            for b in backups.iter_mut() {
+                all.push(b);
+            }
+            loop {
+                let mut moved = false;
+                for source in 0..all.len() {
+                    let drained: VecDeque<Queued> = std::mem::take(&mut all[source].outputs);
+                    let (sends, kept): (Vec<Queued>, Vec<Queued>) =
+                        drained.into_iter().partition(|o| o.kind == OUTPUT_SEND);
+                    all[source].outputs = kept.into_iter().collect();
+                    for send in sends {
+                        moved = true;
+                        let message = Message::unpack_from(&send.bytes).expect("wire round trip");
+                        let to = send.to as usize;
+                        assert_eq!(
+                            all[to].drive(Input::Peer {
+                                from: NodeId(source as u32),
+                                message,
+                            }),
+                            OK
+                        );
+                    }
+                }
+                if !moved {
+                    break;
+                }
+            }
+            for n in &mut all {
+                n.outputs.clear();
+            }
+        };
+
+        let primary = unsafe { &mut *handle.cast::<Node>() };
+        // Propose 3 Set operations to trigger a roll (roll_bytes = 3 records).
+        propose_set(primary, &mut backups, Uuid::from_bytes([1; 16]), 100, 1001);
+        propose_set(primary, &mut backups, Uuid::from_bytes([2; 16]), 200, 2002);
+        propose_set(primary, &mut backups, Uuid::from_bytes([3; 16]), 300, 3003);
+
+        // After 3 records the journal should have rolled: one final .bin +
+        // one .meta, plus a fresh ev-open-*.bin.
+        let entries: Vec<_> = fs::read_dir(&journal_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        let bin_files: Vec<&str> = entries
+            .iter()
+            .filter(|n| n.starts_with("ev-") && n.ends_with(".bin") && !n.contains("open"))
+            .map(|s| s.as_str())
+            .collect();
+        assert_eq!(bin_files.len(), 1, "one rolled file after 3 records");
+        let meta_files: Vec<&str> = entries
+            .iter()
+            .filter(|n| n.ends_with(".meta"))
+            .map(|s| s.as_str())
+            .collect();
+        assert_eq!(meta_files.len(), 1, "one meta file after roll");
+
+        // Verify the meta matches the op/expiry windows.
+        let meta_path = journal_dir.join(meta_files[0]);
+        let meta_bytes = fs::read(&meta_path).unwrap();
+        let meta = Meta::decode(&meta_bytes).expect("valid meta");
+        assert_eq!(meta.count, 3);
+        assert!(meta.op_min <= meta.op_max);
+        assert!(meta.expiry_min <= meta.expiry_max);
+
+        // Parse back the records and verify they are Hold events.
+        let bin_path = journal_dir.join(bin_files[0]);
+        let bin_data = fs::read(&bin_path).unwrap();
+        let events = parse_file(&bin_data);
+        assert_eq!(events.len(), 3);
+        for event in &events {
+            assert_eq!(event.kind, journal::KIND_HOLD);
+            assert_eq!(event.holder, [0xBB; 16]);
+        }
+        assert_eq!(events[0].lock_id, 100);
+        assert_eq!(events[1].lock_id, 200);
+        assert_eq!(events[2].lock_id, 300);
+
+        unsafe { lunet_lock_node_free(handle) };
+        let _ = fs::remove_file(state);
+        let _ = fs::remove_dir_all(&journal_dir);
     }
 }

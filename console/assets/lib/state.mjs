@@ -43,6 +43,11 @@ export const store = {
     series: null,       // {bucketMs, buckets}
     toast: "",          // transient status text
     error: "",
+    // Journal data layer (item64).
+    journalLocks: [],   // active-lock set [{lockId, leaseId, holder, expiry, acquiredTs, renewCount}]
+    journalRates: { bucketSec: 0, buckets: [] }, // per-second rate buckets
+    journalEvents: [],  // recent events (newest first)
+    journalStatus: { filesTotal: 0, filesLoaded: 0, wsConnected: false, caughtUp: false },
   },
   _listeners: new Set(),
   set(patch) {

@@ -2,7 +2,7 @@
 // keeps hours — buckets and events survive reloads and mock restarts.
 
 const DB_NAME = "lock-admin";
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 
 function open() {
   return new Promise((resolve, reject) => {
@@ -11,6 +11,13 @@ function open() {
       const db = req.result;
       if (!db.objectStoreNames.contains("events")) db.createObjectStore("events", { keyPath: "seq" });
       if (!db.objectStoreNames.contains("buckets")) db.createObjectStore("buckets", { keyPath: "tsMs" });
+      // Journal stores (v2).
+      if (!db.objectStoreNames.contains("journalEvents")) {
+        db.createObjectStore("journalEvents", { keyPath: ["ts", "lockId", "leaseId"] });
+      }
+      if (!db.objectStoreNames.contains("loadedFiles")) {
+        db.createObjectStore("loadedFiles", { keyPath: "name" });
+      }
     };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
@@ -67,5 +74,38 @@ export const db = {
     });
     await tx(d, "buckets", "readwrite", (s) => s.delete(IDBKeyRange.upperBound(olderThanMs)));
     d.close();
+  },
+
+  // ---- Journal stores (v2) ----
+
+  /** Upsert journal events (idempotent by [ts, lockId, leaseId] key). */
+  async putJournalEvents(events) {
+    if (!events.length) return;
+    const d = await open();
+    await tx(d, "journalEvents", "readwrite", (s) => {
+      for (const e of events) s.put(e);
+    });
+    d.close();
+  },
+
+  /** Mark a rolled file as fully ingested. */
+  async markFileLoaded(name) {
+    const d = await open();
+    await tx(d, "loadedFiles", "readwrite", (s) => {
+      s.put({ name, loadedAt: Date.now() });
+    });
+    d.close();
+  },
+
+  /** Get all previously loaded file names. */
+  async getLoadedFiles() {
+    const d = await open();
+    const rows = await new Promise((resolve, reject) => {
+      const req = d.transaction("loadedFiles").objectStore("loadedFiles").getAll();
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+    d.close();
+    return rows.map((r) => r.name);
   },
 };

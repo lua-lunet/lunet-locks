@@ -42,7 +42,8 @@ fn set_obeys_the_lease_rules() {
                 100,
                 &serde_json::to_vec(&set(1, 1, 1, 1, 500)).unwrap(),
             )
-            .unwrap(),
+            .unwrap()
+            .0,
     )
     .unwrap();
     let blocked: Response = serde_json::from_slice(
@@ -54,7 +55,8 @@ fn set_obeys_the_lease_rules() {
                 100,
                 &serde_json::to_vec(&set(2, 2, 1, 2, 600)).unwrap(),
             )
-            .unwrap(),
+            .unwrap()
+            .0,
     )
     .unwrap();
     let expired: Response = serde_json::from_slice(
@@ -66,7 +68,8 @@ fn set_obeys_the_lease_rules() {
                 500,
                 &serde_json::to_vec(&set(3, 2, 2, 2, 900)).unwrap(),
             )
-            .unwrap(),
+            .unwrap()
+            .0,
     )
     .unwrap();
 

@@ -6,6 +6,8 @@ ffi.cdef(
         size_t members_len, const uint8_t* members,
         size_t own_len, const uint8_t* own,
         size_t state_len, const uint8_t* state,
+        size_t journal_dir_len, const uint8_t* journal_dir,
+        uint32_t roll_bytes,
         void** out);
     void lunet_lock_node_free(void* node);
     int32_t lunet_lock_node_request(void* node, size_t json_len, const uint8_t* json);
@@ -47,7 +49,7 @@ local errors: {integer: string} = {
 
 local record Native
     lunet_lock_node_new: function(
-        integer, any, integer, any, integer, any, {any}
+        integer, any, integer, any, integer, any, integer, any, integer, {any}
     ): number
     lunet_lock_node_free: function(any)
     lunet_lock_node_request: function(any, integer, any): number
@@ -136,7 +138,7 @@ local record advisory_lock
         view: integer
     end
 
-    new: function({string}, string, string): Node
+    new: function({string}, string, string, string, integer): Node
 end
 
 local Node = advisory_lock.Node
@@ -297,7 +299,13 @@ end
 
 local M: advisory_lock = {}
 
-function M.new(members: {string}, own: string, state_path: string): Node
+function M.new(
+    members: {string},
+    own: string,
+    state_path: string,
+    journal_dir: string,
+    journal_roll_bytes: integer
+): Node
     assert(#members >= 3, "advisory_lock: at least three members are required")
     for _, member in ipairs(members) do
         assert(
@@ -309,13 +317,30 @@ function M.new(members: {string}, own: string, state_path: string): Node
         state_path ~= "" and state_path:find("\0", 1, true) == nil,
         "advisory_lock: invalid state path"
     )
+    assert(
+        journal_dir:find("\0", 1, true) == nil,
+        "advisory_lock: journal dir contains NUL"
+    )
+    assert(
+        journal_roll_bytes >= 0,
+        "advisory_lock: journal roll bytes must be non-negative"
+    )
     local packed = table.concat(members, "\0")
     local out = ffi.new("void*[1]") as {any}
     check(
         (
             tonumber(
                 native.lunet_lock_node_new(
-                    #packed, packed, #own, own, #state_path, state_path, out
+                    #packed,
+                    packed,
+                    #own,
+                    own,
+                    #state_path,
+                    state_path,
+                    #journal_dir,
+                    journal_dir,
+                    journal_roll_bytes,
+                    out
                 )
             ) or -127
         ) as integer

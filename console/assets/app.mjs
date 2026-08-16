@@ -13,6 +13,8 @@ import { store, config } from "./lib/state.mjs";
 import { api } from "./lib/api.mjs";
 import { db } from "./lib/db.mjs";
 import { parseClock } from "./lib/util.mjs";
+import { initMerge, ingestFileEvents, ingestLiveEvent, updateFilesStatus, updateWsStatus } from "./lib/journal/merge.mjs";
+import { connectJournalWs } from "./lib/journal/live.mjs";
 
 // Failure bookkeeping: any failing poller surfaces on the status bar, and
 // the message clears once every poller succeeds again.
@@ -132,3 +134,49 @@ setInterval(() => guard("events", refreshEvents), 2000);
 setInterval(() => guard("series", refreshSeries), 2000);
 setInterval(() => guard("cacheTail", cacheTail), 15000);
 guard("cacheTail", cacheTail);
+
+// ---- Journal data layer ----
+// Spins up the loader worker, live WS, and merge engine. The worker fetches
+// rolled .bin files; the WS tails the open file; the merge engine unifies both
+// into the store's journal* fields.
+
+(async () => {
+  const { loadedNames } = await initMerge();
+
+  // Create the loader worker.
+  const worker = new Worker(
+    new URL("./workers/journal-loader.mjs", import.meta.url),
+    { type: "module" },
+  );
+
+  // Tell the worker about files already in IndexedDB so it skips them.
+  for (const name of loadedNames) {
+    worker.postMessage({ type: "markLoaded", name });
+  }
+
+  worker.onmessage = (e) => {
+    const msg = e.data;
+    if (msg.type === "fileEvents") {
+      ingestFileEvents(msg.name, msg.events);
+    } else if (msg.type === "filesStatus") {
+      updateFilesStatus(msg.filesTotal, msg.filesLoaded);
+    }
+  };
+
+  // Start the initial poll.
+  worker.postMessage({ type: "start" });
+
+  // Connect the live WebSocket.
+  connectJournalWs({
+    onEvent(ev) {
+      ingestLiveEvent(ev);
+    },
+    onRolled(rolled) {
+      // Tell the worker to re-poll for the newly rolled file.
+      worker.postMessage({ type: "rolled", file: rolled.file });
+    },
+    onStatus(connected) {
+      updateWsStatus(connected);
+    },
+  });
+})();

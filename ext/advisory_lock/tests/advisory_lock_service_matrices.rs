@@ -141,6 +141,7 @@ fn execute(service: &mut Service, request: &Request) -> Result<Vec<u8>, String> 
             EXECUTION_TIME,
             &serde_json::to_vec(request).expect("request serializes"),
         )
+        .map(|(bytes, _transition)| bytes)
         .map_err(|error| error.to_string())
 }
 
@@ -176,7 +177,8 @@ fn observed_lease_at(service: &mut Service, lock_id: u64, execution_time: u64) -
                 execution_time,
                 &serde_json::to_vec(&request).unwrap(),
             )
-            .unwrap(),
+            .unwrap()
+            .0,
     )
     .unwrap();
     match response {
@@ -233,7 +235,8 @@ fn release_requires_the_exact_live_lease_and_is_idempotent_after_expiry() {
                     time,
                     &serde_json::to_vec(request).unwrap(),
                 )
-                .unwrap(),
+                .unwrap()
+                .0,
         )
         .unwrap()
     };
@@ -352,7 +355,7 @@ fn service_matrix_is_complete_correlated_and_deterministic() {
                         }
 
                         let response: Response =
-                            serde_json::from_slice(&first_result.unwrap()).unwrap();
+                            serde_json::from_slice(&first_result.unwrap().0).unwrap();
                         match (operation, response) {
                             (
                                 Operation::Get,
@@ -461,7 +464,8 @@ fn lock_isolation_and_u64_extrema_are_preserved() {
                     value,
                     &serde_json::to_vec(&set).unwrap(),
                 )
-                .unwrap(),
+                .unwrap()
+                .0,
         )
         .unwrap();
         assert_eq!(

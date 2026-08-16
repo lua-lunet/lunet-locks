@@ -41,6 +41,8 @@ local record Options
     heartbeat_ms: integer
     election_ms: integer
     recovery_ms: integer
+    event_journal_dir: string
+    event_journal_roll_bytes: integer
 end
 
 local record Pending
@@ -64,7 +66,8 @@ end
 local function usage(): string
     return "usage: lunet-run build/server.lua --node NAME --client IPv4:PORT "
         .. "--state PATH --member NAME=IPv4:PORT (at least three) "
-        .. "[--heartbeat-ms N] [--election-ms N] [--recovery-ms N]"
+        .. "[--heartbeat-ms N] [--election-ms N] [--recovery-ms N] "
+        .. "[--event-journal-dir PATH] [--event-journal-roll-bytes N]"
 end
 
 local function positive(value: string, name: string): integer
@@ -84,6 +87,8 @@ local function parse_options(argv: {string}): Options
     local heartbeat_ms: integer = 200
     local election_ms: integer = 1200
     local recovery_ms: integer = 2500
+    local event_journal_dir: string = ""
+    local event_journal_roll_bytes: integer = 8388608
     local index = 1
     while index <= #argv do
         local flag = argv[index]
@@ -106,6 +111,15 @@ local function parse_options(argv: {string}): Options
             election_ms = positive(value, "server: --election-ms")
         elseif flag == "--recovery-ms" then
             recovery_ms = positive(value, "server: --recovery-ms")
+        elseif flag == "--event-journal-dir" then
+            assert(
+                event_journal_dir == "", "server: --event-journal-dir may appear once"
+            )
+            event_journal_dir = value
+        elseif flag == "--event-journal-roll-bytes" then
+            event_journal_roll_bytes = positive(
+                value, "server: --event-journal-roll-bytes"
+            )
         else
             error("server: unknown option " .. flag)
         end
@@ -128,6 +142,8 @@ local function parse_options(argv: {string}): Options
         heartbeat_ms = heartbeat_ms,
         election_ms = election_ms,
         recovery_ms = recovery_ms,
+        event_journal_dir = event_journal_dir,
+        event_journal_roll_bytes = event_journal_roll_bytes,
     }
 end
 
@@ -179,7 +195,13 @@ local function main(options: Options)
     end
     assert(own_index >= 0, "server: own member missing")
 
-    local node = advisory_lock.new(member_names, options.node, options.state)
+    local node = advisory_lock.new(
+        member_names,
+        options.node,
+        options.state,
+        options.event_journal_dir,
+        options.event_journal_roll_bytes
+    )
     local fingerprint = config.membership_fingerprint(members)
     local membership_log = "advisory-lock membership fingerprint="
         .. fingerprint
