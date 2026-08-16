@@ -27,7 +27,7 @@ class LaApp extends HTMLElement {
         </div>
         <div class="search-wrap">${ICONS.search}
           <input class="input" id="la-search" spellcheck="false"
-                 placeholder="/cluster/members/00000   tag:leader   holder:node-3">
+                 placeholder="filter by lock id or holder">
         </div>
         <div class="seg" id="la-mode">
           ${MODES.map(([v, label]) => `
@@ -55,6 +55,7 @@ class LaApp extends HTMLElement {
           <div class="statusbar">
             <span id="la-count"></span>
             <span class="spacer"></span>
+            <span id="la-journal-status"></span>
             <span class="toast" id="la-toast"></span>
             <span id="la-hint"></span>
           </div>
@@ -74,8 +75,7 @@ class LaApp extends HTMLElement {
     for (const radio of this.querySelectorAll("input[name=mode]")) {
       radio.checked = radio.value === s.mode;
       radio.onchange = () => {
-        const patch = { mode: radio.value, selectedId: null, detail: null };
-        // A stale (past) expiry target shows an empty table; re-arm it.
+        const patch = { mode: radio.value, selectedId: null };
         if (radio.value === "expiry") {
           const atMs = parseClock(store.state.atText, Date.now());
           if (atMs === null || atMs < Date.now()) {
@@ -110,16 +110,16 @@ class LaApp extends HTMLElement {
       this.$("la-range").hidden = st.mode !== "log";
     }
 
+    // Cluster header from mock source (unchanged).
     const c = st.cluster;
     if (c) {
       this.$("la-leader").textContent = `${c.leader} leader · era ${c.era} · view ${c.view}`;
-      const held = st.locksAll.filter((l) => l.state === "held").length;
-      this.$("la-quorum").textContent = `· ${c.nodes.length}/${c.nodes.length} · ${held} held`;
+      this.$("la-quorum").textContent = `· ${c.nodes.length}/${c.nodes.length}`;
     }
     this.$("la-clock").textContent = fmtClock(st.now);
 
-    const hot = st.locksAll.filter((l) =>
-      st.watched.has(l.id) && l.state === "held" && l.expiresAtMs - st.now < config.watchWarnMs).length;
+    const hot = st.journalLocks.filter((l) =>
+      st.watched.has(l.lockId) && l.expiry - st.now < config.watchWarnMs).length;
     this.$("la-watch").innerHTML = st.watched.size
       ? `${st.watched.size} watched${hot ? ` <span class="hot">· ${hot} expiring</span>` : ""}`
       : "";
@@ -127,10 +127,28 @@ class LaApp extends HTMLElement {
     this.$("la-shell").style.gridTemplateColumns = st.selectedId !== null ? "196px 1fr 320px" : "196px 1fr";
     this.$("la-detail").style.display = st.selectedId !== null ? "" : "none";
 
-    this.$("la-count").textContent = st.mode === "log"
-      ? `${st.events.length} events`
-      : `${st.locks.length} of ${st.locksAll.length} locks`;
-    this.$("la-hint").textContent = st.error || "tag: holder: /path";
+    // Count line: journal locks or events depending on mode.
+    if (st.mode === "log") {
+      this.$("la-count").textContent = `${st.journalEvents.length} events`;
+    } else {
+      this.$("la-count").textContent = `${st.journalLocks.length} locks`;
+    }
+
+    // Journal status indicator.
+    const js = st.journalStatus;
+    let journalText;
+    if (!js.filesTotal && !js.wsConnected) {
+      journalText = "journal: offline";
+    } else if (js.caughtUp) {
+      journalText = `journal: ${js.filesLoaded}/${js.filesTotal} files · ws live`;
+    } else if (js.wsConnected) {
+      journalText = `journal: catching up… (${js.filesLoaded}/${js.filesTotal}) · ws live`;
+    } else {
+      journalText = `journal: ${js.filesLoaded}/${js.filesTotal} files · ws offline`;
+    }
+    this.$("la-journal-status").textContent = journalText;
+
+    this.$("la-hint").textContent = st.error || "";
     this.$("la-toast").textContent = st.toast;
   }
 }

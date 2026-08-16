@@ -1,6 +1,7 @@
 -- Lock Admin console lifecycle: render the nginx conf, mint loopback
--- credentials, spawn the bun mock and nginx, and babysit their pidfiles.
--- All paths live under console/tmp; the only logic-free shell is in bin/.
+-- credentials, spawn the bun mock, lock-feed, and nginx, and babysit their
+-- pidfiles. All paths live under console/tmp; the only logic-free shell is
+-- in bin/.
 
 local record Paths
    root: string
@@ -12,7 +13,9 @@ local record Paths
    credentials: string
    mockPid: string
    nginxPid: string
+   feedPid: string
    mockLog: string
+   feedLog: string
 end
 
 local record Ctl
@@ -55,7 +58,9 @@ local function paths(root: string): Paths
       credentials = tmp .. "/credentials",
       mockPid = tmp .. "/mock.pid",
       nginxPid = tmp .. "/nginx.pid",
+      feedPid = tmp .. "/feed.pid",
       mockLog = tmp .. "/mock.log",
+      feedLog = tmp .. "/feed.log",
    }
 end
 
@@ -131,6 +136,65 @@ local function startMock(p: Paths, mockPort: string)
    writeFile(p.mockPid, pid .. "\n")
 end
 
+-- Resolve the lock-feed binary path. If FEED_BIN is unset, default to the
+-- debug build under ext/lock_feed/target/debug/lock-feed. If the binary is
+-- missing, attempt a cargo build; fail loudly if cargo is absent.
+local function resolveFeedBin(root: string): string
+   local bin = os.getenv("FEED_BIN") or ""
+   if bin == "" then
+      bin = root .. "/../ext/lock_feed/target/debug/lock-feed"
+   end
+   local f = io.open(bin, "rb")
+   if f then
+      f:close()
+      return bin
+   end
+   -- Binary missing: try to build it.
+   io.write("lock-feed binary not found at " .. bin .. "; building…\n")
+   local manifest = root .. "/../ext/lock_feed/Cargo.toml"
+   local mf = io.open(manifest, "rb")
+   if not mf then
+      io.stderr:write("ERROR: Cargo.toml not found at " .. manifest .. "\n")
+      os.exit(1)
+   end
+   mf:close()
+   if os.execute("command -v cargo >/dev/null 2>&1") ~= true then
+      io.stderr:write("ERROR: cargo not found on PATH; cannot build lock-feed\n")
+      os.exit(1)
+   end
+   local rc = os.execute('cargo build --manifest-path "' .. manifest .. '"')
+   if rc ~= true then
+      io.stderr:write("ERROR: cargo build failed for lock-feed\n")
+      os.exit(1)
+   end
+   io.write("lock-feed built successfully\n")
+   return bin
+end
+
+local function startFeed(p: Paths, feedPort: string, feedDir: string, feedBin: string)
+   if alive(p.feedPid) then return end
+   local cmd = string.format(
+      '("%s" --dir "%s" --bind 127.0.0.1:%s) >> "%s" 2>&1 & echo $!',
+      feedBin, feedDir, feedPort, p.feedLog)
+   local pid = sh(cmd)
+   if pid == "" then
+      io.stderr:write("ERROR: failed to spawn lock-feed\n")
+      os.exit(1)
+   end
+   writeFile(p.feedPid, pid .. "\n")
+end
+
+local function waitFeedHealthy(feedPort: string): boolean
+   for _ = 1, 40 do
+      local code = sh(string.format(
+         'curl -s -o /dev/null -w "%%{http_code}" --max-time 1 "http://127.0.0.1:%s/health"',
+         feedPort))
+      if code == "200" then return true end
+      os.execute("sleep 0.25")
+   end
+   return false
+end
+
 local function startNginx(p: Paths)
    if alive(p.nginxPid) then return end
    if os.execute(string.format('nginx -t -q -c "%s"', p.conf)) ~= true then
@@ -158,6 +222,8 @@ local function up(root: string): integer
    local p = paths(root)
    local port = os.getenv("PORT") or "8480"
    local mockPort = os.getenv("MOCK_PORT") or "8481"
+   local feedPort = os.getenv("FEED_PORT") or "8482"
+   local feedDir = os.getenv("FEED_DIR") or ""
    os.execute('mkdir -p "' .. p.tmp .. '"')
 
    local conf = render(readFile(p.template), {
@@ -165,6 +231,7 @@ local function up(root: string): integer
       ASSETS = p.assets,
       PORT = port,
       MOCK_PORT = mockPort,
+      FEED_PORT = feedPort,
    })
    if not writeFile(p.conf, conf) then
       io.stderr:write("ERROR: cannot write " .. p.conf .. "\n")
@@ -173,6 +240,20 @@ local function up(root: string): integer
 
    local user, pw = ensureCredentials(p)
    startMock(p, mockPort)
+
+   -- Start lock-feed if FEED_DIR is set; otherwise skip with a note.
+   if feedDir ~= "" then
+      local feedBin = resolveFeedBin(root)
+      startFeed(p, feedPort, feedDir, feedBin)
+      if not waitFeedHealthy(feedPort) then
+         io.stderr:write("WARNING: lock-feed did not become healthy; journal will show offline\n")
+      else
+         io.write("lock-feed: up (port " .. feedPort .. ", dir " .. feedDir .. ")\n")
+      end
+   else
+      io.write("lock-feed: skipped (FEED_DIR not set)\n")
+   end
+
    startNginx(p)
 
    if not waitHealthy(port, user, pw) then
@@ -207,6 +288,10 @@ local function down(root: string): integer
       io.write("nginx stopped\n")
       stopped = true
    end
+   if killPidfile(p.feedPid) then
+      io.write("lock-feed stopped\n")
+      stopped = true
+   end
    if killPidfile(p.mockPid) then
       io.write("mock stopped\n")
       stopped = true
@@ -218,13 +303,16 @@ end
 local function status(root: string): integer
    local p = paths(root)
    local port = os.getenv("PORT") or "8480"
+   local feedPort = os.getenv("FEED_PORT") or "8482"
    local mockUp = alive(p.mockPid)
    local nginxUp = alive(p.nginxPid)
-   io.write("mock:   " .. (mockUp and "running (pid " .. pidOf(p.mockPid) .. ")" or "stopped") .. "\n")
-   io.write("nginx:  " .. (nginxUp and "running (pid " .. pidOf(p.nginxPid) .. ")" or "stopped") .. "\n")
+   local feedUp = alive(p.feedPid)
+   io.write("mock:      " .. (mockUp and "running (pid " .. pidOf(p.mockPid) .. ")" or "stopped") .. "\n")
+   io.write("lock-feed: " .. (feedUp and "running (pid " .. pidOf(p.feedPid) .. ", port " .. feedPort .. ")" or "stopped") .. "\n")
+   io.write("nginx:     " .. (nginxUp and "running (pid " .. pidOf(p.nginxPid) .. ")" or "stopped") .. "\n")
    if mockUp and nginxUp then
       local creds = readFile(p.credentials):gsub("%s+$", "")
-      io.write("url:    http://127.0.0.1:" .. port .. "/  (" .. creds .. ")\n")
+      io.write("url:       http://127.0.0.1:" .. port .. "/  (" .. creds .. ")\n")
       return 0
    end
    return 1

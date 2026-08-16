@@ -1,5 +1,5 @@
-// Telemetry view: a one-line cluster summary plus a single held-locks chart
-// fed by /metrics/series (merged with the IndexedDB history cache).
+// Telemetry view: cluster summary (from mock) plus journal rate charts fed by
+// store.journalRates.buckets (acquire/renew/release per second).
 
 import { store } from "../lib/state.mjs";
 import { esc, fmtClock } from "../lib/util.mjs";
@@ -22,7 +22,7 @@ class LaCharts extends HTMLElement {
       <div style="flex:1;display:flex;flex-direction:column;min-height:0">
         <div class="cluster-summary"></div>
         <div class="charts">
-          <div class="chart-card"><div class="kicker">gauge</div><div class="title">Held locks</div><div class="plot" data-plot="held"></div></div>
+          <div class="chart-card"><div class="kicker">journal rates</div><div class="title">Acquire / Renew / Release per second</div><div class="plot" data-plot="rates"></div></div>
         </div>
       </div>`;
     this._charts = {};
@@ -50,17 +50,16 @@ class LaCharts extends HTMLElement {
   }
 
   update() {
-    const { cluster, series } = store.state;
+    const { cluster, journalRates, journalLocks } = store.state;
 
+    // Cluster header still comes from the mock source.
     if (cluster) {
-      const held = (cluster.nodes ?? []).reduce((n, x) => n + x.locksHeld, 0);
-      const acquirePerSec = (cluster.nodes ?? []).reduce((n, x) => n + x.acquirePerSec, 0);
+      const held = journalLocks.length;
       this.querySelector(".cluster-summary").innerHTML =
         `<span>leader <b>${esc(cluster.leader)}</b></span>` +
         `<span>era <b>${cluster.era}</b></span>` +
         `<span>view <b>${cluster.view}</b></span>` +
-        `<span>held <b>${held}</b></span>` +
-        `<span>acquire/s <b>${acquirePerSec.toFixed(2)}</b></span>`;
+        `<span>held <b>${held}</b></span>`;
     }
 
     if (!window.echarts) {
@@ -73,23 +72,39 @@ class LaCharts extends HTMLElement {
       return;
     }
 
-    if (series?.buckets?.length) {
-      const labels = series.buckets.map((b) => fmtClock(b.tsMs));
+    const buckets = journalRates?.buckets ?? [];
+    if (buckets.length) {
+      const labels = buckets.map((b) => fmtClock(b.tsSec * 1000));
       const tick = Math.max(1, Math.ceil(labels.length / 8));
       const xAxis = { type: "category", data: labels, ...AXIS, axisLabel: { ...AXIS.axisLabel, interval: tick } };
 
-      this._chart("held")?.setOption({
+      this._chart("rates")?.setOption({
         animation: false,
         grid: { left: 36, right: 14, top: 16, bottom: 24 },
-        tooltip: { ...TOOLTIP, formatter: (p) => `${p[0].axisValue}<br/>held: ${p[0].value}` },
+        tooltip: { ...TOOLTIP },
+        legend: { show: true, top: 0, textStyle: { color: "#9397ab", fontSize: 10 } },
         xAxis,
         yAxis: { type: "value", minInterval: 1, ...AXIS },
-        series: [{
-          name: "held", type: "line", smooth: true, symbol: "none",
-          data: series.buckets.map((b) => b.held),
-          lineStyle: { color: "#7b74b8", width: 2 },
-          areaStyle: { color: "rgba(123,116,184,0.18)" },
-        }],
+        series: [
+          {
+            name: "acquire", type: "line", smooth: true, symbol: "none",
+            data: buckets.map((b) => b.acquire),
+            lineStyle: { color: "#7b74b8", width: 2 },
+            areaStyle: { color: "rgba(123,116,184,0.18)" },
+          },
+          {
+            name: "renew", type: "line", smooth: true, symbol: "none",
+            data: buckets.map((b) => b.renew),
+            lineStyle: { color: "#5ba08f", width: 2 },
+            areaStyle: { color: "rgba(91,160,143,0.12)" },
+          },
+          {
+            name: "release", type: "line", smooth: true, symbol: "none",
+            data: buckets.map((b) => b.release),
+            lineStyle: { color: "#c47a6c", width: 2 },
+            areaStyle: { color: "rgba(196,122,108,0.12)" },
+          },
+        ],
       }, { notMerge: true });
     }
   }

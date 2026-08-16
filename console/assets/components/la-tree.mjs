@@ -1,6 +1,6 @@
-// Drill-down tree over lock display paths (/cluster/members/0000001 →
-// cluster → members). Click a node to filter by that path prefix; the caret
-// collapses a subtree. Counts come from the unfiltered lock set.
+// Flat tree over journal lock ids: /locks/<lockId> per active lock. Click a
+// node to select that lock in the detail panel. Numeric lock ids have no
+// hierarchical display paths, so this is a single-level grouping.
 
 import { store } from "../lib/state.mjs";
 import { esc } from "../lib/util.mjs";
@@ -11,51 +11,29 @@ class LaTree extends HTMLElement {
     this.onclick = (e) => {
       const row = e.target.closest(".tree-row");
       if (!row) return;
-      const prefix = row.dataset.prefix;
-      if (e.target.closest(".caret")) {
-        const collapsed = new Set(store.state.collapsed);
-        if (collapsed.has(prefix)) collapsed.delete(prefix); else collapsed.add(prefix);
-        store.set({ collapsed });
-      } else {
-        const q = store.state.query.trim();
-        store.set({ query: q === prefix ? "" : prefix });
-      }
+      const id = Number(row.dataset.id);
+      if (!isNaN(id)) store.set({ selectedId: id });
     };
     this.render();
   }
   disconnectedCallback() { this._unsub?.(); }
 
   render() {
-    const { locksAll, query, collapsed } = store.state;
-    const counts = new Map(); // dir prefix -> lock count
-    for (const l of locksAll) {
-      const parts = l.name.split("/").filter(Boolean);
-      for (let i = 1; i < parts.length; i++) {
-        const key = "/" + parts.slice(0, i).join("/");
-        counts.set(key, (counts.get(key) ?? 0) + 1);
-      }
-    }
-    const keys = [...counts.keys()].sort();
-    const childrenOf = (k) => keys.some((o) => o !== k && o.startsWith(k + "/"));
-    const active = query.trim();
+    const { journalLocks, selectedId } = store.state;
 
-    let html = "";
-    for (const k of keys) {
-      const depth = k.split("/").length - 2; // /cluster → 0
-      // hidden if any ancestor (shallower prefix of k) is collapsed
-      let hidden = false;
-      for (const c of collapsed) {
-        if (k !== c && k.startsWith(c + "/")) { hidden = true; break; }
-      }
-      if (hidden) continue;
-      const hasKids = childrenOf(k);
-      const isActive = active === k;
-      html += `<div class="tree-row${isActive ? " active" : ""}" data-prefix="${esc(k)}" style="padding-left:${8 + depth * 12}px">
-        <span class="caret${collapsed.has(k) ? "" : " open"}">${hasKids ? "▸" : ""}</span>
-        <span class="label">${esc(k.split("/").pop())}</span>
-        <span class="count">${counts.get(k)}</span>
+    // Group header + one row per active lock.
+    let html = `<div class="tree-row" style="padding-left:8px;font-weight:600;color:var(--color-neutral-400)">
+      <span class="label">locks</span>
+      <span class="count">${journalLocks.length}</span>
+    </div>`;
+
+    for (const l of journalLocks) {
+      const isActive = selectedId === l.lockId;
+      html += `<div class="tree-row${isActive ? " active" : ""}" data-id="${l.lockId}" style="padding-left:20px">
+        <span class="label">${esc(String(l.lockId))}</span>
       </div>`;
     }
+
     this.innerHTML = html;
   }
 }
