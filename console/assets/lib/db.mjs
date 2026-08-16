@@ -108,4 +108,16 @@ export const db = {
     d.close();
     return rows.map((r) => r.name);
   },
+
+  /** Read all journaled events, ordered by their [ts, lockId, leaseId] key. */
+  async readJournalEvents() {
+    const d = await open();
+    const rows = await new Promise((resolve, reject) => {
+      const req = d.transaction("journalEvents").objectStore("journalEvents").getAll();
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+    d.close();
+    return rows;
+  },
 };

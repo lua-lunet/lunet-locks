@@ -41,6 +41,17 @@ let filesTotal = 0;
 let filesLoaded = 0;
 let wsConnected = false;
 
+/**
+ * Global idempotency guard. The same event can arrive through several paths
+ * (IndexedDB replay on reload, file pull, WS backlog, session buffer); the
+ * composite key matches the IndexedDB keyPath so a replay never double-counts.
+ */
+const seenKeys = new Set();
+
+function eventKey(ev) {
+  return `${ev.ts}:${ev.lockId}:${ev.leaseId}`;
+}
+
 // ---- helpers ----
 
 function tombstoneKey(lockId, leaseId) {
@@ -79,6 +90,10 @@ function addRecentEvent(ev) {
  */
 function applyEvent(ev) {
   const { kind, ts, lockId, leaseId, holder, expiry } = ev;
+
+  const key = eventKey(ev);
+  if (seenKeys.has(key)) return; // idempotent: never double-count a replay
+  seenKeys.add(key);
 
   bumpRate(ts, kind);
   addRecentEvent(ev);
@@ -199,11 +214,23 @@ function saveSessionBuffer(events) {
 // ---- public API ----
 
 /**
- * Initialize the merge engine: replay session buffer, set up DB catch-up.
- * Returns handlers for worker and WS integration.
+ * Initialize the merge engine: re-seed from IndexedDB (reload catch-up),
+ * then replay the session-storage live tail. Returns handlers for worker
+ * and WS integration.
  */
 export async function initMerge() {
+  // Persisted history first: events come back in [ts, lockId, leaseId] key
+  // order, which is the order the tombstone rules expect.
+  try {
+    const events = await db.readJournalEvents();
+    for (const ev of events) applyEvent(ev);
+  } catch (_) {}
+
+  // Then the live tail recorded since the last file pull. The seen-key guard
+  // makes overlapping events a no-op.
   loadSessionBuffer();
+
+  flushToStore();
 
   // Load previously loaded files from IndexedDB so the worker skips them.
   try {
