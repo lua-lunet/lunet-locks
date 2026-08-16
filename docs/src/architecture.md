@@ -19,6 +19,9 @@ flowchart LR
     R1 <--> A[Rust advisory-lock adapter]
     A <--> V[vrr-core Replica]
     A --> L[Committed lock state machine]
+    A -.->|append-only binary journal| J[Event journal files]
+    J --> LF[lock-feed\nREST + WebSocket]
+    LF --> SPA[Console SPA]
 ```
 
 The **LAL Peer Protocol** is this service's UDP framing and forwarding layer.
@@ -192,6 +195,27 @@ and the positional index of the current view's primary. `leader_for_view(era,
 view)` answers the primary of an arbitrary era-and-view pair through the
 replica's configuration history, or "unknown" when the era falls outside the
 retention window.
+
+## Lock-event journal and console feed
+
+Each replica optionally maintains an append-only binary journal of committed
+lock transitions (hold, renew, release) under a per-replica directory. The
+journal is observability data: it never participates in replication or
+recovery, and a journal error disables journaling without affecting the
+service path. Files roll by byte threshold and are never deleted by any
+component.
+
+The `lock-feed` process serves the journal directory over REST and WebSocket.
+The nginx reverse proxy maps `/feed/` to lock-feed with WebSocket upgrade
+support. The console SPA pulls rolled files via HTTP, tails the open file via
+WebSocket, persists events to IndexedDB keyed by `[ts, lockId, leaseId]` for
+idempotent replay, and applies a tombstone-ahead merge rule so releases that
+arrive before their acquisition produce a correct active-lock view regardless
+of ingestion order.
+
+See [the event journal reference](event-journal.md) for record and metafile
+byte layouts, file naming, resume-on-reopen semantics, corrupt-tail
+tolerance, and the full console catch-up model.
 
 ## Time, recovery, and durability
 

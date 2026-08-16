@@ -26,6 +26,8 @@ from `PATH`.
 
 - [Architecture](architecture.md) describes client forwarding, recovery, and
   operational boundaries.
+- [Event journal](event-journal.md) documents the append-only lock-event
+  journal, the lock-feed server, and the console catch-up model.
 - [External client protocol](client-protocol.md) specifies GET, SET, and
   RELEASE.
 - [Build and tests](build-and-tests.md) describes the pinned runtime and
