@@ -1,19 +1,27 @@
-//! Host-side FFI adapter between the LuaJIT host and the uVRR v0.2.0 core.
+//! Host-side FFI adapter between the LuaJIT host and the uVRR core
+//! (vrr-core @ 0fc6380).
 //!
 //! Concrete core: `Replica<SegmentedLog, WeightedMajority>` running
-//! `Stability::Volatile` — nothing is persisted but the recovery nonce file,
-//! so restart is `Replica::provision` over an empty journal followed by
-//! `Input::Recover` (the tag's Volatile restart path; `reopen` is not used).
+//! `Stability::Volatile` — nothing is persisted but the boot nonce file, so
+//! restart is `Replica::provision` over an empty journal. The core has no
+//! amnesia-recovery protocol: a fenced boot starts clean and the ordinary
+//! bootstrap machinery (tick self-promotion of the genesis primary, view
+//! adoption on the primary's messages) brings the node into the protocol.
+//! `lunet_lock_node_recover` therefore drives that bootstrap tick while the
+//! node is fenced; the full restart story (identity bump +
+//! `Input::Reincarnate`) is future work and the adapter does not pretend
+//! otherwise.
 //!
 //! Adapter policies the core deliberately does not own:
 //!
 //! - **Tick clock.** The adapter owns the tick clock: a monotonic
 //!   nondecreasing milliseconds-since-Unix-epoch value, clamped per node so
 //!   a clock regression never reaches the core. ABI functions take no `at`
-//!   parameter. Recovery ticks come from the durable nonce file
-//!   (`next_nonce`, fsync+rename+dir-sync), never from the ms clock, and are
-//!   clamped the same way so per-node monotonicity holds across the two
-//!   sources (S4: the recovery nonce IS the recovery input's tick).
+//!   parameter. Fenced-boot drives take their tick from the durable nonce
+//!   file (`next_nonce`, fsync+rename+dir-sync) — the nonce no longer
+//!   authorizes a recovery protocol (the core has none); it remains the
+//!   per-node durable tick source so per-node monotonicity holds across
+//!   the two sources (S4 discipline carried over).
 //! - **Identity.** Membership is positional: the member at index `i` in the
 //!   host-supplied order is `NodeId(i)`, and the same order is the genesis
 //!   succession sequence (`primary(v) = order[v mod N]`). Peer indices on
@@ -34,9 +42,9 @@
 //!   exceeds one datagram.
 //! - **Peer payload gate.** The core carries operation payloads opaque and
 //!   validates none of them (B2), so the adapter re-checks every peer-carried
-//!   operation entry (Prepare / DoViewChange / StartView / RecoveryResponse /
-//!   NewState) with `Service` before the message reaches the core — the same
-//!   gate the old adapter called `valid_message_payloads`.
+//!   operation entry (Prepare / DoViewChange / StartView / NewState) with
+//!   `Service` before the message reaches the core — the same gate the old
+//!   adapter called `valid_message_payload`.
 //! - **Lock-event journal.** An optional append-only binary journal records
 //!   every committed lock transition (Hold/Renew/Release) to rolling files
 //!   under a per-replica directory. Enabled when `lunet_lock_node_new`
@@ -84,7 +92,7 @@ use vrr::ids::{NodeId, Operation, OperationId, Tick};
 use vrr::journal::{Journal, Payload, SegmentedLog};
 use vrr::message::{Body, Message};
 use vrr::quorum::WeightedMajority;
-use vrr::replica::{Input, PlanRejection, PublishOutcome, Replica, TimedInput, ViewChangeKnobs};
+use vrr::replica::{Input, PlanRefusal, PublishOutcome, Replica, TimedInput, ViewChangeKnobs};
 use vrr::wire::{Pack, Unpack, UnpackError};
 
 const OK: i32 = 0;
@@ -152,8 +160,9 @@ impl Node {
         Ok(self.last_tick)
     }
 
-    /// The next durable recovery tick (S4: the nonce IS the tick), clamped
-    /// into the same monotone sequence as the ms clock.
+    /// The next durable fenced-boot tick (S4 discipline: the nonce is the
+    /// tick source), clamped into the same monotone sequence as the ms
+    /// clock.
     fn recovery_tick(&mut self) -> Result<u64, i32> {
         let nonce = next_nonce(&self.nonce_path).map_err(|_| CONFIG)?;
         self.last_tick = self.last_tick.max(nonce);
@@ -173,8 +182,9 @@ impl Node {
         self.drive_at(at, event)
     }
 
-    /// A drive whose outer input's tick the caller already chose (recovery
-    /// nonce ticks); feedback inputs inside the loop still sample the clock.
+    /// A drive whose outer input's tick the caller already chose (fenced
+    /// boot nonce ticks); feedback inputs inside the loop still sample the
+    /// clock.
     fn drive_at(&mut self, at: u64, event: Input) -> i32 {
         if self.poisoned {
             return SERVICE;
@@ -364,20 +374,17 @@ impl Node {
                 // without parking); treated as an invariant breach.
                 Err(FAULTED)
             }
-            Effect::RequestApplicationState { through } => {
-                // No checkpoint transfer facility exists in this host; the
-                // core surfaced a shortfall it cannot repair. Log, poison,
-                // and report on subsequent calls — never fabricate state.
-                eprintln!(
-                    "lunet-advisory-lock: application state shortfall through slot {}; \
-                     node poisoned (no application-state transfer facility)",
-                    through.0
-                );
-                Err(FAULTED)
-            }
         }
     }
 
+    /// The fenced-boot drive. The core has no recovery protocol (the
+    /// classic `Input::Recover` exchange was removed upstream): a fenced
+    /// node starts clean, and the only protocol lever is `Input::Tick` —
+    /// the genesis primary self-promotes on it, and the primary's messages
+    /// adopt the fenced backups. The durable nonce remains the tick source
+    /// so the drive stays monotone across restarts. The full restart story
+    /// (identity bump + `Input::Reincarnate`) is future work; this drive
+    /// never fabricates recovered state.
     fn recover(&mut self) -> i32 {
         if self.poisoned {
             return SERVICE;
@@ -386,7 +393,7 @@ impl Node {
             Ok(at) => at,
             Err(error) => return error,
         };
-        self.drive_at(at, Input::Recover)
+        self.drive_at(at, Input::Tick)
     }
 
     /// The current view's primary as a positional index, via the public
@@ -408,12 +415,13 @@ impl Node {
 }
 
 /// Map a plan refusal onto the ABI error codes. `NotPrimary` is the one a
-/// caller can act on (re-forward to the named primary); the rest are
-/// internal states the host cannot repair in place.
-fn plan_error(rejection: PlanRejection) -> i32 {
+/// caller can act on (re-forward to the named primary); the rest — the
+/// fault, the reconfiguration gates, the outstanding-transition bookkeeping
+/// — are internal states the host cannot repair in place.
+fn plan_error(rejection: PlanRefusal) -> i32 {
     match rejection {
-        PlanRejection::NotPrimary { .. } => NOT_LEADER,
-        PlanRejection::Faulted(_) => FAULTED,
+        PlanRefusal::NotPrimary { .. } => NOT_LEADER,
+        PlanRefusal::Faulted(_) => FAULTED,
         _ => SERVICE,
     }
 }
@@ -459,10 +467,6 @@ fn valid_message_payloads(message: &Message) -> bool {
         Body::Prepare { entry, .. } => valid_entry(entry),
         Body::DoViewChange { suffix, .. } => valid_entries(suffix),
         Body::StartView { suffix, .. } => valid_entries(suffix),
-        Body::RecoveryResponse {
-            suffix: Some(suffix),
-            ..
-        } => valid_entries(suffix),
         Body::NewState { entries, .. } => valid_entries(entries),
         _ => true,
     }
@@ -670,7 +674,7 @@ pub unsafe extern "C" fn lunet_lock_node_new(
         } else {
             None
         };
-        let mut node = Node {
+        let node = Node {
             replica,
             outputs: VecDeque::new(),
             service: Service::default(),
@@ -681,11 +685,10 @@ pub unsafe extern "C" fn lunet_lock_node_new(
             poisoned: false,
             journal,
         };
-        // Every boot enters fenced Recovering (the tag's boot rule); drive a
-        // recovery attempt immediately with a durable nonce tick.
-        if node.recover() != OK {
-            return CONFIG;
-        }
+        // Clean start: provision leaves the node fenced `Recovering` with an
+        // empty output queue. There is no boot recovery handshake any more;
+        // the host's fenced-boot drive (`lunet_lock_node_recover`, a tick)
+        // and the primary's messages bring the node into the protocol.
         unsafe { *out = Box::into_raw(Box::new(node)).cast() };
         OK
     })
@@ -1015,10 +1018,11 @@ mod tests {
         }
     }
 
-    /// A fresh three-node cluster brought to Normal: every node boots fenced
-    /// and starts a recovery attempt; the genesis primary (index 0)
+    /// A fresh three-node cluster brought to Normal: every node provisions
+    /// fenced `Recovering` (the boot rule); the genesis primary (index 0)
     /// self-promotes on a tick and broadcasts Commit; the Recovering backups
-    /// adopt the view under the §4 bootstrap rule.
+    /// adopt the view under the §4 bootstrap rule when the primary's
+    /// messages reach them.
     fn boot_cluster() -> [Node; 3] {
         let mut nodes = [
             provision("cluster-one", 0, 3),
@@ -1026,10 +1030,10 @@ mod tests {
             provision("cluster-three", 2, 3),
         ];
         for (index, node) in nodes.iter_mut().enumerate() {
-            assert_eq!(node.recover(), OK, "node {index} starts recovery");
             assert_eq!(
                 node.replica.progress().status(),
-                vrr::progress::Status::Recovering
+                vrr::progress::Status::Recovering,
+                "node {index} boots fenced"
             );
             node.outputs.clear();
         }
@@ -1267,13 +1271,49 @@ mod tests {
         );
         assert!(!handle.is_null());
 
-        // Boot drove one recovery attempt: a Recovery solicitation per
-        // backup, drained through node_next as kind-1 sends.
+        // Clean start: the node boots fenced and quiet — no fabricated
+        // recovery handshake, the output queue is empty.
         let (mut kind, mut to, mut era, mut view) = (0u32, 0u32, 0u32, 0u32);
         let (mut slot_hi, mut slot_lo) = (0u32, 0u32);
         let mut message_id = [0u8; 16];
         let mut len = 0usize;
         let mut buffer = [0u8; MAX_DATAGRAM];
+        assert_eq!(
+            unsafe {
+                lunet_lock_node_next(
+                    handle,
+                    &mut kind,
+                    &mut to,
+                    &mut era,
+                    &mut view,
+                    &mut slot_hi,
+                    &mut slot_lo,
+                    message_id.as_mut_ptr(),
+                    buffer.len(),
+                    &mut len,
+                    buffer.as_mut_ptr(),
+                )
+            },
+            0,
+            "a fenced boot fabricates no outputs"
+        );
+
+        // Status reports the fenced boot state over the ABI.
+        let (mut status, mut leader, mut era, mut view) = (0u32, 0u32, 0u32, 0u32);
+        assert_eq!(
+            unsafe {
+                lunet_lock_node_status(handle, &mut status, &mut leader, &mut era, &mut view)
+            },
+            OK
+        );
+        assert_eq!(status, 2, "recovering");
+        assert_eq!((era, view), (1, 0));
+        assert_eq!(leader, 0);
+
+        // The fenced-boot drive is a tick: the genesis primary self-promotes
+        // and announces its committed frontier to every backup, drained
+        // through node_next as kind-1 sends.
+        assert_eq!(unsafe { lunet_lock_node_recover(handle) }, OK);
         let mut destinations = Vec::new();
         loop {
             let rc = unsafe {
@@ -1306,20 +1346,23 @@ mod tests {
                 u64::from(slot_hi) << 32 | u64::from(slot_lo),
                 message.header.slot.0
             );
-            assert!(matches!(message.body, Body::Recovery { .. }));
+            assert!(matches!(message.body, Body::Commit { .. }));
             destinations.push(to);
         }
-        assert_eq!(destinations, vec![1, 2], "recovery fans out to the backups");
+        assert_eq!(
+            destinations,
+            vec![1, 2],
+            "the promotion fans out to the backups"
+        );
 
-        // Status reports the fenced boot state over the ABI.
-        let (mut status, mut leader, mut era, mut view) = (0u32, 0u32, 0u32, 0u32);
+        // Status reports the promoted state over the ABI.
         assert_eq!(
             unsafe {
                 lunet_lock_node_status(handle, &mut status, &mut leader, &mut era, &mut view)
             },
             OK
         );
-        assert_eq!(status, 2, "recovering");
+        assert_eq!(status, 0, "normal after the bootstrap tick");
         assert_eq!((era, view), (1, 0));
         assert_eq!(leader, 0);
 
@@ -1411,14 +1454,9 @@ mod tests {
             provision("journal-backup-2", 2, 3),
         ];
 
-        // Drive recovery on all nodes and promote to Normal.
+        // Drive the bootstrap: nodes boot fenced, the primary's tick
+        // promotes it, and the route adopts the backups.
         let primary = unsafe { &mut *handle.cast::<Node>() };
-        assert_eq!(primary.recover(), OK);
-        primary.outputs.clear();
-        for backup in &mut backups {
-            assert_eq!(backup.recover(), OK);
-            backup.outputs.clear();
-        }
         assert_eq!(primary.drive(Input::Tick), OK);
 
         // Route until quiet across all three nodes.

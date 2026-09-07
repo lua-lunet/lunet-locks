@@ -2,6 +2,22 @@
 
 Local guidance for this repo. Keep it short, factual, and unsurprising.
 
+## Subagent delegation
+
+- Prefer the subagent delegation skill: work a numbered todo list
+  (`item00`, `item01`, …), write each item's spec to the gitignored
+  `.tmp/delegation/` scratch as `itemNN.md`, launch one agent per spec,
+  gate commits on verified-green work, and use a `wip:` prefix until the
+  feature set is complete. Where doing so does not overwrite any other
+  instruction here or the user's stated preferences.
+
+## Read boundary
+
+- Agents are FORBIDDEN from reading outside this repo. A dependency's code is
+  a git dependency: read it at its GitHub repository (e.g.
+  `https://github.com/lua-lunet/uvrr-core` / raw.githubusercontent.com at the
+  pinned ref), never a sibling checkout on disk and never cargo's home cache.
+
 ## Scope
 
 - `src/` is the shipped Teal source tree.
