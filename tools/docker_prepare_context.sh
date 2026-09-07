@@ -24,4 +24,4 @@ cp "$root/ext/advisory_lock/Cargo.toml" "$root/ext/advisory_lock/Cargo.lock" "$c
 cp -R "$root/ext/advisory_lock/src" "$context/ext/advisory_lock/src"
 cp -R "$root/build" "$context/build"
 mkdir -p "$context/docker"
-cp "$root/docker/Dockerfile" "$root/docker/entrypoint.sh" "$context/docker/"
+cp "$root/docker/Dockerfile" "$root/docker/entrypoint.sh" "$root/docker/cluster.jsonl" "$context/docker/"

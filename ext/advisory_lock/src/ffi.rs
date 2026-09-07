@@ -22,10 +22,14 @@
 //!   authorizes a recovery protocol (the core has none); it remains the
 //!   per-node durable tick source so per-node monotonicity holds across
 //!   the two sources (S4 discipline carried over).
-//! - **Identity.** Membership is positional: the member at index `i` in the
-//!   host-supplied order is `NodeId(i)`, and the same order is the genesis
-//!   succession sequence (`primary(v) = order[v mod N]`). Peer indices on
-//!   the ABI (`from`, `to`, leader outs) are these positional indices.
+//! - **Identity.** Membership is the admin-assigned deployment descriptor:
+//!   the member buffer carries NUL-separated `<u32-id>:<name>` entries, in
+//!   the descriptor's line order. Each id is the member's live `NodeId`
+//!   (sparse, admin-assigned, never recycled), and the buffer order is the
+//!   genesis succession sequence (`primary(v) = order[v mod N]`). Member ids
+//!   are the ABI's peer addresses: `receive`'s `from`, send outputs' `to`,
+//!   and the leader outs all carry member ids; the host maps id -> endpoint
+//!   through the descriptor. `own` is matched by name.
 //! - **Operation identity.** `OperationId` is derived from the client
 //!   request's 16-byte message_id: `msb` = first 8 bytes, `lsb` = last 8,
 //!   both big-endian (the core's wire order). The operation payload IS the
@@ -74,7 +78,9 @@
 //!
 //! Empty `journal_dir` (len=0 or data points to empty string) disables the
 //! journal. `roll_bytes` is the byte threshold at which the current event
-//! file rolls to a final name with an atomic metafile.
+//! file rolls to a final name with an atomic metafile. `members_data` holds
+//! NUL-separated `<u32-id>:<name>` entries in descriptor (genesis succession)
+//! order; `own_data` is the local member's name.
 
 use crate::journal::{self, Journal as LockJournal, JournalEvent};
 use crate::locks::{Service, Transition};
@@ -602,9 +608,17 @@ pub unsafe extern "C" fn lunet_lock_node_new(
         let Ok(journal_dir_data) = (unsafe { bytes(journal_dir_len, journal_dir_data) }) else {
             return INVALID;
         };
+        // Member entries are "<u32-id>:<name>"; the buffer order is the
+        // descriptor's line order — the genesis succession sequence — and
+        // each id is the member's live NodeId.
         let Some(members) = members_data
             .split(|byte| *byte == 0)
-            .map(|member| std::str::from_utf8(member).ok().map(str::to_owned))
+            .map(|entry| {
+                let entry = std::str::from_utf8(entry).ok()?;
+                let (id_text, name) = entry.split_once(':')?;
+                let id = id_text.parse::<u32>().ok()?;
+                Some((id, name.to_owned()))
+            })
             .collect::<Option<Vec<_>>>()
         else {
             return CONFIG;
@@ -626,28 +640,35 @@ pub unsafe extern "C" fn lunet_lock_node_new(
         if state.is_empty()
             || members.is_empty()
             || members.len() > MAX_MEMBERS as usize
-            || members.iter().any(|member| member.is_empty())
+            || members.iter().any(|(_, name)| name.is_empty())
         {
             return CONFIG;
         }
-        let mut unique = members.clone();
-        unique.sort();
-        unique.dedup();
-        if unique.len() != members.len() {
+        let mut unique_ids = members.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+        unique_ids.sort_unstable();
+        unique_ids.dedup();
+        let mut unique_names = members
+            .iter()
+            .map(|(_, name)| name.clone())
+            .collect::<Vec<_>>();
+        unique_names.sort();
+        unique_names.dedup();
+        if unique_ids.len() != members.len() || unique_names.len() != members.len() {
             return CONFIG;
         }
-        let Some(own_index) = members.iter().position(|member| member == own) else {
+        let Some((own_id, _)) = members.iter().find(|(_, name)| name == own) else {
             return CONFIG;
         };
-        // Positional identity: member index i is NodeId(i), and the same
-        // order is the genesis succession sequence.
-        let genesis_order: Vec<NodeId> = (0..members.len() as u32).map(NodeId).collect();
+        // Explicit admin-assigned identity: the descriptor ids in buffer
+        // order are both the live NodeIds and the genesis succession
+        // sequence.
+        let genesis_order: Vec<NodeId> = members.iter().map(|(id, _)| NodeId(*id)).collect();
         let knobs = ViewChangeKnobs {
             primary_timeout: PRIMARY_TIMEOUT_MS,
             view_change_budget: MAX_DATAGRAM,
         };
         let Ok(replica) = Replica::provision(
-            NodeId(own_index as u32),
+            NodeId(*own_id),
             genesis_order,
             WeightedMajority,
             SegmentedLog::new(),
@@ -949,12 +970,19 @@ mod tests {
         fs::remove_file(path).unwrap();
     }
 
+    /// The sparse admin-assigned member ids every test cluster uses, in
+    /// deployment-descriptor (genesis succession) order.
+    const TEST_IDS: [u32; 3] = [10, 20, 30];
+
     fn provision(name: &str, own: u32, members: u32) -> Node {
         let nonce_path = state_path(name);
         initialize_nonce(&nonce_path).expect("nonce file");
         let replica = Replica::provision(
             NodeId(own),
-            (0..members).map(NodeId).collect(),
+            TEST_IDS[..members as usize]
+                .iter()
+                .map(|id| NodeId(*id))
+                .collect(),
             WeightedMajority,
             SegmentedLog::new(),
             Stability::Volatile,
@@ -989,8 +1017,9 @@ mod tests {
 
     /// Deliver every queued send on every node to its destination,
     /// recursively draining whatever the destination emits in answer, until
-    /// no node holds a send. Replies stay queued on their node.
-    fn route_until_quiet(nodes: &mut [Node]) {
+    /// no node holds a send. Replies stay queued on their node. `ids` are
+    /// the member ids of `nodes`, in the same order.
+    fn route_until_quiet(nodes: &mut [Node], ids: &[u32]) {
         loop {
             let mut moved = false;
             for source in 0..nodes.len() {
@@ -1002,10 +1031,13 @@ mod tests {
                 for send in sends {
                     moved = true;
                     let message = Message::unpack_from(&send.bytes).expect("wire round trip");
-                    let to = send.to as usize;
+                    let to = ids
+                        .iter()
+                        .position(|id| *id == send.to)
+                        .expect("known destination");
                     assert_eq!(
                         nodes[to].drive(Input::Peer {
-                            from: NodeId(source as u32),
+                            from: NodeId(ids[source]),
                             message,
                         }),
                         OK
@@ -1019,15 +1051,15 @@ mod tests {
     }
 
     /// A fresh three-node cluster brought to Normal: every node provisions
-    /// fenced `Recovering` (the boot rule); the genesis primary (index 0)
-    /// self-promotes on a tick and broadcasts Commit; the Recovering backups
-    /// adopt the view under the §4 bootstrap rule when the primary's
-    /// messages reach them.
+    /// fenced `Recovering` (the boot rule); the genesis primary (member id
+    /// 10, first in the descriptor order) self-promotes on a tick and
+    /// broadcasts Commit; the Recovering backups adopt the view under the
+    /// §4 bootstrap rule when the primary's messages reach them.
     fn boot_cluster() -> [Node; 3] {
         let mut nodes = [
-            provision("cluster-one", 0, 3),
-            provision("cluster-two", 1, 3),
-            provision("cluster-three", 2, 3),
+            provision("cluster-one", TEST_IDS[0], 3),
+            provision("cluster-two", TEST_IDS[1], 3),
+            provision("cluster-three", TEST_IDS[2], 3),
         ];
         for (index, node) in nodes.iter_mut().enumerate() {
             assert_eq!(
@@ -1043,7 +1075,7 @@ mod tests {
             0,
             "genesis primary promotes to Normal"
         );
-        route_until_quiet(&mut nodes);
+        route_until_quiet(&mut nodes, &TEST_IDS);
         for (index, node) in nodes.iter_mut().enumerate() {
             assert_eq!(
                 node.replica.observer().read().status,
@@ -1069,7 +1101,8 @@ mod tests {
         let message_id = Uuid::from_bytes([7; 16]);
         let payload = request_json(message_id);
 
-        // Propose on the primary (member 0 in the era-1 genesis view).
+        // Propose on the primary (member id 10, first in the era-1 genesis
+        // succession order).
         assert_eq!(request(&mut nodes[0], &payload), OK);
         let prepares: Vec<&Queued> = nodes[0]
             .outputs
@@ -1087,7 +1120,7 @@ mod tests {
         }
 
         // Prepares out, PrepareOks back, Commit out: route everything.
-        route_until_quiet(&mut nodes);
+        route_until_quiet(&mut nodes, &TEST_IDS);
 
         // The quorum committed the slot: exactly one reply, on the proposer
         // only, correlated by the request's message_id.
@@ -1140,6 +1173,7 @@ mod tests {
     fn non_primary_propose_is_refused_not_leader() {
         let mut nodes = boot_cluster();
         let payload = request_json(Uuid::from_bytes([9; 16]));
+        // Member 20 is second in the genesis succession: not the primary.
         assert_eq!(request(&mut nodes[1], &payload), NOT_LEADER);
         assert!(nodes[1].outputs.is_empty());
         assert_eq!(nodes[1].replica.observer().read().accepted, 2);
@@ -1149,11 +1183,11 @@ mod tests {
     fn malformed_and_oversize_ingress_are_refused() {
         let mut nodes = boot_cluster();
         let garbage = [0xFFu8; 64];
-        assert_eq!(receive(&mut nodes[0], 1, &garbage), VRR_MESSAGE);
+        assert_eq!(receive(&mut nodes[0], TEST_IDS[1], &garbage), VRR_MESSAGE);
         let truncated = [0u8; 4];
-        assert_eq!(receive(&mut nodes[0], 1, &truncated), VRR_MESSAGE);
+        assert_eq!(receive(&mut nodes[0], TEST_IDS[1], &truncated), VRR_MESSAGE);
         let oversize = vec![0u8; MAX_DATAGRAM + 1];
-        assert_eq!(receive(&mut nodes[0], 1, &oversize), TOO_LARGE);
+        assert_eq!(receive(&mut nodes[0], TEST_IDS[1], &oversize), TOO_LARGE);
         // A well-formed message whose peer-carried operation payload is not
         // a valid Service request is refused before it reaches the core.
         let forged = Message {
@@ -1176,7 +1210,7 @@ mod tests {
         };
         let mut buf = vec![0u8; forged.packed_len()];
         forged.pack_into(&mut buf).unwrap();
-        assert_eq!(receive(&mut nodes[1], 0, &buf), VRR_MESSAGE);
+        assert_eq!(receive(&mut nodes[1], TEST_IDS[0], &buf), VRR_MESSAGE);
     }
 
     #[test]
@@ -1224,7 +1258,7 @@ mod tests {
         );
         assert_eq!(status, 0, "normal");
         assert_eq!((era, view), (1, 0), "era-1 genesis view");
-        assert_eq!(leader, 0, "genesis primary is member 0");
+        assert_eq!(leader, TEST_IDS[0], "genesis primary is member id 10");
 
         let mut for_view = u32::MAX;
         assert_eq!(
@@ -1233,7 +1267,7 @@ mod tests {
             },
             OK
         );
-        assert_eq!(for_view, 1, "view 1's primary is member 1");
+        assert_eq!(for_view, TEST_IDS[1], "view 1's primary is member id 20");
         assert_eq!(
             unsafe {
                 lunet_lock_node_leader_for_view((&raw mut nodes[1]).cast(), 42, 0, &mut for_view)
@@ -1245,9 +1279,10 @@ mod tests {
 
     #[test]
     fn abi_new_status_next_and_free_round_trip() {
-        // The full C surface: members are NUL-separated names, positional
-        // index is the identity, state is the nonce file path.
-        let members = b"n1\0n2\0n3";
+        // The full C surface: members are NUL-separated "<id>:<name>"
+        // entries in descriptor (genesis succession) order with sparse
+        // admin-assigned ids, state is the nonce file path.
+        let members = b"10:n1\x0020:n2\x0030:n3";
         let own = b"n1";
         let state = state_path("abi-node");
         let state_bytes = state.as_os_str().as_encoded_bytes();
@@ -1308,7 +1343,7 @@ mod tests {
         );
         assert_eq!(status, 2, "recovering");
         assert_eq!((era, view), (1, 0));
-        assert_eq!(leader, 0);
+        assert_eq!(leader, 10);
 
         // The fenced-boot drive is a tick: the genesis primary self-promotes
         // and announces its committed frontier to every backup, drained
@@ -1351,8 +1386,8 @@ mod tests {
         }
         assert_eq!(
             destinations,
-            vec![1, 2],
-            "the promotion fans out to the backups"
+            vec![20, 30],
+            "the promotion fans out to the backups, by member id"
         );
 
         // Status reports the promoted state over the ABI.
@@ -1364,7 +1399,7 @@ mod tests {
         );
         assert_eq!(status, 0, "normal after the bootstrap tick");
         assert_eq!((era, view), (1, 0));
-        assert_eq!(leader, 0);
+        assert_eq!(leader, 10);
 
         unsafe { lunet_lock_node_free(handle) };
         fs::remove_file(state).unwrap();
@@ -1379,8 +1414,8 @@ mod tests {
         assert_eq!(
             unsafe {
                 lunet_lock_node_new(
-                    b"n1\0n2".len(),
-                    b"n1\0n2".as_ptr(),
+                    b"10:n1\x0020:n2".len(),
+                    b"10:n1\x0020:n2".as_ptr(),
                     b"n9".len(),
                     b"n9".as_ptr(),
                     state_bytes.len(),
@@ -1393,12 +1428,66 @@ mod tests {
             },
             CONFIG
         );
-        // duplicate member.
+        // duplicate member id.
         assert_eq!(
             unsafe {
                 lunet_lock_node_new(
-                    b"n1\0n1".len(),
-                    b"n1\0n1".as_ptr(),
+                    b"10:n1\x0010:n2".len(),
+                    b"10:n1\x0010:n2".as_ptr(),
+                    b"n1".len(),
+                    b"n1".as_ptr(),
+                    state_bytes.len(),
+                    state_bytes.as_ptr(),
+                    0,
+                    ptr::null(),
+                    0,
+                    &mut handle,
+                )
+            },
+            CONFIG
+        );
+        // duplicate member name.
+        assert_eq!(
+            unsafe {
+                lunet_lock_node_new(
+                    b"10:n1\x0020:n1".len(),
+                    b"10:n1\x0020:n1".as_ptr(),
+                    b"n1".len(),
+                    b"n1".as_ptr(),
+                    state_bytes.len(),
+                    state_bytes.as_ptr(),
+                    0,
+                    ptr::null(),
+                    0,
+                    &mut handle,
+                )
+            },
+            CONFIG
+        );
+        // malformed entry: no id separator.
+        assert_eq!(
+            unsafe {
+                lunet_lock_node_new(
+                    b"10:n1\x0020n2\x0030:n3".len(),
+                    b"10:n1\x0020n2\x0030:n3".as_ptr(),
+                    b"n1".len(),
+                    b"n1".as_ptr(),
+                    state_bytes.len(),
+                    state_bytes.as_ptr(),
+                    0,
+                    ptr::null(),
+                    0,
+                    &mut handle,
+                )
+            },
+            CONFIG
+        );
+        // malformed entry: non-numeric id.
+        assert_eq!(
+            unsafe {
+                lunet_lock_node_new(
+                    b"ab:n1\x0020:n2\x0030:n3".len(),
+                    b"ab:n1\x0020:n2\x0030:n3".as_ptr(),
                     b"n1".len(),
                     b"n1".as_ptr(),
                     state_bytes.len(),
@@ -1421,7 +1510,7 @@ mod tests {
 
         let journal_dir = state_path("journal-integration");
         let _ = fs::remove_dir_all(&journal_dir);
-        let members = b"n1\0n2\0n3";
+        let members = b"10:n1\x0020:n2\x0030:n3";
         let own = b"n1";
         let state = state_path("journal-node");
         let state_bytes = state.as_os_str().as_encoded_bytes();
@@ -1450,8 +1539,8 @@ mod tests {
 
         // Build two backup nodes (no journal) to form a quorum.
         let mut backups = [
-            provision("journal-backup-1", 1, 3),
-            provision("journal-backup-2", 2, 3),
+            provision("journal-backup-1", TEST_IDS[1], 3),
+            provision("journal-backup-2", TEST_IDS[2], 3),
         ];
 
         // Drive the bootstrap: nodes boot fenced, the primary's tick
@@ -1459,46 +1548,29 @@ mod tests {
         let primary = unsafe { &mut *handle.cast::<Node>() };
         assert_eq!(primary.drive(Input::Tick), OK);
 
-        // Route until quiet across all three nodes.
+        // Route until quiet across all three nodes, by member id.
         let mut all_nodes = vec![primary as *mut Node];
         for b in &mut backups {
             all_nodes.push(b as *mut Node);
         }
-        // Manual route: drain sends from primary to backups and back.
         loop {
             let mut moved = false;
-            // Drain primary's sends.
-            let drained: VecDeque<Queued> =
-                std::mem::take(&mut unsafe { &mut *all_nodes[0] }.outputs);
-            let (sends, kept): (Vec<Queued>, Vec<Queued>) =
-                drained.into_iter().partition(|o| o.kind == OUTPUT_SEND);
-            unsafe { &mut *all_nodes[0] }.outputs = kept.into_iter().collect();
-            for send in sends {
-                moved = true;
-                let message = Message::unpack_from(&send.bytes).expect("wire round trip");
-                let to = send.to as usize;
-                assert_eq!(
-                    unsafe { &mut *all_nodes[to] }.drive(Input::Peer {
-                        from: NodeId(0),
-                        message,
-                    }),
-                    OK
-                );
-            }
-            // Drain backups' sends back to primary.
-            for idx in 1..all_nodes.len() {
+            for source in 0..all_nodes.len() {
                 let drained: VecDeque<Queued> =
-                    std::mem::take(&mut unsafe { &mut *all_nodes[idx] }.outputs);
+                    std::mem::take(&mut unsafe { &mut *all_nodes[source] }.outputs);
                 let (sends, kept): (Vec<Queued>, Vec<Queued>) =
                     drained.into_iter().partition(|o| o.kind == OUTPUT_SEND);
-                unsafe { &mut *all_nodes[idx] }.outputs = kept.into_iter().collect();
+                unsafe { &mut *all_nodes[source] }.outputs = kept.into_iter().collect();
                 for send in sends {
                     moved = true;
                     let message = Message::unpack_from(&send.bytes).expect("wire round trip");
-                    let to = send.to as usize;
+                    let to = TEST_IDS
+                        .iter()
+                        .position(|id| *id == send.to)
+                        .expect("known destination");
                     assert_eq!(
                         unsafe { &mut *all_nodes[to] }.drive(Input::Peer {
-                            from: NodeId(idx as u32),
+                            from: NodeId(TEST_IDS[source]),
                             message,
                         }),
                         OK
@@ -1544,7 +1616,7 @@ mod tests {
                 },
                 OK
             );
-            // Route until quiet across all nodes.
+            // Route until quiet across all nodes, by member id.
             let mut all: Vec<&mut Node> = vec![primary];
             for b in backups.iter_mut() {
                 all.push(b);
@@ -1559,10 +1631,13 @@ mod tests {
                     for send in sends {
                         moved = true;
                         let message = Message::unpack_from(&send.bytes).expect("wire round trip");
-                        let to = send.to as usize;
+                        let to = TEST_IDS
+                            .iter()
+                            .position(|id| *id == send.to)
+                            .expect("known destination");
                         assert_eq!(
                             all[to].drive(Input::Peer {
-                                from: NodeId(source as u32),
+                                from: NodeId(TEST_IDS[source]),
                                 message,
                             }),
                             OK

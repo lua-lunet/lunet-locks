@@ -10,15 +10,21 @@ local MAX_U32 = 4294967295
 local MEMBERSHIP_FINGERPRINT_HEX_BYTES = 16
 local PEER_HEADER_BYTES = #PEER_MAGIC + 1 + MEMBERSHIP_FINGERPRINT_HEX_BYTES
 
+local cluster_config = require("cluster_config")
+
 local function endpoint_key(host: string, port: integer): string
     return host .. ":" .. tostring(port)
 end
 
-local function source_is_member(host: string, port: integer, members: {string}): boolean
+-- Peer sources are authenticated against the deployment descriptor's
+-- endpoints: a datagram from an unlisted host:port never reaches the
+-- fingerprint gate.
+local function source_is_member(
+    host: string, port: integer, members: {cluster_config.ClusterNode}
+): boolean
     local source = endpoint_key(host, port)
     for _, member in ipairs(members) do
-        local _, address = member:match("^([^=]+)=(.+)$")
-        if address == source then
+        if member.host .. ":" .. tostring(member.port) == source then
             return true
         end
     end
@@ -61,8 +67,8 @@ local function decode_peer(packet: string): (boolean, string, string, string)
 end
 
 -- A redirect is deliberately a small fixed-size application packet. It carries
--- no leader index: every fixed ordered membership maps the supplied era+view
--- to its leader through the local replica adapter.
+-- no leader id: every replica maps the supplied era+view to its leader id
+-- through the local replica adapter and the deployment descriptor.
 local function u32_bytes(value: integer): string
     return string.char(
         math.floor(value / 16777216) % 256,

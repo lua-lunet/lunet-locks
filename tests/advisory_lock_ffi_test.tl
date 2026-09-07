@@ -1,7 +1,18 @@
 local advisory_lock = require("advisory_lock")
+local cluster_config = require("cluster_config")
 local tested = require("tested")
 
-local members = {"n1", "n2", "n3"}
+-- The sparse admin-assigned member ids, in descriptor (genesis succession)
+-- order: 101 is the genesis primary.
+local MEMBER_IDS = {101, 202, 303}
+
+local function members(): {cluster_config.ClusterNode}
+    return cluster_config.parse_jsonl(
+        '{"id":101,"name":"n1","host":"127.0.0.1","port":27101}\n'
+            .. '{"id":202,"name":"n2","host":"127.0.0.1","port":27102}\n'
+            .. '{"id":303,"name":"n3","host":"127.0.0.1","port":27103}\n'
+    )
+end
 
 -- The request envelope the native Service decodes; message_id is the
 -- canonical UUID text form of the 16 raw bytes the reply output carries.
@@ -27,7 +38,17 @@ end
 
 -- Deliver every queued "send" on every node to its destination, draining
 -- whatever the destination emits in answer, until no node holds a send.
--- Reply outputs stay queued on their node. Bounded like the Rust harness.
+-- Reply outputs stay queued on their node. Peer addresses are member ids.
+-- Bounded like the Rust harness.
+local function index_of_id(id: integer): integer
+    for index, member_id in ipairs(MEMBER_IDS) do
+        if member_id == id then
+            return index
+        end
+    end
+    error("advisory_lock_ffi_test: unknown replica id " .. tostring(id))
+end
+
 local function route_until_quiet(nodes: {advisory_lock.Node})
     for _ = 1, 64 do
         local moved = false
@@ -35,7 +56,9 @@ local function route_until_quiet(nodes: {advisory_lock.Node})
             for _, output in ipairs(nodes[source]:outputs()) do
                 if output.kind == "send" then
                     moved = true
-                    nodes[output.replica + 1]:receive(source - 1, output.bytes)
+                    nodes[index_of_id(output.replica)]:receive(
+                        MEMBER_IDS[source], output.bytes
+                    )
                 end
             end
         end
@@ -54,19 +77,19 @@ local function drain(nodes: {advisory_lock.Node})
     end
 end
 
--- A fresh three-node cluster brought to Normal: every node boots fenced and
--- starts a recovery attempt inside `new`; the genesis primary (member index
--- 0) self-promotes on a tick and the Recovering backups adopt the view.
+-- A fresh three-node cluster brought to Normal: every node boots fenced;
+-- the genesis primary (member id 101) self-promotes on a tick and the
+-- Recovering backups adopt the view.
 -- Pass journal_dir="" and journal_roll_bytes=0 to disable journaling.
 local function boot_cluster(
     name: string, journal_dir: string, journal_roll_bytes: integer
 ): {advisory_lock.Node}
     local nodes: {advisory_lock.Node} = {}
-    for index, own in ipairs(members) do
+    for index, own in ipairs(MEMBER_IDS) do
         local path = state_path(name .. tostring(index))
         os.remove(path)
         nodes[index] = advisory_lock.new(
-            members, own, path, journal_dir, journal_roll_bytes
+            members(), "n" .. tostring(index), path, journal_dir, journal_roll_bytes
         )
     end
     drain(nodes)
@@ -100,15 +123,15 @@ tested.test(
                     .. ":"
                     .. tostring(node:leader_for_view(status.era, status.view))
                     .. ":"
-                    .. tostring(index - 1)
+                    .. tostring(MEMBER_IDS[index])
             )
         end
         close_cluster(nodes)
         tested.assert(
             {
                 given = "three nodes booted over temp nonce files and pumped quiet",
-                should = "all reach normal in era 1 view 0 behind member 0",
-                expected = "normal:1:0:0:0:0|normal:1:0:0:0:1|normal:1:0:0:0:2",
+                should = "all reach normal in era 1 view 0 behind member id 101",
+                expected = "normal:1:0:101:101:101|normal:1:0:101:101:202|normal:1:0:101:101:303",
                 actual = table.concat(summary, "|"),
             }
         )
@@ -128,7 +151,9 @@ tested.test(
                 for _, output in ipairs(nodes[source]:outputs()) do
                     if output.kind == "send" then
                         moved = true
-                        nodes[output.replica + 1]:receive(source - 1, output.bytes)
+                        nodes[index_of_id(output.replica)]:receive(
+                            MEMBER_IDS[source], output.bytes
+                        )
                     else
                         table.insert(replies, output)
                     end
@@ -180,7 +205,9 @@ tested.test(
                 for _, output in ipairs(nodes[source]:outputs()) do
                     if output.kind == "send" then
                         moved = true
-                        nodes[output.replica + 1]:receive(source - 1, output.bytes)
+                        nodes[index_of_id(output.replica)]:receive(
+                            MEMBER_IDS[source], output.bytes
+                        )
                     else
                         table.insert(first_replies, output)
                     end
@@ -214,7 +241,9 @@ tested.test(
                 for _, output in ipairs(nodes[source]:outputs()) do
                     if output.kind == "send" then
                         moved = true
-                        nodes[output.replica + 1]:receive(source - 1, output.bytes)
+                        nodes[index_of_id(output.replica)]:receive(
+                            MEMBER_IDS[source], output.bytes
+                        )
                     else
                         table.insert(third_replies, output)
                     end
@@ -278,8 +307,10 @@ tested.test(
     "receive with garbage bytes raises the replication-message error",
     function()
         local nodes = boot_cluster("garbage", "", 0)
-        local raised = pcall(function() nodes[1]:receive(1, string.rep("\255", 64)) end)
-        local truncated = pcall(function() nodes[1]:receive(1, "\0\0\0\0") end)
+        local raised = pcall(
+            function() nodes[1]:receive(202, string.rep("\255", 64)) end
+        )
+        local truncated = pcall(function() nodes[1]:receive(202, "\0\0\0\0") end)
         close_cluster(nodes)
         tested.assert(
             {
@@ -326,7 +357,9 @@ tested.test(
                 for _, output in ipairs(nodes[source]:outputs()) do
                     if output.kind == "send" then
                         moved = true
-                        nodes[output.replica + 1]:receive(source - 1, output.bytes)
+                        nodes[index_of_id(output.replica)]:receive(
+                            MEMBER_IDS[source], output.bytes
+                        )
                     end
                 end
             end

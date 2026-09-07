@@ -15,6 +15,7 @@ local directory = source:match("^@(.+)/[^/]+$") or "."
 package.path = directory .. "/?.lua;" .. package.path
 
 local advisory_lock = require("advisory_lock")
+local cluster_config = require("cluster_config")
 local config = require("config")
 local lunet = require("lunet")
 local membership_guard = require("membership_guard")
@@ -37,7 +38,8 @@ local record Options
     node: string
     client: string
     state: string
-    members: {string}
+    cluster: string
+    nodes: {cluster_config.ClusterNode}
     heartbeat_ms: integer
     election_ms: integer
     recovery_ms: integer
@@ -65,7 +67,8 @@ end
 
 local function usage(): string
     return "usage: lunet-run build/server.lua --node NAME --client IPv4:PORT "
-        .. "--state PATH --member NAME=IPv4:PORT (at least three) "
+        .. "--state PATH --cluster PATH (JSONL deployment descriptor, "
+        .. "at least three entries) "
         .. "[--heartbeat-ms N] [--election-ms N] [--recovery-ms N] "
         .. "[--event-journal-dir PATH] [--event-journal-roll-bytes N]"
 end
@@ -79,11 +82,21 @@ local function positive(value: string, name: string): integer
     return parsed as integer
 end
 
+-- The deployment descriptor is the live membership: every entry's id is the
+-- replica's NodeId and its line order is the genesis succession sequence.
+local function read_descriptor(path: string): {cluster_config.ClusterNode}
+    local file = io.open(path, "r")
+    assert(file ~= nil, "server: cannot read cluster descriptor " .. path)
+    local text = file:read("a")
+    file:close()
+    return cluster_config.parse_jsonl(text)
+end
+
 local function parse_options(argv: {string}): Options
     local node: string = ""
     local client: string = ""
     local state: string = ""
-    local members: {string} = {}
+    local cluster: string = ""
     local heartbeat_ms: integer = 200
     local election_ms: integer = 1200
     local recovery_ms: integer = 2500
@@ -103,8 +116,9 @@ local function parse_options(argv: {string}): Options
         elseif flag == "--state" then
             assert(state == "", "server: --state may appear once")
             state = value
-        elseif flag == "--member" then
-            table.insert(members, value)
+        elseif flag == "--cluster" then
+            assert(cluster == "", "server: --cluster may appear once")
+            cluster = value
         elseif flag == "--heartbeat-ms" then
             heartbeat_ms = positive(value, "server: --heartbeat-ms")
         elseif flag == "--election-ms" then
@@ -126,10 +140,12 @@ local function parse_options(argv: {string}): Options
         index = index + 2
     end
     assert(
-        node ~= "" and client ~= "" and state ~= "", "server: required options missing"
+        node ~= "" and client ~= "" and state ~= "" and cluster ~= "",
+        "server: required options missing"
     )
     config.endpoint(client)
-    config.members(node, members)
+    local nodes = read_descriptor(cluster)
+    config.members(node, nodes)
     assert(
         election_ms >= heartbeat_ms,
         "server: election timeout must be at least heartbeat"
@@ -138,7 +154,8 @@ local function parse_options(argv: {string}): Options
         node = node,
         client = client,
         state = state,
-        members = members,
+        cluster = cluster,
+        nodes = nodes,
         heartbeat_ms = heartbeat_ms,
         election_ms = election_ms,
         recovery_ms = recovery_ms,
@@ -175,28 +192,32 @@ end
 
 local function main(options: Options)
     local client_host, client_port = split_endpoint(options.client)
-    local members = config.members(options.node, options.members)
-    local member_names: {string} = {}
-    local index_by_endpoint: {string: integer} = {}
-    local endpoint_by_index: {integer: string} = {}
-    local own_index = 0
+    local members = config.members(options.node, options.nodes)
+    -- Live addressing is the descriptor's admin-assigned ids: the native
+    -- adapter speaks member ids on the ABI (`receive` from, send `to`,
+    -- leader outs), and this table set is the id <-> endpoint view of the
+    -- same descriptor.
+    local endpoint_by_id: {integer: string} = {}
+    local id_by_endpoint: {string: integer} = {}
+    local own_id = 0
+    local own_rank = 0
     local udp_host = ""
     local udp_port = 0
-    for index, member in ipairs(members) do
-        table.insert(member_names, member.name)
+    for rank, member in ipairs(members) do
         local key = member.endpoint.host .. ":" .. tostring(member.endpoint.port)
-        index_by_endpoint[key] = index - 1
-        endpoint_by_index[index - 1] = key
+        endpoint_by_id[member.id] = key
+        id_by_endpoint[key] = member.id
         if member.name == options.node then
-            own_index = index - 1
+            own_id = member.id
+            own_rank = rank - 1
             udp_host = member.endpoint.host
             udp_port = member.endpoint.port
         end
     end
-    assert(own_index >= 0, "server: own member missing")
+    assert(udp_host ~= "", "server: own member missing")
 
     local node = advisory_lock.new(
-        member_names,
+        options.nodes,
         options.node,
         options.state,
         options.event_journal_dir,
@@ -205,7 +226,7 @@ local function main(options: Options)
     local fingerprint = config.membership_fingerprint(members)
     local membership_log = "advisory-lock membership fingerprint="
         .. fingerprint
-        .. " encoding=lunet-advisory-lock/membership/v1"
+        .. " encoding=lunet-advisory-lock/membership/v2"
     log_membership(membership_log)
     local peer, peer_error = udp.bind(udp_host, udp_port)
     assert(peer ~= nil, "server: UDP bind failed: " .. (peer_error or "unknown"))
@@ -255,8 +276,8 @@ local function main(options: Options)
         assert(ok ~= nil, "server: UDP send failed: " .. (send_error or "unknown"))
     end
 
-    local function send_vrr(index: integer, payload: string)
-        local endpoint = endpoint_by_index[index]
+    local function send_vrr(replica: integer, payload: string)
+        local endpoint = endpoint_by_id[replica]
         assert(endpoint ~= nil, "server: native output has unknown replica")
         send_endpoint(
             endpoint, transport.encode_peer(transport.PEER_VRR, fingerprint, payload)
@@ -270,8 +291,8 @@ local function main(options: Options)
         )
     end
 
-    local function send_application_peer(index: integer, payload: string)
-        local endpoint = endpoint_by_index[index]
+    local function send_application_peer(replica: integer, payload: string)
+        local endpoint = endpoint_by_id[replica]
         assert(endpoint ~= nil, "server: application output has unknown replica")
         send_application(endpoint, payload)
     end
@@ -303,7 +324,7 @@ local function main(options: Options)
     local function forward_to(waiter: Pending, leader: integer, message_id: string)
         -- A booting/recovering cluster may have no known leader; leave the
         -- waiter for the deadline loop to retry rather than asserting.
-        if leader < 0 or leader >= #members then
+        if leader == LEADER_UNKNOWN or endpoint_by_id[leader] == nil then
             return
         end
         waiter.forwarded_to = leader
@@ -327,9 +348,9 @@ local function main(options: Options)
         end
         local status = node:status()
         if
-            status.leader ~= own_index
-            and status.leader < #members
+            status.leader ~= own_id
             and status.leader ~= LEADER_UNKNOWN
+            and endpoint_by_id[status.leader] ~= nil
         then
             forward_to(waiter, status.leader, message_id)
         end
@@ -340,7 +361,7 @@ local function main(options: Options)
             local packet, host, port = udp.recv(peer)
             if packet ~= nil and host ~= nil and port ~= nil then
                 local source_endpoint = host .. ":" .. tostring(port)
-                if transport.source_is_member(host, port, options.members) then
+                if transport.source_is_member(host, port, options.nodes) then
                     local valid, kind, received_fingerprint, payload = transport.decode_peer(
                         packet
                     )
@@ -357,7 +378,7 @@ local function main(options: Options)
                             local status = node:status()
                             if
                                 guard:allows_client_operation()
-                                and status.leader == own_index
+                                and status.leader == own_id
                             then
                                 forwarded_from[message_id] = source_endpoint
                                 local ok = pcall(
@@ -383,10 +404,8 @@ local function main(options: Options)
                         then
                             local message_id = payload:sub(2, 1 + MESSAGE_ID_BYTES)
                             local waiter = pending[message_id]
-                            local source_index = index_by_endpoint[source_endpoint]
-                            if
-                                waiter ~= nil and source_index == waiter.forwarded_to
-                            then
+                            local source_id = id_by_endpoint[source_endpoint]
+                            if waiter ~= nil and source_id == waiter.forwarded_to then
                                 waiter.result = payload:sub(2 + MESSAGE_ID_BYTES)
                                 waiter.done = true
                             end
@@ -395,13 +414,13 @@ local function main(options: Options)
                                 payload
                             )
                             local waiter = pending[message_id]
-                            local source_index = index_by_endpoint[source_endpoint]
+                            local source_id = id_by_endpoint[source_endpoint]
                             if
                                 redirect_valid
                                 and waiter ~= nil
-                                and source_index ~= nil
+                                and source_id ~= nil
                                 and transport.valid_not_leader(
-                                    waiter.forwarded_to, source_index
+                                    waiter.forwarded_to, source_id
                                 )
                             then
                                 if guard:allows_client_operation() then
@@ -415,7 +434,7 @@ local function main(options: Options)
                             end
                         end
                     elseif valid and kind == transport.PEER_VRR then
-                        local replica = index_by_endpoint[source_endpoint]
+                        local replica = id_by_endpoint[source_endpoint]
                         if replica ~= nil then
                             if node:status().leader == replica then
                                 leader_elapsed_ms = 0
@@ -448,11 +467,15 @@ local function main(options: Options)
     end
 
     local function election_loop()
-        local stagger = own_index * 200
+        -- Election stagger spreads the genesis succession ranks so two
+        -- simultaneous timers cannot collide; the descriptor's line order
+        -- (the genesis succession sequence) gives every member a stable
+        -- rank.
+        local stagger = own_rank * 200
         while true do
             lunet.sleep(POLL_MS)
             local status = node:status()
-            if status.state == "normal" and status.leader == own_index then
+            if status.state == "normal" and status.leader == own_id then
                 leader_elapsed_ms = 0
             else
                 leader_elapsed_ms = leader_elapsed_ms + POLL_MS

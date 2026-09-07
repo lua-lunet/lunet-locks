@@ -93,9 +93,7 @@ start() {
     "$run" build/server.lua \
         --node "$name" --client "127.0.0.1:$client_port" \
         --state "$work/$name.nonce" \
-        --member n1=127.0.0.1:27101 \
-        --member n2=127.0.0.1:27102 \
-        --member n3=127.0.0.1:27103 \
+        --cluster "$work/cluster.jsonl" \
         >"$work/$name.out" 2>"$work/$name.err" &
     pid=$!
     pids="$pids $pid"
@@ -104,6 +102,14 @@ start() {
     # topology at every call site and prevent accidental port reuse.
     test "$peer_port" -ge 1
 }
+
+# The deployment descriptor: sparse, admin-assigned, never-recycled NodeIds;
+# line order is the genesis succession sequence (n1 is the genesis primary).
+cat >"$work/cluster.jsonl" <<'EOF'
+{"id":101,"name":"n1","host":"127.0.0.1","port":27101}
+{"id":202,"name":"n2","host":"127.0.0.1","port":27102}
+{"id":303,"name":"n3","host":"127.0.0.1","port":27103}
+EOF
 
 # Send every line on one connection, preserving the server's sequential client
 # path. The expected marker list has one fixed JSON fragment per response.

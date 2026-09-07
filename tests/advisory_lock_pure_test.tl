@@ -1,3 +1,4 @@
+local cluster_config = require("cluster_config")
 local config = require("config")
 local membership_guard = require("membership_guard")
 local tested = require("tested")
@@ -8,75 +9,93 @@ local function fails(f: function(): boolean): boolean
     return not ok
 end
 
+local function nodes(): {cluster_config.ClusterNode}
+    return cluster_config.parse_jsonl(
+        '{"id":11,"name":"n1","host":"127.0.0.1","port":7001}\n'
+            .. '{"id":22,"name":"n2","host":"127.0.0.1","port":7002}\n'
+            .. '{"id":33,"name":"n3","host":"127.0.0.1","port":7003}\n'
+    )
+end
+
 tested.test(
-    "config accepts a sorted three-node literal IPv4 membership",
+    "config derives id-bearing members from the deployment descriptor",
     function()
-        local members = config.members(
-            "n2",
-            {
-                "n1=127.0.0.1:7001",
-                "n2=127.0.0.1:7002",
-                "n3=127.0.0.1:7003",
-            }
-        )
+        local members = config.members("n2", nodes())
         tested.assert(
             {
-                given = "a sorted three-node membership containing --node once",
-                should = "return parsed endpoints",
-                expected = "127.0.0.1:7002",
-                actual = members[2].endpoint.host
-                    .. ":"
-                    .. tostring(members[2].endpoint.port),
+                given = "a parsed three-entry descriptor containing --node once",
+                should = "return members in descriptor order with their admin ids and endpoints",
+                expected = "11:n1:127.0.0.1:7001|22:n2:127.0.0.1:7002|33:n3:127.0.0.1:7003",
+                actual = table.concat(
+                    {
+                        tostring(members[1].id)
+                            .. ":"
+                            .. members[1].name
+                            .. ":"
+                            .. members[1].endpoint.host
+                            .. ":"
+                            .. tostring(members[1].endpoint.port),
+                        tostring(members[2].id)
+                            .. ":"
+                            .. members[2].name
+                            .. ":"
+                            .. members[2].endpoint.host
+                            .. ":"
+                            .. tostring(members[2].endpoint.port),
+                        tostring(members[3].id)
+                            .. ":"
+                            .. members[3].name
+                            .. ":"
+                            .. members[3].endpoint.host
+                            .. ":"
+                            .. tostring(members[3].endpoint.port),
+                    },
+                    "|"
+                ),
             }
         )
     end
 )
 
 tested.test(
-    "config rejects unsorted, duplicate, non-literal, and missing local members",
+    "config keeps descriptor order, rejects duplicate names and absent locals",
     function()
-        local unsorted = fails(
-            function(): boolean
-                config.members(
-                    "n1",
-                    {"n2=127.0.0.1:7002", "n1=127.0.0.1:7001", "n3=127.0.0.1:7003"}
-                )
-                return true
-            end
+        local sparse = cluster_config.parse_jsonl(
+            '{"id":303,"name":"n3","host":"127.0.0.1","port":7003}\n'
+                .. '{"id":11,"name":"n1","host":"127.0.0.1","port":7001}\n'
+                .. '{"id":22,"name":"n2","host":"127.0.0.1","port":7002}\n'
         )
-        local duplicate = fails(
+        local members = config.members("n1", sparse)
+        local duplicate_names = fails(
             function(): boolean
                 config.members(
                     "n1",
-                    {"n1=127.0.0.1:7001", "n1=127.0.0.1:7002", "n3=127.0.0.1:7003"}
-                )
-                return true
-            end
-        )
-        local hostname = fails(
-            function(): boolean
-                config.members(
-                    "n1",
-                    {"n1=localhost:7001", "n2=127.0.0.1:7002", "n3=127.0.0.1:7003"}
+                    {
+                        {id = 11, name = "n1", host = "127.0.0.1", port = 7001},
+                        {id = 22, name = "n1", host = "127.0.0.1", port = 7002},
+                        {id = 33, name = "n3", host = "127.0.0.1", port = 7003},
+                    } as {cluster_config.ClusterNode}
                 )
                 return true
             end
         )
         local absent = fails(
-            function(): boolean
-                config.members(
-                    "n4",
-                    {"n1=127.0.0.1:7001", "n2=127.0.0.1:7002", "n3=127.0.0.1:7003"}
-                )
-                return true
-            end
+            function(): boolean config.members("n4", nodes()); return true end
         )
         tested.assert(
             {
-                given = "invalid membership shapes",
-                should = "reject each before opening sockets",
-                expected = true,
-                actual = unsorted and duplicate and hostname and absent,
+                given = "a non-lexically-ordered sparse descriptor and invalid membership shapes",
+                should = "preserve line order as the genesis succession and reject the rest before sockets",
+                expected = "303:11:22:true:true",
+                actual = tostring(members[1].id)
+                    .. ":"
+                    .. tostring(members[2].id)
+                    .. ":"
+                    .. tostring(members[3].id)
+                    .. ":"
+                    .. tostring(duplicate_names)
+                    .. ":"
+                    .. tostring(absent),
             }
         )
     end
@@ -107,27 +126,20 @@ tested.test(
 tested.test(
     "membership fingerprint has one canonical ordered SHA-256 representation",
     function()
-        local members = config.members(
-            "n1",
-            {
-                "n1=127.0.0.1:7001",
-                "n2=127.0.0.1:7002",
-                "n3=127.0.0.1:7003",
-            }
-        )
+        local members = config.members("n1", nodes())
         local changed = config.members(
             "n1",
-            {
-                "n1=127.0.0.1:7001",
-                "n2=127.0.0.1:7002",
-                "n3=127.0.0.1:7004",
-            }
+            cluster_config.parse_jsonl(
+                '{"id":11,"name":"n1","host":"127.0.0.1","port":7001}\n'
+                    .. '{"id":22,"name":"n2","host":"127.0.0.1","port":7002}\n'
+                    .. '{"id":33,"name":"n3","host":"127.0.0.1","port":7004}\n'
+            )
         )
         tested.assert(
             {
-                given = "the documented domain-separated, length-delimited membership bytes",
+                given = "the documented domain-separated, length-delimited ordered (id, name, endpoint) membership bytes",
                 should = "produce a stable SHA-256 short fingerprint and change with membership",
-                expected = "fcd4b13820df1fc3:true",
+                expected = "792aaa6463f0cb42:true",
                 actual = config.membership_fingerprint(members)
                     .. ":"
                     .. tostring(
@@ -143,7 +155,7 @@ tested.test(
 tested.test(
     "transport envelopes every peer payload with fingerprint and authenticates sources",
     function()
-        local fingerprint = "fcd4b13820df1fc3"
+        local fingerprint = "792aaa6463f0cb42"
         local envelope = transport.encode_peer(
             transport.PEER_VRR, fingerprint, "opaque vrr datagram"
         )
@@ -155,16 +167,11 @@ tested.test(
             application
         )
         local invalid = transport.decode_peer("vrr datagram")
-        local members = {
-            "n1=127.0.0.1:7001",
-            "n2=127.0.0.1:7002",
-            "n3=127.0.0.1:7003",
-        }
         tested.assert(
             {
                 given = "opaque VRR and application peer traffic",
                 should = "require a typed fingerprint envelope before source-authenticated delivery",
-                expected = "true:\1:fcd4b13820df1fc3:opaque vrr datagram:true:\2:fcd4b13820df1fc3:\1opaque application payload:false:true:false",
+                expected = "true:\1:792aaa6463f0cb42:opaque vrr datagram:true:\2:792aaa6463f0cb42:\1opaque application payload:false:true:false",
                 actual = tostring(valid)
                     .. ":"
                     .. kind
@@ -183,10 +190,10 @@ tested.test(
                     .. ":"
                     .. tostring(invalid)
                     .. ":"
-                    .. tostring(transport.source_is_member("127.0.0.1", 7002, members))
+                    .. tostring(transport.source_is_member("127.0.0.1", 7002, nodes()))
                     .. ":"
                     .. tostring(
-                        transport.source_is_member("127.0.0.1", 7999, members)
+                        transport.source_is_member("127.0.0.1", 7999, nodes())
                     ),
             }
         )
@@ -194,7 +201,7 @@ tested.test(
 )
 
 tested.test(
-    "transport round-trips a correlated era+view redirect without a leader index",
+    "transport round-trips a correlated era+view redirect without a leader id",
     function()
         local message_id = string.rep("x", transport.MESSAGE_ID_BYTES)
         local redirect = transport.encode_not_leader(message_id, 7, 4294967295)
@@ -221,13 +228,13 @@ tested.test(
 tested.test(
     "transport accepts only a redirect from its current forwarding destination",
     function()
-        local valid = transport.valid_not_leader(1, 1)
-        local wrong_source = transport.valid_not_leader(1, 0)
-        local not_forwarded = transport.valid_not_leader(-1, 1)
+        local valid = transport.valid_not_leader(22, 22)
+        local wrong_source = transport.valid_not_leader(22, 11)
+        local not_forwarded = transport.valid_not_leader(-1, 22)
         tested.assert(
             {
-                given = "redirects from expected and unexpected UDP peers",
-                should = "accept only source-correlated redirects; leader comes from the local view map",
+                given = "redirects from expected and unexpected member ids",
+                should = "accept only source-correlated redirects; the leader id comes from the local view map",
                 expected = "true:false:false",
                 actual = tostring(valid)
                     .. ":"
@@ -242,10 +249,10 @@ tested.test(
 tested.test(
     "a mismatched peer fingerprint permanently quarantines client operations",
     function()
-        local guard = membership_guard.new("fcd4b13820df1fc3")
-        local matching = guard:accept_fingerprint("fcd4b13820df1fc3")
+        local guard = membership_guard.new("792aaa6463f0cb42")
+        local matching = guard:accept_fingerprint("792aaa6463f0cb42")
         local mismatched = guard:accept_fingerprint("deadbeefdeadbeef")
-        local after = guard:accept_fingerprint("fcd4b13820df1fc3")
+        local after = guard:accept_fingerprint("792aaa6463f0cb42")
         tested.assert(
             {
                 given = "a matching redirect followed by a valid-source different membership",

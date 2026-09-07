@@ -1,3 +1,4 @@
+local cluster_config = require("cluster_config")
 local ffi = require("ffi")
 
 ffi.cdef(
@@ -138,7 +139,7 @@ local record advisory_lock
         view: integer
     end
 
-    new: function({string}, string, string, string, integer): Node
+    new: function({cluster_config.ClusterNode}, string, string, string, integer): Node
 end
 
 local Node = advisory_lock.Node
@@ -299,8 +300,13 @@ end
 
 local M: advisory_lock = {}
 
+-- The ABI member buffer carries explicit admin ids, one NUL-separated
+-- "<id>:<name>" entry per member, in deployment-descriptor order: that order
+-- is the genesis succession sequence and each id is the member's live
+-- NodeId. `own` is matched by name; every peer address on the ABI (receive
+-- `from`, send `to`, leader outs) is a member id.
 function M.new(
-    members: {string},
+    members: {cluster_config.ClusterNode},
     own: string,
     state_path: string,
     journal_dir: string,
@@ -308,8 +314,9 @@ function M.new(
 ): Node
     assert(#members >= 3, "advisory_lock: at least three members are required")
     for _, member in ipairs(members) do
+        local entry = tostring(member.id) .. ":" .. member.name
         assert(
-            member:find("\0", 1, true) == nil, "advisory_lock: membership contains NUL"
+            entry:find("\0", 1, true) == nil, "advisory_lock: membership contains NUL"
         )
     end
     assert(own:find("\0", 1, true) == nil, "advisory_lock: own member contains NUL")
@@ -325,7 +332,11 @@ function M.new(
         journal_roll_bytes >= 0,
         "advisory_lock: journal roll bytes must be non-negative"
     )
-    local packed = table.concat(members, "\0")
+    local entries: {string} = {}
+    for _, member in ipairs(members) do
+        table.insert(entries, tostring(member.id) .. ":" .. member.name)
+    end
+    local packed = table.concat(entries, "\0")
     local out = ffi.new("void*[1]") as {any}
     check(
         (

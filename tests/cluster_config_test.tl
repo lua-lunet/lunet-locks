@@ -39,6 +39,29 @@ tested.test(
 )
 
 tested.test(
+    "cluster_config preserves line order: it is the explicit genesis succession",
+    function()
+        local nodes = cluster_config.parse_jsonl(
+            '{"id":300,"name":"n1","host":"127.0.0.1","port":7001}\n'
+                .. '{"id":100,"name":"n2","host":"127.0.0.1","port":7002}\n'
+                .. '{"id":200,"name":"n3","host":"127.0.0.1","port":7003}\n'
+        )
+        tested.assert(
+            {
+                given = "a descriptor whose line order differs from id and name order",
+                should = "keep line order verbatim: the core folds it as the genesis member order (primary(v) = order[v mod N])",
+                expected = "300|100|200",
+                actual = tostring(nodes[1].id)
+                    .. "|"
+                    .. tostring(nodes[2].id)
+                    .. "|"
+                    .. tostring(nodes[3].id),
+            }
+        )
+    end
+)
+
+tested.test(
     "cluster_config rejects duplicate ids, duplicate names, and malformed entries",
     function()
         local duplicate_id = fails(
@@ -76,6 +99,53 @@ tested.test(
                 should = "reject each",
                 expected = true,
                 actual = duplicate_id and duplicate_name and bad_host and empty,
+            }
+        )
+    end
+)
+
+tested.test(
+    "cluster_config ids must fit u32 and cannot take the reserved LEADER_UNKNOWN value",
+    function()
+        local reserved = fails(
+            function(): boolean
+                cluster_config.parse_jsonl(
+                    '{"id":4294967295,"name":"n1","host":"127.0.0.1","port":7001}\n'
+                )
+                return true
+            end
+        )
+        local overflow = fails(
+            function(): boolean
+                cluster_config.parse_jsonl(
+                    '{"id":4294967296,"name":"n1","host":"127.0.0.1","port":7001}\n'
+                )
+                return true
+            end
+        )
+        local negative = fails(
+            function(): boolean
+                cluster_config.parse_jsonl(
+                    '{"id":-1,"name":"n1","host":"127.0.0.1","port":7001}\n'
+                )
+                return true
+            end
+        )
+        local max_allowed = cluster_config.parse_jsonl(
+            '{"id":4294967294,"name":"n1","host":"127.0.0.1","port":7001}\n'
+        )
+        tested.assert(
+            {
+                given = "ids above the u32 NodeId domain or equal to the reserved adapter sentinel",
+                should = "reject each and admit the largest legal u32 id",
+                expected = "true:true:true:4294967294",
+                actual = tostring(reserved)
+                    .. ":"
+                    .. tostring(overflow)
+                    .. ":"
+                    .. tostring(negative)
+                    .. ":"
+                    .. tostring(max_allowed[1].id),
             }
         )
     end

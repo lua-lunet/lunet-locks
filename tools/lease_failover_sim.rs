@@ -209,6 +209,17 @@ fn holder_in(reply: &str, known_holders: &[String]) -> Option<usize> {
 }
 
 fn start_cluster(root: &Path, runtime: &Path, work: &Path) -> io::Result<Cluster> {
+    // The deployment descriptor: sparse, admin-assigned, never-recycled
+    // NodeIds; line order is the genesis succession sequence (n1 is the
+    // genesis primary).
+    fs::write(
+        work.join("cluster.jsonl"),
+        concat!(
+            "{\"id\":101,\"name\":\"n1\",\"host\":\"127.0.0.1\",\"port\":29111}\n",
+            "{\"id\":202,\"name\":\"n2\",\"host\":\"127.0.0.1\",\"port\":29112}\n",
+            "{\"id\":303,\"name\":\"n3\",\"host\":\"127.0.0.1\",\"port\":29113}\n",
+        ),
+    )?;
     let mut children = Vec::new();
     for (name, client_port, peer_port) in [
         ("n1", 29101, 29111),
@@ -230,9 +241,8 @@ fn start_cluster(root: &Path, runtime: &Path, work: &Path) -> io::Result<Cluster
                 "--state",
                 &work.join(format!("{name}.nonce")).display().to_string(),
             ])
-            .args(["--member", "n1=127.0.0.1:29111"])
-            .args(["--member", "n2=127.0.0.1:29112"])
-            .args(["--member", "n3=127.0.0.1:29113"])
+            .arg("--cluster")
+            .arg(work.join("cluster.jsonl"))
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr))
             .spawn()?;

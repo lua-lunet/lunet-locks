@@ -1,18 +1,27 @@
--- Admin-facing cluster deployment descriptor: a sparse, admin-assigned
--- integer id -> {name, host, port} map, one flattened JSON object per line
--- (JSONL) so the file diffs and greps like a log, not a blob.
+-- The cluster deployment descriptor and THE live membership-addressing
+-- scheme: a sparse, admin-assigned integer id -> {name, host, port} map, one
+-- flattened JSON object per line (JSONL) so the file diffs and greps like a
+-- log, not a blob.
 --
--- Scope note (see AGENTS.md "vrr-core" boundary): this module is additive
--- and local-only. `config.tl`'s `members()` derives each replica's
--- protocol-level index from its *position in a lexically-sorted name list*,
--- and that ordered membership maps deployment entries to the host-supplied
--- `NodeId` each replica presents at the FFI boundary (see `server.tl`'s
--- `index_by_endpoint`/`endpoint_by_index`). Upstream vrr-core v0.2.0 does not
--- implement reconfiguration, so the sparse, admin-chosen, never-recycled ids
--- defined here cannot become the live membership-addressing scheme; the
--- descriptor remains local-only.
--- This module only reads/writes the deployment descriptor file; it does not
--- feed `config.members()` or `server.tl`.
+-- Contract:
+-- - Every entry's `id` is the replica's live `NodeId` on the ABI and in peer
+--   routing; `config.tl`'s `members()` derives membership from this
+--   descriptor, and `server.tl` maps ids to endpoints through it. Ids are
+--   admin-assigned, sparse, and never recycled across deployments: a
+--   recycled id would alias a superseded incarnation's identity. Sparse and
+--   never-recycled ids remain an operator invariant this module cannot
+--   enforce across runs (no persistent id allocator); it only rejects
+--   in-file duplicate ids and duplicate names.
+-- - The file's line order is the explicit genesis succession sequence: the
+--   descriptor order is passed to the core as the genesis member order, and
+--   the core's `primary(v) = order[v mod N]` resolves over it. Line order —
+--   not lexical name order — is authoritative, and every replica must carry
+--   an identical descriptor file.
+-- - An id must fit the core's `NodeId(u32)` and cannot be 4294967295: the
+--   native adapter reserves that value as its LEADER_UNKNOWN report.
+--
+-- This module only reads/writes the deployment descriptor file; it never
+-- opens sockets and stays pure for the test suite.
 
 local record ClusterNode
     id: integer
@@ -68,6 +77,12 @@ local function parse_line(line: string, line_no: integer): ClusterNode
     local id = tonumber(id_text) as integer
     local port = tonumber(port_text) as integer
     assert(id >= 0, "cluster_config: line " .. tostring(line_no) .. " id must be >= 0")
+    assert(
+        id <= 4294967294,
+        "cluster_config: line "
+            .. tostring(line_no)
+            .. " id must fit u32 and cannot be the reserved LEADER_UNKNOWN value 4294967295"
+    )
     assert(
         name_text:match("^[%w_-]+$") ~= nil,
         "cluster_config: line " .. tostring(line_no) .. " name must be [%w_-]+"

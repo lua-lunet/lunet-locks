@@ -32,6 +32,7 @@ RUN apt-get update \
 COPY --from=native /app/ext/advisory_lock/target/release/liblunet_advisory_lock.so /app/lib/
 COPY build /app/build
 COPY docker/entrypoint.sh /app/docker/entrypoint.sh
+COPY docker/cluster.jsonl /app/docker/cluster.jsonl
 RUN chmod 755 /app/docker/entrypoint.sh
 
 ENV LUNET_ADVISORY_LOCK_LIB=/app/lib/liblunet_advisory_lock.so

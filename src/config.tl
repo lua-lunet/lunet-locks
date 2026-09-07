@@ -4,14 +4,18 @@ local record Endpoint
 end
 
 local record Member
+    id: integer
     name: string
     endpoint: Endpoint
 end
 
 -- Membership bytes are deliberately domain-separated and length-delimited.
--- The lexical member order is validated by `members` before this is called.
-local MEMBERSHIP_DOMAIN = "lunet-advisory-lock/membership/v1\0"
+-- The member order is the deployment descriptor's line order — the explicit
+-- genesis succession sequence — validated by `members` before this is called.
+local MEMBERSHIP_DOMAIN = "lunet-advisory-lock/membership/v2\0"
 local FINGERPRINT_HEX_BYTES = 16
+
+local cluster_config = require("cluster_config")
 
 local bit = require("bit")
 
@@ -191,34 +195,32 @@ local function endpoint(value: string): Endpoint
     return {host = host, port = port as integer}
 end
 
-local function member(value: string): Member
-    local name, address = value:match("^([^=]+)=(.+)$")
-    assert(
-        name ~= nil and address ~= nil and name:match("^[%w_-]+$") ~= nil,
-        "config: member must be name=IPv4:port"
-    )
-    return {name = name, endpoint = endpoint(address)}
-end
-
-local function members(local_name: string, values: {string}): {Member}
-    assert(#values >= 3, "config: at least three members are required")
+-- Membership derives from the deployment descriptor: every entry's id is the
+-- replica's live NodeId, and the descriptor's line order is the explicit
+-- genesis succession sequence (`primary(v) = order[v mod N]` in the core).
+-- Names must be unique, ids are already unique and u32-bounded by the
+-- descriptor parser, and the local node must appear exactly once.
+local function members(
+    local_name: string, nodes: {cluster_config.ClusterNode}
+): {Member}
+    assert(#nodes >= 3, "config: at least three members are required")
     local parsed: {Member} = {}
-    local seen: {string: boolean} = {}
+    local seen_names: {string: boolean} = {}
     local local_count = 0
-    local previous = ""
-    for _, value in ipairs(values) do
-        local current = member(value)
-        assert(not seen[current.name], "config: member names must be unique")
-        assert(
-            previous == "" or previous < current.name,
-            "config: members must be lexically sorted"
-        )
-        seen[current.name] = true
-        previous = current.name
-        if current.name == local_name then
+    for _, node in ipairs(nodes) do
+        assert(not seen_names[node.name], "config: member names must be unique")
+        seen_names[node.name] = true
+        if node.name == local_name then
             local_count = local_count + 1
         end
-        table.insert(parsed, current)
+        table.insert(
+            parsed,
+            {
+                id = node.id,
+                name = node.name,
+                endpoint = {host = node.host, port = node.port},
+            }
+        )
     end
     assert(local_count == 1, "config: --node must appear exactly once in membership")
     return parsed
@@ -227,9 +229,13 @@ end
 local function membership_bytes(ordered: {Member}): string
     local encoded = MEMBERSHIP_DOMAIN .. tostring(#ordered) .. ":"
     for _, current in ipairs(ordered) do
+        local id = tostring(current.id)
         local host = current.endpoint.host
         local port = tostring(current.endpoint.port)
         encoded = encoded
+            .. tostring(#id)
+            .. ":"
+            .. id
             .. tostring(#current.name)
             .. ":"
             .. current.name
@@ -249,7 +255,6 @@ end
 
 return {
     endpoint = endpoint,
-    member = member,
     members = members,
     membership_bytes = membership_bytes,
     membership_fingerprint = membership_fingerprint,
