@@ -1,7 +1,7 @@
 -- The cluster deployment descriptor and THE live membership-addressing
--- scheme: a sparse, admin-assigned integer id -> {name, host, port} map, one
--- flattened JSON object per line (JSONL) so the file diffs and greps like a
--- log, not a blob.
+-- scheme: a sparse, admin-assigned integer id -> {name, host, port, genesis}
+-- map, one flattened JSON object per line (JSONL) so the file diffs and greps
+-- like a log, not a blob.
 --
 -- Contract:
 -- - Every entry's `id` is the replica's live `NodeId` on the ABI and in peer
@@ -12,11 +12,19 @@
 --   never-recycled ids remain an operator invariant this module cannot
 --   enforce across runs (no persistent id allocator); it only rejects
 --   in-file duplicate ids and duplicate names.
--- - The file's line order is the explicit genesis succession sequence: the
---   descriptor order is passed to the core as the genesis member order, and
---   the core's `primary(v) = order[v mod N]` resolves over it. Line order —
---   not lexical name order — is authoritative, and every replica must carry
---   an identical descriptor file.
+-- - The `genesis` field marks the deployment's founding membership. The
+--   genesis lines (in line order) are the explicit genesis succession
+--   sequence the core folds as the founding configuration
+--   (`primary(v) = order[v mod N]` in the core); every replica must carry
+--   the identical genesis lines. A member that joined a live cluster
+--   through a committed reconfiguration is appended after the genesis lines
+--   with `"genesis":false` — the descriptor relation between processes is a
+--   superset with the new member appended and identical line order for
+--   shared members. Running processes never reload the file; live members
+--   learn a joining member's endpoint through the admin broadcast.
+-- - The membership fingerprint (config.tl) is over the genesis lines only:
+--   the deployment's identity is its founding membership, stable across
+--   live superset growth.
 -- - An id must fit the core's `NodeId(u32)` and cannot be 4294967295: the
 --   native adapter reserves that value as its LEADER_UNKNOWN report.
 --
@@ -28,6 +36,7 @@ local record ClusterNode
     name: string
     host: string
     port: integer
+    genesis: boolean
 end
 
 local function ipv4(host: string): boolean
@@ -50,16 +59,17 @@ local function ipv4(host: string): boolean
     return count == 4 and host:find("%.") ~= nil
 end
 
--- Minimal single-line JSON encode/decode restricted to this record's four
+-- Minimal single-line JSON encode/decode restricted to this record's five
 -- known keys. No general JSON support is needed (or wanted): a fixed,
 -- typed schema keeps this module dependency-free and trivially auditable.
 local function encode_line(node: ClusterNode): string
     return string.format(
-        '{"id":%d,"name":%s,"host":%s,"port":%d}',
+        '{"id":%d,"name":%s,"host":%s,"port":%d,"genesis":%s}',
         node.id,
         string.format("%q", node.name),
         string.format("%q", node.host),
-        node.port
+        node.port,
+        node.genesis and "true" or "false"
     )
 end
 
@@ -68,11 +78,20 @@ local function parse_line(line: string, line_no: integer): ClusterNode
     local name_text = line:match('"name"%s*:%s*"([^"]*)"')
     local host_text = line:match('"host"%s*:%s*"([^"]*)"')
     local port_text = line:match('"port"%s*:%s*(%d+)')
+    local genesis_text = line:match('"genesis"%s*:%s*(%a+)')
     assert(
-        id_text ~= nil and name_text ~= nil and host_text ~= nil and port_text ~= nil,
+        id_text ~= nil
+            and name_text ~= nil
+            and host_text ~= nil
+            and port_text ~= nil
+            and genesis_text ~= nil,
         "cluster_config: line "
             .. tostring(line_no)
-            .. " must be {\"id\":N,\"name\":\"...\",\"host\":\"...\",\"port\":N}"
+            .. " must be {\"id\":N,\"name\":\"...\",\"host\":\"...\",\"port\":N,\"genesis\":bool}"
+    )
+    assert(
+        genesis_text == "true" or genesis_text == "false",
+        "cluster_config: line " .. tostring(line_no) .. " genesis must be true or false"
     )
     local id = tonumber(id_text) as integer
     local port = tonumber(port_text) as integer
@@ -95,7 +114,13 @@ local function parse_line(line: string, line_no: integer): ClusterNode
         port >= 1 and port <= 65535,
         "cluster_config: line " .. tostring(line_no) .. " port must be 1..65535"
     )
-    return {id = id, name = name_text, host = host_text, port = port}
+    return {
+        id = id,
+        name = name_text,
+        host = host_text,
+        port = port,
+        genesis = genesis_text == "true",
+    }
 end
 
 -- Parses JSONL text: one node per non-blank, non-comment (#...) line.
@@ -136,6 +161,47 @@ local function parse_jsonl(text: string): {ClusterNode}
     return nodes
 end
 
+-- The genesis succession: the descriptor's genesis lines, in line order.
+-- This is the founding membership every replica must carry identically and
+-- the order the core folds as the genesis configuration.
+local function genesis_members(nodes: {ClusterNode}): {ClusterNode}
+    local genesis: {ClusterNode} = {}
+    for _, node in ipairs(nodes) do
+        if node.genesis then
+            table.insert(genesis, node)
+        end
+    end
+    assert(#genesis >= 3, "cluster_config: at least three genesis members are required")
+    return genesis
+end
+
+-- The superset relation between two deployments' descriptors: every genesis
+-- line of the second appears, in order, as a line of the first (ids, names
+-- and endpoints identical). A live superset growth appends joining members;
+-- shared lines never move or change.
+local function superset_of(larger: {ClusterNode}, smaller: {ClusterNode}): boolean
+    local cursor = 1
+    for _, node in ipairs(smaller) do
+        local found = false
+        while cursor <= #larger and not found do
+            local candidate = larger[cursor]
+            cursor = cursor + 1
+            if
+                candidate.id == node.id
+                and candidate.name == node.name
+                and candidate.host == node.host
+                and candidate.port == node.port
+            then
+                found = true
+            end
+        end
+        if not found then
+            return false
+        end
+    end
+    return true
+end
+
 local function encode_jsonl(nodes: {ClusterNode}): string
     local lines: {string} = {}
     for _, node in ipairs(nodes) do
@@ -149,4 +215,6 @@ return {
     parse_jsonl = parse_jsonl,
     encode_jsonl = encode_jsonl,
     encode_line = encode_line,
+    genesis_members = genesis_members,
+    superset_of = superset_of,
 }

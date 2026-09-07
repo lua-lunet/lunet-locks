@@ -106,9 +106,9 @@ start() {
 # The deployment descriptor: sparse, admin-assigned, never-recycled NodeIds;
 # line order is the genesis succession sequence (n1 is the genesis primary).
 cat >"$work/cluster.jsonl" <<'EOF'
-{"id":101,"name":"n1","host":"127.0.0.1","port":27101}
-{"id":202,"name":"n2","host":"127.0.0.1","port":27102}
-{"id":303,"name":"n3","host":"127.0.0.1","port":27103}
+{"id":101,"name":"n1","host":"127.0.0.1","port":27101,"genesis":true}
+{"id":202,"name":"n2","host":"127.0.0.1","port":27102,"genesis":true}
+{"id":303,"name":"n3","host":"127.0.0.1","port":27103,"genesis":true}
 EOF
 
 # Send every line on one connection, preserving the server's sequential client

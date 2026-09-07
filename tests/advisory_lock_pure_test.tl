@@ -11,9 +11,9 @@ end
 
 local function nodes(): {cluster_config.ClusterNode}
     return cluster_config.parse_jsonl(
-        '{"id":11,"name":"n1","host":"127.0.0.1","port":7001}\n'
-            .. '{"id":22,"name":"n2","host":"127.0.0.1","port":7002}\n'
-            .. '{"id":33,"name":"n3","host":"127.0.0.1","port":7003}\n'
+        '{"id":11,"name":"n1","host":"127.0.0.1","port":7001,"genesis":true}\n'
+            .. '{"id":22,"name":"n2","host":"127.0.0.1","port":7002,"genesis":true}\n'
+            .. '{"id":33,"name":"n3","host":"127.0.0.1","port":7003,"genesis":true}\n'
     )
 end
 
@@ -61,9 +61,9 @@ tested.test(
     "config keeps descriptor order, rejects duplicate names and absent locals",
     function()
         local sparse = cluster_config.parse_jsonl(
-            '{"id":303,"name":"n3","host":"127.0.0.1","port":7003}\n'
-                .. '{"id":11,"name":"n1","host":"127.0.0.1","port":7001}\n'
-                .. '{"id":22,"name":"n2","host":"127.0.0.1","port":7002}\n'
+            '{"id":303,"name":"n3","host":"127.0.0.1","port":7003,"genesis":true}\n'
+                .. '{"id":11,"name":"n1","host":"127.0.0.1","port":7001,"genesis":true}\n'
+                .. '{"id":22,"name":"n2","host":"127.0.0.1","port":7002,"genesis":true}\n'
         )
         local members = config.members("n1", sparse)
         local duplicate_names = fails(
@@ -71,9 +71,27 @@ tested.test(
                 config.members(
                     "n1",
                     {
-                        {id = 11, name = "n1", host = "127.0.0.1", port = 7001},
-                        {id = 22, name = "n1", host = "127.0.0.1", port = 7002},
-                        {id = 33, name = "n3", host = "127.0.0.1", port = 7003},
+                        {
+                            id = 11,
+                            name = "n1",
+                            host = "127.0.0.1",
+                            port = 7001,
+                            genesis = true,
+                        },
+                        {
+                            id = 22,
+                            name = "n1",
+                            host = "127.0.0.1",
+                            port = 7002,
+                            genesis = true,
+                        },
+                        {
+                            id = 33,
+                            name = "n3",
+                            host = "127.0.0.1",
+                            port = 7003,
+                            genesis = true,
+                        },
                     } as {cluster_config.ClusterNode}
                 )
                 return true
@@ -130,16 +148,16 @@ tested.test(
         local changed = config.members(
             "n1",
             cluster_config.parse_jsonl(
-                '{"id":11,"name":"n1","host":"127.0.0.1","port":7001}\n'
-                    .. '{"id":22,"name":"n2","host":"127.0.0.1","port":7002}\n'
-                    .. '{"id":33,"name":"n3","host":"127.0.0.1","port":7004}\n'
+                '{"id":11,"name":"n1","host":"127.0.0.1","port":7001,"genesis":true}\n'
+                    .. '{"id":22,"name":"n2","host":"127.0.0.1","port":7002,"genesis":true}\n'
+                    .. '{"id":33,"name":"n3","host":"127.0.0.1","port":7004,"genesis":true}\n'
             )
         )
         tested.assert(
             {
                 given = "the documented domain-separated, length-delimited ordered (id, name, endpoint) membership bytes",
                 should = "produce a stable SHA-256 short fingerprint and change with membership",
-                expected = "792aaa6463f0cb42:true",
+                expected = "87df81de485555d1:true",
                 actual = config.membership_fingerprint(members)
                     .. ":"
                     .. tostring(
@@ -153,9 +171,42 @@ tested.test(
 )
 
 tested.test(
+    "the deployment fingerprint is over the genesis membership and survives superset growth",
+    function()
+        local grown = cluster_config.parse_jsonl(
+            '{"id":11,"name":"n1","host":"127.0.0.1","port":7001,"genesis":true}\n'
+                .. '{"id":22,"name":"n2","host":"127.0.0.1","port":7002,"genesis":true}\n'
+                .. '{"id":33,"name":"n3","host":"127.0.0.1","port":7003,"genesis":true}\n'
+                .. '{"id":44,"name":"n4","host":"127.0.0.1","port":7004,"genesis":false}\n'
+        )
+        local repointed = cluster_config.parse_jsonl(
+            '{"id":11,"name":"n1","host":"127.0.0.1","port":7001,"genesis":true}\n'
+                .. '{"id":22,"name":"n2","host":"127.0.0.1","port":7002,"genesis":true}\n'
+                .. '{"id":33,"name":"n3","host":"127.0.0.1","port":7903,"genesis":true}\n'
+        )
+        tested.assert(
+            {
+                given = "the genesis membership bytes under the v3 domain: an appended joiner, then a repointed genesis endpoint",
+                should = "keep the fingerprint byte-stable across a live join and move it when a genesis endpoint moves",
+                expected = "87df81de485555d1:87df81de485555d1:false",
+                actual = config.genesis_fingerprint(nodes())
+                    .. ":"
+                    .. config.genesis_fingerprint(grown)
+                    .. ":"
+                    .. tostring(
+                        config.genesis_fingerprint(
+                            nodes()
+                        ) == config.genesis_fingerprint(repointed)
+                    ),
+            }
+        )
+    end
+)
+
+tested.test(
     "transport envelopes every peer payload with fingerprint and authenticates sources",
     function()
-        local fingerprint = "792aaa6463f0cb42"
+        local fingerprint = "87df81de485555d1"
         local envelope = transport.encode_peer(
             transport.PEER_VRR, fingerprint, "opaque vrr datagram"
         )
@@ -171,7 +222,7 @@ tested.test(
             {
                 given = "opaque VRR and application peer traffic",
                 should = "require a typed fingerprint envelope before source-authenticated delivery",
-                expected = "true:\1:792aaa6463f0cb42:opaque vrr datagram:true:\2:792aaa6463f0cb42:\1opaque application payload:false:true:false",
+                expected = "true:\1:87df81de485555d1:opaque vrr datagram:true:\2:87df81de485555d1:\1opaque application payload:false:true:false",
                 actual = tostring(valid)
                     .. ":"
                     .. kind
@@ -249,10 +300,10 @@ tested.test(
 tested.test(
     "a mismatched peer fingerprint permanently quarantines client operations",
     function()
-        local guard = membership_guard.new("792aaa6463f0cb42")
-        local matching = guard:accept_fingerprint("792aaa6463f0cb42")
+        local guard = membership_guard.new("87df81de485555d1")
+        local matching = guard:accept_fingerprint("87df81de485555d1")
         local mismatched = guard:accept_fingerprint("deadbeefdeadbeef")
-        local after = guard:accept_fingerprint("792aaa6463f0cb42")
+        local after = guard:accept_fingerprint("87df81de485555d1")
         tested.assert(
             {
                 given = "a matching redirect followed by a valid-source different membership",

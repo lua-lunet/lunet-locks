@@ -29,7 +29,33 @@
 //!   genesis succession sequence (`primary(v) = order[v mod N]`). Member ids
 //!   are the ABI's peer addresses: `receive`'s `from`, send outputs' `to`,
 //!   and the leader outs all carry member ids; the host maps id -> endpoint
-//!   through the descriptor. `own` is matched by name.
+//!   through the descriptor. `own` is matched by name. A post-genesis
+//!   (joined-later) entry carries a `:j` suffix: `<u32-id>:<name>:j`. Such
+//!   entries are outside the genesis order — the core's `provision` refuses
+//!   an `own` that is not a founding member — so a node whose `own` names a
+//!   `:j` entry boots as a JOINER: `Replica::reopen` over the deployment's
+//!   genesis (the entries `provision` installs, mirrored byte-for-byte, plus
+//!   the era table folded from them), fenced `Recovering`, addressed but
+//!   outside every configuration until a committed `Join` admits it. Upstream
+//!   has no fresh-node catch-up at this commit: the establishing operation's
+//!   fan-out reaches configuration members only and the `GetState` serving
+//!   gate serves configuration members only, so the joiner evaluates only
+//!   the era-1 traffic its genesis table covers and drops everything past it
+//!   by name — the same boundary upstream's own learner corpus states
+//!   (§10 acquisition, future work). The joiner fabricates nothing.
+//! - **Reconfiguration.** `lunet_lock_node_reconfigure` drives
+//!   `Input::Reconfigure { op, pivot }` (Join at weight 0 / Increment /
+//!   Leave at weight 0) on the current primary through the ordinary
+//!   plan/publish pipeline. The host derives the non-stop overlap pivot with
+//!   the core's own `construct_pivot` (`config(e+1)` probed exactly the way
+//!   the planner probes it, at `accepted().next()`); a `None` result — or a
+//!   failed probe — drives the stop-the-world fallback with `pivot: None`,
+//!   which upstream defines as a latency outcome, never an error. The era
+//!   advances exactly at the establishing operation's commit; refusals never
+//!   enter the log. Error mapping: `NotPrimary` is the one actionable code
+//!   (NOT_LEADER, re-forward to the named primary); every other refusal
+//!   (transition-outstanding gates, fold and closed-intersection gates,
+//!   view-exhaustion) is internal and reports SERVICE.
 //! - **Operation identity.** `OperationId` is derived from the client
 //!   request's 16-byte message_id: `msb` = first 8 bytes, `lsb` = last 8,
 //!   both big-endian (the core's wire order). The operation payload IS the
@@ -80,7 +106,8 @@
 //! journal. `roll_bytes` is the byte threshold at which the current event
 //! file rolls to a final name with an atomic metafile. `members_data` holds
 //! NUL-separated `<u32-id>:<name>` entries in descriptor (genesis succession)
-//! order; `own_data` is the local member's name.
+//! order, with post-genesis entries suffixed `:j` (see Identity above);
+//! `own_data` is the local member's name.
 
 use crate::journal::{self, Journal as LockJournal, JournalEvent};
 use crate::locks::{Service, Transition};
@@ -91,14 +118,19 @@ use std::io::Write;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::ptr;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use vrr::configuration::MAX_MEMBERS;
+use vrr::configuration::{EraTable, INIT_SLOT, MAX_MEMBERS, SystemOperation, VOID_SLOT};
 use vrr::effects::{Effect, Stability};
-use vrr::ids::{NodeId, Operation, OperationId, Tick};
-use vrr::journal::{Journal, Payload, SegmentedLog};
+use vrr::ids::{Era, NodeId, Operation, OperationId, Slot, Tick, View, ViewId};
+use vrr::journal::{Journal, LogEntry, Payload, SegmentedLog};
 use vrr::message::{Body, Message};
-use vrr::quorum::WeightedMajority;
-use vrr::replica::{Input, PlanRefusal, PublishOutcome, Replica, TimedInput, ViewChangeKnobs};
+use vrr::progress::Status;
+use vrr::quorum::{WeightedMajority, construct_pivot};
+use vrr::replica::{
+    Input, PersistedProgress, Pivot, PlanRefusal, PublishOutcome, Replica, TimedInput,
+    ViewChangeKnobs,
+};
 use vrr::wire::{Pack, Unpack, UnpackError};
 
 const OK: i32 = 0;
@@ -478,6 +510,109 @@ fn valid_message_payloads(message: &Message) -> bool {
     }
 }
 
+/// One parsed member-buffer entry: the admin-assigned id, the name, and
+/// whether the member joined after genesis (the `<id>:<name>:j` grammar).
+/// A `:j` entry is outside the genesis succession order; it registers the
+/// id->name mapping and, when it is `own`, selects the joiner boot.
+struct MemberEntry {
+    id: u32,
+    name: String,
+    joined: bool,
+}
+
+/// Reconfiguration operation codes for `lunet_lock_node_reconfigure`.
+const RECONFIGURE_JOIN: u32 = 1;
+const RECONFIGURE_INCREMENT: u32 = 2;
+const RECONFIGURE_LEAVE: u32 = 3;
+
+/// `lunet_lock_node_reconfigure`'s Join position sentinel: append at the
+/// core's current succession end (resolved against the folded configuration).
+const POSITION_APPEND: u32 = u32::MAX;
+
+fn parse_member_entry(entry: &[u8]) -> Option<MemberEntry> {
+    let text = std::str::from_utf8(entry).ok()?;
+    let (id_text, rest) = text.split_once(':')?;
+    let id = id_text.parse::<u32>().ok()?;
+    let (name, joined) = match rest.split_once(':') {
+        Some((name, "j")) => (name, true),
+        Some(_) => return None,
+        None => (rest, false),
+    };
+    Some(MemberEntry {
+        id,
+        name: name.to_owned(),
+        joined,
+    })
+}
+
+/// The joiner boot (see the module's Identity note): a later life over the
+/// deployment's genesis. The journal and the era table hold exactly the
+/// entries `provision` installs — mirrored byte-for-byte so the joiner's
+/// slot-2 entry equals the cluster's committed one — and `reopen` fences the
+/// node to `Recovering` regardless. Nothing about a restart is pretended: the
+/// node holds the shared committed root and nothing else.
+fn joiner_replica(
+    own: NodeId,
+    genesis_order: Vec<NodeId>,
+    knobs: ViewChangeKnobs,
+) -> Result<Core, i32> {
+    let table = EraTable::genesis()
+        .extend(&SystemOperation::Void, VOID_SLOT)
+        .and_then(|table| {
+            table.extend(
+                &SystemOperation::Init {
+                    order: genesis_order.clone(),
+                },
+                INIT_SLOT,
+            )
+        })
+        .map_err(|_| CONFIG)?;
+    let era = table.current().era;
+    let genesis = [
+        LogEntry {
+            slot: VOID_SLOT,
+            era: Era::INITIAL,
+            payload: Payload::System(SystemOperation::Void),
+        },
+        LogEntry {
+            slot: INIT_SLOT,
+            era,
+            payload: Payload::System(SystemOperation::Init {
+                order: genesis_order,
+            }),
+        },
+    ];
+    let mut journal = SegmentedLog::new();
+    if journal.install_suffix(VOID_SLOT, &genesis).is_err() {
+        return Err(CONFIG);
+    }
+    let view = ViewId {
+        era,
+        view: View::INITIAL,
+    };
+    let persisted = PersistedProgress {
+        current: view,
+        retained: view,
+        status: Status::Recovering,
+        accepted: INIT_SLOT,
+        committed: INIT_SLOT,
+        applied: INIT_SLOT,
+        checkpoint: Slot::NONE,
+        revision: 0,
+        fault: None,
+    };
+    Replica::reopen(
+        own,
+        WeightedMajority,
+        journal,
+        persisted,
+        Arc::new(table),
+        Stability::Volatile,
+        knobs,
+    )
+    .map_err(|_| CONFIG)
+}
+
 unsafe fn bytes<'a>(len: usize, data: *const u8) -> Result<&'a [u8], i32> {
     if data.is_null() {
         return if len == 0 { Ok(&[]) } else { Err(INVALID) };
@@ -608,17 +743,13 @@ pub unsafe extern "C" fn lunet_lock_node_new(
         let Ok(journal_dir_data) = (unsafe { bytes(journal_dir_len, journal_dir_data) }) else {
             return INVALID;
         };
-        // Member entries are "<u32-id>:<name>"; the buffer order is the
-        // descriptor's line order — the genesis succession sequence — and
-        // each id is the member's live NodeId.
+        // Member entries are "<u32-id>:<name>"; a post-genesis (joined)
+        // entry is "<u32-id>:<name>:j". The plain-entry order is the
+        // descriptor's genesis succession sequence and each id is the
+        // member's live NodeId.
         let Some(members) = members_data
             .split(|byte| *byte == 0)
-            .map(|entry| {
-                let entry = std::str::from_utf8(entry).ok()?;
-                let (id_text, name) = entry.split_once(':')?;
-                let id = id_text.parse::<u32>().ok()?;
-                Some((id, name.to_owned()))
-            })
+            .map(parse_member_entry)
             .collect::<Option<Vec<_>>>()
         else {
             return CONFIG;
@@ -640,42 +771,57 @@ pub unsafe extern "C" fn lunet_lock_node_new(
         if state.is_empty()
             || members.is_empty()
             || members.len() > MAX_MEMBERS as usize
-            || members.iter().any(|(_, name)| name.is_empty())
+            || members.iter().any(|member| member.name.is_empty())
         {
             return CONFIG;
         }
-        let mut unique_ids = members.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+        let mut unique_ids = members.iter().map(|member| member.id).collect::<Vec<_>>();
         unique_ids.sort_unstable();
         unique_ids.dedup();
         let mut unique_names = members
             .iter()
-            .map(|(_, name)| name.clone())
+            .map(|member| member.name.clone())
             .collect::<Vec<_>>();
         unique_names.sort();
         unique_names.dedup();
         if unique_ids.len() != members.len() || unique_names.len() != members.len() {
             return CONFIG;
         }
-        let Some((own_id, _)) = members.iter().find(|(_, name)| name == own) else {
+        let Some(own_member) = members.iter().find(|member| member.name == own) else {
             return CONFIG;
         };
-        // Explicit admin-assigned identity: the descriptor ids in buffer
-        // order are both the live NodeIds and the genesis succession
-        // sequence.
-        let genesis_order: Vec<NodeId> = members.iter().map(|(id, _)| NodeId(*id)).collect();
+        // Explicit admin-assigned identity: the descriptor's genesis (plain)
+        // ids in buffer order are both the live NodeIds of the founding
+        // membership and the genesis succession sequence.
+        let genesis_order: Vec<NodeId> = members
+            .iter()
+            .filter(|member| !member.joined)
+            .map(|member| NodeId(member.id))
+            .collect();
         let knobs = ViewChangeKnobs {
             primary_timeout: PRIMARY_TIMEOUT_MS,
             view_change_budget: MAX_DATAGRAM,
         };
-        let Ok(replica) = Replica::provision(
-            NodeId(*own_id),
-            genesis_order,
-            WeightedMajority,
-            SegmentedLog::new(),
-            Stability::Volatile,
-            knobs,
-        ) else {
-            return CONFIG;
+        let own_id = NodeId(own_member.id);
+        let replica = if own_member.joined {
+            // A post-genesis member boots as a joiner: a later life over the
+            // deployment's genesis, fenced until the stream proves currency.
+            match joiner_replica(own_id, genesis_order, knobs) {
+                Ok(replica) => replica,
+                Err(_) => return CONFIG,
+            }
+        } else {
+            match Replica::provision(
+                own_id,
+                genesis_order,
+                WeightedMajority,
+                SegmentedLog::new(),
+                Stability::Volatile,
+                knobs,
+            ) {
+                Ok(replica) => replica,
+                Err(_) => return CONFIG,
+            }
         };
         let nonce_path = PathBuf::from(state);
         if initialize_nonce(&nonce_path).is_err() {
@@ -774,6 +920,75 @@ pub unsafe extern "C" fn lunet_lock_node_request(
             node.pending.remove(&id);
         }
         result
+    })
+}
+
+impl Node {
+    /// The non-stop overlap pivot for a reconfiguration, derived the
+    /// upstream way: the host builds it with the core's own `construct_pivot`
+    /// against the current configuration and the configuration the
+    /// establishing operation folds at the slot it would occupy — the same
+    /// slot the planner's gate 5 probes. `None` (no legal pivot for this
+    /// leader, or the fold probe failed) drives the stop-the-world
+    /// fallback, which upstream defines as a latency outcome, never an
+    /// error; the core's `validate_pivot` gate still judges whatever the
+    /// host passes.
+    fn derived_pivot(&self, op: &SystemOperation) -> Option<Pivot> {
+        let next_slot = self.replica.progress().accepted().next()?;
+        let next_table = self
+            .replica
+            .progress()
+            .config()
+            .extend(op, next_slot)
+            .ok()?;
+        let current = &self.replica.progress().config().current().config;
+        construct_pivot(
+            &WeightedMajority,
+            current,
+            &next_table.current().config,
+            self.replica.own(),
+        )
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lunet_lock_node_reconfigure(
+    node: *mut c_void,
+    op: u32,
+    member: u32,
+    position: u32,
+) -> i32 {
+    guarded(|| {
+        let Some(node) = (unsafe { node.cast::<Node>().as_mut() }) else {
+            return INVALID;
+        };
+        let position = if op == RECONFIGURE_JOIN && position == POSITION_APPEND {
+            let len = node
+                .replica
+                .progress()
+                .config()
+                .current()
+                .config
+                .order()
+                .len();
+            match u32::try_from(len) {
+                Ok(len) => len,
+                Err(_) => return SERVICE,
+            }
+        } else {
+            position
+        };
+        let system = match op {
+            RECONFIGURE_JOIN => SystemOperation::Join {
+                node: NodeId(member),
+                position,
+            },
+            RECONFIGURE_INCREMENT => SystemOperation::Increment(NodeId(member)),
+            RECONFIGURE_LEAVE => SystemOperation::Leave(NodeId(member)),
+            _ => return INVALID,
+        };
+        let pivot = node.derived_pivot(&system);
+        node.drive(Input::Reconfigure { op: system, pivot })
     })
 }
 
@@ -1093,6 +1308,676 @@ mod tests {
 
     fn receive(node: &mut Node, from: u32, data: &[u8]) -> i32 {
         unsafe { lunet_lock_node_receive((&raw mut *node).cast(), from, data.len(), data.as_ptr()) }
+    }
+
+    fn reconfigure(node: &mut Node, op: u32, member: u32, position: u32) -> i32 {
+        unsafe { lunet_lock_node_reconfigure((&raw mut *node).cast(), op, member, position) }
+    }
+
+    fn pop_send(node: &mut Node, to: u32, tag: vrr::wire::Tag) -> Option<Queued> {
+        let drained: VecDeque<Queued> = std::mem::take(&mut node.outputs);
+        let mut found = None;
+        let mut kept = VecDeque::new();
+        for output in drained {
+            if found.is_none()
+                && output.kind == OUTPUT_SEND
+                && output.to == to
+                && Message::unpack_from(&output.bytes)
+                    .ok()
+                    .is_some_and(|message| message.header.tag == tag)
+            {
+                found = Some(output);
+            } else {
+                kept.push_back(output);
+            }
+        }
+        node.outputs = kept;
+        found
+    }
+
+    /// Feeds one queued send to its destination and drains the destination's
+    /// answers the same way, one hop at a time. `nodes`/`ids` are parallel
+    /// arrays (the `ids[i]` member runs `nodes[i]`).
+    fn deliver_hop(nodes: &mut [Node], ids: &[u32], source: usize, send: Queued) {
+        let message = Message::unpack_from(&send.bytes).expect("wire round trip");
+        let to = ids
+            .iter()
+            .position(|id| *id == send.to)
+            .expect("known destination");
+        assert_eq!(
+            nodes[to].drive(Input::Peer {
+                from: NodeId(ids[source]),
+                message,
+            }),
+            OK
+        );
+    }
+
+    /// Drives a suspicion fence on `driver`: one `Input::Tick` stamped past
+    /// the primary-timeout window (the adapter clamps ticks to the wall
+    /// clock, so the test stamps a synthetic monotone value), then the
+    /// ordinary fence choreography routes to quiescence.
+    fn drive_fence(nodes: &mut [Node], ids: &[u32], driver: usize) {
+        let at = nodes[driver].last_tick + PRIMARY_TIMEOUT_MS + 1;
+        assert_eq!(nodes[driver].drive_at(at, Input::Tick), OK);
+        route_until_quiet(nodes, ids);
+    }
+
+    /// The joiner member of the four-node tests: id 40, booted the joiner
+    /// way — a later life over the deployment's genesis, fenced
+    /// `Recovering`, addressed, and outside every configuration until a
+    /// committed `Join` admits it.
+    fn provision_joiner(name: &str, own: u32, genesis: &[u32]) -> Node {
+        let nonce_path = state_path(name);
+        initialize_nonce(&nonce_path).expect("nonce file");
+        let replica = match joiner_replica(
+            NodeId(own),
+            genesis.iter().map(|id| NodeId(*id)).collect(),
+            ViewChangeKnobs {
+                primary_timeout: PRIMARY_TIMEOUT_MS,
+                view_change_budget: MAX_DATAGRAM,
+            },
+        ) {
+            Ok(replica) => replica,
+            Err(_) => panic!("joiner boot"),
+        };
+        Node {
+            replica,
+            outputs: VecDeque::new(),
+            service: Service::default(),
+            replies: HashMap::new(),
+            pending: HashMap::new(),
+            nonce_path,
+            last_tick: 0,
+            poisoned: false,
+            journal: None,
+        }
+    }
+
+    /// The four-node cluster at "the join committed": the three genesis
+    /// incumbents bootstrapped with member id 40 as primary, the join
+    /// established through the ABI, era 2 folded at the commit, and the
+    /// ordinary view change into era 2 not yet run. The joiner holds the
+    /// deployment's genesis and nothing else: it adopts the announced
+    /// era-1 view through the bootstrap rule, its frontier stands at the
+    /// genesis slots, and its era table covers era 1 only (see the
+    /// module's Identity note).
+    fn boot_four_and_join() -> ([Node; 4], [u32; 4]) {
+        let [one, two, three] = boot_cluster();
+        let joiner = provision_joiner("cluster-joiner", 40, &TEST_IDS);
+        assert_eq!(joiner.replica.progress().status(), Status::Recovering);
+        let mut nodes = [one, two, three, joiner];
+        let ids = [TEST_IDS[0], TEST_IDS[1], TEST_IDS[2], 40];
+
+        // The join: `construct_pivot` cannot place a non-member in either
+        // vote set (the cardinality rule's union coverage), so the adapter
+        // drives the stop-the-world fallback: the establishing Prepare goes
+        // to every backup, and the era awaits the ordinary view change.
+        assert_eq!(
+            reconfigure(&mut nodes[0], RECONFIGURE_JOIN, 40, POSITION_APPEND),
+            OK
+        );
+        let prepare = pop_send(&mut nodes[0], TEST_IDS[1], vrr::wire::Tag::Prepare)
+            .expect("the establishing Prepare reaches every backup");
+        let prepare_two = pop_send(&mut nodes[0], TEST_IDS[2], vrr::wire::Tag::Prepare)
+            .expect("the establishing Prepare reaches every backup");
+        assert!(
+            pop_send(&mut nodes[0], 40, vrr::wire::Tag::Prepare).is_none(),
+            "a non-member is never in the establishing fan-out"
+        );
+        assert_eq!(nodes[0].replica.progress().config().current().era, Era(1));
+        deliver_hop(&mut nodes, &ids, 0, prepare);
+        deliver_hop(&mut nodes, &ids, 0, prepare_two);
+        let ok = pop_send(&mut nodes[1], TEST_IDS[0], vrr::wire::Tag::PrepareOk)
+            .expect("the backup acknowledges");
+        let ok_two = pop_send(&mut nodes[2], TEST_IDS[0], vrr::wire::Tag::PrepareOk)
+            .expect("the backup acknowledges");
+        deliver_hop(&mut nodes, &ids, 1, ok);
+        deliver_hop(&mut nodes, &ids, 2, ok_two);
+
+        // The commit folds era 2 (the joiner at weight 0), the commit
+        // cascade announces the frontier to every folded-configuration
+        // member, and the stop-the-world path arms no planned machine.
+        // Route the announcements: the backups' commit advance folds era 2
+        // too, which is what their later fence targets read (§8.7.8).
+        route_until_quiet(&mut nodes, &ids);
+        assert_eq!(
+            nodes[0].replica.progress().config().current().era,
+            Era(2),
+            "the era advances exactly at the establishing commit"
+        );
+        for node in nodes[..3].iter_mut() {
+            assert_eq!(
+                node.replica.progress().config().current().era,
+                Era(2),
+                "every incumbent folds the era through the commit cascade"
+            );
+        }
+        assert!(
+            pop_send(
+                &mut nodes[0],
+                TEST_IDS[2],
+                vrr::wire::Tag::PlannedViewChange
+            )
+            .is_none(),
+            "the stop-the-world path solicits nothing"
+        );
+        (nodes, ids)
+    }
+
+    /// Mirrors upstream's
+    /// `tests/nonstop_overlap_protocol.rs::overlap_transition_runs_the_seven_steps_without_stopping_the_stream`
+    /// through the adapter ABI: a three-node genesis cluster, the
+    /// incrementing reconfiguration with the adapter-derived pivot, the
+    /// seven steps in order, and the client stream uninterrupted.
+    #[test]
+    fn reconfigure_abi_runs_the_nonstop_overlap_transition() {
+        let mut nodes = boot_cluster();
+        let ids = TEST_IDS;
+
+        // Step 1: the establishing proposal goes to `qII - {L}` and nowhere
+        // else, routed under the era its entry is stamped with; acceptance
+        // establishes nothing.
+        assert_eq!(
+            reconfigure(&mut nodes[0], RECONFIGURE_INCREMENT, TEST_IDS[1], 0),
+            OK
+        );
+        let prepare = pop_send(&mut nodes[0], TEST_IDS[1], vrr::wire::Tag::Prepare)
+            .expect("the pivot routes the Prepare to qII - {L}");
+        assert!(
+            pop_send(&mut nodes[0], TEST_IDS[2], vrr::wire::Tag::Prepare).is_none(),
+            "never outside qII"
+        );
+        assert_eq!((prepare.era, prepare.view, prepare.slot >> 32), (1, 0, 0));
+        let message = Message::unpack_from(&prepare.bytes).expect("wire round trip");
+        let Body::Prepare { entry, .. } = &message.body else {
+            panic!("the send is the establishing Prepare")
+        };
+        assert_eq!(entry.slot, Slot(3));
+        assert_eq!(entry.era, Era(1));
+        assert_eq!(
+            nodes[0].replica.progress().config().current().era,
+            Era(1),
+            "acceptance establishes nothing"
+        );
+
+        // Step 2: acceptance through qII, then the commit — the era folds,
+        // the pivot lands on the era record, and the solicitation goes to
+        // `qI - {L}` (never `qII - {L}`) while the leader stays in (1, 0).
+        deliver_hop(&mut nodes, &ids, 0, prepare);
+        let ok = pop_send(&mut nodes[1], TEST_IDS[0], vrr::wire::Tag::PrepareOk)
+            .expect("the qII member acknowledges");
+        deliver_hop(&mut nodes, &ids, 1, ok);
+        let solicitation = pop_send(
+            &mut nodes[0],
+            TEST_IDS[2],
+            vrr::wire::Tag::PlannedViewChange,
+        )
+        .expect("exactly one solicitation, to qI - {L}");
+        assert!(
+            pop_send(
+                &mut nodes[0],
+                TEST_IDS[1],
+                vrr::wire::Tag::PlannedViewChange
+            )
+            .is_none(),
+            "qII - {{L}} never sees the solicitation"
+        );
+        assert_eq!(
+            (solicitation.era, solicitation.view),
+            (2, 3),
+            "the header names v' = (2, 3); the core routes the copy under the current era (the \
+             adapter reports encoded headers, not effect route eras)"
+        );
+        let record = nodes[0]
+            .replica
+            .progress()
+            .config()
+            .record(Era(2))
+            .expect("the fold recorded era 2");
+        assert_eq!(record.established_by, Slot(3));
+        assert_eq!(
+            record.pivot,
+            Some(Pivot {
+                q_i: vec![NodeId(TEST_IDS[0]), NodeId(TEST_IDS[2])],
+                q_ii: vec![NodeId(TEST_IDS[0]), NodeId(TEST_IDS[1])],
+            }),
+            "the pivot is threaded onto the era record at the fold"
+        );
+        assert_eq!(
+            nodes[0].replica.observer().read().view,
+            0,
+            "the leader has not switched"
+        );
+
+        // Step 3: the qI recipient answers with planned evidence and
+        // RETAINS its view — no fence, still Normal in (1, 0) — and opens
+        // the suffix fallback fetch.
+        deliver_hop(&mut nodes, &ids, 0, solicitation);
+        let evidence = pop_send(&mut nodes[2], TEST_IDS[0], vrr::wire::Tag::DoViewChange)
+            .expect("the planned answer");
+        let fetch = pop_send(&mut nodes[2], TEST_IDS[0], vrr::wire::Tag::GetState)
+            .expect("the suffix fallback fetch opened");
+        let answer = Message::unpack_from(&evidence.bytes).expect("wire round trip");
+        let Body::DoViewChange { evidence: kind, .. } = &answer.body else {
+            panic!("the answer is a DoViewChange")
+        };
+        assert!(matches!(kind, vrr::message::EvidenceKind::Planned));
+        assert_eq!((evidence.era, evidence.view), (2, 3), "the answer names v'");
+        let snapshot = nodes[2].replica.observer().read();
+        assert_eq!((snapshot.status, snapshot.era, snapshot.view), (0, 1, 0));
+
+        // Step 4 (interleaved): the client stream continues — an ordinary
+        // era-2 prepare commits through qII while the planned exchange runs.
+        assert_eq!(
+            request(&mut nodes[0], &request_json(Uuid::from_bytes([21; 16]))),
+            OK
+        );
+        let stream_one = pop_send(&mut nodes[0], TEST_IDS[1], vrr::wire::Tag::Prepare)
+            .expect("the stream fans out to the era-1 backups");
+        let stream_two = pop_send(&mut nodes[0], TEST_IDS[2], vrr::wire::Tag::Prepare)
+            .expect("the stream fans out to the era-1 backups");
+        assert_eq!(
+            (stream_one.era, stream_one.view),
+            (1, 0),
+            "the encoded header stays in the current view; the core routes the copy under the \
+             entry's era (the adapter reports headers, not effect route eras)"
+        );
+        let Body::Prepare { entry, .. } = &Message::unpack_from(&stream_one.bytes)
+            .expect("wire round trip")
+            .body
+        else {
+            panic!("the send is a Prepare")
+        };
+        assert_eq!(entry.era, Era(2), "stamped with the authorizing era");
+        let _ = stream_two;
+        // Only the qII copy is delivered (upstream's script does the
+        // same): own vote plus the heavy member's weight clears the era-2
+        // threshold mid-transition.
+        deliver_hop(&mut nodes, &ids, 0, stream_one);
+        assert!(
+            pop_send(&mut nodes[2], TEST_IDS[0], vrr::wire::Tag::GetState).is_none(),
+            "the light member's copy was never delivered: its step-3 fetch stands"
+        );
+        let ok_one = pop_send(&mut nodes[1], TEST_IDS[0], vrr::wire::Tag::PrepareOk)
+            .expect("the qII member acknowledges the stream");
+        deliver_hop(&mut nodes, &ids, 1, ok_one);
+        assert!(
+            pop_send(&mut nodes[2], TEST_IDS[0], vrr::wire::Tag::PrepareOk).is_none(),
+            "the light member's copy was never delivered"
+        );
+        assert_eq!(
+            nodes[0].replica.progress().committed(),
+            Slot(4),
+            "the client operation committed through qII mid-transition"
+        );
+        assert_eq!(nodes[0].replica.observer().read().view, 0, "still in v");
+
+        // Step 5: the responder's fetch folds the era through the ordinary
+        // state-transfer path — still no view change anywhere.
+        deliver_hop(&mut nodes, &ids, 2, fetch);
+        let chunk = pop_send(&mut nodes[0], TEST_IDS[2], vrr::wire::Tag::NewState)
+            .expect("the leader serves the fetch");
+        assert_eq!(chunk.era, 1, "served under the requested era's record");
+        deliver_hop(&mut nodes, &ids, 0, chunk);
+        let snapshot = nodes[2].replica.observer().read();
+        assert_eq!(
+            nodes[2].replica.progress().config().current().era,
+            Era(2),
+            "the fetched commit folded the era"
+        );
+        assert_eq!(snapshot.committed, 4);
+        assert_eq!(snapshot.status, 0, "retention survives the fetch");
+        assert_eq!(snapshot.view, 0);
+
+        // Step 6: the planned answer completes the quorum — the casting
+        // vote and the switch are ONE published transition, and StartView
+        // goes to every member of config(e+1) under the successor era.
+        deliver_hop(&mut nodes, &ids, 2, evidence);
+        let snapshot = nodes[0].replica.observer().read();
+        assert_eq!(snapshot.status, 0, "the leader resumed normal operation");
+        assert_eq!((snapshot.era, snapshot.view), (2, 3), "the single switch");
+        let start_one = pop_send(&mut nodes[0], TEST_IDS[1], vrr::wire::Tag::StartView)
+            .expect("StartView to every member of config(e+1)");
+        let start_two = pop_send(&mut nodes[0], TEST_IDS[2], vrr::wire::Tag::StartView)
+            .expect("StartView to every member of config(e+1)");
+        assert_eq!((start_one.era, start_one.view), (2, 3));
+        let Body::StartView { committed, .. } = &Message::unpack_from(&start_one.bytes)
+            .expect("wire round trip")
+            .body
+        else {
+            panic!("the announcement is a StartView")
+        };
+        assert_eq!(*committed, Slot(4), "the frontier the vote certified");
+
+        // Step 7: the members install and the stream continues under the
+        // NEW configuration's arithmetic (weights [1, 2, 1], threshold 3):
+        // the light member's answer alone cannot commit, the heavy one's
+        // does.
+        deliver_hop(&mut nodes, &ids, 0, start_one);
+        deliver_hop(&mut nodes, &ids, 0, start_two);
+        for node in nodes[1..3].iter_mut() {
+            let snapshot = node.replica.observer().read();
+            assert_eq!((snapshot.status, snapshot.era, snapshot.view), (0, 2, 3));
+        }
+        assert_eq!(
+            request(&mut nodes[0], &request_json(Uuid::from_bytes([22; 16]))),
+            OK
+        );
+        let p_one = pop_send(&mut nodes[0], TEST_IDS[1], vrr::wire::Tag::Prepare)
+            .expect("the post-transition stream");
+        let p_two = pop_send(&mut nodes[0], TEST_IDS[2], vrr::wire::Tag::Prepare)
+            .expect("the post-transition stream");
+        deliver_hop(&mut nodes, &ids, 0, p_one);
+        deliver_hop(&mut nodes, &ids, 0, p_two);
+        let light = pop_send(&mut nodes[2], TEST_IDS[0], vrr::wire::Tag::PrepareOk)
+            .expect("the light member answers");
+        deliver_hop(&mut nodes, &ids, 2, light);
+        assert_eq!(
+            nodes[0].replica.progress().committed(),
+            Slot(4),
+            "qI alone cannot commit"
+        );
+        let heavy = pop_send(&mut nodes[1], TEST_IDS[0], vrr::wire::Tag::PrepareOk)
+            .expect("the heavy member answers");
+        deliver_hop(&mut nodes, &ids, 1, heavy);
+        assert_eq!(
+            nodes[0].replica.progress().committed(),
+            Slot(5),
+            "the heavy qII member commits it"
+        );
+    }
+
+    /// Joins a fourth member at weight 0 through the ABI, observes the era-2
+    /// commit and the quorum arithmetic under the new configuration, then
+    /// leaves the zero-weight member and commits era 3. The joiner is the
+    /// upstream learner (the corpus's class F, through the adapter): the
+    /// leader streams TO it once the view enters the era that admitted it,
+    /// and the learner drops the stream by name — its genesis table covers
+    /// era 1 only, and the missing range is unservable to a non-member of
+    /// the era a fetch can name. The named drop is the proof of arrival.
+    #[test]
+    fn reconfigure_abi_joins_a_learner_then_leaves_it_at_zero() {
+        let (mut nodes, ids) = boot_four_and_join();
+        drive_fence(&mut nodes, &ids, 2);
+        let snapshot = nodes[1].replica.observer().read();
+        assert_eq!((snapshot.status, snapshot.era, snapshot.view), (0, 2, 1));
+
+        // The era-2 stream: the fan-out follows the view's configuration
+        // and reaches the weight-0 learner. The learner RECEIVES its copy
+        // and drops it by name: nothing queued, frontier and table
+        // unchanged at the genesis.
+        assert_eq!(
+            request(&mut nodes[1], &request_json(Uuid::from_bytes([31; 16]))),
+            OK
+        );
+        let to_learner = pop_send(&mut nodes[1], 40, vrr::wire::Tag::Prepare)
+            .expect("the learner is in the view configuration's fan-out");
+        deliver_hop(&mut nodes, &ids, 1, to_learner);
+        let snapshot = nodes[3].replica.observer().read();
+        assert_eq!(
+            (snapshot.status, snapshot.era, snapshot.accepted),
+            (2, 1, 2),
+            "the joiner stays fenced: the commit cascade targets the view's era only, and the \
+             era-2 stream and StartView are unevaluable at its genesis table (its fetch is \
+             dropped at the serving gate)"
+        );
+        assert!(nodes[3].outputs.is_empty(), "the drop emits nothing");
+
+        // Quorum arithmetic under the new configuration: weights [1,1,1,0],
+        // total 3, threshold 2 — one voter's acknowledgment alongside the
+        // primary's own vote commits.
+        let p_one = pop_send(&mut nodes[1], TEST_IDS[0], vrr::wire::Tag::Prepare)
+            .expect("the voter's copy");
+        let p_undelivered = pop_send(&mut nodes[1], TEST_IDS[2], vrr::wire::Tag::Prepare)
+            .expect("the second voter's copy");
+        drop(p_undelivered);
+        deliver_hop(&mut nodes, &ids, 1, p_one);
+        let ok_one = pop_send(&mut nodes[0], TEST_IDS[1], vrr::wire::Tag::PrepareOk)
+            .expect("the voter acknowledges");
+        deliver_hop(&mut nodes, &ids, 0, ok_one);
+        assert_eq!(
+            nodes[1].replica.progress().committed(),
+            Slot(4),
+            "the learner's weight is not needed"
+        );
+
+        // Leave the zero-weight member: the adapter's derived pivot places
+        // the departing learner inside qI, so the establishing Prepare goes
+        // only to `qII - {L}` = {id 10}; the commit advances the era to 3
+        // and the departed identity is gone from the folded configuration.
+        assert_eq!(reconfigure(&mut nodes[1], RECONFIGURE_LEAVE, 40, 0), OK);
+        let prepare = pop_send(&mut nodes[1], TEST_IDS[0], vrr::wire::Tag::Prepare)
+            .expect("the pivot routes the establishing Prepare");
+        assert!(
+            pop_send(&mut nodes[1], TEST_IDS[2], vrr::wire::Tag::Prepare).is_none()
+                && pop_send(&mut nodes[1], 40, vrr::wire::Tag::Prepare).is_none(),
+            "the pivot routes to qII - {{L}} only"
+        );
+        deliver_hop(&mut nodes, &ids, 1, prepare);
+        let ok = pop_send(&mut nodes[0], TEST_IDS[1], vrr::wire::Tag::PrepareOk)
+            .expect("the qII member acknowledges");
+        deliver_hop(&mut nodes, &ids, 0, ok);
+        // The commit cascade announces the frontier; route to quiescence so
+        // every incumbent folds era 3. The planned machine stalls on the
+        // unserved learner (its vote never arrives), so the leader's view
+        // stands still.
+        route_until_quiet(&mut nodes, &ids);
+        assert_eq!(
+            nodes[1].replica.progress().config().current().era,
+            Era(3),
+            "the leave commits era 3"
+        );
+        assert_eq!(
+            nodes[1].replica.observer().read().view,
+            1,
+            "the planned quorum waits on the unserved learner"
+        );
+        assert!(
+            nodes[1]
+                .replica
+                .progress()
+                .config()
+                .current()
+                .config
+                .weight_of(NodeId(40))
+                .is_none(),
+            "the departed identity is out of the configuration"
+        );
+        // The era the leave established awaits the ordinary view change
+        // (§8.7.8): the fence completes the entry — the latency outcome the
+        // unserved catch-up costs.
+        drive_fence(&mut nodes, &ids, 0);
+        let snapshot = nodes[2].replica.observer().read();
+        assert_eq!((snapshot.status, snapshot.era, snapshot.view), (0, 3, 2));
+    }
+
+    /// Joins the fourth member, enters era 2, then promotes it with a
+    /// committed Increment through the non-stop overlap: the adapter's
+    /// derived pivot puts the (weight-0, not-yet-caught-up) learner inside
+    /// `qII` — its zero weight contributes nothing to either commit
+    /// threshold — and the planned quorum over `qI = {L, id 30}` completes
+    /// without stopping the stream. The promoted arithmetic is four voters
+    /// (threshold 3): a single acknowledgment no longer commits.
+    #[test]
+    fn reconfigure_abi_promotes_the_learner_and_moves_the_quorum_arithmetic() {
+        let (mut nodes, ids) = boot_four_and_join();
+        drive_fence(&mut nodes, &ids, 2);
+        let snapshot = nodes[1].replica.observer().read();
+        assert_eq!((snapshot.status, snapshot.era, snapshot.view), (0, 2, 1));
+
+        // The promotion on the era-2 primary: the establishing Prepare goes
+        // only to `qII - {L}` = {id 10, id 40}.
+        assert_eq!(reconfigure(&mut nodes[1], RECONFIGURE_INCREMENT, 40, 0), OK);
+        let to_voter = pop_send(&mut nodes[1], TEST_IDS[0], vrr::wire::Tag::Prepare)
+            .expect("the pivot routes the establishing Prepare");
+        let to_learner = pop_send(&mut nodes[1], 40, vrr::wire::Tag::Prepare)
+            .expect("the learner is inside qII: it receives the copy, weight or no weight");
+        assert!(
+            pop_send(&mut nodes[1], TEST_IDS[2], vrr::wire::Tag::Prepare).is_none(),
+            "never outside qII"
+        );
+        assert_eq!(
+            nodes[1].replica.progress().config().current().era,
+            Era(2),
+            "acceptance establishes nothing"
+        );
+
+        // The learner cannot evaluate the establishing copy (its table
+        // covers era 1 only): the named drop is the proof of arrival.
+        deliver_hop(&mut nodes, &ids, 1, to_learner);
+        assert!(
+            pop_send(&mut nodes[3], TEST_IDS[1], vrr::wire::Tag::PrepareOk).is_none(),
+            "the unserved learner cannot acknowledge"
+        );
+
+        // The commit through qII folds era 3 (weights [1,1,1,1]) and
+        // solicits planned evidence from `qI - {L}` = {id 30}.
+        deliver_hop(&mut nodes, &ids, 1, to_voter);
+        let ok = pop_send(&mut nodes[0], TEST_IDS[1], vrr::wire::Tag::PrepareOk)
+            .expect("the qII member acknowledges");
+        deliver_hop(&mut nodes, &ids, 0, ok);
+        let solicitation = pop_send(
+            &mut nodes[1],
+            TEST_IDS[2],
+            vrr::wire::Tag::PlannedViewChange,
+        )
+        .expect("the solicitation reaches qI - {L}");
+        assert_eq!(nodes[1].replica.progress().config().current().era, Era(3));
+        assert_eq!(
+            nodes[1].replica.observer().read().view,
+            1,
+            "the leader has not switched"
+        );
+
+        // The planned answer completes the quorum — ONE published
+        // transition — and StartView goes to every member of config(e+1)
+        // under the successor era. (The mid-transition stream mirror lives
+        // in the three-node overlap test; here the lagging incumbents first
+        // install the promoted era through the StartView suffixes.)
+        deliver_hop(&mut nodes, &ids, 1, solicitation);
+        let evidence = pop_send(&mut nodes[2], TEST_IDS[1], vrr::wire::Tag::DoViewChange)
+            .expect("the qI member answers planned evidence");
+        deliver_hop(&mut nodes, &ids, 2, evidence);
+        let snapshot = nodes[1].replica.observer().read();
+        assert_eq!(
+            (snapshot.status, snapshot.era, snapshot.view),
+            (0, 3, 5),
+            "the single switch: v' = (3, 5) selects the primary under the new order"
+        );
+        let start_one = pop_send(&mut nodes[1], TEST_IDS[0], vrr::wire::Tag::StartView)
+            .expect("StartView to every member of config(e+1)");
+        let start_two = pop_send(&mut nodes[1], TEST_IDS[2], vrr::wire::Tag::StartView)
+            .expect("StartView to every member of config(e+1)");
+        let start_three = pop_send(&mut nodes[1], 40, vrr::wire::Tag::StartView)
+            .expect("StartView to every member of config(e+1)");
+        assert_eq!((start_one.era, start_one.view), (3, 5));
+        deliver_hop(&mut nodes, &ids, 1, start_one);
+        deliver_hop(&mut nodes, &ids, 1, start_two);
+        deliver_hop(&mut nodes, &ids, 1, start_three);
+        assert!(
+            pop_send(&mut nodes[3], TEST_IDS[1], vrr::wire::Tag::PrepareOk).is_none(),
+            "the unserved learner installs nothing and acknowledges nothing"
+        );
+        // Route the commit cascade and the installed suffixes, then let the
+        // ordinary tick re-run the retained offers: the StartView arrived
+        // before the fetched suffix made it constructible (§13.1 step 5's
+        // ruling), so the install completes on the tick.
+        route_until_quiet(&mut nodes, &ids);
+        for node in nodes[..3].iter_mut() {
+            assert_eq!(node.drive(Input::Tick), OK);
+        }
+        route_until_quiet(&mut nodes, &ids);
+        for node in nodes[..3].iter_mut() {
+            let snapshot = node.replica.observer().read();
+            assert_eq!((snapshot.status, snapshot.era, snapshot.view), (0, 3, 5));
+        }
+
+        // The stream continues under the promoted arithmetic: threshold 3
+        // under weights [1,1,1,1]. One acknowledgment does not commit; the
+        // second does. The promoted member's copy arrives and is dropped by
+        // name — it cannot acknowledge what it cannot evaluate.
+        assert_eq!(
+            request(&mut nodes[1], &request_json(Uuid::from_bytes([41; 16]))),
+            OK
+        );
+        let p_one = pop_send(&mut nodes[1], TEST_IDS[0], vrr::wire::Tag::Prepare)
+            .expect("the voter's copy");
+        let p_two = pop_send(&mut nodes[1], TEST_IDS[2], vrr::wire::Tag::Prepare)
+            .expect("the voter's copy");
+        let p_three = pop_send(&mut nodes[1], 40, vrr::wire::Tag::Prepare)
+            .expect("the promoted member is in the fan-out");
+        assert_eq!((p_one.era, p_one.view), (3, 5), "the header names v'");
+        deliver_hop(&mut nodes, &ids, 1, p_one);
+        let ok_one = pop_send(&mut nodes[0], TEST_IDS[1], vrr::wire::Tag::PrepareOk)
+            .expect("the voter acknowledges");
+        deliver_hop(&mut nodes, &ids, 0, ok_one);
+        assert_eq!(
+            nodes[1].replica.progress().committed(),
+            Slot(4),
+            "one of the two needed votes does not commit"
+        );
+        deliver_hop(&mut nodes, &ids, 1, p_two);
+        let ok_two = pop_send(&mut nodes[2], TEST_IDS[1], vrr::wire::Tag::PrepareOk)
+            .expect("the voter acknowledges");
+        deliver_hop(&mut nodes, &ids, 2, ok_two);
+        assert_eq!(
+            nodes[1].replica.progress().committed(),
+            Slot(5),
+            "the second voter's acknowledgment clears threshold 3"
+        );
+        deliver_hop(&mut nodes, &ids, 1, p_three);
+        assert!(
+            pop_send(&mut nodes[3], TEST_IDS[1], vrr::wire::Tag::PrepareOk).is_none(),
+            "the promoted member still cannot evaluate the stream: no acknowledgment, by name"
+        );
+    }
+
+    /// Refusals keep the log untouched: a non-primary is NOT_LEADER (the one
+    /// actionable code), a reconfigure while a transition is outstanding is
+    /// SERVICE, a fold-refused operation is SERVICE, and a bad op code is
+    /// INVALID.
+    #[test]
+    fn reconfigure_abi_refusals_never_touch_the_log() {
+        let (mut nodes, _ids) = boot_four_and_join();
+
+        // Non-primary: the actionable refusal, with nothing proposed.
+        let frontier = nodes[1].replica.observer().read().accepted;
+        assert_eq!(
+            reconfigure(&mut nodes[1], RECONFIGURE_INCREMENT, 40, 0),
+            NOT_LEADER
+        );
+        assert!(nodes[1].outputs.is_empty());
+        assert_eq!(nodes[1].replica.observer().read().accepted, frontier);
+
+        // The join already committed era 2 and the ordinary view change has
+        // not run: a second reconfigure is refused by the
+        // transition-outstanding gate — internal, SERVICE.
+        let frontier = nodes[0].replica.observer().read().accepted;
+        assert_eq!(
+            reconfigure(&mut nodes[0], RECONFIGURE_INCREMENT, TEST_IDS[0], 0),
+            SERVICE
+        );
+        assert!(nodes[0].outputs.is_empty());
+        assert_eq!(nodes[0].replica.observer().read().accepted, frontier);
+
+        // Fold-refused operations (a member already in the configuration)
+        // never enter the log either.
+        assert_eq!(
+            reconfigure(
+                &mut nodes[0],
+                RECONFIGURE_JOIN,
+                TEST_IDS[0],
+                POSITION_APPEND
+            ),
+            SERVICE
+        );
+        assert!(nodes[0].outputs.is_empty());
+        assert_eq!(nodes[0].replica.observer().read().accepted, frontier);
+
+        // Bad op codes are invalid arguments.
+        assert_eq!(reconfigure(&mut nodes[0], 0, 40, 0), INVALID);
+        assert_eq!(reconfigure(&mut nodes[0], 4, 40, 0), INVALID);
     }
 
     #[test]

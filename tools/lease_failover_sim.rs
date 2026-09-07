@@ -215,9 +215,9 @@ fn start_cluster(root: &Path, runtime: &Path, work: &Path) -> io::Result<Cluster
     fs::write(
         work.join("cluster.jsonl"),
         concat!(
-            "{\"id\":101,\"name\":\"n1\",\"host\":\"127.0.0.1\",\"port\":29111}\n",
-            "{\"id\":202,\"name\":\"n2\",\"host\":\"127.0.0.1\",\"port\":29112}\n",
-            "{\"id\":303,\"name\":\"n3\",\"host\":\"127.0.0.1\",\"port\":29113}\n",
+            "{\"id\":101,\"name\":\"n1\",\"host\":\"127.0.0.1\",\"port\":29111,\"genesis\":true}\n",
+            "{\"id\":202,\"name\":\"n2\",\"host\":\"127.0.0.1\",\"port\":29112,\"genesis\":true}\n",
+            "{\"id\":303,\"name\":\"n3\",\"host\":\"127.0.0.1\",\"port\":29113,\"genesis\":true}\n",
         ),
     )?;
     let mut children = Vec::new();

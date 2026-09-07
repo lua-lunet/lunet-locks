@@ -8,9 +8,9 @@ local MEMBER_IDS = {101, 202, 303}
 
 local function members(): {cluster_config.ClusterNode}
     return cluster_config.parse_jsonl(
-        '{"id":101,"name":"n1","host":"127.0.0.1","port":27101}\n'
-            .. '{"id":202,"name":"n2","host":"127.0.0.1","port":27102}\n'
-            .. '{"id":303,"name":"n3","host":"127.0.0.1","port":27103}\n'
+        '{"id":101,"name":"n1","host":"127.0.0.1","port":27101,"genesis":true}\n'
+            .. '{"id":202,"name":"n2","host":"127.0.0.1","port":27102,"genesis":true}\n'
+            .. '{"id":303,"name":"n3","host":"127.0.0.1","port":27103,"genesis":true}\n'
     )
 end
 

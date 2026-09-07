@@ -12,6 +12,8 @@ ffi.cdef(
         void** out);
     void lunet_lock_node_free(void* node);
     int32_t lunet_lock_node_request(void* node, size_t json_len, const uint8_t* json);
+    int32_t lunet_lock_node_reconfigure(
+        void* node, uint32_t op, uint32_t member, uint32_t position);
     int32_t lunet_lock_node_receive(
         void* node, uint32_t from, size_t len, const uint8_t* data);
     int32_t lunet_lock_node_idle(void* node);
@@ -35,6 +37,13 @@ ffi.cdef(
 local MAX_DATAGRAM = 65507
 local MESSAGE_ID_BYTES = 16
 local NOT_LEADER = -8
+-- `lunet_lock_node_reconfigure` operation codes: Join at weight 0, weight
+-- Increment (learner to voter), Leave (only at weight 0, per the core's
+-- rules). The position sentinel means "append at the core's succession end".
+local RECONFIGURE_JOIN = 1
+local RECONFIGURE_INCREMENT = 2
+local RECONFIGURE_LEAVE = 3
+local POSITION_APPEND = 4294967295
 
 local errors: {integer: string} = {
     [-1] = "invalid argument",
@@ -54,6 +63,7 @@ local record Native
     ): number
     lunet_lock_node_free: function(any)
     lunet_lock_node_request: function(any, integer, any): number
+    lunet_lock_node_reconfigure: function(any, integer, integer, integer): number
     lunet_lock_node_receive: function(any, integer, integer, any): number
     lunet_lock_node_idle: function(any): number
     lunet_lock_node_leader_timeout: function(any): number
@@ -112,6 +122,7 @@ local record advisory_lock
         _leader: {number}
 
         request: function(Node, string): boolean, string
+        reconfigure: function(Node, string, integer): boolean, string
         receive: function(Node, integer, string): boolean
         idle: function(Node): boolean
         leader_timeout: function(Node): boolean
@@ -165,6 +176,34 @@ end
 function Node:request(json: string): boolean, string
     local rc = (
         tonumber(native.lunet_lock_node_request(self._handle, #json, json)) or -127
+    ) as integer
+    if rc == NOT_LEADER then
+        return nil, "not_leader"
+    end
+    return check(rc)
+end
+
+-- Proposes a membership reconfiguration on this node. Leader-only: the
+-- adapter drives `Input::Reconfigure` through the ordinary pipeline, the
+-- era advances exactly at the establishing operation's commit, and every
+-- refusal except NotPrimary reports as a raised error (NotPrimary returns
+-- the non-raising "not_leader" so the caller re-forwards to the named
+-- primary, exactly as for lock requests).
+function Node:reconfigure(action: string, id: integer): boolean, string
+    local op: integer
+    if action == "join" then
+        op = RECONFIGURE_JOIN
+    elseif action == "increment" then
+        op = RECONFIGURE_INCREMENT
+    elseif action == "leave" then
+        op = RECONFIGURE_LEAVE
+    else
+        error("advisory_lock: unknown reconfigure action " .. action, 2)
+    end
+    local rc = (
+        tonumber(
+            native.lunet_lock_node_reconfigure(self._handle, op, id, POSITION_APPEND)
+        ) or -127
     ) as integer
     if rc == NOT_LEADER then
         return nil, "not_leader"
@@ -301,10 +340,14 @@ end
 local M: advisory_lock = {}
 
 -- The ABI member buffer carries explicit admin ids, one NUL-separated
--- "<id>:<name>" entry per member, in deployment-descriptor order: that order
--- is the genesis succession sequence and each id is the member's live
--- NodeId. `own` is matched by name; every peer address on the ABI (receive
--- `from`, send `to`, leader outs) is a member id.
+-- "<id>:<name>" entry per genesis member, in deployment-descriptor order:
+-- that order is the genesis succession sequence and each id is the member's
+-- live NodeId. A member that joined a live cluster carries a ":j" suffix —
+-- it sits outside the genesis order, and a node whose own name matches such
+-- an entry boots the joiner way (a later life over the deployment's
+-- genesis, fenced until the stream proves currency). `own` is matched by
+-- name; every peer address on the ABI (receive `from`, send `to`, leader
+-- outs) is a member id.
 function M.new(
     members: {cluster_config.ClusterNode},
     own: string,
@@ -315,6 +358,9 @@ function M.new(
     assert(#members >= 3, "advisory_lock: at least three members are required")
     for _, member in ipairs(members) do
         local entry = tostring(member.id) .. ":" .. member.name
+        if not member.genesis then
+            entry = entry .. ":j"
+        end
         assert(
             entry:find("\0", 1, true) == nil, "advisory_lock: membership contains NUL"
         )
@@ -334,7 +380,11 @@ function M.new(
     )
     local entries: {string} = {}
     for _, member in ipairs(members) do
-        table.insert(entries, tostring(member.id) .. ":" .. member.name)
+        local entry = tostring(member.id) .. ":" .. member.name
+        if not member.genesis then
+            entry = entry .. ":j"
+        end
+        table.insert(entries, entry)
     end
     local packed = table.concat(entries, "\0")
     local out = ffi.new("void*[1]") as {any}
@@ -371,6 +421,7 @@ function M.new(
         _status = ffi.new("uint32_t[1]") as {number},
         _leader = ffi.new("uint32_t[1]") as {number},
         request = Node.request,
+        reconfigure = Node.reconfigure,
         receive = Node.receive,
         idle = Node.idle,
         leader_timeout = Node.leader_timeout,

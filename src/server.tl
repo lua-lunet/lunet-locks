@@ -3,6 +3,16 @@
 -- This file intentionally owns only transport and client correlation.  Lock
 -- ordering, duplicate suppression, clock sampling, and recovery nonces stay
 -- in the native adapter.
+--
+-- The reconfiguration admin verbs (join/increment/leave) ride the same TCP
+-- client channel, the same forward/redirect machinery, and the same peer
+-- envelope as the lock operations. They are operator-trusted at exactly the
+-- same level as the lock verbs: no separate authentication exists on either
+-- channel, and this is the deployment's stated trust model, not a gap. The
+-- leader drives the reconfiguration through the native adapter; the peers
+-- learn an endpoint change through the application-level ADMIN broadcast
+-- (a join adds the addressing row before the commit, a leave removes it
+-- after).
 local record DebugInfo
     source: string
 end
@@ -15,6 +25,7 @@ local directory = source:match("^@(.+)/[^/]+$") or "."
 package.path = directory .. "/?.lua;" .. package.path
 
 local advisory_lock = require("advisory_lock")
+local admin = require("admin")
 local cluster_config = require("cluster_config")
 local config = require("config")
 local lunet = require("lunet")
@@ -193,10 +204,19 @@ end
 local function main(options: Options)
     local client_host, client_port = split_endpoint(options.client)
     local members = config.members(options.node, options.nodes)
+    -- The deployment fingerprint is over the GENESIS membership in
+    -- descriptor line order (membership/v3): stable across live superset
+    -- growth, so a joining replica's descriptor never quarantines the
+    -- peers it joins; a differently-founded deployment still does.
+    local fingerprint = config.genesis_fingerprint(options.nodes)
+    local membership_log = "advisory-lock membership fingerprint="
+        .. fingerprint
+        .. " encoding=lunet-advisory-lock/membership/v3 scope=genesis"
     -- Live addressing is the descriptor's admin-assigned ids: the native
     -- adapter speaks member ids on the ABI (`receive` from, send `to`,
     -- leader outs), and this table set is the id <-> endpoint view of the
-    -- same descriptor.
+    -- descriptor, grown at runtime by the admin broadcast (a joining
+    -- member's row is added, a departed member's rows are removed).
     local endpoint_by_id: {integer: string} = {}
     local id_by_endpoint: {string: integer} = {}
     local own_id = 0
@@ -223,10 +243,6 @@ local function main(options: Options)
         options.event_journal_dir,
         options.event_journal_roll_bytes
     )
-    local fingerprint = config.membership_fingerprint(members)
-    local membership_log = "advisory-lock membership fingerprint="
-        .. fingerprint
-        .. " encoding=lunet-advisory-lock/membership/v2"
     log_membership(membership_log)
     local peer, peer_error = udp.bind(udp_host, udp_port)
     assert(peer ~= nil, "server: UDP bind failed: " .. (peer_error or "unknown"))
@@ -278,7 +294,19 @@ local function main(options: Options)
 
     local function send_vrr(replica: integer, payload: string)
         local endpoint = endpoint_by_id[replica]
-        assert(endpoint ~= nil, "server: native output has unknown replica")
+        -- A replica this process cannot address yet (a joining member whose
+        -- row the admin broadcast has not reached us) is unsendable, not
+        -- fatal: the datagram is dropped with a note and the core's
+        -- retransmission/timers carry the protocol. The pre-broadcast race
+        -- window is the only producer of such a send.
+        if endpoint == nil then
+            log_membership(
+                "advisory-lock cannot address replica "
+                    .. tostring(replica)
+                    .. "; datagram dropped"
+            )
+            return
+        end
         send_endpoint(
             endpoint, transport.encode_peer(transport.PEER_VRR, fingerprint, payload)
         )
@@ -295,6 +323,74 @@ local function main(options: Options)
         local endpoint = endpoint_by_id[replica]
         assert(endpoint ~= nil, "server: application output has unknown replica")
         send_application(endpoint, payload)
+    end
+
+    -- The membership change, carried to every replica this process can
+    -- address. Operator-trusted: the admin verbs travel the same
+    -- unauthenticated TCP client channel and the same peer envelope as the
+    -- lock operations — no separate auth exists; that is the deployment's
+    -- trust model, stated here as fact.
+    local function broadcast_member(payload: string)
+        for id, endpoint in pairs(endpoint_by_id) do
+            if id ~= own_id then
+                send_application(endpoint, payload)
+            end
+        end
+    end
+
+    -- Drives one admin verb on this node. Returns (true, ack) when the
+    -- reconfiguration was proposed and its establishing operation committed
+    -- (the era advances at the commit — the core's folded configuration is
+    -- the commit truth), (false, "not_leader") when this node must redirect,
+    -- and raises through the ABI's other refusals. A join adds the joining
+    -- member's addressing row before the drive (the core's first send to
+    -- the new member must resolve) and broadcasts it at proposal time —
+    -- additive and idempotent at the peers, safe because the core sends
+    -- nothing to a pre-commit non-member. A leave broadcasts after the
+    -- commit, so a proposal that dies never strands a streaming member.
+    local function handle_admin(
+        action: string, id: integer, name: string, endpoint: string
+    ): (boolean, string)
+        if action == "join" and endpoint_by_id[id] == nil then
+            endpoint_by_id[id] = endpoint
+            id_by_endpoint[endpoint] = id
+        end
+        local driven, proposed, leader_error = pcall(
+            function(): (boolean, string) return node:reconfigure(action, id) end
+        )
+        if not driven then
+            -- A core refusal (fold gate, transition-outstanding, poisoned
+            -- replica) is reported to the operator as a rejected verb, the
+            -- same honesty the lock errors get: the operation never entered
+            -- the log.
+            return true, '{"action":"'
+                .. action
+                .. '","id":'
+                .. tostring(id)
+                .. ',"accepted":false}'
+        end
+        if proposed == nil then
+            -- NotPrimary: the one actionable refusal; the caller redirects.
+            return false, leader_error or "not_leader"
+        end
+        if action == "join" then
+            broadcast_member(admin.encode_join(id, name, endpoint))
+        end
+        local era = node:status().era
+        local waited = 0
+        while node:status().era <= era and waited < CLIENT_DEADLINE_MS do
+            lunet.sleep(POLL_MS)
+            waited = waited + POLL_MS
+        end
+        if action == "leave" then
+            broadcast_member(admin.encode_leave(id))
+            local departed = endpoint_by_id[id]
+            endpoint_by_id[id] = nil
+            if departed ~= nil then
+                id_by_endpoint[departed] = nil
+            end
+        end
+        return true, admin.encode_ack(action, id)
     end
 
     local function flush(outputs: {Output})
@@ -335,6 +431,33 @@ local function main(options: Options)
         assert(
             guard:allows_client_operation(), "server: membership configuration is dirty"
         )
+        -- The admin verbs (join/increment/leave) ride the same client
+        -- channel and the same redirect machinery as the lock operations.
+        local is_verb, verb = admin.decode_verb(waiter.json)
+        if is_verb then
+            local status = node:status()
+            if status.leader == own_id then
+                local driven, ack = handle_admin(
+                    verb.action, verb.id, verb.name, verb.endpoint
+                )
+                if driven then
+                    waiter.result = ack
+                    waiter.done = true
+                    waiter.forwarded_to = -1
+                    return
+                end
+            elseif
+                status.leader ~= own_id
+                and status.leader ~= LEADER_UNKNOWN
+                and endpoint_by_id[status.leader] ~= nil
+            then
+                forward_to(waiter, status.leader, message_id)
+                return
+            end
+            -- No known leader (or this node just lost leadership): the
+            -- deadline loop retries with the then-current state.
+            return
+        end
         local accepted, request_error = node:request(waiter.json)
         flush(node:outputs() as {Output})
         if accepted then
@@ -369,14 +492,81 @@ local function main(options: Options)
                         quarantine(received_fingerprint)
                     elseif valid and kind == transport.PEER_APPLICATION then
                         local direction = payload:sub(1, 1)
-                        if
+                        if direction == admin.ADMIN_DIRECTION then
+                            -- A membership change from a peer (the leader's
+                            -- broadcast of a live reconfiguration). Same
+                            -- validation class as the lock ops: decode
+                            -- strictly, apply idempotently; a payload that does
+                            -- not decode is dropped, never partially applied.
+                            local change_valid, change = admin.decode_change(payload)
+                            if change_valid then
+                                if
+                                    change.kind == "join"
+                                    and endpoint_by_id[change.id] == nil
+                                then
+                                    endpoint_by_id[change.id] = change.endpoint
+                                    id_by_endpoint[change.endpoint] = change.id
+                                elseif change.kind == "leave" then
+                                    local departed = endpoint_by_id[change.id]
+                                    endpoint_by_id[change.id] = nil
+                                    if departed ~= nil then
+                                        id_by_endpoint[departed] = nil
+                                    end
+                                end
+                            end
+                        elseif
                             direction == FORWARD_REQUEST
                             and #payload > 1 + MESSAGE_ID_BYTES
                         then
                             local message_id = payload:sub(2, 1 + MESSAGE_ID_BYTES)
                             local json = payload:sub(2 + MESSAGE_ID_BYTES)
                             local status = node:status()
+                            local is_verb, verb = admin.decode_verb(json)
                             if
+                                is_verb
+                                and guard:allows_client_operation()
+                                and status.leader ~= own_id
+                            then
+                                -- A forwarded admin verb reaches the
+                                -- leader only: redirect through the
+                                -- existing machinery so the forwarder
+                                -- re-resolves and re-forwards.
+                                send_application(
+                                    source_endpoint,
+                                    transport.encode_not_leader(
+                                        message_id, status.era, status.view
+                                    )
+                                )
+                            elseif is_verb and guard:allows_client_operation() then
+                                -- The poll for the establishing commit must
+                                -- not stall the receive loop: the commit's
+                                -- own round trip runs there.
+                                lunet.spawn(
+                                    function()
+                                        local driven, ack = handle_admin(
+                                            verb.action,
+                                            verb.id,
+                                            verb.name,
+                                            verb.endpoint
+                                        )
+                                        if driven then
+                                            send_application(
+                                                source_endpoint,
+                                                transport.FORWARD_RESPONSE
+                                                    .. message_id
+                                                    .. ack
+                                            )
+                                        else
+                                            send_application(
+                                                source_endpoint,
+                                                transport.encode_not_leader(
+                                                    message_id, status.era, status.view
+                                                )
+                                            )
+                                        end
+                                    end
+                                )
+                            elseif
                                 guard:allows_client_operation()
                                 and status.leader == own_id
                             then

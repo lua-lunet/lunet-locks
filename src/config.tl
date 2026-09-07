@@ -10,9 +10,13 @@ local record Member
 end
 
 -- Membership bytes are deliberately domain-separated and length-delimited.
--- The member order is the deployment descriptor's line order — the explicit
--- genesis succession sequence — validated by `members` before this is called.
-local MEMBERSHIP_DOMAIN = "lunet-advisory-lock/membership/v2\0"
+-- The fingerprint is over the deployment's GENESIS membership in descriptor
+-- line order — the founding succession sequence. Live reconfigurations grow
+-- the descriptor superset without moving the fingerprint: a deployment's
+-- identity is its founding membership, and a live transition must never
+-- quarantine the peers it reconfigures (the guard's dirty-quarantine rule
+-- still catches a differently-founded deployment byte for byte).
+local MEMBERSHIP_DOMAIN = "lunet-advisory-lock/membership/v3\0"
 local FINGERPRINT_HEX_BYTES = 16
 
 local cluster_config = require("cluster_config")
@@ -196,8 +200,8 @@ local function endpoint(value: string): Endpoint
 end
 
 -- Membership derives from the deployment descriptor: every entry's id is the
--- replica's live NodeId, and the descriptor's line order is the explicit
--- genesis succession sequence (`primary(v) = order[v mod N]` in the core).
+-- replica's live NodeId, and the genesis lines' order (validated separately
+-- by `genesis_fingerprint`) is the explicit genesis succession sequence.
 -- Names must be unique, ids are already unique and u32-bounded by the
 -- descriptor parser, and the local node must appear exactly once.
 local function members(
@@ -253,10 +257,39 @@ local function membership_fingerprint(ordered: {Member}): string
     return sha256_hex(membership_bytes(ordered)):sub(1, FINGERPRINT_HEX_BYTES)
 end
 
+-- The deployment fingerprint: SHA-256 over the GENESIS membership in
+-- descriptor line order. Stable across live superset growth (a joining
+-- member's line changes no byte); a changed genesis line — id, name or
+-- endpoint — changes it.
+local function genesis_fingerprint(nodes: {cluster_config.ClusterNode}): string
+    local genesis = cluster_config.genesis_members(nodes)
+    local seen_ids: {integer: boolean} = {}
+    local seen_names: {string: boolean} = {}
+    local ordered: {Member} = {}
+    for _, node in ipairs(genesis) do
+        assert(
+            not seen_ids[node.id] and not seen_names[node.name],
+            "config: genesis membership lines must be unique"
+        )
+        seen_ids[node.id] = true
+        seen_names[node.name] = true
+        table.insert(
+            ordered,
+            {
+                id = node.id,
+                name = node.name,
+                endpoint = {host = node.host, port = node.port},
+            }
+        )
+    end
+    return membership_fingerprint(ordered)
+end
+
 return {
     endpoint = endpoint,
     members = members,
     membership_bytes = membership_bytes,
     membership_fingerprint = membership_fingerprint,
+    genesis_fingerprint = genesis_fingerprint,
     FINGERPRINT_HEX_BYTES = FINGERPRINT_HEX_BYTES,
 }
