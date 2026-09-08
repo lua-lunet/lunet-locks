@@ -22,6 +22,21 @@
 -- from the socket the deployment attributes to the old id, with no
 -- application-level broadcast. The genesis membership fingerprint is
 -- untouched: a restart changes no descriptor line.
+--
+-- Admin verbs carry the same host robustness the lock path gets from the
+-- native adapter's exactly-once handling, at the Teal layer: the leader
+-- claims each driven verb by message_id in a dedup cache and settles its
+-- FIRST outcome there, so a duplicate forward (the forwarder's heartbeat
+-- re-submits, a re-driven line) replays the same ack instead of racing a
+-- refusal ahead of the true one. A verb whose establishing commit does not
+-- land within the client deadline is answered honestly — accepted:false
+-- with a reason, since the verb may still commit later; the operator
+-- re-drives with a fresh message_id and duplicates of the old one replay
+-- the cached outcome truthfully. On the forwarder side, a non-leader
+-- retries an unacknowledged verb with the same bounded, ordered rotation
+-- over the live member list the lock path uses: it never re-submits a
+-- message_id while its redirect/ack is in flight, and a NOT_LEADER
+-- redirect or a silent-leader window just advances the rotation.
 local record DebugInfo
     source: string
 end
@@ -49,6 +64,9 @@ local FORWARD_NOT_LEADER = transport.FORWARD_NOT_LEADER
 local MESSAGE_ID_BYTES = transport.MESSAGE_ID_BYTES
 local CLIENT_DEADLINE_MS = 30000
 local POLL_MS = 10
+-- The leader's per-process verb dedup cache bound (settled entries evict
+-- first-in-first-out; in-flight drives are never evicted).
+local ADMIN_CACHE_LIMIT = 1024
 local MAX_CLIENT_REQUEST = transport.MAX_DATAGRAM - transport.PEER_HEADER_BYTES - 1 - MESSAGE_ID_BYTES
 -- The native adapter reports u32::MAX when no leader is known for an era/view
 -- (booting or recovering cluster, or an era outside the retention window).
@@ -73,6 +91,11 @@ local record Pending
     result: string
     done: boolean
     forwarded_to: integer
+    -- Admin-verb forwarder state: the replica id the verb was last
+    -- forwarded to (-1 until the first forward) and the heartbeat attempts
+    -- since that forward (a silent-leader window advances the rotation).
+    verb_cursor: integer
+    verb_age_attempts: integer
 end
 
 local record Output
@@ -266,6 +289,7 @@ local function main(options: Options)
     local pending: {string: Pending} = {}
     local forwarded_from: {string: string} = {}
     local active_clients: {string: any} = {}
+    local admin_cache = admin.new_cache(ADMIN_CACHE_LIMIT)
     local leader_elapsed_ms = 0
     local guard = membership_guard.new(fingerprint)
     local listener_open = true
@@ -351,19 +375,23 @@ local function main(options: Options)
     end
 
     -- Drives one admin verb on this node. Returns (true, ack) when the
-    -- reconfiguration was proposed and its establishing operation committed
-    -- (the era advances at the commit — the core's folded configuration is
-    -- the commit truth), (false, "not_leader") when this node must redirect,
-    -- and raises through the ABI's other refusals. A join adds the joining
-    -- member's addressing row before the drive (the core's first send to
-    -- the new member must resolve) and broadcasts it at proposal time —
-    -- additive and idempotent at the peers, safe because the core sends
-    -- nothing to a pre-commit non-member. A leave broadcasts after the
-    -- commit, so a proposal that dies never strands a streaming member. A
-    -- decrement moves no endpoint and broadcasts nothing (the increment
-    -- path); the operator's departure sequence is decrement, wait for the
-    -- era to commit, then leave — a leave of a weight>0 member is refused
-    -- by the core's fold gate and reported as a rejected verb.
+    -- reconfiguration was proposed and either its establishing operation
+    -- committed (the era advances at the commit — the core's folded
+    -- configuration is the commit truth) or the client deadline expired
+    -- first (the honest ack: accepted:false with a reason, since the verb
+    -- may still commit later), (false, "not_leader") when this node must
+    -- redirect, and raises through the ABI's other refusals. A join adds
+    -- the joining member's addressing row before the drive (the core's
+    -- first send to the new member must resolve) and broadcasts it at
+    -- proposal time — additive and idempotent at the peers, safe because
+    -- the core sends nothing to a pre-commit non-member. A leave
+    -- broadcasts after the COMMIT (never at deadline expiry, where the
+    -- departure may still be uncommitted), so a proposal that dies never
+    -- strands a streaming member. A decrement moves no endpoint and
+    -- broadcasts nothing (the increment path); the operator's departure
+    -- sequence is decrement, wait for the era to commit, then leave — a
+    -- leave of a weight>0 member is refused by the core's fold gate and
+    -- reported as a rejected verb.
     local function handle_admin(
         action: string, id: integer, name: string, endpoint: string
     ): (boolean, string)
@@ -399,15 +427,35 @@ local function main(options: Options)
             lunet.sleep(POLL_MS)
             waited = waited + POLL_MS
         end
-        if action == "leave" then
-            broadcast_member(admin.encode_leave(id))
-            local departed = endpoint_by_id[id]
-            endpoint_by_id[id] = nil
-            if departed ~= nil then
-                id_by_endpoint[departed] = nil
+        if node:status().era > era then
+            if action == "leave" then
+                broadcast_member(admin.encode_leave(id))
+                local departed = endpoint_by_id[id]
+                endpoint_by_id[id] = nil
+                if departed ~= nil then
+                    id_by_endpoint[departed] = nil
+                end
+            end
+            return true, admin.encode_ack(action, id)
+        end
+        -- The establishing commit did not land within the client deadline.
+        -- The verb may still commit later; this ack refuses honestly and
+        -- the dedup cache replays it truthfully for duplicates.
+        return true, admin.encode_deadline_ack(action, id)
+    end
+
+    -- The forwarder rotation's candidate list: the live member ids in
+    -- ascending order, self excluded (this replica only reaches this list
+    -- as a non-leader, and forwarding a verb to itself would only loop).
+    local function rotation_candidates(): {integer}
+        local ids: {integer} = {}
+        for id, _ in pairs(endpoint_by_id) do
+            if id ~= own_id then
+                table.insert(ids, id)
             end
         end
-        return true, admin.encode_ack(action, id)
+        table.sort(ids)
+        return ids
     end
 
     local function flush(outputs: {Output})
@@ -455,30 +503,64 @@ local function main(options: Options)
         )
         -- The admin verbs (join/increment/decrement/leave) ride the same
         -- client channel and the same redirect machinery as the lock
-        -- operations.
+        -- operations, with the dedup/rotation discipline on top.
         local is_verb, verb = admin.decode_verb(waiter.json)
         if is_verb then
             local status = node:status()
             if status.leader == own_id then
+                local cache_state = admin_cache:seen(message_id)
+                if cache_state == "settled" then
+                    -- A re-driven verb is answered from the cache with the
+                    -- FIRST outcome: no re-drive, no racing refusal.
+                    local _, ack = admin_cache:replay(message_id)
+                    waiter.result = ack
+                    waiter.done = true
+                    waiter.forwarded_to = -1
+                    return
+                elseif cache_state == "in_flight" then
+                    -- Another drive of this message_id is running (a
+                    -- forwarded copy); its outcome settles the cache.
+                    return
+                end
+                admin_cache:claim(message_id)
                 local driven, ack = handle_admin(
                     verb.action, verb.id, verb.name, verb.endpoint
                 )
                 if driven then
+                    admin_cache:settle(message_id, ack)
                     waiter.result = ack
                     waiter.done = true
                     waiter.forwarded_to = -1
                     return
                 end
-            elseif
-                status.leader ~= own_id
-                and status.leader ~= LEADER_UNKNOWN
-                and endpoint_by_id[status.leader] ~= nil
-            then
-                forward_to(waiter, status.leader, message_id)
-                return
+                -- NotPrimary: nothing was proposed by this drive; the
+                -- claim is released and the rotation below carries the
+                -- verb onward.
+                admin_cache:release(message_id)
             end
-            -- No known leader (or this node just lost leadership): the
-            -- deadline loop retries with the then-current state.
+            -- Forwarder rotation: the same bounded, ordered retry-over-
+            -- members discipline the lock path gets from the adapter. The
+            -- forwarder never re-submits a message_id while its redirect/
+            -- ack is in flight; a NOT_LEADER redirect (handled in the
+            -- receive loop) or a silent-leader window advances the
+            -- rotation.
+            local stale = waiter.verb_age_attempts * options.heartbeat_ms >= options.election_ms
+            if waiter.verb_cursor < 0 or stale then
+                waiter.verb_age_attempts = 0
+                if
+                    not stale
+                    and status.leader ~= own_id
+                    and status.leader ~= LEADER_UNKNOWN
+                    and endpoint_by_id[status.leader] ~= nil
+                then
+                    waiter.verb_cursor = status.leader
+                else
+                    waiter.verb_cursor = admin.next_in_rotation(
+                        rotation_candidates(), waiter.verb_cursor
+                    )
+                end
+                forward_to(waiter, waiter.verb_cursor, message_id)
+            end
             return
         end
         local accepted, request_error = node:request(waiter.json)
@@ -561,34 +643,55 @@ local function main(options: Options)
                                     )
                                 )
                             elseif is_verb and guard:allows_client_operation() then
-                                -- The poll for the establishing commit must
-                                -- not stall the receive loop: the commit's
-                                -- own round trip runs there.
-                                lunet.spawn(
-                                    function()
-                                        local driven, ack = handle_admin(
-                                            verb.action,
-                                            verb.id,
-                                            verb.name,
-                                            verb.endpoint
-                                        )
-                                        if driven then
-                                            send_application(
-                                                source_endpoint,
-                                                transport.FORWARD_RESPONSE
-                                                    .. message_id
-                                                    .. ack
+                                -- The dedup cache keeps every forward of
+                                -- this message_id answered exactly once:
+                                -- a settled duplicate replays the FIRST
+                                -- ack; an in-flight duplicate is dropped
+                                -- (the first drive's response serves this
+                                -- forwarder's same message_id); only the
+                                -- first copy is driven.
+                                local cache_state = admin_cache:seen(message_id)
+                                if cache_state == "settled" then
+                                    local _, ack = admin_cache:replay(message_id)
+                                    send_application(
+                                        source_endpoint,
+                                        transport.FORWARD_RESPONSE .. message_id .. ack
+                                    )
+                                elseif cache_state == "new" then
+                                    admin_cache:claim(message_id)
+                                    -- The poll for the establishing commit
+                                    -- must not stall the receive loop: the
+                                    -- commit's own round trip runs there.
+                                    lunet.spawn(
+                                        function()
+                                            local driven, ack = handle_admin(
+                                                verb.action,
+                                                verb.id,
+                                                verb.name,
+                                                verb.endpoint
                                             )
-                                        else
-                                            send_application(
-                                                source_endpoint,
-                                                transport.encode_not_leader(
-                                                    message_id, status.era, status.view
+                                            if driven then
+                                                admin_cache:settle(message_id, ack)
+                                                send_application(
+                                                    source_endpoint,
+                                                    transport.FORWARD_RESPONSE
+                                                        .. message_id
+                                                        .. ack
                                                 )
-                                            )
+                                            else
+                                                admin_cache:release(message_id)
+                                                send_application(
+                                                    source_endpoint,
+                                                    transport.encode_not_leader(
+                                                        message_id,
+                                                        status.era,
+                                                        status.view
+                                                    )
+                                                )
+                                            end
                                         end
-                                    end
-                                )
+                                    )
+                                end
                             elseif
                                 guard:allows_client_operation()
                                 and status.leader == own_id
@@ -637,11 +740,28 @@ local function main(options: Options)
                                 )
                             then
                                 if guard:allows_client_operation() then
-                                    local leader = node:leader_for_view(era, view)
-                                    -- LEADER_UNKNOWN: the era/view maps to no
-                                    -- known leader; the deadline loop retries.
-                                    if leader ~= LEADER_UNKNOWN then
-                                        forward_to(waiter, leader, message_id)
+                                    local redirect_is_verb = admin.decode_verb(
+                                        waiter.json
+                                    )
+                                    if redirect_is_verb then
+                                        -- An admin verb's redirect just
+                                        -- advances the ordered rotation
+                                        -- over the live member list.
+                                        waiter.verb_age_attempts = 0
+                                        waiter.verb_cursor = admin.next_in_rotation(
+                                            rotation_candidates(), waiter.verb_cursor
+                                        )
+                                        forward_to(
+                                            waiter, waiter.verb_cursor, message_id
+                                        )
+                                    else
+                                        local leader = node:leader_for_view(era, view)
+                                        -- LEADER_UNKNOWN: the era/view maps
+                                        -- to no known leader; the deadline
+                                        -- loop retries.
+                                        if leader ~= LEADER_UNKNOWN then
+                                            forward_to(waiter, leader, message_id)
+                                        end
                                     end
                                 end
                             end
@@ -758,6 +878,8 @@ local function main(options: Options)
                 result = "",
                 done = false,
                 forwarded_to = -1,
+                verb_cursor = -1,
+                verb_age_attempts = 0,
             }
             pending[message_id] = waiter
         end
@@ -783,6 +905,7 @@ local function main(options: Options)
                 slept = slept + POLL_MS
             end
             attempts = attempts + 1
+            waiter.verb_age_attempts = waiter.verb_age_attempts + 1
         end
         if pending[message_id] == waiter then
             pending[message_id] = nil

@@ -195,4 +195,176 @@ tested.test(
     end
 )
 
+tested.test(
+    "admin encodes the honest deadline acknowledgment with its reason",
+    function()
+        tested.assert(
+            {
+                given = "a verb whose establishing commit did not land within the client deadline",
+                should = "refuse it with a reason, never accept uncommitted state",
+                expected = '{"action":"decrement","id":400,"accepted":false,"reason":"deadline"}',
+                actual = admin.encode_deadline_ack("decrement", 400),
+            }
+        )
+    end
+)
+
+tested.test(
+    "the dedup cache drives a verb once and replays the first outcome for duplicates",
+    function()
+        local cache = admin.new_cache(8)
+        local accepted_ack = '{"action":"decrement","id":400,"accepted":true}'
+        local states = cache:seen(UUID) .. ":" .. tostring(cache:claim(UUID))
+        local duplicate_while_in_flight = cache:seen(UUID)
+        cache:settle(UUID, accepted_ack)
+        local settled = cache:seen(UUID)
+        local replayed, ack = cache:replay(UUID)
+        -- A late settle (a duplicate drive's refusal) never overwrites the
+        -- first outcome.
+        cache:settle(UUID, '{"action":"decrement","id":400,"accepted":false}')
+        local replayed_again, ack_again = cache:replay(UUID)
+        tested.assert(
+            {
+                given = "one drive of a verb and two duplicates of its message_id arriving around it",
+                should = "claim exactly once, report in_flight before the outcome, and replay the FIRST ack after it",
+                expected = "new:true:in_flight:settled:true:"
+                    .. accepted_ack
+                    .. ":true:"
+                    .. accepted_ack,
+                actual = states
+                    .. ":"
+                    .. duplicate_while_in_flight
+                    .. ":"
+                    .. settled
+                    .. ":"
+                    .. tostring(replayed)
+                    .. ":"
+                    .. ack
+                    .. ":"
+                    .. tostring(replayed_again)
+                    .. ":"
+                    .. ack_again,
+            }
+        )
+    end
+)
+
+tested.test(
+    "a re-driven committed verb returns the ORIGINAL ack, not a fresh refusal",
+    function()
+        local cache = admin.new_cache(8)
+        local original = '{"action":"increment","id":404,"accepted":true}'
+        cache:claim(UUID)
+        cache:settle(UUID, original)
+        -- The re-drive reaches the cache settled: it replays the original
+        -- ack instead of driving into the core's refusal.
+        local state = cache:seen(UUID)
+        local replayed, ack = cache:replay(UUID)
+        tested.assert(
+            {
+                given = "a committed verb whose message_id is submitted again",
+                should = "answer with the original accepted ack and never re-drive",
+                expected = "settled:true:" .. original,
+                actual = state .. ":" .. tostring(replayed) .. ":" .. ack,
+            }
+        )
+    end
+)
+
+tested.test(
+    "a released claim is drivable again and a settled outcome survives release",
+    function()
+        local cache = admin.new_cache(8)
+        cache:claim(UUID)
+        cache:release(UUID)
+        local released_state = cache:seen(UUID)
+        local reclaimed = cache:claim(UUID)
+        cache:settle(UUID, '{"action":"join","id":404,"accepted":true}')
+        cache:release(UUID)
+        local replayed, ack = cache:replay(UUID)
+        tested.assert(
+            {
+                given = "a NotPrimary drive (claim released) and then a settled outcome on the reclaimed claim",
+                should = "allow the fresh drive after release and keep the settled ack after a settled release",
+                expected = "new:true:true:{\"action\":\"join\",\"id\":404,\"accepted\":true}",
+                actual = released_state
+                    .. ":"
+                    .. tostring(reclaimed)
+                    .. ":"
+                    .. tostring(replayed)
+                    .. ":"
+                    .. ack,
+            }
+        )
+    end
+)
+
+tested.test(
+    "the dedup cache evicts settled entries at its bound and never an in-flight drive",
+    function()
+        local cache = admin.new_cache(2)
+        local first = "018f3f2a-7b1c-4c50-9f2a-3f4b5c6d7e80"
+        local second = "018f3f2a-7b1c-4c50-9f2a-3f4b5c6d7e81"
+        local third = "018f3f2a-7b1c-4c50-9f2a-3f4b5c6d7e82"
+        local fourth = "018f3f2a-7b1c-4c50-9f2a-3f4b5c6d7e83"
+        cache:claim(first)
+        cache:settle(first, '{"action":"join","id":1,"accepted":true}')
+        cache:claim(second)
+        cache:claim(third)
+        -- third's claim evicts first (oldest settled); second is in flight.
+        local first_evicted = cache:seen(first)
+        local second_kept = cache:seen(second)
+        cache:claim(fourth)
+        -- fourth's claim would exceed the bound, but the oldest entry
+        -- (second) is in flight and is never evicted.
+        local fourth_kept = cache:seen(fourth)
+        local second_still_kept = cache:seen(second)
+        tested.assert(
+            {
+                given = "a cache at its bound with an in-flight drive at the eviction head",
+                should = "evict the oldest settled entry first and keep every in-flight drive",
+                expected = "new:in_flight:in_flight:in_flight",
+                actual = first_evicted
+                    .. ":"
+                    .. second_kept
+                    .. ":"
+                    .. fourth_kept
+                    .. ":"
+                    .. second_still_kept,
+            }
+        )
+    end
+)
+
+tested.test(
+    "the forwarder rotation advances in member order and wraps",
+    function()
+        local members = {100, 200, 300}
+        local first = admin.next_in_rotation(members, -1)
+        local second = admin.next_in_rotation(members, first)
+        local third = admin.next_in_rotation(members, second)
+        local wrapped = admin.next_in_rotation(members, third)
+        local past_gap = admin.next_in_rotation(members, 150)
+        local empty = admin.next_in_rotation({}, -1)
+        tested.assert(
+            {
+                given = "the live member list in ascending order and one id per advance",
+                should = "start at the smallest member, advance in order, wrap, skip past a gap, and yield -1 on an empty list",
+                expected = "100:200:300:100:200:-1",
+                actual = tostring(first)
+                    .. ":"
+                    .. tostring(second)
+                    .. ":"
+                    .. tostring(third)
+                    .. ":"
+                    .. tostring(wrapped)
+                    .. ":"
+                    .. tostring(past_gap)
+                    .. ":"
+                    .. tostring(empty),
+            }
+        )
+    end
+)
+
 return tested

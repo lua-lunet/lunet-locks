@@ -26,6 +26,16 @@
 --   leave.
 -- - Every payload is length-delimited and strictly shaped; a payload that
 --   does not decode is dropped by the peer, never applied partially.
+-- - The host robustness for the verbs is pure here too. The dedup cache
+--   correlates a driven verb by its message_id: the leader claims a verb
+--   before driving it, settles the FIRST outcome (accepted, refused, or the
+--   honest deadline ack), and replays that same ack for every duplicate —
+--   no re-drive, no racing refusal ahead of the true acknowledgment. A
+--   claim that came back NotPrimary is released, so the new leader drives
+--   the verb fresh. The rotation helper gives the forwarder the same
+--   bounded, ordered retry-over-members discipline the lock path gets from
+--   the adapter: a redirect or a silent-leader window just advances the
+--   rotation.
 
 local record Verb
     action: string
@@ -49,6 +59,13 @@ local MAX_U32 = 4294967294
 
 local config = require("config")
 
+local function valid_action(action: string): boolean
+    return action == "join"
+        or action == "increment"
+        or action == "decrement"
+        or action == "leave"
+end
+
 local function valid_uuid(message_id: string): boolean
     if #message_id ~= 36 then
         return false
@@ -71,12 +88,7 @@ end
 
 local function decode_verb(json: string): (boolean, Verb)
     local action = json:match('"action"%s*:%s*"([^"]*)"')
-    if
-        action ~= "join"
-        and action ~= "increment"
-        and action ~= "decrement"
-        and action ~= "leave"
-    then
+    if not valid_action(action) then
         return false,
             {
                 action = "",
@@ -243,14 +255,146 @@ end
 -- establishing operation's commit, which the client observes through the
 -- replica's status.
 local function encode_ack(action: string, id: integer): string
-    assert(
-        action == "join"
-            or action == "increment"
-            or action == "decrement"
-            or action == "leave",
-        "admin: invalid ack action"
-    )
+    assert(valid_action(action), "admin: invalid ack action")
     return '{"action":"' .. action .. '","id":' .. tostring(id) .. ',"accepted":true}'
+end
+
+-- The honest acknowledgment for a verb whose establishing commit did not
+-- land within the client's deadline: refused with a reason, because the
+-- verb may still commit later. The operator re-drives with a fresh
+-- message_id; duplicates of the timed-out one replay this exact line from
+-- the dedup cache, truthfully.
+local function encode_deadline_ack(action: string, id: integer): string
+    assert(valid_action(action), "admin: invalid ack action")
+    return '{"action":"'
+        .. action
+        .. '","id":'
+        .. tostring(id)
+        .. ',"accepted":false,"reason":"deadline"}'
+end
+
+-- The verb dedup cache: correlates a driven verb by its message_id so the
+-- leader answers a duplicate with the FIRST outcome instead of re-driving
+-- it into a racing refusal. A claimed verb is in flight until its outcome
+-- settles; a claim released on a NotPrimary redirect is drivable again.
+local record CacheEntry
+    settled: boolean
+    ack: string
+end
+
+local record DedupCache
+    entries: {string: CacheEntry}
+    order: {string}
+    limit: integer
+
+    seen: function(self: DedupCache, message_id: string): string
+    claim: function(self: DedupCache, message_id: string): boolean
+    settle: function(self: DedupCache, message_id: string, ack: string)
+    replay: function(self: DedupCache, message_id: string): (boolean, string)
+    release: function(self: DedupCache, message_id: string)
+end
+
+local function cache_seen(self: DedupCache, message_id: string): string
+    local entry = self.entries[message_id]
+    if entry == nil then
+        return "new"
+    elseif entry.settled then
+        return "settled"
+    end
+    return "in_flight"
+end
+
+local function cache_claim(self: DedupCache, message_id: string): boolean
+    if self.entries[message_id] ~= nil then
+        return false
+    end
+    self.entries[message_id] = {settled = false, ack = ""}
+    table.insert(self.order, message_id)
+    -- Bounded memory: the oldest settled entries yield their slots. A drive
+    -- still in flight is never evicted, so a duplicate can never re-drive
+    -- it and race a refusal ahead of the true ack.
+    while #self.order > self.limit do
+        local oldest = self.order[1]
+        local entry = self.entries[oldest]
+        if entry ~= nil and not entry.settled then
+            break
+        end
+        table.remove(self.order, 1)
+        self.entries[oldest] = nil
+    end
+    return true
+end
+
+-- Records the FIRST outcome only: a second settle of the same message_id
+-- is ignored, so the replayed ack is always the original one.
+local function cache_settle(self: DedupCache, message_id: string, ack: string)
+    local entry = self.entries[message_id]
+    if entry ~= nil and not entry.settled then
+        entry.settled = true
+        entry.ack = ack
+    end
+end
+
+local function cache_replay(self: DedupCache, message_id: string): (boolean, string)
+    local entry = self.entries[message_id]
+    if entry ~= nil and entry.settled then
+        return true, entry.ack
+    end
+    return false, ""
+end
+
+-- Drops an unsettled claim: the drive came back NotPrimary (nothing was
+-- proposed by it), so the new leader must be able to drive the verb fresh.
+local function cache_release(self: DedupCache, message_id: string)
+    local entry = self.entries[message_id]
+    if entry ~= nil and not entry.settled then
+        self.entries[message_id] = nil
+        for index, id in ipairs(self.order) do
+            if id == message_id then
+                table.remove(self.order, index)
+                break
+            end
+        end
+    end
+end
+
+local record cache_factory
+    new: function(integer): DedupCache
+end
+
+local cache: cache_factory = {}
+
+function cache.new(limit: integer): DedupCache
+    assert(limit >= 1, "admin: cache limit must be positive")
+    return {
+        entries = {},
+        order = {},
+        limit = limit,
+        seen = cache_seen,
+        claim = cache_claim,
+        settle = cache_settle,
+        replay = cache_replay,
+        release = cache_release,
+    }
+end
+
+-- The forwarder rotation's next hop over the live member list: the
+-- smallest listed id greater than `current`, wrapping to the smallest
+-- listed id; `current < 0` starts the rotation. An empty list yields -1
+-- (nothing to try). The caller supplies the list with its own id already
+-- removed: a non-leader does not drive verbs, so forwarding to itself
+-- would only loop.
+local function next_in_rotation(ids: {integer}, current: integer): integer
+    local chosen = -1
+    for _, id in ipairs(ids) do
+        if id > current and (chosen < 0 or id < chosen) then
+            chosen = id
+        end
+    end
+    if chosen < 0 and #ids > 0 then
+        chosen = ids[1]
+    end
+    return chosen
 end
 
 return {
@@ -262,4 +406,7 @@ return {
     encode_leave = encode_leave,
     decode_change = decode_change,
     encode_ack = encode_ack,
+    encode_deadline_ack = encode_deadline_ack,
+    new_cache = cache.new,
+    next_in_rotation = next_in_rotation,
 }
