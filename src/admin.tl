@@ -4,10 +4,10 @@
 -- admin acknowledgment line.
 --
 -- Contract:
--- - The join/increment/leave verbs are operator-trusted at exactly the same
---   level as the lock verbs today: the TCP client channel has no separate
---   authentication, and any client that can acquire locks can propose
---   membership changes to the leader. This is a fact of the current
+-- - The join/increment/decrement/leave verbs are operator-trusted at exactly
+--   the same level as the lock verbs today: the TCP client channel has no
+--   separate authentication, and any client that can acquire locks can
+--   propose membership changes to the leader. This is a fact of the current
 --   deployment surface, not a gap to be worked around here.
 -- - A verb decodes strictly (unknown actions, malformed ids, bad message
 --   ids and bad endpoints are refused, never guessed) and is leader-only:
@@ -18,10 +18,12 @@
 --   an endpoint row: a join adds the joining member's addressing row at the
 --   peers (additive and idempotent, safe before the commit because the core
 --   sends nothing to a pre-commit non-member), and a leave removes the
---   departed member's rows after the commit. An increment moves no
---   endpoint, so it broadcasts nothing: the peers learn weight changes the
---   same way they learn every committed operation, from the replication
---   stream.
+--   departed member's rows after the commit. An increment or a decrement
+--   moves no endpoint, so neither broadcasts anything: the peers learn
+--   weight changes the same way they learn every committed operation, from
+--   the replication stream. A leave requires the member to be at weight 0:
+--   the operator's sequence is decrement, wait for the era to commit, then
+--   leave.
 -- - Every payload is length-delimited and strictly shaped; a payload that
 --   does not decode is dropped by the peer, never applied partially.
 
@@ -69,7 +71,12 @@ end
 
 local function decode_verb(json: string): (boolean, Verb)
     local action = json:match('"action"%s*:%s*"([^"]*)"')
-    if action ~= "join" and action ~= "increment" and action ~= "leave" then
+    if
+        action ~= "join"
+        and action ~= "increment"
+        and action ~= "decrement"
+        and action ~= "leave"
+    then
         return false,
             {
                 action = "",
@@ -237,7 +244,10 @@ end
 -- replica's status.
 local function encode_ack(action: string, id: integer): string
     assert(
-        action == "join" or action == "increment" or action == "leave",
+        action == "join"
+            or action == "increment"
+            or action == "decrement"
+            or action == "leave",
         "admin: invalid ack action"
     )
     return '{"action":"' .. action .. '","id":' .. tostring(id) .. ',"accepted":true}'

@@ -76,7 +76,8 @@
 //!   identity so the host can compare leaders against it after a bump.
 //! - **Reconfiguration.** `lunet_lock_node_reconfigure` drives
 //!   `Input::Reconfigure { op, pivot }` (Join at weight 0 / Increment /
-//!   Leave at weight 0) on the current primary through the ordinary
+//!   Decrement (voter to learner) / Leave at weight 0) on the current primary
+//!   through the ordinary
 //!   plan/publish pipeline. The host derives the non-stop overlap pivot with
 //!   the core's own `construct_pivot` (`config(e+1)` probed exactly the way
 //!   the planner probes it, at `accepted().next()`); a `None` result — or a
@@ -581,9 +582,12 @@ struct MemberEntry {
 }
 
 /// Reconfiguration operation codes for `lunet_lock_node_reconfigure`.
+/// The departure route is `Decrement` to weight 0, then `Leave` (the core's
+/// one departure route); a weight-0 member cannot be decremented further.
 const RECONFIGURE_JOIN: u32 = 1;
 const RECONFIGURE_INCREMENT: u32 = 2;
 const RECONFIGURE_LEAVE: u32 = 3;
+const RECONFIGURE_DECREMENT: u32 = 4;
 
 /// `lunet_lock_node_reconfigure`'s Join position sentinel: append at the
 /// core's current succession end (resolved against the folded configuration).
@@ -1153,6 +1157,7 @@ pub unsafe extern "C" fn lunet_lock_node_reconfigure(
                 position,
             },
             RECONFIGURE_INCREMENT => SystemOperation::Increment(NodeId(member)),
+            RECONFIGURE_DECREMENT => SystemOperation::Decrement(NodeId(member)),
             RECONFIGURE_LEAVE => SystemOperation::Leave(NodeId(member)),
             _ => return INVALID,
         };
@@ -2334,13 +2339,259 @@ mod tests {
         );
     }
 
+    /// The four-node cluster with a full voting member: the join
+    /// established era 2 at weight 0, the learner folded its admitting era
+    /// and caught up, and the committed Increment promoted it through the
+    /// non-stop overlap. The state is era 3, weights [1,1,1,1], view (3, 5)
+    /// led by member id 20, every machine quiet.
+    fn boot_four_join_promote() -> ([Node; 4], [u32; 4]) {
+        let (mut nodes, ids) = boot_four_and_join();
+        drive_fence(&mut nodes, &ids, 2);
+        assert_eq!(nodes[1].replica.observer().read().view, 1);
+
+        // The learner folds its admitting era at the boot fence and the
+        // ordinary tick installs the retained offer: it is caught up.
+        assert_eq!(nodes[3].drive(Input::Tick), OK);
+        route_until_quiet(&mut nodes, &ids);
+        let snapshot = nodes[3].replica.observer().read();
+        assert_eq!((snapshot.status, snapshot.era, snapshot.view), (0, 2, 1));
+
+        // The promotion through the non-stop overlap: the pivot places the
+        // weight-0 learner inside qII, the commit folds era 3, the planned
+        // quorum over qI completes, and the ONE switch installs v' = (3, 5).
+        assert_eq!(reconfigure(&mut nodes[1], RECONFIGURE_INCREMENT, 40, 0), OK);
+        let to_learner = pop_send(&mut nodes[1], 40, vrr::wire::Tag::Prepare)
+            .expect("the learner is inside qII: it receives the copy");
+        let to_voter = pop_send(&mut nodes[1], TEST_IDS[0], vrr::wire::Tag::Prepare)
+            .expect("the pivot routes the establishing Prepare");
+        assert!(
+            pop_send(&mut nodes[1], TEST_IDS[2], vrr::wire::Tag::Prepare).is_none(),
+            "never outside qII"
+        );
+        deliver_hop(&mut nodes, &ids, 1, to_learner);
+        let ok_learner = pop_send(&mut nodes[3], TEST_IDS[1], vrr::wire::Tag::PrepareOk)
+            .expect("the caught-up learner acknowledges the establishing copy");
+        deliver_hop(&mut nodes, &ids, 3, ok_learner);
+        assert_eq!(
+            nodes[1].replica.progress().committed(),
+            Slot(3),
+            "the learner's vote is not counted while its weight is 0"
+        );
+        deliver_hop(&mut nodes, &ids, 1, to_voter);
+        let ok = pop_send(&mut nodes[0], TEST_IDS[1], vrr::wire::Tag::PrepareOk)
+            .expect("the qII member acknowledges");
+        deliver_hop(&mut nodes, &ids, 0, ok);
+        route_until_quiet(&mut nodes, &ids);
+        let snapshot = nodes[1].replica.observer().read();
+        assert_eq!(
+            (snapshot.status, snapshot.era, snapshot.view),
+            (0, 3, 5),
+            "the single switch installs the promoted view"
+        );
+        let snapshot = nodes[3].replica.observer().read();
+        assert_eq!(
+            (snapshot.status, snapshot.era, snapshot.view),
+            (0, 3, 5),
+            "the promoted member folds the era that promotes it"
+        );
+        // Settle the lagging incumbent: the ordinary tick re-runs the
+        // retained offers and every incumbent ends in the promoted view.
+        for node in nodes[..3].iter_mut() {
+            assert_eq!(node.drive(Input::Tick), OK);
+        }
+        route_until_quiet(&mut nodes, &ids);
+        for node in nodes[..3].iter_mut() {
+            let snapshot = node.replica.observer().read();
+            assert_eq!(
+                (snapshot.status, snapshot.era, snapshot.view),
+                (0, 3, 5),
+                "every incumbent settles in the promoted view"
+            );
+        }
+        (nodes, ids)
+    }
+
+    /// The full voter departure through the ABI — the core's one departure
+    /// route as a four-era sequence: the join establishes era 2 (weight 0),
+    /// the Increment promotes (era 3, weight 1), the Decrement lowers the
+    /// voter back to a learner (era 4, weight 0), and the Leave removes the
+    /// weight-0 member (era 5, out of the configuration). Every step is its
+    /// own committed era; the operator's sequence is decrement, wait for
+    /// the era to commit, then leave.
+    #[test]
+    fn reconfigure_abi_departs_a_voter_by_decrement_then_leave() {
+        let (mut nodes, ids) = boot_four_join_promote();
+
+        // The decrement: the promoted voter is lowered back to weight 0.
+        // No legal pivot exists for this geometry — the pivot condition's
+        // legs cannot be satisfied when a voting member's weight drops in
+        // the four-member universe (qI and qII each need the full
+        // threshold, and the two sets share only the leader) — so the
+        // adapter drives the stop-the-world fallback: the establishing
+        // Prepare reaches every backup, and the era awaits the ordinary
+        // fence. A latency outcome, never an error.
+        assert_eq!(reconfigure(&mut nodes[1], RECONFIGURE_DECREMENT, 40, 0), OK);
+        let to_one = pop_send(&mut nodes[1], TEST_IDS[0], vrr::wire::Tag::Prepare)
+            .expect("the stop-the-world fallback reaches every backup");
+        let to_three = pop_send(&mut nodes[1], TEST_IDS[2], vrr::wire::Tag::Prepare)
+            .expect("the stop-the-world fallback reaches every backup");
+        let to_learner = pop_send(&mut nodes[1], 40, vrr::wire::Tag::Prepare)
+            .expect("the stop-the-world fallback reaches every backup");
+        assert!(
+            pop_send(
+                &mut nodes[1],
+                TEST_IDS[1],
+                vrr::wire::Tag::PlannedViewChange
+            )
+            .is_none(),
+            "no legal pivot: the fallback solicits nothing"
+        );
+        deliver_hop(&mut nodes, &ids, 1, to_one);
+        deliver_hop(&mut nodes, &ids, 1, to_three);
+        deliver_hop(&mut nodes, &ids, 1, to_learner);
+        let ok_one = pop_send(&mut nodes[0], TEST_IDS[1], vrr::wire::Tag::PrepareOk)
+            .expect("the voter acknowledges");
+        let ok_three = pop_send(&mut nodes[2], TEST_IDS[1], vrr::wire::Tag::PrepareOk)
+            .expect("the voter acknowledges");
+        deliver_hop(&mut nodes, &ids, 0, ok_one);
+        deliver_hop(&mut nodes, &ids, 2, ok_three);
+        route_until_quiet(&mut nodes, &ids);
+        assert_eq!(
+            nodes[1].replica.progress().config().current().era,
+            Era(4),
+            "the decrement commits era 4"
+        );
+        assert_eq!(
+            nodes[1]
+                .replica
+                .progress()
+                .config()
+                .current()
+                .config
+                .weight_of(NodeId(40)),
+            Some(vrr::configuration::Weight(0)),
+            "the voter is a learner again in the era the decrement established"
+        );
+        assert_eq!(
+            nodes[1]
+                .replica
+                .progress()
+                .config()
+                .current()
+                .config
+                .weight_of(NodeId(TEST_IDS[0])),
+            Some(vrr::configuration::Weight(1)),
+            "the incumbents keep their weight"
+        );
+        // The era the decrement established awaits the ordinary view change
+        // (§8.7.8): the fence completes the entry.
+        drive_fence(&mut nodes, &ids, 0);
+        for node in nodes[..3].iter_mut() {
+            let snapshot = node.replica.observer().read();
+            assert_eq!(
+                (snapshot.status, snapshot.era, snapshot.view),
+                (0, 4, 6),
+                "the fence completes the era-4 entry at every incumbent"
+            );
+        }
+        let snapshot = nodes[3].replica.observer().read();
+        assert_eq!(
+            (snapshot.status, snapshot.era, snapshot.view),
+            (0, 4, 6),
+            "the learner folds the era the decrement established and holds the settled view"
+        );
+
+        // The leave: the weight-0 member departs. Driven on the era-4
+        // primary (view 6 selects id 30 under the succession order). The
+        // derived pivot places the departing member inside qI — the
+        // establishing Prepare goes only to `qII - {L}` = {id 10}.
+        assert_eq!(reconfigure(&mut nodes[2], RECONFIGURE_LEAVE, 40, 0), OK);
+        let prepare = pop_send(&mut nodes[2], TEST_IDS[0], vrr::wire::Tag::Prepare)
+            .expect("the pivot routes the establishing Prepare");
+        assert!(
+            pop_send(&mut nodes[2], TEST_IDS[1], vrr::wire::Tag::Prepare).is_none()
+                && pop_send(&mut nodes[2], 40, vrr::wire::Tag::Prepare).is_none(),
+            "the pivot routes to qII - {{L}} only: the departing member sits inside qI"
+        );
+        deliver_hop(&mut nodes, &ids, 2, prepare);
+        let ok = pop_send(&mut nodes[0], TEST_IDS[2], vrr::wire::Tag::PrepareOk)
+            .expect("the qII member acknowledges");
+        deliver_hop(&mut nodes, &ids, 0, ok);
+        route_until_quiet(&mut nodes, &ids);
+
+        // The commit folds era 5: the departed identity is out of the
+        // folded configuration, and the commit cascade no longer reaches
+        // it — it stands at its last caught-up frontier.
+        assert_eq!(
+            nodes[2].replica.progress().config().current().era,
+            Era(5),
+            "the leave commits era 5"
+        );
+        assert!(
+            nodes[2]
+                .replica
+                .progress()
+                .config()
+                .current()
+                .config
+                .weight_of(NodeId(40))
+                .is_none(),
+            "the departed identity is out of the configuration"
+        );
+        assert_eq!(
+            nodes[2].replica.progress().committed(),
+            Slot(6),
+            "the incumbents fold the leave"
+        );
+        let snapshot = nodes[3].replica.observer().read();
+        assert_eq!(
+            (
+                snapshot.status,
+                snapshot.era,
+                snapshot.view,
+                snapshot.committed
+            ),
+            (0, 4, 6, 5),
+            "the departed learner holds its last caught-up view"
+        );
+        // The leave-planned-quorum tension: the departing member sits
+        // inside qI, and once the leave commits the §6 membership discard
+        // blocks every message FROM the departed identity — its planned
+        // answer, which the solicitation explicitly solicits, can never be
+        // counted. The leader's view stands still.
+        assert_eq!(
+            nodes[2].replica.observer().read().view,
+            6,
+            "the planned quorum waits on the discarded departed identity"
+        );
+        // The era the leave established awaits the ordinary view change
+        // (§8.7.8): the fence completes the entry — the latency outcome
+        // the departing-member pivot costs.
+        drive_fence(&mut nodes, &ids, 0);
+        for node in nodes[..3].iter_mut() {
+            let snapshot = node.replica.observer().read();
+            assert_eq!(
+                (snapshot.status, snapshot.era, snapshot.view),
+                (0, 5, 7),
+                "the fence completes the era-5 entry at every incumbent"
+            );
+        }
+        let snapshot = nodes[3].replica.observer().read();
+        assert_eq!(
+            (snapshot.status, snapshot.era, snapshot.view),
+            (0, 4, 6),
+            "the departed identity stays fenced at its last caught-up view: its future \
+             messages are foreign"
+        );
+    }
+
     /// Refusals keep the log untouched: a non-primary is NOT_LEADER (the one
     /// actionable code), a reconfigure while a transition is outstanding is
     /// SERVICE, a fold-refused operation is SERVICE, and a bad op code is
     /// INVALID.
     #[test]
     fn reconfigure_abi_refusals_never_touch_the_log() {
-        let (mut nodes, _ids) = boot_four_and_join();
+        let (mut nodes, ids) = boot_four_and_join();
 
         // Non-primary: the actionable refusal, with nothing proposed.
         let frontier = nodes[1].replica.observer().read().accepted;
@@ -2353,11 +2604,19 @@ mod tests {
 
         // The join already committed era 2 and the ordinary view change has
         // not run: a second reconfigure is refused by the
-        // transition-outstanding gate — internal, SERVICE.
+        // transition-outstanding gate — internal, SERVICE. The decrement is
+        // refused by the same gate.
         let frontier = nodes[0].replica.observer().read().accepted;
         assert_eq!(
             reconfigure(&mut nodes[0], RECONFIGURE_INCREMENT, TEST_IDS[0], 0),
             SERVICE
+        );
+        assert!(nodes[0].outputs.is_empty());
+        assert_eq!(nodes[0].replica.observer().read().accepted, frontier);
+        assert_eq!(
+            reconfigure(&mut nodes[0], RECONFIGURE_DECREMENT, 40, 0),
+            SERVICE,
+            "a decrement while a transition is outstanding is internal"
         );
         assert!(nodes[0].outputs.is_empty());
         assert_eq!(nodes[0].replica.observer().read().accepted, frontier);
@@ -2376,9 +2635,40 @@ mod tests {
         assert!(nodes[0].outputs.is_empty());
         assert_eq!(nodes[0].replica.observer().read().accepted, frontier);
 
-        // Bad op codes are invalid arguments.
+        // Enter era 2's own view, then the fold-gate refusals on the
+        // primary: a leave of a weight>0 member (the core's NonZeroWeight —
+        // the departure route is decrement first), a decrement of a
+        // non-member, and a decrement of the weight-0 learner (the core's
+        // WeightUnderflow). All internal, all SERVICE, none in the log.
+        drive_fence(&mut nodes, &ids, 2);
+        let primary = &mut nodes[1];
+        let frontier = primary.replica.observer().read().accepted;
+        assert_eq!(
+            reconfigure(primary, RECONFIGURE_LEAVE, TEST_IDS[0], 0),
+            SERVICE,
+            "a leave of a voter is fold-refused: the departure route is decrement first"
+        );
+        assert!(primary.outputs.is_empty());
+        assert_eq!(primary.replica.observer().read().accepted, frontier);
+        assert_eq!(
+            reconfigure(primary, RECONFIGURE_DECREMENT, 99, 0),
+            SERVICE,
+            "a decrement of a non-member is fold-refused"
+        );
+        assert!(primary.outputs.is_empty());
+        assert_eq!(primary.replica.observer().read().accepted, frontier);
+        assert_eq!(
+            reconfigure(primary, RECONFIGURE_DECREMENT, 40, 0),
+            SERVICE,
+            "a decrement of a weight-0 member is fold-refused: a learner has no weight to give"
+        );
+        assert!(primary.outputs.is_empty());
+        assert_eq!(primary.replica.observer().read().accepted, frontier);
+
+        // Bad op codes are invalid arguments. (4 is Decrement now.)
         assert_eq!(reconfigure(&mut nodes[0], 0, 40, 0), INVALID);
-        assert_eq!(reconfigure(&mut nodes[0], 4, 40, 0), INVALID);
+        assert_eq!(reconfigure(&mut nodes[0], 5, 40, 0), INVALID);
+        assert_eq!(reconfigure(&mut nodes[0], 99, 40, 0), INVALID);
     }
 
     #[test]

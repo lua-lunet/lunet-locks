@@ -4,10 +4,10 @@
 -- ordering, duplicate suppression, clock sampling, and the durable
 -- incarnation marker stay in the native adapter.
 --
--- The reconfiguration admin verbs (join/increment/leave) ride the same TCP
--- client channel, the same forward/redirect machinery, and the same peer
--- envelope as the lock operations. They are operator-trusted at exactly the
--- same level as the lock verbs: no separate authentication exists on either
+-- The reconfiguration admin verbs (join/increment/decrement/leave) ride the
+-- same TCP client channel, the same forward/redirect machinery, and the same
+-- peer envelope as the lock operations. They are operator-trusted at exactly
+-- the same level as the lock verbs: no separate authentication exists on either
 -- channel, and this is the deployment's stated trust model, not a gap. The
 -- leader drives the reconfiguration through the native adapter; the peers
 -- learn an endpoint change through the application-level ADMIN broadcast
@@ -359,7 +359,11 @@ local function main(options: Options)
     -- the new member must resolve) and broadcasts it at proposal time —
     -- additive and idempotent at the peers, safe because the core sends
     -- nothing to a pre-commit non-member. A leave broadcasts after the
-    -- commit, so a proposal that dies never strands a streaming member.
+    -- commit, so a proposal that dies never strands a streaming member. A
+    -- decrement moves no endpoint and broadcasts nothing (the increment
+    -- path); the operator's departure sequence is decrement, wait for the
+    -- era to commit, then leave — a leave of a weight>0 member is refused
+    -- by the core's fold gate and reported as a rejected verb.
     local function handle_admin(
         action: string, id: integer, name: string, endpoint: string
     ): (boolean, string)
@@ -449,8 +453,9 @@ local function main(options: Options)
         assert(
             guard:allows_client_operation(), "server: membership configuration is dirty"
         )
-        -- The admin verbs (join/increment/leave) ride the same client
-        -- channel and the same redirect machinery as the lock operations.
+        -- The admin verbs (join/increment/decrement/leave) ride the same
+        -- client channel and the same redirect machinery as the lock
+        -- operations.
         local is_verb, verb = admin.decode_verb(waiter.json)
         if is_verb then
             local status = node:status()

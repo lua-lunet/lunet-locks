@@ -39,11 +39,13 @@ local MAX_DATAGRAM = 65507
 local MESSAGE_ID_BYTES = 16
 local NOT_LEADER = -8
 -- `lunet_lock_node_reconfigure` operation codes: Join at weight 0, weight
--- Increment (learner to voter), Leave (only at weight 0, per the core's
--- rules). The position sentinel means "append at the core's succession end".
+-- Increment (learner to voter), Decrement (voter to learner), Leave (only
+-- at weight 0, per the core's rules). The position sentinel means "append
+-- at the core's succession end".
 local RECONFIGURE_JOIN = 1
 local RECONFIGURE_INCREMENT = 2
 local RECONFIGURE_LEAVE = 3
+local RECONFIGURE_DECREMENT = 4
 local POSITION_APPEND = 4294967295
 
 local errors: {integer: string} = {
@@ -198,6 +200,8 @@ function Node:reconfigure(action: string, id: integer): boolean, string
         op = RECONFIGURE_JOIN
     elseif action == "increment" then
         op = RECONFIGURE_INCREMENT
+    elseif action == "decrement" then
+        op = RECONFIGURE_DECREMENT
     elseif action == "leave" then
         op = RECONFIGURE_LEAVE
     else
