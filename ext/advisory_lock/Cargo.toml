@@ -14,5 +14,12 @@ serde_json = "1"
 uuid = { version = "1", features = ["serde"] }
 vrr = { package = "vrr-core", git = "https://github.com/lua-lunet/uvrr-core.git", rev = "0fc6380aa36f45c92b3b7c8df679d7f7991803aa" } # commit 0fc6380, upstream main at time of bump
 
+# The §10 learner-era-fold patch branch: the submodule under ext/uvrr-core
+# carries the upstream commit plus the learner acquisition rule, so the
+# demo's joined learner converges. See ext/uvrr-core's branch
+# lunet-locks/learner-era-fold and the drafted upstream issue.
+[patch."https://github.com/lua-lunet/uvrr-core.git"]
+vrr-core = { path = "../uvrr-core" }
+
 [dev-dependencies]
 proptest = "1.11.0"

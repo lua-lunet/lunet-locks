@@ -1,0 +1,3 @@
+[submodule "ext/uvrr-core"]
+	path = ext/uvrr-core
+	url = https://github.com/lua-lunet/uvrr-core.git

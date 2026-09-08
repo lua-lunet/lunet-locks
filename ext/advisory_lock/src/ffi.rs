@@ -1894,11 +1894,12 @@ mod tests {
     /// Joins a fourth member at weight 0 through the ABI, observes the era-2
     /// commit and the quorum arithmetic under the new configuration, then
     /// leaves the zero-weight member and commits era 3. The joiner is the
-    /// upstream learner (the corpus's class F, through the adapter): the
-    /// leader streams TO it once the view enters the era that admitted it,
-    /// and the learner drops the stream by name — its genesis table covers
-    /// era 1 only, and the missing range is unservable to a non-member of
-    /// the era a fetch can name. The named drop is the proof of arrival.
+    /// upstream learner: the fence's StartView arrives one era past its
+    /// boot table, the §10 learner acquisition serves its fetch and folds
+    /// the era that admitted it at the boot fence, and the retained offer
+    /// installs on the next ordinary tick — the joiner catches up without
+    /// ever voting. The leave completes the non-stop overlap with the
+    /// caught-up learner answering the planned solicitation.
     #[test]
     fn reconfigure_abi_joins_a_learner_then_leaves_it_at_zero() {
         let (mut nodes, ids) = boot_four_and_join();
@@ -1906,10 +1907,31 @@ mod tests {
         let snapshot = nodes[1].replica.observer().read();
         assert_eq!((snapshot.status, snapshot.era, snapshot.view), (0, 2, 1));
 
+        // The §10 learner acquisition, through the ABI: the StartView one
+        // era past the boot table retains its offer and fetches the
+        // missing range under the boot view; the primary serves the fetch
+        // (the learner is a member of the primary's current
+        // configuration); the boot-fenced acquisition folds the era that
+        // admitted it and walks the accepted frontier. The learner stays
+        // fenced: it adopted no view and its vote is never counted.
+        let snapshot = nodes[3].replica.observer().read();
+        assert_eq!(
+            (
+                snapshot.status,
+                nodes[3].replica.progress().config().current().era.0,
+                snapshot.accepted
+            ),
+            (2, 2, 3),
+            "the joiner folded its admitting era at the boot fence and caught up to the \
+             incumbents' frontier"
+        );
+
         // The era-2 stream: the fan-out follows the view's configuration
-        // and reaches the weight-0 learner. The learner RECEIVES its copy
-        // and drops it by name: nothing queued, frontier and table
-        // unchanged at the genesis.
+        // and reaches the weight-0 learner. The learner is still fenced at
+        // its boot view, so the stream is the higher-view signal: it
+        // fences into the leader's view and opens its own fetch — never
+        // installation evidence. An ordinary tick re-runs the retained
+        // offer and the install completes the catch-up.
         assert_eq!(
             request(&mut nodes[1], &request_json(Uuid::from_bytes([31; 16]))),
             OK
@@ -1919,13 +1941,44 @@ mod tests {
         deliver_hop(&mut nodes, &ids, 1, to_learner);
         let snapshot = nodes[3].replica.observer().read();
         assert_eq!(
-            (snapshot.status, snapshot.era, snapshot.accepted),
-            (2, 1, 2),
-            "the joiner stays fenced: the commit cascade targets the view's era only, and the \
-             era-2 stream and StartView are unevaluable at its genesis table (its fetch is \
-             dropped at the serving gate)"
+            (snapshot.status, snapshot.era, snapshot.view),
+            (1, 2, 1),
+            "the learner fenced into the leader's view, never installation evidence"
         );
-        assert!(nodes[3].outputs.is_empty(), "the drop emits nothing");
+        assert_eq!(nodes[3].drive(Input::Tick), OK);
+        route_until_quiet(&mut nodes, &ids);
+        let snapshot = nodes[3].replica.observer().read();
+        assert_eq!(
+            (
+                snapshot.status,
+                snapshot.era,
+                snapshot.view,
+                snapshot.committed
+            ),
+            (0, 2, 1, 4),
+            "the retained offer installs: the learner is caught up to the commit cascade, \
+             still vote-less"
+        );
+        nodes[3].outputs.clear();
+        // The learner acknowledges the stream — and the primary discards
+        // the vote by name: weight 0 counts against no quorum. A fresh
+        // proposal commits on the leader's and one voting member's
+        // acknowledgment alone; the learner's alone does not clear it.
+        assert_eq!(
+            request(&mut nodes[1], &request_json(Uuid::from_bytes([32; 16]))),
+            OK
+        );
+        let to_learner = pop_send(&mut nodes[1], 40, vrr::wire::Tag::Prepare)
+            .expect("the caught-up learner is in the fan-out");
+        deliver_hop(&mut nodes, &ids, 1, to_learner);
+        let ok_learner = pop_send(&mut nodes[3], TEST_IDS[1], vrr::wire::Tag::PrepareOk)
+            .expect("the caught-up learner acknowledges");
+        deliver_hop(&mut nodes, &ids, 3, ok_learner);
+        assert_eq!(
+            nodes[1].replica.progress().committed(),
+            Slot(4),
+            "the learner's vote is not counted"
+        );
 
         // Quorum arithmetic under the new configuration: weights [1,1,1,0],
         // total 3, threshold 2 — one voter's acknowledgment alongside the
@@ -1941,7 +1994,7 @@ mod tests {
         deliver_hop(&mut nodes, &ids, 0, ok_one);
         assert_eq!(
             nodes[1].replica.progress().committed(),
-            Slot(4),
+            Slot(5),
             "the learner's weight is not needed"
         );
 
@@ -1961,20 +2014,24 @@ mod tests {
         let ok = pop_send(&mut nodes[0], TEST_IDS[1], vrr::wire::Tag::PrepareOk)
             .expect("the qII member acknowledges");
         deliver_hop(&mut nodes, &ids, 0, ok);
-        // The commit cascade announces the frontier; route to quiescence so
-        // every incumbent folds era 3. The planned machine stalls on the
-        // unserved learner (its vote never arrives), so the leader's view
-        // stands still.
+        // The commit folds era 3 and solicits planned evidence from
+        // `qI - {L}` = {id 40}: the caught-up learner answers, the planned
+        // quorum completes, and the switch to v' is ONE published
+        // transition — StartView(v') to every member of config(e+1).
         route_until_quiet(&mut nodes, &ids);
         assert_eq!(
             nodes[1].replica.progress().config().current().era,
             Era(3),
             "the leave commits era 3"
         );
+        // The planned machine stalls: the departing learner sits inside
+        // qI, and once the leave commits the §6 membership discard blocks
+        // every message FROM the departed identity — its planned answer
+        // can never count. The leader's view stands still.
         assert_eq!(
             nodes[1].replica.observer().read().view,
             1,
-            "the planned quorum waits on the unserved learner"
+            "the planned quorum waits on the discarded departed identity"
         );
         assert!(
             nodes[1]
@@ -1988,11 +2045,20 @@ mod tests {
             "the departed identity is out of the configuration"
         );
         // The era the leave established awaits the ordinary view change
-        // (§8.7.8): the fence completes the entry — the latency outcome the
-        // unserved catch-up costs.
+        // (§8.7.8): the fence completes the entry — the latency outcome
+        // the departing-member pivot costs.
         drive_fence(&mut nodes, &ids, 0);
         let snapshot = nodes[2].replica.observer().read();
         assert_eq!((snapshot.status, snapshot.era, snapshot.view), (0, 3, 2));
+        // The departed learner: it folded the era that departs it (the
+        // commit cascade reached it before the fan-out excluded it) and
+        // stays fenced at its last era — its future messages are foreign.
+        let snapshot = nodes[3].replica.observer().read();
+        assert_eq!(
+            (snapshot.status, snapshot.era, snapshot.view),
+            (0, 2, 1),
+            "the departed identity holds its last caught-up view"
+        );
     }
 
     /// Joins the fourth member, enters era 2, then promotes it with a
@@ -2133,6 +2199,138 @@ mod tests {
         assert!(
             pop_send(&mut nodes[3], TEST_IDS[1], vrr::wire::Tag::PrepareOk).is_none(),
             "the promoted member still cannot evaluate the stream: no acknowledgment, by name"
+        );
+    }
+
+    /// The full seven-step join, now completing: the joined learner folds
+    /// era 2 at the boot fence (the §10 acquisition), the retained offer
+    /// installs it into the leader's view, the committed Increment promotes
+    /// it through the non-stop overlap, and the promoted member — caught
+    /// up, weight 1 — participates in the promoted arithmetic: with one
+    /// voting member silent, its acknowledgment completes the era-3
+    /// quorum.
+    #[test]
+    fn reconfigure_abi_joined_learner_completes_the_seven_step_join() {
+        let (mut nodes, ids) = boot_four_and_join();
+        drive_fence(&mut nodes, &ids, 2);
+        assert_eq!(
+            nodes[1].replica.observer().read().view,
+            1,
+            "member 20 leads era 2"
+        );
+
+        // The acquisition: the fence's StartView arrived one era past the
+        // boot table, the fetch was served, the admitting era folded, and
+        // the ordinary tick installs the retained offer.
+        assert_eq!(nodes[3].drive(Input::Tick), OK);
+        route_until_quiet(&mut nodes, &ids);
+        let snapshot = nodes[3].replica.observer().read();
+        assert_eq!((snapshot.status, snapshot.era, snapshot.view), (0, 2, 1));
+        assert_eq!(
+            nodes[3].replica.progress().config().current().era,
+            Era(2),
+            "the joined learner folded the era that admitted it"
+        );
+
+        // The promotion on the era-2 primary, through the non-stop
+        // overlap: the adapter's derived pivot places the weight-0 learner
+        // inside qII, the commit folds era 3, the planned quorum over
+        // qI = {L, id 30} completes, and the ONE switch installs v' =
+        // (3, 5) with StartView to every member of config(e+1).
+        assert_eq!(reconfigure(&mut nodes[1], RECONFIGURE_INCREMENT, 40, 0), OK);
+        let to_voter = pop_send(&mut nodes[1], TEST_IDS[0], vrr::wire::Tag::Prepare)
+            .expect("the pivot routes the establishing Prepare");
+        let to_learner = pop_send(&mut nodes[1], 40, vrr::wire::Tag::Prepare)
+            .expect("the learner is inside qII: it receives the copy");
+        assert!(
+            pop_send(&mut nodes[1], TEST_IDS[2], vrr::wire::Tag::Prepare).is_none(),
+            "never outside qII"
+        );
+        // The caught-up learner ACCEPTS the establishing copy: the era is
+        // evaluable now. Its vote is discarded at the primary — weight 0.
+        deliver_hop(&mut nodes, &ids, 1, to_learner);
+        let ok_learner = pop_send(&mut nodes[3], TEST_IDS[1], vrr::wire::Tag::PrepareOk)
+            .expect("the caught-up learner acknowledges the establishing copy");
+        deliver_hop(&mut nodes, &ids, 3, ok_learner);
+        assert_eq!(
+            nodes[1].replica.progress().committed(),
+            Slot(3),
+            "the learner's vote is not counted while its weight is 0"
+        );
+
+        // The commit through qII folds era 3 (weights [1,1,1,1]) and
+        // solicits planned evidence from `qI - {L}` = {id 30}; the
+        // commit cascade carries the promotion to every member of the
+        // view's configuration — the caught-up learner folds the era
+        // that promotes it. The planned answer completes the quorum —
+        // ONE published transition — and StartView(v') reaches every
+        // member of config(e+1).
+        deliver_hop(&mut nodes, &ids, 1, to_voter);
+        let ok = pop_send(&mut nodes[0], TEST_IDS[1], vrr::wire::Tag::PrepareOk)
+            .expect("the qII member acknowledges");
+        deliver_hop(&mut nodes, &ids, 0, ok);
+        route_until_quiet(&mut nodes, &ids);
+        assert_eq!(nodes[1].replica.progress().config().current().era, Era(3));
+        let snapshot = nodes[1].replica.observer().read();
+        assert_eq!(
+            (snapshot.status, snapshot.era, snapshot.view),
+            (0, 3, 5),
+            "the single switch: v' = (3, 5) selects the primary under the new order"
+        );
+        let snapshot = nodes[3].replica.observer().read();
+        assert_eq!(
+            (
+                snapshot.status,
+                snapshot.era,
+                snapshot.view,
+                snapshot.committed
+            ),
+            (0, 3, 5, 4),
+            "the promoted member installs the promoted view, caught up"
+        );
+
+        // The stream continues under the promoted arithmetic: threshold 3
+        // under weights [1,1,1,1]. With one voting member's copy
+        // undelivered, the promoted member's acknowledgment is the
+        // difference: the leader's own plus one incumbent is not a
+        // quorum; the promoted member's vote completes it.
+        assert_eq!(
+            request(&mut nodes[1], &request_json(Uuid::from_bytes([42; 16]))),
+            OK
+        );
+        let p_learner = pop_send(&mut nodes[1], 40, vrr::wire::Tag::Prepare)
+            .expect("the promoted member is in the fan-out");
+        deliver_hop(&mut nodes, &ids, 1, p_learner);
+        let ok_learner = pop_send(&mut nodes[3], TEST_IDS[1], vrr::wire::Tag::PrepareOk)
+            .expect("the promoted member acknowledges — it evaluates the stream now");
+        deliver_hop(&mut nodes, &ids, 3, ok_learner);
+        assert_eq!(
+            nodes[1].replica.progress().committed(),
+            Slot(4),
+            "the leader and the promoted member are not an era-3 quorum alone"
+        );
+        let p_one = pop_send(&mut nodes[1], TEST_IDS[0], vrr::wire::Tag::Prepare)
+            .expect("the voter's copy");
+        deliver_hop(&mut nodes, &ids, 1, p_one);
+        let ok_one = pop_send(&mut nodes[0], TEST_IDS[1], vrr::wire::Tag::PrepareOk)
+            .expect("the voter acknowledges");
+        deliver_hop(&mut nodes, &ids, 0, ok_one);
+        assert_eq!(
+            nodes[1].replica.progress().committed(),
+            Slot(5),
+            "the promoted member's vote completes the era-3 quorum"
+        );
+        route_until_quiet(&mut nodes, &ids);
+        assert!(
+            nodes[3]
+                .replica
+                .progress()
+                .config()
+                .current()
+                .config
+                .weight_of(NodeId(40))
+                == Some(vrr::configuration::Weight(1)),
+            "the promoted member is a full voter in the era it joined"
         );
     }
 
@@ -2955,36 +3153,62 @@ mod tests {
             "the forged vote queued nothing"
         );
 
-        // Class F: the leader streams to the weight-0 learner; the learner
-        // receives its copy and drops it by name, while the voting members
-        // commit without it (era-3 arithmetic: threshold 2).
+        // Class F: the leader streams to the rejoining member. With the §10
+        // learner acquisition the stream is no longer a named drop: the
+        // era-3 stream arrives past the learner's frontier, the gap ruling
+        // fetches the missing range (slot 5's promotion batch) from the
+        // primary, and the served chunk folds era 3 at the learner. The
+        // rejoining member is a weight-1 member of the era now: its
+        // acknowledgment counts, and its applied history is the real
+        // committed one.
         assert_eq!(
             request(&mut nodes[1], &request_json(Uuid::from_bytes([52; 16]))),
             OK
         );
-        let stream = pop_send(&mut nodes[1], TEST_IDS[0], vrr::wire::Tag::Prepare)
-            .expect("the voter's copy");
         let to_learner = pop_send(&mut nodes[1], BUMPED_ID, vrr::wire::Tag::Prepare)
             .expect("the learner is in the fan-out");
         deliver_hop(&mut nodes, &ids, 1, to_learner);
-        assert!(
-            nodes[2].outputs.is_empty(),
-            "the learner drops the stream by name: no acknowledgment, nothing queued"
+        // The gap ruling fetches the missing range; the primary serves it
+        // (the rejoining member is a member of its current configuration)
+        // and the chunk folds the promotion era. The routing also commits
+        // the client operation through the voting members.
+        route_until_quiet_drop(&mut nodes, &ids, TEST_IDS[2]);
+        let snapshot = nodes[2].replica.observer().read();
+        assert_eq!(
+            (snapshot.status, snapshot.committed),
+            (0, 6),
+            "the learner folded the era that promoted it and caught up to the frontier"
         );
-        deliver_hop(&mut nodes, &ids, 1, stream);
-        let ok = pop_send(&mut nodes[0], TEST_IDS[1], vrr::wire::Tag::PrepareOk)
-            .expect("the voter acknowledges");
-        deliver_hop(&mut nodes, &ids, 0, ok);
+        assert_eq!(
+            snapshot.applied, 6,
+            "the learner applies the real committed history: no lock state fabricated"
+        );
         assert_eq!(
             nodes[1].replica.progress().committed(),
             Slot(6),
-            "the client operation commits without the learner (two forced batches occupied 4 and 5)"
+            "the promotion batch and the client operation are committed"
         );
-        let snapshot = nodes[2].replica.observer().read();
-        assert_eq!(snapshot.status, 2, "the learner stays fenced");
+
+        // The rejoining member's vote now counts: with one voting member
+        // silent, the leader's own and the member's acknowledgment clear
+        // the era-3 threshold (2 of total 3).
         assert_eq!(
-            snapshot.applied, 2,
-            "the learner applies nothing beyond its genesis: no lock state fabricated"
+            request(&mut nodes[1], &request_json(Uuid::from_bytes([53; 16]))),
+            OK
+        );
+        let to_voter = pop_send(&mut nodes[1], TEST_IDS[0], vrr::wire::Tag::Prepare)
+            .expect("the voter's copy (staged, never delivered)");
+        drop(to_voter);
+        let to_member = pop_send(&mut nodes[1], BUMPED_ID, vrr::wire::Tag::Prepare)
+            .expect("the rejoining member is in the fan-out");
+        deliver_hop(&mut nodes, &ids, 1, to_member);
+        let ok_member = pop_send(&mut nodes[2], TEST_IDS[1], vrr::wire::Tag::PrepareOk)
+            .expect("the caught-up member acknowledges");
+        deliver_hop(&mut nodes, &ids, 2, ok_member);
+        assert_eq!(
+            nodes[1].replica.progress().committed(),
+            Slot(7),
+            "the rejoining member's vote counts under the era-3 arithmetic"
         );
     }
 
