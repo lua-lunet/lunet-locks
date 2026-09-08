@@ -56,7 +56,9 @@ client_port_of() {
 start_node() {
     name=$1
     tcp=$(client_port_of "$name")
-    "$BIN" --name "$name" --config "$CONFIG" \
+    # Per-node info-level files by default; the operator opts the cluster
+    # into debug/trace detail by exporting RUST_LOG (see README).
+    RUST_LOG="${RUST_LOG:-info}" "$BIN" --name "$name" --config "$CONFIG" \
         --client "127.0.0.1:$tcp" \
         --state "$RUN/state/$name.state" \
         --log "$RUN/logs/$name.log" \
@@ -98,7 +100,7 @@ name_of() {
 }
 
 total_renews() {
-    grep -h "^lease-attempt " "$RUN"/logs/*.log 2>/dev/null | grep -c "op=renew"
+    grep -h "lease-attempt " "$RUN"/logs/*.log* 2>/dev/null | grep -c "op=renew"
 }
 
 # Drive one admin verb at the cluster: try every node's client port until
@@ -128,7 +130,7 @@ drive_verb() {
 
 # The node id holding the lease (the latest grant across all logs).
 holder_id() {
-    grep -h "^note grant " "$RUN"/logs/*.log 2>/dev/null | awk '
+    grep -h "grant node=" "$RUN"/logs/*.log* 2>/dev/null | awk '
         {
             ts = 0; node = 0
             for (i = 1; i <= NF; i++) {
@@ -142,7 +144,7 @@ holder_id() {
 
 # The last granted expiry of one node id.
 last_expiry_of() {
-    grep -h "^note grant " "$RUN"/logs/*.log 2>/dev/null | awk -v holder="$1" '
+    grep -h "grant node=" "$RUN"/logs/*.log* 2>/dev/null | awk -v holder="$1" '
         {
             ts = 0; node = 0; expiry = 0
             for (i = 1; i <= NF; i++) {
@@ -161,7 +163,7 @@ wait_for_steal() {
     holder=$2
     deadline=$3
     while [ "$(now_ms)" -lt "$deadline" ]; do
-        line=$(grep -h "^note grant " "$RUN"/logs/*.log 2>/dev/null | awk -v after="$after" -v holder="$holder" '
+        line=$(grep -h "grant node=" "$RUN"/logs/*.log* 2>/dev/null | awk -v after="$after" -v holder="$holder" '
             {
                 ts = 0; node = 0; op = ""
                 for (i = 1; i <= NF; i++) {
@@ -221,7 +223,7 @@ T1=$(now_ms)
 echo "stability window: $T0 .. $T1"
 
 cadence=$(awk -v t0="$T0" -v t1="$T1" '
-    /^lease-attempt /{
+    /lease-attempt /{
         ts = 0; node = ""; op = ""
         for (i = 2; i <= NF; i++) {
             if (index($i, "ts=") == 1) ts = substr($i, 4) + 0
@@ -264,14 +266,14 @@ cadence=$(awk -v t0="$T0" -v t1="$T1" '
         printf "MEASURED renew %.0f\n", mean_renew
         printf "MEASURED holder %s\n", holder
     }
-' "$RUN"/logs/*.log) || fail "stability-window assertions: $cadence"
+' "$RUN"/logs/*.log*) || fail "stability-window assertions: $cadence"
 
 echo "$cadence"
 MEAN_RENEW=$(printf '%s\n' "$cadence" | awk '/^MEASURED renew /{printf "%.0f", $3}')
 echo "measured renewal cadence: ${MEAN_RENEW} ms"
 
 overlap=$(awk '
-    /^note grant /{
+    /grant node=/{
         ts = 0; node = 0; expiry = 0
         for (i = 1; i <= NF; i++) {
             if (index($i, "ts=") == 1) ts = substr($i, 4) + 0
@@ -285,8 +287,8 @@ overlap=$(awk '
         if (expiry > live[node]) live[node] = expiry
     }
     END { exit bad ? 1 : 0 }
-' "$RUN"/logs/*.log) || fail "overlapping lease windows: $overlap"
-echo "overlap check: no two holders' windows overlap across $(cat "$RUN"/logs/*.log | grep -c '^note grant ') grants"
+' "$RUN"/logs/*.log*) || fail "overlapping lease windows: $overlap"
+echo "overlap check: no two holders' windows overlap across $(cat "$RUN"/logs/*.log* | grep -c 'grant node=') grants"
 
 # ------------------------------------------------------- kill cycles ----
 
@@ -315,7 +317,7 @@ while [ "$cycle" -le 3 ]; do
     bumped=""
     while [ "$(now_ms)" -lt "$boot_deadline" ]; do
         bumped=$(awk -v after="$kill_ts" -v desc="$hid" '
-            /^note boot /{
+            /boot name=/{
                 ts = 0; own = 0; inc = 0
                 for (i = 1; i <= NF; i++) {
                     if (index($i, "ts=") == 1) ts = substr($i, 4) + 0
@@ -323,7 +325,7 @@ while [ "$cycle" -le 3 ]; do
                     else if (index($i, "incarnation=") == 1) inc = substr($i, 13) + 0
                 }
                 if (ts > after && inc >= 1 && own != desc) { print own; exit }
-            }' "$RUN/logs/$hname.log")
+            }' "$RUN/logs/$hname.log"*)
         [ -n "$bumped" ] && break
         sleep 0.3
     done
@@ -333,14 +335,14 @@ while [ "$cycle" -le 3 ]; do
     remap_deadline=$(( $(now_ms) + 30000 ))
     remaps=0
     while [ "$(now_ms)" -lt "$remap_deadline" ]; do
-        remaps=$(grep -l "note remap old=$hid new=$bumped" "$RUN"/logs/*.log 2>/dev/null | grep -v "$hname" | wc -l | tr -d ' ')
+        remaps=$(grep -l "remap old=$hid new=$bumped" "$RUN"/logs/*.log* 2>/dev/null | grep -v "$hname" | wc -l | tr -d ' ')
         [ "$remaps" -ge 2 ] && break
         sleep 0.3
     done
     [ "$remaps" -ge 2 ] || fail "cycle $cycle: remap notice old=$hid new=$bumped seen at only $remaps peers"
     echo "cycle $cycle: remap notice seen at $remaps peers"
 
-    held_again=$(grep -h "^note grant " "$RUN/logs/$hname.log" | awk -v bumped="$bumped" '
+    held_again=$(grep -h "grant node=" "$RUN"/logs/$hname.log* | awk -v bumped="$bumped" '
         {
             node = 0
             for (i = 1; i <= NF; i++) if (index($i, "node=") == 1) node = substr($i, 6) + 0

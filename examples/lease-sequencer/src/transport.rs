@@ -27,9 +27,7 @@ pub fn encode_peer(kind: u8, fingerprint: &str, payload: &[u8]) -> Vec<u8> {
 }
 
 pub fn decode_peer(packet: &[u8]) -> Option<(u8, &str, &[u8])> {
-    if packet.len() < PEER_HEADER_BYTES
-        || &packet[..PEER_MAGIC.len()] != PEER_MAGIC
-    {
+    if packet.len() < PEER_HEADER_BYTES || &packet[..PEER_MAGIC.len()] != PEER_MAGIC {
         return None;
     }
     let kind = packet[PEER_MAGIC.len()];
@@ -37,10 +35,8 @@ pub fn decode_peer(packet: &[u8]) -> Option<(u8, &str, &[u8])> {
         return None;
     }
     let fingerprint_start = PEER_MAGIC.len() + 1;
-    let fingerprint = std::str::from_utf8(
-        &packet[fingerprint_start..fingerprint_start + 16],
-    )
-    .ok()?;
+    let fingerprint =
+        std::str::from_utf8(&packet[fingerprint_start..fingerprint_start + 16]).ok()?;
     if fingerprint.len() != 16 || !fingerprint.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }

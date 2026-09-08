@@ -143,7 +143,7 @@
 
 use crate::journal::{self, Journal as LockJournal, JournalEvent};
 use crate::locks::{Service, Transition};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{OsString, c_void};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -152,11 +152,13 @@ use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tracing::{debug, info, trace, warn};
 use vrr::configuration::{EraTable, INIT_SLOT, MAX_MEMBERS, SystemOperation, VOID_SLOT};
 use vrr::effects::{Effect, Stability};
 use vrr::ids::{Era, NodeId, Operation, OperationId, Slot, Tick, View, ViewId};
 use vrr::journal::{Journal, LogEntry, Payload, SegmentedLog};
 use vrr::message::{Body, Message};
+use vrr::observe::Diagnostic;
 use vrr::progress::Status;
 use vrr::quorum::{WeightedMajority, construct_pivot};
 use vrr::replica::{
@@ -164,6 +166,51 @@ use vrr::replica::{
     ViewChangeKnobs,
 };
 use vrr::wire::{Pack, Unpack, UnpackError};
+
+/// An unexpected-but-not-provably-impossible condition — a "maybe" in the
+/// TigerBeetle model — reported where the path today logs nothing.
+///
+/// The two-tier convention this adapter follows:
+///
+/// - **Invariants** are conditions whose impossibility the surrounding code
+///   establishes (a reply cache hit must never re-execute the Service, ticks
+///   are nondecreasing, a reincarnated identity never reuses the old id, the
+///   output queue carries only kinds 1/2, a poisoned node executes nothing).
+///   They are `assert!`ed: a violation is a bug and the node stops. Through
+///   the Rust API (`Node`) the panic propagates to the embedder's process;
+///   through the C ABI the boundary's `catch_unwind` poisons the node and
+///   reports `PANIC` — an unwound panic must never cross into C. Either way
+///   the node never continues past a violated invariant, in tests AND
+///   release.
+/// - **Maybes** are conditions that are not provably impossible and are
+///   often adversary- or environment-adjacent (a datagram attributed to an
+///   unknown peer id, a send to an unaddressable replica, an ack for an
+///   unclaimed verb, a folded-era regression). In test/debug builds
+///   (`cfg!(test)` or `cfg!(debug_assertions)`) the macro panics, so the
+///   test suite and any smoke run surface it; in release it logs `warn!`
+///   with full context and continues — mirroring upstream's totality stance
+///   (`wire.rs`: "a decoder that aborts the host process on a hostile
+///   datagram is a denial-of-service vector"), which never lets hostile or
+///   merely unexpected input crash a release build.
+///
+/// Upstream (`uvrr-core`) has no equivalent helper — its
+/// `src/invariant.rs` names drops through the `Diagnostic` observation and
+/// faults impossible local transitions, but neither asserts nor warns; the
+/// convention is proposed upstream in the drafted issue (see
+/// `.tmp/delegation/item13-upstream-invariant-issue.md`) and this macro is
+/// the reference implementation. It is exported so downstream embedders
+/// (e.g. the `lease-sequencer` example) report their host-side maybes under
+/// the same convention.
+#[macro_export]
+macro_rules! maybe_invariant {
+    ($($arg:tt)*) => {
+        if cfg!(test) || cfg!(debug_assertions) {
+            panic!("maybe-invariant violation: {}", format_args!($($arg)*));
+        } else {
+            ::tracing::warn!($($arg)*);
+        }
+    };
+}
 
 pub const OK: i32 = 0;
 pub const INVALID: i32 = -1;
@@ -248,6 +295,17 @@ pub struct Node {
     /// bumped node re-announces `Reincarnation(old, new)` on every
     /// fenced-boot drive (§8). `None` for an incarnation-0 boot.
     reincarnate_from: Option<NodeId>,
+    /// The descriptor's member ids (the low band, `:j` entries included):
+    /// the address space `receive` accepts. A message attributed to a
+    /// low-band id outside this set is a maybe (an unknown peer id).
+    known_ids: HashSet<u32>,
+    /// The last (era, view) reported for lifecycle `debug!` events.
+    last_view: Option<(u32, u32)>,
+    /// The last leader reported for lifecycle `info!` events.
+    last_leader: Option<u32>,
+    /// The last folded configuration era, for the folded-era-regression
+    /// maybe.
+    last_config_era: Option<u32>,
     /// Append-only lock-event journal. `None` when journaling is disabled
     /// (empty journal_dir at construction) or after a journal error.
     journal: Option<LockJournal>,
@@ -260,7 +318,16 @@ impl Node {
     /// marker, not a tick source.
     fn tick(&mut self) -> Result<u64, i32> {
         let now = unix_millis()?;
-        self.last_tick = self.last_tick.max(now);
+        let next = self.last_tick.max(now);
+        // Invariant (asserted, always): ticks are nondecreasing — the clamp
+        // holds even across a wall-clock regression.
+        assert!(
+            next >= self.last_tick,
+            "tick regression: last={} next={}",
+            self.last_tick,
+            next
+        );
+        self.last_tick = next;
         Ok(self.last_tick)
     }
 
@@ -293,6 +360,11 @@ impl Node {
                 return SERVICE;
             }
             let result = catch_unwind(AssertUnwindSafe(|| {
+                // Invariant (asserted, always): poison means poisoned — no
+                // post-poison execution. The loop-top guard reports SERVICE
+                // for a poisoned node (the host may poll it); the execution
+                // point itself must never be reached while poisoned.
+                assert!(!self.poisoned, "post-poison execution");
                 let planned = self
                     .replica
                     .plan(&input, &self.replica.journal().view())
@@ -334,7 +406,50 @@ impl Node {
                 }
             }
         }
+        self.report();
         OK
+    }
+
+    /// The lifecycle/observability read after a quiet drive: the named
+    /// drop diagnostic (the core publishes every transition's drop outcome
+    /// and nobody read it before), the view-change `debug!`, the
+    /// leader-change `info!`, and the folded-era-regression maybe. One
+    /// seqlock read per drive, level-gated formatting.
+    fn report(&mut self) {
+        let diagnostic = self.replica.observer().read_diagnostic();
+        if diagnostic != Diagnostic::None {
+            warn!(?diagnostic, "peer input dropped with a named diagnostic");
+        }
+        let snapshot = self.replica.observer().read();
+        if self.last_view != Some((snapshot.era, snapshot.view)) {
+            debug!(
+                node = self.replica.own().0,
+                era = snapshot.era,
+                view = snapshot.view,
+                "view changed"
+            );
+            self.last_view = Some((snapshot.era, snapshot.view));
+        }
+        let leader = self.primary_index();
+        if self.last_leader != Some(leader) {
+            info!(
+                node = self.replica.own().0,
+                era = snapshot.era,
+                view = snapshot.view,
+                leader,
+                "leader change"
+            );
+            self.last_leader = Some(leader);
+        }
+        let config_era = self.replica.progress().config().current().era.0;
+        if folded_era_regressed(self.last_config_era, config_era) {
+            maybe_invariant!(
+                "folded configuration era regressed (previous={}, current={})",
+                self.last_config_era.unwrap_or_default(),
+                config_era
+            );
+        }
+        self.last_config_era = Some(config_era);
     }
 
     fn apply_effect(&mut self, effect: Effect, pending: &mut Vec<TimedInput>) -> Result<(), i32> {
@@ -370,6 +485,17 @@ impl Node {
                     // never re-execute (B2). No journal append for duplicates.
                     (cached.clone(), None)
                 } else {
+                    // Invariant (asserted, always): exactly-once reply
+                    // correlation — a Service executes exactly once per
+                    // message_id; the cached path above replays without
+                    // re-executing. If the cache were populated for this id
+                    // between the check and here, the duplicate would have
+                    // taken the cached path and this branch is a bug.
+                    assert!(
+                        !self.replies.contains_key(&message_id),
+                        "exactly-once: a cached reply must never re-execute the Service \
+                         (message_id={message_id:?})"
+                    );
                     // The committed entry carries only the operation identity
                     // and the opaque payload; the client ids ride inside the
                     // JSON and the execution time is the host's clock — the
@@ -550,6 +676,7 @@ impl Node {
     /// the correlated reply arrives later as a kind-2 `NodeOutput` keyed by
     /// the request's message_id; the ABI's negative codes otherwise.
     pub fn request(&mut self, json: &[u8]) -> i32 {
+        trace!(len = json.len(), "node request entry");
         if json.len() > MAX_DATAGRAM {
             return TOO_LARGE;
         }
@@ -592,8 +719,20 @@ impl Node {
     /// Deliver one peer datagram payload attributed to member id `from`
     /// (the host has already authenticated the source endpoint).
     pub fn receive(&mut self, from: u32, data: &[u8]) -> i32 {
+        trace!(from, len = data.len(), "node receive entry");
         if data.len() > MAX_DATAGRAM {
             return TOO_LARGE;
+        }
+        // A message attributed to a low-band id outside the descriptor's
+        // address space is a maybe: unexpected, not provably impossible (a
+        // misconfigured or hostile sender), and survivable — the core drops
+        // it by name (Diagnostic::UnknownSender). Bumped (high-band) ids are
+        // the reincarnation story's legitimate callers and exempt.
+        if !self.known_ids.contains(&from) && from < (1u32 << 24) {
+            maybe_invariant!(
+                "message from an unknown peer id (from={from}, len={})",
+                data.len()
+            );
         }
         // W5: `Incomplete` means "more bytes could make this a message" and
         // `Malformed` means none could; over datagram transport there is no
@@ -601,10 +740,31 @@ impl Node {
         let message = match Message::unpack_from(data) {
             Ok(message) => message,
             Err(UnpackError::Incomplete { .. } | UnpackError::Malformed(_)) => {
+                warn!(
+                    from,
+                    len = data.len(),
+                    "undecodable peer datagram discarded"
+                );
                 return VRR_MESSAGE;
             }
         };
+        trace!(
+            from,
+            len = data.len(),
+            era = message.header.view.era.0,
+            view = message.header.view.view.0,
+            slot = message.header.slot.0,
+            tag = ?message.header.tag,
+            "datagram in"
+        );
         if !valid_message_payloads(&message) {
+            warn!(
+                from,
+                era = message.header.view.era.0,
+                view = message.header.view.view.0,
+                slot = message.header.slot.0,
+                "peer-carried payload failed the Service gate; datagram discarded"
+            );
             return VRR_MESSAGE;
         }
         self.drive(Input::Peer {
@@ -615,12 +775,14 @@ impl Node {
 
     /// Heartbeat tick.
     pub fn idle(&mut self) -> i32 {
+        trace!("node idle entry");
         self.drive(Input::Tick)
     }
 
     /// Election tick: same liveness input — tick-driven suspicion is the
     /// tag's only view-change trigger (`ViewChangeKnobs::primary_timeout`).
     pub fn leader_timeout(&mut self) -> i32 {
+        trace!("node leader timeout entry");
         self.drive(Input::Tick)
     }
 
@@ -638,11 +800,17 @@ impl Node {
             return SERVICE;
         }
         if let Some(old) = self.reincarnate_from {
+            debug!(
+                node = self.replica.own().0,
+                old = old.0,
+                "fenced-boot drive: re-announcing the reincarnation"
+            );
             let result = self.drive(Input::Reincarnate { old });
             if result != OK {
                 return result;
             }
         }
+        debug!(node = self.replica.own().0, "fenced-boot drive: tick");
         self.drive(Input::Tick)
     }
 
@@ -702,6 +870,23 @@ impl Node {
     /// Pop the next queued output, if any.
     pub fn next_output(&mut self) -> Option<NodeOutput> {
         let queued = self.outputs.pop_front()?;
+        // Invariant (asserted, always): the output queue carries only the
+        // send (1) and reply (2) kinds — any other kind is an adapter bug
+        // the host cannot interpret.
+        assert!(
+            queued.kind == OUTPUT_SEND || queued.kind == OUTPUT_REPLY,
+            "output queue carries an unknown kind {}",
+            queued.kind
+        );
+        trace!(
+            kind = queued.kind,
+            to = queued.to,
+            era = queued.era,
+            view = queued.view,
+            slot = queued.slot,
+            len = queued.bytes.len(),
+            "datagram out"
+        );
         Some(NodeOutput {
             kind: queued.kind,
             to: queued.to,
@@ -714,11 +899,21 @@ impl Node {
     }
 }
 
+/// Whether the folded configuration era moved backwards across two
+/// observations. The folded era advances exactly at a committed
+/// reconfiguration's establishing operation; it never regresses. A
+/// regression is a maybe (not provably impossible for a host juggling era
+/// snapshots, and survivable), not an assert.
+fn folded_era_regressed(previous: Option<u32>, current: u32) -> bool {
+    matches!(previous, Some(previous) if current < previous)
+}
+
 /// Map a plan refusal onto the ABI error codes. `NotPrimary` is the one a
 /// caller can act on (re-forward to the named primary); the rest — the
 /// fault, the reconfiguration gates, the outstanding-transition bookkeeping
 /// — are internal states the host cannot repair in place.
 fn plan_error(rejection: PlanRefusal) -> i32 {
+    debug!(?rejection, "plan refused");
     match rejection {
         PlanRefusal::NotPrimary { .. } => NOT_LEADER,
         PlanRefusal::Faulted(_) => FAULTED,
@@ -1114,6 +1309,37 @@ fn node_from_parts(
         };
         NodeId(bumped)
     };
+    // Invariant (asserted, always): a reincarnated identity never reuses
+    // the old id — the bump moves the identity into the high band, disjoint
+    // from the whole descriptor space by construction.
+    assert!(
+        incarnation == 0 || own_id.0 != own_member.id && own_id.0 >= (1u32 << 24),
+        "reincarnated identity reuses the old id (old={}, new={})",
+        own_member.id,
+        own_id.0
+    );
+    if incarnation > 0 {
+        info!(
+            old = own_member.id,
+            new = own_id.0,
+            incarnation,
+            "restart: the incarnation bumped, the node is a reincarnated later life"
+        );
+    }
+    info!(
+        own = own_id.0,
+        incarnation,
+        boot = if own_member.joined {
+            "joiner"
+        } else {
+            "genesis"
+        },
+        "node provisioned"
+    );
+    let known_ids = members
+        .iter()
+        .map(|member| member.id)
+        .collect::<HashSet<_>>();
     let reincarnate_from = (incarnation > 0).then_some(NodeId(own_member.id));
     let replica = match (incarnation > 0, own_member.joined) {
         // A bumped boot is a later life over the deployment's genesis —
@@ -1169,6 +1395,10 @@ fn node_from_parts(
         last_tick: 0,
         poisoned: false,
         reincarnate_from,
+        known_ids,
+        last_view: None,
+        last_leader: None,
+        last_config_era: None,
         journal,
     };
     // The bumped node's entry ticket (§4): the wire phase always
@@ -1566,6 +1796,10 @@ mod tests {
             last_tick: 0,
             poisoned: false,
             reincarnate_from: None,
+            known_ids: TEST_IDS.iter().copied().collect(),
+            last_view: None,
+            last_leader: None,
+            last_config_era: None,
             journal: None,
         }
     }
@@ -1739,6 +1973,10 @@ mod tests {
             last_tick: 0,
             poisoned: false,
             reincarnate_from: None,
+            known_ids: genesis.iter().copied().chain([own]).collect(),
+            last_view: None,
+            last_leader: None,
+            last_config_era: None,
             journal: None,
         }
     }
@@ -3871,5 +4109,174 @@ mod tests {
         unsafe { lunet_lock_node_free(handle) };
         let _ = fs::remove_file(state);
         let _ = fs::remove_dir_all(&journal_dir);
+    }
+
+    // ------------------------------------------------------------------
+    // Invariants (asserted, always) and maybes (test builds crash,
+    // release warns and continues). Red/green per the discipline: the
+    // maybe tests were run red against the unwired paths before the
+    // maybe_invariant! call sites landed.
+    // ------------------------------------------------------------------
+
+    /// The duplicate-request path replays the cached reply without
+    /// re-proposing: the second `request` queues exactly one reply output
+    /// (identical bytes) and zero send outputs — the Service is never
+    /// re-executed and never re-proposed.
+    #[test]
+    fn duplicate_request_replays_the_cached_reply_without_reproposing() {
+        let mut nodes = boot_cluster();
+        let json = request_json(Uuid::from_bytes([7; 16]));
+        assert_eq!(request(&mut nodes[0], &json), OK);
+        route_until_quiet(&mut nodes, &TEST_IDS);
+        let mut first = None;
+        while let Some(output) = nodes[0].next_output() {
+            if output.kind == OUTPUT_REPLY {
+                assert!(first.is_none(), "exactly one reply for the request");
+                first = Some(output.bytes);
+            }
+        }
+        let first = first.expect("the request's reply is queued");
+        // The duplicate: replay, no re-propose.
+        assert_eq!(request(&mut nodes[0], &json), OK);
+        let mut replies = Vec::new();
+        let mut sends = 0;
+        while let Some(output) = nodes[0].next_output() {
+            if output.kind == OUTPUT_REPLY {
+                replies.push(output.bytes);
+            } else {
+                sends += 1;
+            }
+        }
+        assert_eq!(replies, vec![first], "the cached bytes replay verbatim");
+        assert_eq!(sends, 0, "the duplicate proposes nothing");
+    }
+
+    /// Every output the adapter ever queues carries kind 1 (send) or 2
+    /// (reply) — drained across a boot, a stream, a fence, and a
+    /// reconfiguration.
+    #[test]
+    fn output_queue_carries_only_send_and_reply_kinds() {
+        let (mut nodes, ids) = boot_four_and_join();
+        assert_eq!(
+            request(&mut nodes[0], &request_json(Uuid::from_bytes([9; 16]))),
+            OK
+        );
+        drive_fence(&mut nodes, &ids, 2);
+        for node in nodes.iter_mut() {
+            let drained = std::mem::take(&mut node.outputs);
+            for output in drained {
+                assert!(
+                    output.kind == OUTPUT_SEND || output.kind == OUTPUT_REPLY,
+                    "kind {} in the output queue",
+                    output.kind
+                );
+            }
+        }
+    }
+
+    /// The dirty restart bumps the identity into the high band: the
+    /// reincarnated identity never reuses the old id (the asserted boot
+    /// invariant, exercised through `Node::open`).
+    #[test]
+    fn reincarnated_identity_never_reuses_the_old_id() {
+        let path = state_path("reincarnate-invariant");
+        let members = TEST_IDS
+            .iter()
+            .map(|id| format!("{id}:member{id}"))
+            .collect::<Vec<_>>()
+            .join("\0");
+        let first =
+            Node::open(&members, "member10", path.to_str().unwrap(), None, 0).expect("first boot");
+        assert_eq!(first.own_id(), TEST_IDS[0]);
+        drop(first);
+        let second = Node::open(&members, "member10", path.to_str().unwrap(), None, 0)
+            .expect("dirty boot bumps");
+        let bumped = second.own_id();
+        assert_ne!(bumped, TEST_IDS[0], "the old id is never reused");
+        assert!(bumped >= (1u32 << 24), "the bumped id is high band");
+        assert_eq!(bumped, TEST_IDS[0] + (1u32 << 24));
+    }
+
+    /// Ticks are nondecreasing: the clamp holds a wall-clock regression
+    /// back to the last tick.
+    #[test]
+    fn ticks_are_nondecreasing_and_clamped() {
+        let mut node = provision("ticks", TEST_IDS[0], 3);
+        let first = node.tick().expect("clock after epoch");
+        let second = node.tick().expect("clock after epoch");
+        assert!(second >= first);
+        // A future last_tick (a synthetic monotone stamp) holds the clamp:
+        // the returned tick never goes below it.
+        node.last_tick = first + 10_000;
+        assert_eq!(node.tick().unwrap(), first + 10_000);
+    }
+
+    /// Poison means poisoned: a poisoned node executes nothing — every
+    /// entry reports SERVICE and the queues stay empty.
+    #[test]
+    fn poisoned_node_executes_nothing() {
+        let mut node = provision("poison", TEST_IDS[0], 3);
+        node.poisoned = true;
+        assert_eq!(node.idle(), SERVICE);
+        assert_eq!(node.leader_timeout(), SERVICE);
+        assert_eq!(node.recover(), SERVICE);
+        assert_eq!(
+            request(&mut node, &request_json(Uuid::from_bytes([3; 16]))),
+            SERVICE
+        );
+        assert!(
+            node.next_output().is_none(),
+            "a poisoned node emits nothing"
+        );
+        assert!(node.outputs.is_empty());
+    }
+
+    /// The unknown-peer-id maybe: a datagram attributed to a low-band id
+    /// outside the descriptor address space crashes a test build (the
+    /// maybe fires) and passes silently in release (warn-and-continue).
+    /// Red was demonstrated against the unwired `receive` (the call
+    /// returned OK under `catch_unwind` in a debug build).
+    #[test]
+    fn maybe_unknown_low_band_peer_id_fires_in_test_builds() {
+        let mut node = provision("unknown-peer", TEST_IDS[0], 3);
+        let junk = vec![0u8; 8];
+        let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| node.receive(99_999, &junk)));
+        if cfg!(test) || cfg!(debug_assertions) {
+            let error = outcome.expect_err("the maybe crashes a test build");
+            let message = error
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| error.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_default();
+            assert!(
+                message.contains("maybe-invariant violation"),
+                "the panic names the maybe: {message}"
+            );
+        } else {
+            outcome.expect("release warns and continues");
+        }
+    }
+
+    /// The folded-era regression helper: true exactly when the folded
+    /// configuration era moved backwards. Wired as a maybe in `report`.
+    #[test]
+    fn folded_era_regression_is_detected() {
+        assert!(!folded_era_regressed(None, 1));
+        assert!(!folded_era_regressed(Some(1), 1));
+        assert!(!folded_era_regressed(Some(1), 2));
+        assert!(folded_era_regressed(Some(2), 1));
+    }
+
+    /// A full protocol run — boot, stream, fence, join, promote — trips no
+    /// maybe and no invariant: the green run the wired paths must survive.
+    #[test]
+    fn protocol_run_trips_no_maybe() {
+        let (mut nodes, ids) = boot_four_and_join();
+        drive_fence(&mut nodes, &ids, 2);
+        assert_eq!(
+            request(&mut nodes[1], &request_json(Uuid::from_bytes([11; 16]))),
+            OK
+        );
+        route_until_quiet(&mut nodes, &ids);
     }
 }

@@ -18,14 +18,38 @@ Every node runs the same driver:
 - if another node holds it, poll it as a GET and schedule the next poll at
   the reported expiry plus `rand()*100 ms`.
 
-Every attempt is logged to the node's log file as
+Every attempt is logged at `info` as
 
 ```
 lease-attempt ts=<ms> node=<id> op=set|renew|get|steal expiry=<ms>
 ```
 
-with `note ...` lines for boot, membership, leader changes, grants, the
-reincarnation remap, and undeliverable datagrams.
+with further `info` events for boot, membership, leader changes, grants,
+the reincarnation remap, and periodic status, and `warn` events for the
+unexpected-but-survivable.
+
+## Tracing
+
+The node logs through `tracing`; the library (`lunet_advisory_lock`)
+emits events and the binary owns the subscriber stack, exactly the
+tokio-rs guidance: a downstream embedder chooses its own subscriber.
+This binary installs `tracing_subscriber::fmt` with
+`EnvFilter::from_default_env()` (the `RUST_LOG` variable), ANSI off, no
+line timestamp (events carry their own `ts=` fields), writing through
+`tracing_appender`'s `NonBlocking` writer to a per-node **daily rolling**
+file (the `--log` path's stem becomes the file prefix under the same
+directory). The `WorkerGuard` is held for the process lifetime and
+flushes on an orderly shutdown.
+
+**Loss window.** `NonBlocking` is drop-on-overflow: when a node writes
+faster than the worker drains, events are dropped, never backpressured
+and never blocking the datagram path. Events written in the last moments
+before a `SIGKILL` (the kill cycles in `run.sh`) are likewise lost — the
+worker had no chance to flush. The stability check therefore asserts on
+steady-state streams, never on a tail. Under the default `RUST_LOG=info`
+the per-datagram `trace!` events are compiled in but filtered before any
+formatting, and the cadence assertions hold (measured: renewal ~250 ms,
+poll ~2x renewal).
 
 ## Host policy: the client stream pauses during an era transition
 
@@ -54,8 +78,12 @@ port is the descriptor's UDP peer port + 1000.
 ./run.sh     # the stability check (also as ./check.sh)
 ```
 
-`run.sh` builds the crate, starts the six nodes with fresh state, drives the
-joins and the two increments at the leader, runs the stability window
+`run.sh` builds the crate, starts the six nodes with fresh state (each
+node's file at `RUST_LOG=info` unless the operator exports another
+`RUST_LOG` — e.g. `RUST_LOG=debug` or
+`RUST_LOG="lunet_advisory_lock=trace,info"` opts a run into per-datagram
+detail), drives the joins and the two increments at the leader, runs the
+stability window
 (cadence and poll assertions from the logs), and then three kill/restart
 cycles: SIGKILL the current holder, wait 2000 ms, assert a survivor steals
 the lease, restart the killed leader on the same state file, assert the

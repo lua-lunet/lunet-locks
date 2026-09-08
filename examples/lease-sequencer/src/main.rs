@@ -15,16 +15,16 @@
 mod transport;
 
 use lunet_advisory_lock::{
-    Node, NOT_LEADER, OK, POSITION_APPEND, RECONFIGURE_DECREMENT, RECONFIGURE_INCREMENT,
-    RECONFIGURE_JOIN, RECONFIGURE_LEAVE,
+    NOT_LEADER, Node, OK, POSITION_APPEND, RECONFIGURE_DECREMENT, RECONFIGURE_INCREMENT,
+    RECONFIGURE_JOIN, RECONFIGURE_LEAVE, maybe_invariant,
 };
 use std::collections::HashMap;
-use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
-use std::path::Path;
 use std::process::exit;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tracing::info;
+use tracing_appender::non_blocking::WorkerGuard;
 
 /// The sequencer lease's sentinel lock id.
 const LOCK_ID: u64 = 0x0DDBA11;
@@ -131,7 +131,6 @@ struct Host {
     driver: Driver,
     forwarded_from: HashMap<[u8; 16], (SocketAddr, u64)>,
     conns: Vec<Conn>,
-    log: File,
 }
 
 fn millis() -> u64 {
@@ -139,6 +138,39 @@ fn millis() -> u64 {
         .duration_since(UNIX_EPOCH)
         .expect("clock before epoch")
         .as_millis() as u64
+}
+
+/// The tracing subscriber stack. `--log` names the per-node file; its stem
+/// becomes the daily-rolling file prefix under the same directory. The
+/// returned `WorkerGuard` must live for the process lifetime.
+fn init_tracing(log_path: &str) -> WorkerGuard {
+    let path = std::path::Path::new(log_path);
+    let dir = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let prefix = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("node");
+    let appender = tracing_appender::rolling::RollingFileAppender::builder()
+        .rotation(tracing_appender::rolling::Rotation::DAILY)
+        .filename_prefix(prefix)
+        .filename_suffix("log")
+        .build(dir)
+        .unwrap_or_else(|e| {
+            eprintln!("lease-sequencer: cannot open rolling log {log_path}: {e}");
+            exit(2);
+        });
+    let (writer, guard) = tracing_appender::non_blocking(appender);
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_ansi(false)
+        .with_target(false)
+        .without_time()
+        .with_writer(writer)
+        .init();
+    guard
 }
 
 struct Rng(u64);
@@ -260,23 +292,15 @@ fn parse_options() -> Options {
 }
 
 impl Host {
-    fn log(&mut self, line: &str) {
-        let _ = writeln!(self.log, "{line}");
-        let _ = self.log.flush();
-        eprintln!("{line}");
+    fn note(&self, body: &str) {
+        info!("{} ts={}", body, millis());
     }
 
-    fn note(&mut self, body: &str) {
-        let line = format!("note {} ts={}", body, millis());
-        self.log(&line);
-    }
-
-    fn lease_attempt(&mut self, node_id: u32, op: &str, expiry: u64) {
-        let line = format!(
+    fn lease_attempt(&self, node_id: u32, op: &str, expiry: u64) {
+        info!(
             "lease-attempt ts={} node={node_id} op={op} expiry={expiry}",
             millis()
         );
-        self.log(&line);
     }
 
     fn send_application(&mut self, addr: SocketAddr, payload: &[u8]) {
@@ -314,15 +338,26 @@ impl Host {
         while let Some(out) = self.node.next_output() {
             if out.kind == OUTPUT_SEND {
                 let Some(&addr) = self.peers.get(&out.to) else {
-                    let line = format!(
-                        "note cannot-address ts={} replica={}; datagram dropped",
-                        millis(),
-                        out.to
+                    // The maybe: a send to an unaddressable replica. Not
+                    // provably impossible (the peer may be down mid-remap —
+                    // the known "cannot address replica <old-id>" window
+                    // after a reincarnation remap) and survivable: the
+                    // datagram is dropped. Test/debug builds crash so the
+                    // smokes surface it; release warns with full context.
+                    maybe_invariant!(
+                        "cannot address replica (to={} kind={} era={} view={} slot={} len={}); \
+                         datagram dropped",
+                        out.to,
+                        out.kind,
+                        out.era,
+                        out.view,
+                        out.slot,
+                        out.bytes.len()
                     );
-                    self.log(&line);
                     continue;
                 };
-                let packet = transport::encode_peer(transport::PEER_VRR, &self.fingerprint, &out.bytes);
+                let packet =
+                    transport::encode_peer(transport::PEER_VRR, &self.fingerprint, &out.bytes);
                 let _ = self.sock.send_to(&packet, addr);
             } else if out.kind == OUTPUT_REPLY {
                 if let Some((dest, _)) = self.forwarded_from.remove(&out.message_id) {
@@ -361,7 +396,15 @@ impl Host {
     /// One lock op's submission route: propose locally as the leader, or
     /// forward to the leader over the application channel; anything else is
     /// a backoff-and-retry for the policy loop.
-    fn route_op(&mut self, rc: i32, op: Op, json: &str, message_id: [u8; 16], now: u64, rng: &mut Rng) {
+    fn route_op(
+        &mut self,
+        rc: i32,
+        op: Op,
+        json: &str,
+        message_id: [u8; 16],
+        now: u64,
+        rng: &mut Rng,
+    ) {
         if rc == OK {
             self.driver.pending = Some(Pending {
                 message_id,
@@ -469,9 +512,7 @@ impl Host {
             Op::Set | Op::Steal | Op::Renew => {
                 let granted = reply["granted"].as_bool() == Some(true);
                 if granted {
-                    let expiry = reply["lease"]["expiry"]
-                        .as_u64()
-                        .unwrap_or(now + LEASE_MS);
+                    let expiry = reply["lease"]["expiry"].as_u64().unwrap_or(now + LEASE_MS);
                     self.driver.held_expiry = Some(expiry);
                     self.note(&format!(
                         "grant node={} op={} expiry={expiry}",
@@ -567,14 +608,12 @@ fn main() {
         .collect();
     let fingerprint = transport::genesis_fingerprint(&genesis);
 
-    let log = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(Path::new(&options.log))
-        .unwrap_or_else(|e| {
-            eprintln!("lease-sequencer: cannot open log {}: {e}", options.log);
-            exit(2);
-        });
+    // The subscriber stack (the binary owns it; the library stays
+    // subscriber-free): `RUST_LOG` env-filter, ANSI off, no line timestamp
+    // (events carry their own `ts=` fields), through `NonBlocking` over a
+    // per-node daily rolling file. The guard is held for the process
+    // lifetime and flushes on an orderly shutdown.
+    let _worker_guard = init_tracing(&options.log);
     let node =
         Node::open(&members, &options.name, &options.state, None, 0).unwrap_or_else(|code| {
             eprintln!("lease-sequencer: node boot failed with code {code}");
@@ -640,7 +679,6 @@ fn main() {
         driver,
         forwarded_from: HashMap::new(),
         conns: Vec::new(),
-        log,
     };
     host.note(&format!(
         "boot name={} descriptor-id={own_desc_id} own={own_id} incarnation={incarnation}",
@@ -709,6 +747,7 @@ fn pump_udp(host: &mut Host, now: u64, rng: &mut Rng) {
             return;
         };
         let Some(&replica) = host.addr_to_id.get(&addr) else {
+            tracing::warn!(source = %addr, len, "datagram from an unregistered endpoint dropped");
             continue;
         };
         handle_packet(host, replica, addr, &buf[..len], now, rng);
@@ -727,6 +766,8 @@ fn handle_packet(
         return;
     };
     if fingerprint != host.fingerprint {
+        // Unexpected but survivable: a datagram from outside the
+        // deployment's genesis fingerprint.
         host.note("dirty-fingerprint; datagram dropped");
         return;
     }
@@ -779,7 +820,10 @@ fn handle_packet(
             }
         }
         0x02 => {
-            // FORWARD_RESPONSE: correlate to the driver's pending op.
+            // FORWARD_RESPONSE: correlate to the driver's pending op. An
+            // ack that correlates to nothing is a maybe: unexpected, not
+            // provably impossible (the pending op may have timed out and
+            // been retried in the window), and survivable.
             if payload.len() > 1 + 16
                 && host
                     .driver
@@ -791,38 +835,39 @@ fn handle_packet(
                     let op = pending.op;
                     host.driver_complete(op, &payload[17..], now, rng);
                 }
+            } else if payload.len() > 1 + 16 {
+                let mut message_id = [0u8; 16];
+                message_id.copy_from_slice(&payload[1..17]);
+                maybe_invariant!(
+                    "ack for an unclaimed verb (message_id={}, len={})",
+                    uuid::Uuid::from_bytes(message_id),
+                    payload.len()
+                );
             }
         }
-        0x03 => {
-            // FORWARD_NOT_LEADER: drop the pending op; the policy retries.
-            if payload.len() == 1 + 16 + 8
-                && host
-                    .driver
-                    .pending
-                    .as_ref()
-                    .is_some_and(|p| p.message_id == payload[1..17])
-            {
-                host.driver.pending = None;
-                host.driver.next_action_at = now + rng.below(80) + 20;
-            }
+        // FORWARD_NOT_LEADER: drop the pending op; the policy retries.
+        0x03 if payload.len() == 1 + 16 + 8
+            && host
+                .driver
+                .pending
+                .as_ref()
+                .is_some_and(|p| p.message_id == payload[1..17]) =>
+        {
+            host.driver.pending = None;
+            host.driver.next_action_at = now + rng.below(80) + 20;
         }
         _ => {}
     }
 }
 
 fn pump_tcp(host: &mut Host, now: u64, rng: &mut Rng) {
-    loop {
-        match host.listener.accept() {
-            Ok((stream, _)) => {
-                let _ = stream.set_nonblocking(true);
-                host.conns.push(Conn {
-                    stream,
-                    buf: Vec::new(),
-                    pending: None,
-                });
-            }
-            Err(_) => break,
-        }
+    while let Ok((stream, _)) = host.listener.accept() {
+        let _ = stream.set_nonblocking(true);
+        host.conns.push(Conn {
+            stream,
+            buf: Vec::new(),
+            pending: None,
+        });
     }
     // Sweep the forward-correlation deadlines.
     let stale: Vec<[u8; 16]> = host
@@ -909,7 +954,9 @@ fn pending_deadline(host: &mut Host, index: usize, now: u64) -> bool {
             } else if now < *deadline {
                 return true;
             } else {
-                format!("\"action\":\"{action}\",\"id\":{id},\"accepted\":false,\"reason\":\"deadline\"")
+                format!(
+                    "\"action\":\"{action}\",\"id\":{id},\"accepted\":false,\"reason\":\"deadline\""
+                )
             };
             let line = format!("{{{reply}}}\n");
             let conn = &mut host.conns[index];
@@ -924,18 +971,24 @@ fn pending_deadline(host: &mut Host, index: usize, now: u64) -> bool {
 
 fn handle_client_line(host: &mut Host, index: usize, line: &str, now: u64, rng: &mut Rng) -> bool {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-        let _ = host.conns[index].stream.write_all(b"{\"error\":\"bad_request\"}\n");
+        let _ = host.conns[index]
+            .stream
+            .write_all(b"{\"error\":\"bad_request\"}\n");
         return true;
     };
     let Some(action) = value["action"].as_str().map(|s| s.to_string()) else {
         // A lock verb: propose locally; a non-leader answers the error the
         // operator (or the run.sh driver) re-routes.
         let Some(message_id_hex) = value["message_id"].as_str() else {
-            let _ = host.conns[index].stream.write_all(b"{\"error\":\"bad_request\"}\n");
+            let _ = host.conns[index]
+                .stream
+                .write_all(b"{\"error\":\"bad_request\"}\n");
             return true;
         };
         let Some(message_id) = transport::uuid_bytes(message_id_hex) else {
-            let _ = host.conns[index].stream.write_all(b"{\"error\":\"bad_request\"}\n");
+            let _ = host.conns[index]
+                .stream
+                .write_all(b"{\"error\":\"bad_request\"}\n");
             return true;
         };
         let rc = host.node.request(line.as_bytes());
@@ -965,18 +1018,24 @@ fn handle_client_line(host: &mut Host, index: usize, line: &str, now: u64, rng: 
         "leave" => RECONFIGURE_LEAVE,
         "decrement" => RECONFIGURE_DECREMENT,
         _ => {
-            let _ = host.conns[index].stream.write_all(b"{\"error\":\"bad_request\"}\n");
+            let _ = host.conns[index]
+                .stream
+                .write_all(b"{\"error\":\"bad_request\"}\n");
             return true;
         }
     };
     let Some(id) = value["id"].as_u64() else {
-        let _ = host.conns[index].stream.write_all(b"{\"error\":\"bad_request\"}\n");
+        let _ = host.conns[index]
+            .stream
+            .write_all(b"{\"error\":\"bad_request\"}\n");
         return true;
     };
     let id = id as u32;
     let status = host.node.status();
     if status.state != STATE_NORMAL || status.leader != host.own_id {
-        let _ = host.conns[index].stream.write_all(b"{\"error\":\"not_leader\"}\n");
+        let _ = host.conns[index]
+            .stream
+            .write_all(b"{\"error\":\"not_leader\"}\n");
         return true;
     }
     let rc = host.node.reconfigure(op, id, POSITION_APPEND);
