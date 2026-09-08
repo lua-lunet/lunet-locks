@@ -165,16 +165,16 @@ use vrr::replica::{
 };
 use vrr::wire::{Pack, Unpack, UnpackError};
 
-const OK: i32 = 0;
-const INVALID: i32 = -1;
-const CONFIG: i32 = -2;
-const CLIENT_JSON: i32 = -4;
-const VRR_MESSAGE: i32 = -5;
-const TOO_LARGE: i32 = -6;
-const SERVICE: i32 = -7;
-const NOT_LEADER: i32 = -8;
-const FAULTED: i32 = -9;
-const PANIC: i32 = -127;
+pub const OK: i32 = 0;
+pub const INVALID: i32 = -1;
+pub const CONFIG: i32 = -2;
+pub const CLIENT_JSON: i32 = -4;
+pub const VRR_MESSAGE: i32 = -5;
+pub const TOO_LARGE: i32 = -6;
+pub const SERVICE: i32 = -7;
+pub const NOT_LEADER: i32 = -8;
+pub const FAULTED: i32 = -9;
+pub const PANIC: i32 = -127;
 
 const OUTPUT_SEND: u32 = 1;
 const OUTPUT_REPLY: u32 = 2;
@@ -472,29 +472,6 @@ impl Node {
         }
     }
 
-    /// The fenced-boot drive. The core has no recovery protocol (the
-    /// classic `Input::Recover` exchange was removed upstream): a fenced
-    /// node starts clean, and the only protocol lever is `Input::Tick` —
-    /// the genesis primary self-promotes on it, and the primary's messages
-    /// adopt the fenced backups. A bumped node (a dirty restart) re-drives
-    /// its `Input::Reincarnate { old }` announcement first, on every fenced
-    /// drive, until it stops being fenced — upstream's §8 re-announce; the
-    /// core self-gates the announcement (a member already voting at
-    /// weight >= 1 has nothing to announce). The drive never fabricates
-    /// recovered state.
-    fn recover(&mut self) -> i32 {
-        if self.poisoned {
-            return SERVICE;
-        }
-        if let Some(old) = self.reincarnate_from {
-            let result = self.drive(Input::Reincarnate { old });
-            if result != OK {
-                return result;
-            }
-        }
-        self.drive(Input::Tick)
-    }
-
     /// The current view's primary as a positional index, via the public
     /// route: progress config -> era record -> configuration primary.
     fn primary_index(&self) -> u32 {
@@ -510,6 +487,230 @@ impl Node {
             Some(node) => node.0,
             None => LEADER_UNKNOWN,
         }
+    }
+}
+
+/// One queued output for an embedded host (`Node::next_output`): a unicast
+/// peer datagram (`kind == 1`, deliver `bytes` to member id `to` over the
+/// host's own peer transport) or a client reply (`kind == 2`, `bytes`
+/// answers the request carrying `message_id`).
+pub struct NodeOutput {
+    pub kind: u32,
+    pub to: u32,
+    pub era: u32,
+    pub view: u32,
+    pub slot: u64,
+    pub message_id: [u8; 16],
+    pub bytes: Vec<u8>,
+}
+
+/// One status snapshot for an embedded host (`Node::status`): the
+/// replication state (`0` normal, `1` view_change, `2` recovering,
+/// `3` replaying), the current view's primary as a member id (`u32::MAX`
+/// when unknown or void), the current view's era and view, and the folded
+/// configuration table's current era — the two eras differ exactly while a
+/// committed reconfiguration's establishing era awaits the view that
+/// enters it.
+pub struct NodeStatus {
+    pub state: u32,
+    pub leader: u32,
+    pub era: u32,
+    pub view: u32,
+    pub config_era: u32,
+}
+
+impl Node {
+    /// Safe constructor over the same grammar the C ABI takes: `members` is
+    /// the NUL-separated `<u32-id>:<name>` member buffer in descriptor
+    /// (genesis succession) order, post-genesis entries suffixed `:j`;
+    /// `own` is the local member's name; `state` is the durable
+    /// incarnation-marker path; `journal_dir` enables the lock-event
+    /// journal (an empty string disables it, matching the ABI's
+    /// empty-buffer rule) with `roll_bytes` as its roll threshold.
+    pub fn open(
+        members: &str,
+        own: &str,
+        state: &str,
+        journal_dir: Option<&str>,
+        roll_bytes: u32,
+    ) -> Result<Node, i32> {
+        catch_unwind(AssertUnwindSafe(|| {
+            node_from_parts(
+                members.as_bytes(),
+                own.as_bytes(),
+                state.as_bytes(),
+                journal_dir.filter(|dir| !dir.is_empty()),
+                roll_bytes,
+            )
+        }))
+        .unwrap_or(Err(PANIC))
+    }
+
+    /// Propose a client request (the lock-verb JSON). `0` on acceptance —
+    /// the correlated reply arrives later as a kind-2 `NodeOutput` keyed by
+    /// the request's message_id; the ABI's negative codes otherwise.
+    pub fn request(&mut self, json: &[u8]) -> i32 {
+        if json.len() > MAX_DATAGRAM {
+            return TOO_LARGE;
+        }
+        let Ok(request) = Service::decode(json) else {
+            return CLIENT_JSON;
+        };
+        let (message_id, _, _) = request.ids();
+        let message_id = *message_id.as_bytes();
+        // Duplicate suppression (B2): a request whose reply is already cached
+        // replays the cached bytes without re-proposing or re-executing.
+        if let Some(cached) = self.replies.get(&message_id) {
+            self.outputs.push_back(Queued {
+                kind: OUTPUT_REPLY,
+                to: 0,
+                era: 0,
+                view: 0,
+                slot: 0,
+                message_id,
+                bytes: cached.clone(),
+            });
+            return OK;
+        }
+        if json.len() + PREPARE_OVERHEAD > MAX_DATAGRAM {
+            return TOO_LARGE;
+        }
+        let id = operation_id(message_id);
+        self.pending.insert(id, message_id);
+        let result = self.drive(Input::Propose {
+            operation: Operation {
+                id,
+                payload: json.to_vec().into_boxed_slice(),
+            },
+        });
+        if result != OK {
+            self.pending.remove(&id);
+        }
+        result
+    }
+
+    /// Deliver one peer datagram payload attributed to member id `from`
+    /// (the host has already authenticated the source endpoint).
+    pub fn receive(&mut self, from: u32, data: &[u8]) -> i32 {
+        if data.len() > MAX_DATAGRAM {
+            return TOO_LARGE;
+        }
+        // W5: `Incomplete` means "more bytes could make this a message" and
+        // `Malformed` means none could; over datagram transport there is no
+        // reassembly, so both are a bad datagram from this host's view.
+        let message = match Message::unpack_from(data) {
+            Ok(message) => message,
+            Err(UnpackError::Incomplete { .. } | UnpackError::Malformed(_)) => {
+                return VRR_MESSAGE;
+            }
+        };
+        if !valid_message_payloads(&message) {
+            return VRR_MESSAGE;
+        }
+        self.drive(Input::Peer {
+            from: NodeId(from),
+            message,
+        })
+    }
+
+    /// Heartbeat tick.
+    pub fn idle(&mut self) -> i32 {
+        self.drive(Input::Tick)
+    }
+
+    /// Election tick: same liveness input — tick-driven suspicion is the
+    /// tag's only view-change trigger (`ViewChangeKnobs::primary_timeout`).
+    pub fn leader_timeout(&mut self) -> i32 {
+        self.drive(Input::Tick)
+    }
+
+    /// One fenced-boot drive. The core has no recovery protocol: a fenced
+    /// node starts clean, and the only protocol lever is `Input::Tick` —
+    /// the genesis primary self-promotes on it, and the primary's messages
+    /// adopt the fenced backups. A bumped node (a dirty restart) re-drives
+    /// its `Input::Reincarnate { old }` announcement first, on every fenced
+    /// drive, until it stops being fenced — upstream's §8 re-announce; the
+    /// core self-gates the announcement (a member already voting at
+    /// weight >= 1 has nothing to announce). The drive never fabricates
+    /// recovered state.
+    pub fn recover(&mut self) -> i32 {
+        if self.poisoned {
+            return SERVICE;
+        }
+        if let Some(old) = self.reincarnate_from {
+            let result = self.drive(Input::Reincarnate { old });
+            if result != OK {
+                return result;
+            }
+        }
+        self.drive(Input::Tick)
+    }
+
+    /// Drive a reconfiguration operation on this node: `op` is one of the
+    /// `RECONFIGURE_*` codes, `member` the target member id, `position` the
+    /// join succession position (`POSITION_APPEND` appends at the current
+    /// succession end).
+    pub fn reconfigure(&mut self, op: u32, member: u32, position: u32) -> i32 {
+        let position = if op == RECONFIGURE_JOIN && position == POSITION_APPEND {
+            let len = self
+                .replica
+                .progress()
+                .config()
+                .current()
+                .config
+                .order()
+                .len();
+            match u32::try_from(len) {
+                Ok(len) => len,
+                Err(_) => return SERVICE,
+            }
+        } else {
+            position
+        };
+        let system = match op {
+            RECONFIGURE_JOIN => SystemOperation::Join {
+                node: NodeId(member),
+                position,
+            },
+            RECONFIGURE_INCREMENT => SystemOperation::Increment(NodeId(member)),
+            RECONFIGURE_DECREMENT => SystemOperation::Decrement(NodeId(member)),
+            RECONFIGURE_LEAVE => SystemOperation::Leave(NodeId(member)),
+            _ => return INVALID,
+        };
+        let pivot = self.derived_pivot(&system);
+        self.drive(Input::Reconfigure { op: system, pivot })
+    }
+
+    /// The live identity: the descriptor id at incarnation 0, the bumped
+    /// high-band id after a dirty restart.
+    pub fn own_id(&self) -> u32 {
+        self.replica.own().0
+    }
+
+    /// The status snapshot (see `NodeStatus`).
+    pub fn status(&self) -> NodeStatus {
+        let snapshot = self.replica.observer().read();
+        NodeStatus {
+            state: snapshot.status,
+            leader: self.primary_index(),
+            era: snapshot.era,
+            view: snapshot.view,
+            config_era: self.replica.progress().config().current().era.0,
+        }
+    }
+
+    /// Pop the next queued output, if any.
+    pub fn next_output(&mut self) -> Option<NodeOutput> {
+        let queued = self.outputs.pop_front()?;
+        Some(NodeOutput {
+            kind: queued.kind,
+            to: queued.to,
+            era: queued.era,
+            view: queued.view,
+            slot: queued.slot,
+            message_id: queued.message_id,
+            bytes: queued.bytes,
+        })
     }
 }
 
@@ -584,14 +785,14 @@ struct MemberEntry {
 /// Reconfiguration operation codes for `lunet_lock_node_reconfigure`.
 /// The departure route is `Decrement` to weight 0, then `Leave` (the core's
 /// one departure route); a weight-0 member cannot be decremented further.
-const RECONFIGURE_JOIN: u32 = 1;
-const RECONFIGURE_INCREMENT: u32 = 2;
-const RECONFIGURE_LEAVE: u32 = 3;
-const RECONFIGURE_DECREMENT: u32 = 4;
+pub const RECONFIGURE_JOIN: u32 = 1;
+pub const RECONFIGURE_INCREMENT: u32 = 2;
+pub const RECONFIGURE_LEAVE: u32 = 3;
+pub const RECONFIGURE_DECREMENT: u32 = 4;
 
 /// `lunet_lock_node_reconfigure`'s Join position sentinel: append at the
 /// core's current succession end (resolved against the folded configuration).
-const POSITION_APPEND: u32 = u32::MAX;
+pub const POSITION_APPEND: u32 = u32::MAX;
 
 fn parse_member_entry(entry: &[u8]) -> Option<MemberEntry> {
     let text = std::str::from_utf8(entry).ok()?;
@@ -827,6 +1028,168 @@ fn guarded(run: impl FnOnce() -> i32) -> i32 {
 /// margin over the payload so admission can refuse before proposing.
 const PREPARE_OVERHEAD: usize = 20 + 1 + 8 + 4 + 1 + 16 + 4 + 8;
 
+/// The construction body shared by the C ABI's `lunet_lock_node_new` and
+/// the embedded host's `Node::open`: parse the member buffer, classify the
+/// boot from the durable incarnation marker, and build the replica. Each
+/// failure returns its ABI code.
+fn node_from_parts(
+    members_data: &[u8],
+    own_data: &[u8],
+    state_data: &[u8],
+    journal_dir: Option<&str>,
+    roll_bytes: u32,
+) -> Result<Node, i32> {
+    // Member entries are "<u32-id>:<name>"; a post-genesis (joined)
+    // entry is "<u32-id>:<name>:j". The plain-entry order is the
+    // descriptor's genesis succession sequence and each id is the
+    // member's live NodeId.
+    let Some(members) = members_data
+        .split(|byte| *byte == 0)
+        .map(parse_member_entry)
+        .collect::<Option<Vec<_>>>()
+    else {
+        return Err(CONFIG);
+    };
+    let Ok(own) = std::str::from_utf8(own_data) else {
+        return Err(CONFIG);
+    };
+    let Ok(state) = std::str::from_utf8(state_data) else {
+        return Err(CONFIG);
+    };
+    if state.is_empty()
+        || members.is_empty()
+        || members.len() > MAX_MEMBERS as usize
+        || members
+            .iter()
+            .any(|member| member.name.is_empty() || member.id as u64 > INCARNATION_LOW_MAX)
+    {
+        return Err(CONFIG);
+    }
+    let mut unique_ids = members.iter().map(|member| member.id).collect::<Vec<_>>();
+    unique_ids.sort_unstable();
+    unique_ids.dedup();
+    let mut unique_names = members
+        .iter()
+        .map(|member| member.name.clone())
+        .collect::<Vec<_>>();
+    unique_names.sort();
+    unique_names.dedup();
+    if unique_ids.len() != members.len() || unique_names.len() != members.len() {
+        return Err(CONFIG);
+    }
+    let Some(own_member) = members.iter().find(|member| member.name == own) else {
+        return Err(CONFIG);
+    };
+    // Explicit admin-assigned identity: the descriptor's genesis (plain)
+    // ids in buffer order are both the live NodeIds of the founding
+    // membership and the genesis succession sequence. Every buffer id
+    // is an incarnation-0 id (the low band, validated above), which is
+    // what keeps a bumped identity's high band disjoint from it.
+    let genesis_order: Vec<NodeId> = members
+        .iter()
+        .filter(|member| !member.joined)
+        .map(|member| NodeId(member.id))
+        .collect();
+    let knobs = ViewChangeKnobs {
+        primary_timeout: PRIMARY_TIMEOUT_MS,
+        view_change_budget: MAX_DATAGRAM,
+    };
+    // The durable incarnation marker: first boot 0, a clean continue
+    // keeps the incarnation, a dirty boot bumps it (see the module's
+    // Incarnation note and `boot_marker`).
+    let state_path = PathBuf::from(state);
+    let incarnation = match boot_marker(&state_path) {
+        Ok(incarnation) => incarnation,
+        Err(_) => return Err(CONFIG),
+    };
+    let own_id = if incarnation == 0 {
+        NodeId(own_member.id)
+    } else {
+        let bumped = match (own_member.id as u64)
+            .checked_add(incarnation * INCARNATION_BASE)
+            .and_then(|value| u32::try_from(value).ok())
+        {
+            Some(value) => value,
+            None => return Err(CONFIG),
+        };
+        NodeId(bumped)
+    };
+    let reincarnate_from = (incarnation > 0).then_some(NodeId(own_member.id));
+    let replica = match (incarnation > 0, own_member.joined) {
+        // A bumped boot is a later life over the deployment's genesis —
+        // the honest Volatile equivalent of upstream's `restart_as`
+        // (`Replica::reopen` under the new own; there is no durable
+        // journal to carry forward). The node holds exactly the shared
+        // committed root and nothing else, fenced until (if ever) the
+        // stream proves currency.
+        (true, _) => match joiner_replica(own_id, genesis_order, knobs) {
+            Ok(replica) => replica,
+            Err(_) => return Err(CONFIG),
+        },
+        // A post-genesis member boots as a joiner: a later life over the
+        // deployment's genesis, fenced until the stream proves currency.
+        (false, true) => match joiner_replica(own_id, genesis_order, knobs) {
+            Ok(replica) => replica,
+            Err(_) => return Err(CONFIG),
+        },
+        (false, false) => {
+            match Replica::provision(
+                own_id,
+                genesis_order,
+                WeightedMajority,
+                SegmentedLog::new(),
+                Stability::Volatile,
+                knobs,
+            ) {
+                Ok(replica) => replica,
+                Err(_) => return Err(CONFIG),
+            }
+        }
+    };
+    let journal = if let Some(dir) = journal_dir {
+        match LockJournal::open(Path::new(dir), roll_bytes as u64) {
+            Ok(j) => Some(j),
+            Err(e) => {
+                eprintln!(
+                    "lunet-advisory-lock: journal open failed ({e}); \
+                     journaling disabled for this process"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let mut node = Node {
+        replica,
+        outputs: VecDeque::new(),
+        service: Service::default(),
+        replies: HashMap::new(),
+        pending: HashMap::new(),
+        last_tick: 0,
+        poisoned: false,
+        reincarnate_from,
+        journal,
+    };
+    // The bumped node's entry ticket (§4): the wire phase always
+    // follows the bump. The announcement is emitted at boot; every
+    // later fenced-boot drive re-announces (§8) while the node stays
+    // fenced. A failure here is a boot failure: the node is destroyed
+    // and the error reported, never half-announced.
+    if let Some(old) = node.reincarnate_from {
+        let result = node.drive(Input::Reincarnate { old });
+        if result != OK {
+            return Err(result);
+        }
+    }
+    // Clean start otherwise: provision leaves the node fenced
+    // `Recovering` with an empty output queue. There is no boot
+    // recovery handshake; the host's fenced-boot drive
+    // (`lunet_lock_node_recover`, a tick) and the primary's messages
+    // bring the node into the protocol.
+    Ok(node)
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lunet_lock_node_new(
     members_len: usize,
@@ -856,164 +1219,23 @@ pub unsafe extern "C" fn lunet_lock_node_new(
         let Ok(journal_dir_data) = (unsafe { bytes(journal_dir_len, journal_dir_data) }) else {
             return INVALID;
         };
-        // Member entries are "<u32-id>:<name>"; a post-genesis (joined)
-        // entry is "<u32-id>:<name>:j". The plain-entry order is the
-        // descriptor's genesis succession sequence and each id is the
-        // member's live NodeId.
-        let Some(members) = members_data
-            .split(|byte| *byte == 0)
-            .map(parse_member_entry)
-            .collect::<Option<Vec<_>>>()
-        else {
-            return CONFIG;
-        };
-        let Ok(own) = std::str::from_utf8(own_data) else {
-            return CONFIG;
-        };
-        let Ok(state) = std::str::from_utf8(state_data) else {
-            return CONFIG;
-        };
         let journal_dir = if journal_dir_data.is_empty() {
             None
         } else {
-            match std::str::from_utf8(journal_dir_data) {
-                Ok(s) if !s.is_empty() => Some(s),
-                _ => None,
-            }
+            std::str::from_utf8(journal_dir_data)
+                .ok()
+                .filter(|s| !s.is_empty())
         };
-        if state.is_empty()
-            || members.is_empty()
-            || members.len() > MAX_MEMBERS as usize
-            || members
-                .iter()
-                .any(|member| member.name.is_empty() || member.id as u64 > INCARNATION_LOW_MAX)
-        {
-            return CONFIG;
+        match catch_unwind(AssertUnwindSafe(|| {
+            node_from_parts(members_data, own_data, state_data, journal_dir, roll_bytes)
+        })) {
+            Ok(Ok(node)) => {
+                unsafe { *out = Box::into_raw(Box::new(node)).cast() };
+                OK
+            }
+            Ok(Err(code)) => code,
+            Err(_) => PANIC,
         }
-        let mut unique_ids = members.iter().map(|member| member.id).collect::<Vec<_>>();
-        unique_ids.sort_unstable();
-        unique_ids.dedup();
-        let mut unique_names = members
-            .iter()
-            .map(|member| member.name.clone())
-            .collect::<Vec<_>>();
-        unique_names.sort();
-        unique_names.dedup();
-        if unique_ids.len() != members.len() || unique_names.len() != members.len() {
-            return CONFIG;
-        }
-        let Some(own_member) = members.iter().find(|member| member.name == own) else {
-            return CONFIG;
-        };
-        // Explicit admin-assigned identity: the descriptor's genesis (plain)
-        // ids in buffer order are both the live NodeIds of the founding
-        // membership and the genesis succession sequence. Every buffer id
-        // is an incarnation-0 id (the low band, validated above), which is
-        // what keeps a bumped identity's high band disjoint from it.
-        let genesis_order: Vec<NodeId> = members
-            .iter()
-            .filter(|member| !member.joined)
-            .map(|member| NodeId(member.id))
-            .collect();
-        let knobs = ViewChangeKnobs {
-            primary_timeout: PRIMARY_TIMEOUT_MS,
-            view_change_budget: MAX_DATAGRAM,
-        };
-        // The durable incarnation marker: first boot 0, a clean continue
-        // keeps the incarnation, a dirty boot bumps it (see the module's
-        // Incarnation note and `boot_marker`).
-        let state_path = PathBuf::from(state);
-        let incarnation = match boot_marker(&state_path) {
-            Ok(incarnation) => incarnation,
-            Err(_) => return CONFIG,
-        };
-        let own_id = if incarnation == 0 {
-            NodeId(own_member.id)
-        } else {
-            let bumped = match (own_member.id as u64)
-                .checked_add(incarnation * INCARNATION_BASE)
-                .and_then(|value| u32::try_from(value).ok())
-            {
-                Some(value) => value,
-                None => return CONFIG,
-            };
-            NodeId(bumped)
-        };
-        let reincarnate_from = (incarnation > 0).then_some(NodeId(own_member.id));
-        let replica = match (incarnation > 0, own_member.joined) {
-            // A bumped boot is a later life over the deployment's genesis —
-            // the honest Volatile equivalent of upstream's `restart_as`
-            // (`Replica::reopen` under the new own; there is no durable
-            // journal to carry forward). The node holds exactly the shared
-            // committed root and nothing else, fenced until (if ever) the
-            // stream proves currency.
-            (true, _) => match joiner_replica(own_id, genesis_order, knobs) {
-                Ok(replica) => replica,
-                Err(_) => return CONFIG,
-            },
-            // A post-genesis member boots as a joiner: a later life over the
-            // deployment's genesis, fenced until the stream proves currency.
-            (false, true) => match joiner_replica(own_id, genesis_order, knobs) {
-                Ok(replica) => replica,
-                Err(_) => return CONFIG,
-            },
-            (false, false) => {
-                match Replica::provision(
-                    own_id,
-                    genesis_order,
-                    WeightedMajority,
-                    SegmentedLog::new(),
-                    Stability::Volatile,
-                    knobs,
-                ) {
-                    Ok(replica) => replica,
-                    Err(_) => return CONFIG,
-                }
-            }
-        };
-        let journal = if let Some(dir) = journal_dir {
-            match LockJournal::open(Path::new(dir), roll_bytes as u64) {
-                Ok(j) => Some(j),
-                Err(e) => {
-                    eprintln!(
-                        "lunet-advisory-lock: journal open failed ({e}); \
-                         journaling disabled for this process"
-                    );
-                    None
-                }
-            }
-        } else {
-            None
-        };
-        let mut node = Node {
-            replica,
-            outputs: VecDeque::new(),
-            service: Service::default(),
-            replies: HashMap::new(),
-            pending: HashMap::new(),
-            last_tick: 0,
-            poisoned: false,
-            reincarnate_from,
-            journal,
-        };
-        // The bumped node's entry ticket (§4): the wire phase always
-        // follows the bump. The announcement is emitted at boot; every
-        // later fenced-boot drive re-announces (§8) while the node stays
-        // fenced. A failure here is a boot failure: the node is destroyed
-        // and the error reported, never half-announced.
-        if let Some(old) = node.reincarnate_from {
-            let result = node.drive(Input::Reincarnate { old });
-            if result != OK {
-                return result;
-            }
-        }
-        // Clean start otherwise: provision leaves the node fenced
-        // `Recovering` with an empty output queue. There is no boot
-        // recovery handshake; the host's fenced-boot drive
-        // (`lunet_lock_node_recover`, a tick) and the primary's messages
-        // bring the node into the protocol.
-        unsafe { *out = Box::into_raw(Box::new(node)).cast() };
-        OK
     })
 }
 
@@ -1056,43 +1278,7 @@ pub unsafe extern "C" fn lunet_lock_node_request(
         let Ok(json) = (unsafe { bytes(json_len, json) }) else {
             return INVALID;
         };
-        if json.len() > MAX_DATAGRAM {
-            return TOO_LARGE;
-        }
-        let Ok(request) = Service::decode(json) else {
-            return CLIENT_JSON;
-        };
-        let (message_id, _, _) = request.ids();
-        let message_id = *message_id.as_bytes();
-        // Duplicate suppression (B2): a request whose reply is already cached
-        // replays the cached bytes without re-proposing or re-executing.
-        if let Some(cached) = node.replies.get(&message_id) {
-            node.outputs.push_back(Queued {
-                kind: OUTPUT_REPLY,
-                to: 0,
-                era: 0,
-                view: 0,
-                slot: 0,
-                message_id,
-                bytes: cached.clone(),
-            });
-            return OK;
-        }
-        if json.len() + PREPARE_OVERHEAD > MAX_DATAGRAM {
-            return TOO_LARGE;
-        }
-        let id = operation_id(message_id);
-        node.pending.insert(id, message_id);
-        let result = node.drive(Input::Propose {
-            operation: Operation {
-                id,
-                payload: json.to_vec().into_boxed_slice(),
-            },
-        });
-        if result != OK {
-            node.pending.remove(&id);
-        }
-        result
+        node.request(json)
     })
 }
 
@@ -1135,34 +1321,7 @@ pub unsafe extern "C" fn lunet_lock_node_reconfigure(
         let Some(node) = (unsafe { node.cast::<Node>().as_mut() }) else {
             return INVALID;
         };
-        let position = if op == RECONFIGURE_JOIN && position == POSITION_APPEND {
-            let len = node
-                .replica
-                .progress()
-                .config()
-                .current()
-                .config
-                .order()
-                .len();
-            match u32::try_from(len) {
-                Ok(len) => len,
-                Err(_) => return SERVICE,
-            }
-        } else {
-            position
-        };
-        let system = match op {
-            RECONFIGURE_JOIN => SystemOperation::Join {
-                node: NodeId(member),
-                position,
-            },
-            RECONFIGURE_INCREMENT => SystemOperation::Increment(NodeId(member)),
-            RECONFIGURE_DECREMENT => SystemOperation::Decrement(NodeId(member)),
-            RECONFIGURE_LEAVE => SystemOperation::Leave(NodeId(member)),
-            _ => return INVALID,
-        };
-        let pivot = node.derived_pivot(&system);
-        node.drive(Input::Reconfigure { op: system, pivot })
+        node.reconfigure(op, member, position)
     })
 }
 
@@ -1180,25 +1339,7 @@ pub unsafe extern "C" fn lunet_lock_node_receive(
         let Ok(data) = (unsafe { bytes(len, data) }) else {
             return INVALID;
         };
-        if data.len() > MAX_DATAGRAM {
-            return TOO_LARGE;
-        }
-        // W5: `Incomplete` means "more bytes could make this a message" and
-        // `Malformed` means none could; over datagram transport there is no
-        // reassembly, so both are a bad datagram from this host's view.
-        let message = match Message::unpack_from(data) {
-            Ok(message) => message,
-            Err(UnpackError::Incomplete { .. } | UnpackError::Malformed(_)) => {
-                return VRR_MESSAGE;
-            }
-        };
-        if !valid_message_payloads(&message) {
-            return VRR_MESSAGE;
-        }
-        node.drive(Input::Peer {
-            from: NodeId(from),
-            message,
-        })
+        node.receive(from, data)
     })
 }
 

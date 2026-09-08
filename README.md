@@ -57,6 +57,20 @@ On a local Colima Docker daemon, run the same dynamic-client simulation against
 three stable containers with `make docker-simulation`. It uses a plain Docker
 build and named Docker volumes—never BuildKit or bind mounts.
 
+## The embedded-sequencer demo
+
+`examples/lease-sequencer` is the Corfu-style downstream design draft: six
+storage nodes, two per three datacenters, each process embedding the
+advisory-lock adapter directly in Rust (`Node::open`, no C ABI, no Lunet)
+and binding a UDP peer port plus a TCP client NDJSON port. One node holds
+the sequencer lease (500 ms, renewed at 250 ms); every other node polls the
+lease and re-polls at the reported expiry plus `rand()*100 ms`. The stability
+check (`examples/lease-sequencer/run.sh`) drives the three joins and two
+increments, asserts the renewal and poll cadences from the per-node logs,
+and runs three SIGKILL/restart cycles asserting the lease steal and the
+reincarnation rejoin. See that directory's README for the downstream
+consumption story.
+
 ## The ordering core
 
 The core is vendored as the `ext/uvrr-core` git submodule on the branch

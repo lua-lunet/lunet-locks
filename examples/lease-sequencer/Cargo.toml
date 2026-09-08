@@ -1,0 +1,10 @@
+[package]
+name = "lease-sequencer"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+
+[dependencies]
+lunet-advisory-lock = { path = "../../ext/advisory_lock" }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }

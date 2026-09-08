@@ -1,0 +1,11 @@
+# The downstream consumption story in one file: six storage nodes, two per
+# datacenter, one UDP peer port each (the TCP client port is the peer port
+# + 1000, assigned by run.sh). Genesis lines (one per DC) are the founding
+# membership in line order; the second node of each DC joins the live
+# cluster through the join verb and is appended after the genesis lines.
+{"id":1,"name":"dc1-node1","host":"127.0.0.1","port":41101,"genesis":true}
+{"id":2,"name":"dc2-node1","host":"127.0.0.1","port":41102,"genesis":true}
+{"id":3,"name":"dc3-node1","host":"127.0.0.1","port":41103,"genesis":true}
+{"id":4,"name":"dc1-node2","host":"127.0.0.1","port":41104,"genesis":false}
+{"id":5,"name":"dc2-node2","host":"127.0.0.1","port":41105,"genesis":false}
+{"id":6,"name":"dc3-node2","host":"127.0.0.1","port":41106,"genesis":false}
