@@ -100,9 +100,10 @@ simulation-test: tools/lease_failover_sim.rs
 simulation: lunet-runtime build $(SIM_BIN)
 	SIM_ROOT=$(CURDIR) LUNET_RUN=$(abspath $(LUNET_RUN)) $(SIM_BIN) --duration $(SIM_DURATION)
 
-# Follow vrr-core's conventional plain multi-stage `docker build` model. A
-# disposable vendored context avoids BuildKit SSH mounts while retaining the
-# exact private dependency revision.
+# Plain multi-stage `docker build`. The prepared context carries the vendored
+# dependency sources and the ext/uvrr-core submodule source (the manifest's
+# [patch] section resolves vrr-core to the submodule), so nothing is fetched
+# over the network inside Docker and no BuildKit mounts are needed.
 DOCKER_IMAGE ?= lunet-advisory-lock
 DOCKER_PLATFORM ?= native
 docker-build: build lunet-runtime

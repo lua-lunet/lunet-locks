@@ -43,3 +43,45 @@ successful (`released: true`, `lease: null`). A mismatched live lease returns
 
 All lease fields are unsigned 64-bit JSON integers and are parsed in Rust, not
 through LuaJIT numbers.
+
+## Membership administration
+
+Four admin verbs propose live membership changes over the same TCP channel:
+`join`, `increment`, `decrement`, and `leave`. They are operator-trusted at
+exactly the same level as the lock verbs — the TCP client channel has no
+separate authentication, and any client that can acquire locks can propose
+membership changes to the leader.
+
+A `join` names the new member's id, name, and client-or-peer endpoint; the
+other three name only the id:
+
+```json
+{"action":"join","message_id":"03030303-0303-0303-0303-030303030303","id":404,"name":"n4","endpoint":"127.0.0.1:27104"}
+{"action":"increment","message_id":"03030303-0303-0303-0303-030303030304","id":404}
+{"action":"decrement","message_id":"03030303-0303-0303-0303-030303030305","id":404}
+{"action":"leave","message_id":"03030303-0303-0303-0303-030303030306","id":404}
+```
+
+A non-leader replica forwards a verb through the ordinary redirect machinery.
+The leader drives the reconfiguration through the native adapter and answers
+with one of three acknowledgment shapes:
+
+- `{"action":"join","id":404,"accepted":true}` — the establishing operation
+  committed and the leader's era advanced. The acknowledgment therefore
+  arrives only after the commit and can take longer than a lock operation;
+  a stop-the-world era entry in particular awaits the ordinary fence.
+- `{"action":"leave","id":404,"accepted":false}` — the core refused the
+  reconfiguration (fold gate, transition-outstanding gate); nothing entered
+  the log.
+- `{"action":"leave","id":404,"accepted":false,"reason":"deadline"}` — the
+  establishing commit did not land within the client deadline. The verb may
+  still commit later; re-drive with a fresh `message_id`. Duplicates of the
+  timed-out verb replay this exact line from the leader's dedup cache, and
+  every duplicate of any verb replays its first outcome.
+
+The operator's sequences follow the weight rules: add a member with `join`
+(the member enters at weight 0, a learner) then `increment` (the learner
+becomes a voter); remove a member with `decrement` (the voter returns to
+weight 0), wait for that era to commit, then `leave` — a leave of a member
+above weight 0 is refused. Ids are the deployment descriptor's
+admin-assigned, never-recycled member ids.
