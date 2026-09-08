@@ -2954,7 +2954,7 @@ mod tests {
                 (message.header.view.era.0, message.header.view.view.0)
             );
             assert_eq!(
-                u64::from(slot_hi) << 32 | u64::from(slot_lo),
+                (u64::from(slot_hi) << 32) | u64::from(slot_lo),
                 message.header.slot.0
             );
             assert!(matches!(message.body, Body::Commit { .. }));
