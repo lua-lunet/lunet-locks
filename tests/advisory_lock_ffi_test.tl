@@ -124,14 +124,16 @@ tested.test(
                     .. tostring(node:leader_for_view(status.era, status.view))
                     .. ":"
                     .. tostring(MEMBER_IDS[index])
+                    .. ":"
+                    .. tostring(node:own_id())
             )
         end
         close_cluster(nodes)
         tested.assert(
             {
-                given = "three nodes booted over temp nonce files and pumped quiet",
-                should = "all reach normal in era 1 view 0 behind member id 101",
-                expected = "normal:1:0:101:101:101|normal:1:0:101:101:202|normal:1:0:101:101:303",
+                given = "three nodes booted over temp state files and pumped quiet",
+                should = "all reach normal in era 1 view 0 behind member id 101, each reporting its own descriptor identity",
+                expected = "normal:1:0:101:101:101:101|normal:1:0:101:101:202:202|normal:1:0:101:101:303:303",
                 actual = table.concat(summary, "|"),
             }
         )

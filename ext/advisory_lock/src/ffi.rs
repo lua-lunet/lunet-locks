@@ -2,26 +2,32 @@
 //! (vrr-core @ 0fc6380).
 //!
 //! Concrete core: `Replica<SegmentedLog, WeightedMajority>` running
-//! `Stability::Volatile` — nothing is persisted but the boot nonce file, so
-//! restart is `Replica::provision` over an empty journal. The core has no
-//! amnesia-recovery protocol: a fenced boot starts clean and the ordinary
-//! bootstrap machinery (tick self-promotion of the genesis primary, view
-//! adoption on the primary's messages) brings the node into the protocol.
-//! `lunet_lock_node_recover` therefore drives that bootstrap tick while the
-//! node is fenced; the full restart story (identity bump +
-//! `Input::Reincarnate`) is future work and the adapter does not pretend
-//! otherwise.
+//! `Stability::Volatile` — nothing is persisted but the boot state file, so
+//! a same-identity clean restart does not exist in this embedder: every
+//! restart of a process that has been running is DIRTY. The restart story is
+//! upstream's Crash-Stop-Self-Evict protocol
+//! (`src/replica/reincarnation.rs`): the durable state file is the
+//! incarnation marker (the four-superblock discipline collapsed to one
+//! copy), a dirty boot bumps the identity, the bumped node drives
+//! `Input::Reincarnate { old }` — the `Reincarnation(old, new)` entry
+//! ticket — and the stable leader computes `forced_steps` idempotently from
+//! the committed configuration, proposing each remaining era's batch
+//! through the ordinary reconfiguration pipeline, continued tick-driven,
+//! until the new identity sits at weight 1 in the old succession position
+//! and the old identity is evicted. The reincarnated node reopens over the
+//! deployment's genesis (the only true shared history a Volatile process
+//! has) and acquires nothing beyond it — the learner's streamed catch-up is
+//! upstream §10 future work — so it replays no lock state it did not
+//! commit, exactly like the joiner.
 //!
 //! Adapter policies the core deliberately does not own:
 //!
 //! - **Tick clock.** The adapter owns the tick clock: a monotonic
 //!   nondecreasing milliseconds-since-Unix-epoch value, clamped per node so
 //!   a clock regression never reaches the core. ABI functions take no `at`
-//!   parameter. Fenced-boot drives take their tick from the durable nonce
-//!   file (`next_nonce`, fsync+rename+dir-sync) — the nonce no longer
-//!   authorizes a recovery protocol (the core has none); it remains the
-//!   per-node durable tick source so per-node monotonicity holds across
-//!   the two sources (S4 discipline carried over).
+//!   parameter. Ticks come from the ms clock only; the durable state file
+//!   is the incarnation marker, not a tick source (the old nonce-as-tick
+//!   role is retired with the amnesia protocol it served).
 //! - **Identity.** Membership is the admin-assigned deployment descriptor:
 //!   the member buffer carries NUL-separated `<u32-id>:<name>` entries, in
 //!   the descriptor's line order. Each id is the member's live `NodeId`
@@ -43,6 +49,31 @@
 //!   the era-1 traffic its genesis table covers and drops everything past it
 //!   by name — the same boundary upstream's own learner corpus states
 //!   (§10 acquisition, future work). The joiner fabricates nothing.
+//! - **Incarnation (the restart story).** The durable state file is the
+//!   incarnation marker: one line `<incarnation> <flushed|unflushed>`,
+//!   written atomically (fsync+rename+dir-sync). The boot classifies
+//!   upstream-style (`SuperblockCopies::classify`): marker `flushed` -> a
+//!   clean continue under the same incarnation; `unflushed` (the running
+//!   sentinel every operating process leaves behind) -> DIRTY -> the
+//!   incarnation bumps and the marker is rewritten `(new, flushed)` — the
+//!   bump's commitment — then `(new, unflushed)` as operating begins. A
+//!   bumped identity is derived deterministically, without operator
+//!   intervention: descriptor ids are incarnation-0 ids in the low band
+//!   `[0, 16777214]`, and the k-th incarnation's identity is
+//!   `low + k * 2^24` — a unique high-band id that can never alias a
+//!   descriptor id (the low band is the whole descriptor space), never
+//!   overflow u32, and never reach the reserved LEADER_UNKNOWN value
+//!   `u32::MAX` (descriptor id 16777215 is forbidden precisely because
+//!   `255 * 2^24 + 16777215 = 4294967295`); the bump refuses at exhaustion
+//!   (incarnation 255), mirroring upstream's checked `Incarnation::bump`.
+//!   A bumped boot reopens the reincarnation way — a later life over the
+//!   deployment's genesis, the honest Volatile equivalent of upstream's
+//!   `restart_as` (`reopen` under the new `own`; there is no durable
+//!   journal to carry forward) — and drives `Input::Reincarnate { old }`
+//!   immediately and on every later fenced-boot drive (the §8 re-announce;
+//!   the core self-gates: a member already voting at weight ≥ 1 has
+//!   nothing to announce). `lunet_lock_node_own_id` reports the live
+//!   identity so the host can compare leaders against it after a bump.
 //! - **Reconfiguration.** `lunet_lock_node_reconfigure` drives
 //!   `Input::Reconfigure { op, pivot }` (Join at weight 0 / Increment /
 //!   Leave at weight 0) on the current primary through the ordinary
@@ -160,6 +191,35 @@ const PRIMARY_TIMEOUT_MS: u64 = 5000;
 /// leader-for-view report in that case.
 const LEADER_UNKNOWN: u32 = u32::MAX;
 
+/// The descriptor id band's top: incarnation-0 ids live in
+/// `[0, INCARNATION_LOW_MAX]`; the value `INCARNATION_LOW_MAX + 1` is
+/// forbidden because at incarnation 255 it would derive the reserved
+/// `LEADER_UNKNOWN` value (see the module's Incarnation note).
+const INCARNATION_LOW_MAX: u64 = (1u64 << 24) - 2; // 16777214
+
+/// The bump base: the k-th incarnation's identity is
+/// `low + k * INCARNATION_BASE`, placing every bumped identity in the
+/// high band `[2^24, u32::MAX - 1]`, disjoint from the whole descriptor
+/// space by construction.
+const INCARNATION_BASE: u64 = 1u64 << 24;
+
+/// The highest incarnation a bump may produce. The next one would overflow
+/// the band arithmetic; the bump refuses instead of wrapping a superseded
+/// identity into circulation (upstream `Incarnation::bump`,
+/// `src/replica/reincarnation.rs:413-417`).
+const INCARNATION_MAX: u64 = 255;
+
+/// A superblock copy's marker, upstream-style
+/// (`src/replica/reincarnation.rs:423-430`): `Flushed` = "the durable
+/// state is a self-consistent checkpoint of this identity, written at the
+/// bump and at a clean shutdown"; `Unflushed` = the running sentinel, left
+/// behind by every process that has been operating on volatile state.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Marker {
+    Flushed,
+    Unflushed,
+}
+
 struct Queued {
     kind: u32,
     to: u32,
@@ -181,9 +241,12 @@ pub struct Node {
     /// Operations proposed through this node's `request` entry and not yet
     /// applied: `OperationId` -> message_id bytes. Only these get replies.
     pending: HashMap<OperationId, [u8; 16]>,
-    nonce_path: PathBuf,
     last_tick: u64,
     poisoned: bool,
+    /// The superseded identity when this node booted a DIRTY restart: the
+    /// bumped node re-announces `Reincarnation(old, new)` on every
+    /// fenced-boot drive (§8). `None` for an incarnation-0 boot.
+    reincarnate_from: Option<NodeId>,
     /// Append-only lock-event journal. `None` when journaling is disabled
     /// (empty journal_dir at construction) or after a journal error.
     journal: Option<LockJournal>,
@@ -191,19 +254,12 @@ pub struct Node {
 
 impl Node {
     /// The next monotonic tick from the adapter-owned ms clock (never
-    /// decreasing per node, even across a wall-clock regression).
+    /// decreasing per node, even across a wall-clock regression). Ticks
+    /// come from the clock only — the durable state file is the incarnation
+    /// marker, not a tick source.
     fn tick(&mut self) -> Result<u64, i32> {
         let now = unix_millis()?;
         self.last_tick = self.last_tick.max(now);
-        Ok(self.last_tick)
-    }
-
-    /// The next durable fenced-boot tick (S4 discipline: the nonce is the
-    /// tick source), clamped into the same monotone sequence as the ms
-    /// clock.
-    fn recovery_tick(&mut self) -> Result<u64, i32> {
-        let nonce = next_nonce(&self.nonce_path).map_err(|_| CONFIG)?;
-        self.last_tick = self.last_tick.max(nonce);
         Ok(self.last_tick)
     }
 
@@ -419,19 +475,23 @@ impl Node {
     /// classic `Input::Recover` exchange was removed upstream): a fenced
     /// node starts clean, and the only protocol lever is `Input::Tick` —
     /// the genesis primary self-promotes on it, and the primary's messages
-    /// adopt the fenced backups. The durable nonce remains the tick source
-    /// so the drive stays monotone across restarts. The full restart story
-    /// (identity bump + `Input::Reincarnate`) is future work; this drive
-    /// never fabricates recovered state.
+    /// adopt the fenced backups. A bumped node (a dirty restart) re-drives
+    /// its `Input::Reincarnate { old }` announcement first, on every fenced
+    /// drive, until it stops being fenced — upstream's §8 re-announce; the
+    /// core self-gates the announcement (a member already voting at
+    /// weight >= 1 has nothing to announce). The drive never fabricates
+    /// recovered state.
     fn recover(&mut self) -> i32 {
         if self.poisoned {
             return SERVICE;
         }
-        let at = match self.recovery_tick() {
-            Ok(at) => at,
-            Err(error) => return error,
-        };
-        self.drive_at(at, Input::Tick)
+        if let Some(old) = self.reincarnate_from {
+            let result = self.drive(Input::Reincarnate { old });
+            if result != OK {
+                return result;
+            }
+        }
+        self.drive(Input::Tick)
     }
 
     /// The current view's primary as a positional index, via the public
@@ -627,33 +687,41 @@ fn unix_millis() -> Result<u64, i32> {
         .and_then(|duration| u64::try_from(duration.as_millis()).map_err(|_| SERVICE))
 }
 
-fn initialize_nonce(path: &Path) -> std::io::Result<bool> {
-    match OpenOptions::new().write(true).create_new(true).open(path) {
-        Ok(mut file) => {
-            file.write_all(b"0\n")?;
-            file.sync_all()?;
-            sync_parent(path)?;
-            Ok(false)
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            read_nonce(path)?;
-            Ok(true)
-        }
-        Err(error) => Err(error),
+/// The marker file's on-disk line: `<incarnation> <flushed|unflushed>`.
+fn marker_line(incarnation: u64, marker: Marker) -> String {
+    let marker_text = match marker {
+        Marker::Flushed => "flushed",
+        Marker::Unflushed => "unflushed",
+    };
+    format!("{incarnation} {marker_text}\n")
+}
+
+/// Parses the marker line. Anything else is an unreadable marker: the boot
+/// refuses rather than guessing an identity.
+fn parse_marker(text: &str) -> Option<(u64, Marker)> {
+    let line = text.trim();
+    let (incarnation_text, marker_text) = line.split_once(' ')?;
+    let incarnation = incarnation_text.parse::<u64>().ok()?;
+    if incarnation > INCARNATION_MAX {
+        return None;
     }
+    let marker = match marker_text {
+        "flushed" => Marker::Flushed,
+        "unflushed" => Marker::Unflushed,
+        _ => return None,
+    };
+    Some((incarnation, marker))
 }
 
-fn read_nonce(path: &Path) -> std::io::Result<u64> {
-    fs::read_to_string(path)?
-        .trim()
-        .parse()
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid nonce"))
+fn read_marker(path: &Path) -> std::io::Result<(u64, Marker)> {
+    parse_marker(&fs::read_to_string(path)?)
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid marker"))
 }
 
-fn next_nonce(path: &Path) -> std::io::Result<u64> {
-    let nonce = read_nonce(path)?
-        .checked_add(1)
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "nonce overflow"))?;
+/// One durable marker write: fsync+rename+dir-sync (POSIX crash
+/// consistency — persist the new directory entry, not just the file's
+/// data; Windows no-ops the directory sync, see `sync_dir`).
+fn write_marker(path: &Path, incarnation: u64, marker: Marker) -> std::io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let base = path.file_name().unwrap_or_default();
     let unique = SystemTime::now()
@@ -668,7 +736,7 @@ fn next_nonce(path: &Path) -> std::io::Result<u64> {
         .create_new(true)
         .open(&temporary)?;
     let result = (|| {
-        writeln!(file, "{nonce}")?;
+        file.write_all(marker_line(incarnation, marker).as_bytes())?;
         file.sync_all()?;
         fs::rename(&temporary, path)?;
         sync_parent(path)
@@ -676,7 +744,48 @@ fn next_nonce(path: &Path) -> std::io::Result<u64> {
     if result.is_err() {
         let _ = fs::remove_file(&temporary);
     }
-    result.map(|_| nonce)
+    result
+}
+
+/// Boot-time marker discipline (upstream `SuperblockCopies::restart`,
+/// `src/replica/reincarnation.rs:526-541`, collapsed to one durable copy):
+/// a missing file is a first boot at incarnation 0, left `unflushed` (the
+/// running sentinel). A `flushed` marker is a clean continue: same
+/// incarnation, rewritten `unflushed` as operating begins. An `unflushed`
+/// marker is DIRTY: the incarnation bumps (refusing at exhaustion), the
+/// marker is rewritten `(new, flushed)` — the bump's commitment — and then
+/// `(new, unflushed)` as operating begins.
+fn boot_marker(path: &Path) -> Result<u64, i32> {
+    match OpenOptions::new().write(true).create_new(true).open(path) {
+        Ok(mut file) => {
+            let result = (|| {
+                file.write_all(marker_line(0, Marker::Unflushed).as_bytes())?;
+                file.sync_all()?;
+                sync_parent(path)
+            })();
+            result.map_err(|_| CONFIG)?;
+            Ok(0)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let (incarnation, marker) = read_marker(path).map_err(|_| CONFIG)?;
+            match marker {
+                Marker::Flushed => {
+                    write_marker(path, incarnation, Marker::Unflushed).map_err(|_| CONFIG)?;
+                    Ok(incarnation)
+                }
+                Marker::Unflushed => {
+                    let bumped = incarnation
+                        .checked_add(1)
+                        .filter(|next| *next <= INCARNATION_MAX)
+                        .ok_or(CONFIG)?;
+                    write_marker(path, bumped, Marker::Flushed).map_err(|_| CONFIG)?;
+                    write_marker(path, bumped, Marker::Unflushed).map_err(|_| CONFIG)?;
+                    Ok(bumped)
+                }
+            }
+        }
+        Err(_) => Err(CONFIG),
+    }
 }
 
 fn sync_parent(path: &Path) -> std::io::Result<()> {
@@ -771,7 +880,9 @@ pub unsafe extern "C" fn lunet_lock_node_new(
         if state.is_empty()
             || members.is_empty()
             || members.len() > MAX_MEMBERS as usize
-            || members.iter().any(|member| member.name.is_empty())
+            || members
+                .iter()
+                .any(|member| member.name.is_empty() || member.id as u64 > INCARNATION_LOW_MAX)
         {
             return CONFIG;
         }
@@ -792,7 +903,9 @@ pub unsafe extern "C" fn lunet_lock_node_new(
         };
         // Explicit admin-assigned identity: the descriptor's genesis (plain)
         // ids in buffer order are both the live NodeIds of the founding
-        // membership and the genesis succession sequence.
+        // membership and the genesis succession sequence. Every buffer id
+        // is an incarnation-0 id (the low band, validated above), which is
+        // what keeps a bumped identity's high band disjoint from it.
         let genesis_order: Vec<NodeId> = members
             .iter()
             .filter(|member| !member.joined)
@@ -802,31 +915,58 @@ pub unsafe extern "C" fn lunet_lock_node_new(
             primary_timeout: PRIMARY_TIMEOUT_MS,
             view_change_budget: MAX_DATAGRAM,
         };
-        let own_id = NodeId(own_member.id);
-        let replica = if own_member.joined {
+        // The durable incarnation marker: first boot 0, a clean continue
+        // keeps the incarnation, a dirty boot bumps it (see the module's
+        // Incarnation note and `boot_marker`).
+        let state_path = PathBuf::from(state);
+        let incarnation = match boot_marker(&state_path) {
+            Ok(incarnation) => incarnation,
+            Err(_) => return CONFIG,
+        };
+        let own_id = if incarnation == 0 {
+            NodeId(own_member.id)
+        } else {
+            let bumped = match (own_member.id as u64)
+                .checked_add(incarnation * INCARNATION_BASE)
+                .and_then(|value| u32::try_from(value).ok())
+            {
+                Some(value) => value,
+                None => return CONFIG,
+            };
+            NodeId(bumped)
+        };
+        let reincarnate_from = (incarnation > 0).then_some(NodeId(own_member.id));
+        let replica = match (incarnation > 0, own_member.joined) {
+            // A bumped boot is a later life over the deployment's genesis —
+            // the honest Volatile equivalent of upstream's `restart_as`
+            // (`Replica::reopen` under the new own; there is no durable
+            // journal to carry forward). The node holds exactly the shared
+            // committed root and nothing else, fenced until (if ever) the
+            // stream proves currency.
+            (true, _) => match joiner_replica(own_id, genesis_order, knobs) {
+                Ok(replica) => replica,
+                Err(_) => return CONFIG,
+            },
             // A post-genesis member boots as a joiner: a later life over the
             // deployment's genesis, fenced until the stream proves currency.
-            match joiner_replica(own_id, genesis_order, knobs) {
+            (false, true) => match joiner_replica(own_id, genesis_order, knobs) {
                 Ok(replica) => replica,
                 Err(_) => return CONFIG,
-            }
-        } else {
-            match Replica::provision(
-                own_id,
-                genesis_order,
-                WeightedMajority,
-                SegmentedLog::new(),
-                Stability::Volatile,
-                knobs,
-            ) {
-                Ok(replica) => replica,
-                Err(_) => return CONFIG,
+            },
+            (false, false) => {
+                match Replica::provision(
+                    own_id,
+                    genesis_order,
+                    WeightedMajority,
+                    SegmentedLog::new(),
+                    Stability::Volatile,
+                    knobs,
+                ) {
+                    Ok(replica) => replica,
+                    Err(_) => return CONFIG,
+                }
             }
         };
-        let nonce_path = PathBuf::from(state);
-        if initialize_nonce(&nonce_path).is_err() {
-            return CONFIG;
-        }
         let journal = if let Some(dir) = journal_dir {
             match LockJournal::open(Path::new(dir), roll_bytes as u64) {
                 Ok(j) => Some(j),
@@ -841,21 +981,33 @@ pub unsafe extern "C" fn lunet_lock_node_new(
         } else {
             None
         };
-        let node = Node {
+        let mut node = Node {
             replica,
             outputs: VecDeque::new(),
             service: Service::default(),
             replies: HashMap::new(),
             pending: HashMap::new(),
-            nonce_path,
             last_tick: 0,
             poisoned: false,
+            reincarnate_from,
             journal,
         };
-        // Clean start: provision leaves the node fenced `Recovering` with an
-        // empty output queue. There is no boot recovery handshake any more;
-        // the host's fenced-boot drive (`lunet_lock_node_recover`, a tick)
-        // and the primary's messages bring the node into the protocol.
+        // The bumped node's entry ticket (§4): the wire phase always
+        // follows the bump. The announcement is emitted at boot; every
+        // later fenced-boot drive re-announces (§8) while the node stays
+        // fenced. A failure here is a boot failure: the node is destroyed
+        // and the error reported, never half-announced.
+        if let Some(old) = node.reincarnate_from {
+            let result = node.drive(Input::Reincarnate { old });
+            if result != OK {
+                return result;
+            }
+        }
+        // Clean start otherwise: provision leaves the node fenced
+        // `Recovering` with an empty output queue. There is no boot
+        // recovery handshake; the host's fenced-boot drive
+        // (`lunet_lock_node_recover`, a tick) and the primary's messages
+        // bring the node into the protocol.
         unsafe { *out = Box::into_raw(Box::new(node)).cast() };
         OK
     })
@@ -868,6 +1020,23 @@ pub unsafe extern "C" fn lunet_lock_node_free(node: *mut c_void) {
             drop(Box::from_raw(node.cast::<Node>()));
         }));
     }
+}
+
+/// The node's live identity: the descriptor id at incarnation 0, the
+/// bumped high-band id after a dirty restart. The host compares leaders
+/// against it (`status.leader == own_id`) — after a bump the descriptor
+/// row still names the superseded id, so the live value is the only honest
+/// self-check.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lunet_lock_node_own_id(node: *mut c_void, out_id: *mut u32) -> i32 {
+    guarded(|| {
+        if node.is_null() || out_id.is_null() {
+            return INVALID;
+        }
+        let node = unsafe { &mut *node.cast::<Node>() };
+        unsafe { *out_id = node.replica.own().0 };
+        OK
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -1174,14 +1343,44 @@ mod tests {
     }
 
     #[test]
-    fn recovery_nonces_are_created_then_durably_incremented() {
-        let path = state_path("nonce");
-        assert!(!initialize_nonce(&path).expect("first boot creates nonce"));
-        assert_eq!(fs::read_to_string(&path).unwrap(), "0\n");
-        assert_eq!(next_nonce(&path).unwrap(), 1);
-        assert_eq!(fs::read_to_string(&path).unwrap(), "1\n");
-        assert_eq!(next_nonce(&path).unwrap(), 2);
-        assert_eq!(fs::read_to_string(&path).unwrap(), "2\n");
+    fn incarnation_marker_is_created_then_bumps_and_continues() {
+        let path = state_path("marker");
+        assert_eq!(boot_marker(&path).expect("first boot"), 0);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "0 unflushed\n");
+        // A restart over the running sentinel is dirty: the incarnation
+        // bumps and the marker is rewritten (new, flushed), then
+        // (new, unflushed) as operating begins.
+        assert_eq!(boot_marker(&path).expect("dirty boot bumps"), 1);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "1 unflushed\n");
+        assert_eq!(boot_marker(&path).expect("second bump"), 2);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "2 unflushed\n");
+        // A clean checkpoint (flushed) continues under the same incarnation:
+        // the running sentinel replaces it, the identity never regresses.
+        write_marker(&path, 7, Marker::Flushed).unwrap();
+        assert_eq!(boot_marker(&path).expect("clean continue"), 7);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "7 unflushed\n");
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn incarnation_marker_refuses_malformed_and_exhausted_identities() {
+        let path = state_path("marker-bad");
+        fs::write(&path, "not a marker\n").unwrap();
+        assert_eq!(boot_marker(&path), Err(CONFIG));
+        fs::write(&path, "999 unflushed\n").unwrap();
+        assert_eq!(boot_marker(&path), Err(CONFIG));
+        fs::write(&path, "3 stale\n").unwrap();
+        assert_eq!(boot_marker(&path), Err(CONFIG));
+        // The bump refuses at exhaustion instead of wrapping a superseded
+        // identity into circulation (upstream `Incarnation::bump`,
+        // reincarnation.rs:413-417).
+        fs::write(&path, format!("{} unflushed\n", INCARNATION_MAX)).unwrap();
+        assert_eq!(boot_marker(&path), Err(CONFIG));
+        fs::write(&path, format!("{} flushed\n", INCARNATION_MAX)).unwrap();
+        assert_eq!(
+            boot_marker(&path).expect("the exhausted identity still continues"),
+            255
+        );
         fs::remove_file(path).unwrap();
     }
 
@@ -1190,8 +1389,13 @@ mod tests {
     const TEST_IDS: [u32; 3] = [10, 20, 30];
 
     fn provision(name: &str, own: u32, members: u32) -> Node {
-        let nonce_path = state_path(name);
-        initialize_nonce(&nonce_path).expect("nonce file");
+        provision_at(&state_path(name), own, members)
+    }
+
+    /// A provisioned node over an explicit state path, so the reincarnation
+    /// test can restart the same durable marker file through the real ABI.
+    fn provision_at(path: &Path, own: u32, members: u32) -> Node {
+        boot_marker(path).expect("marker file");
         let replica = Replica::provision(
             NodeId(own),
             TEST_IDS[..members as usize]
@@ -1213,9 +1417,9 @@ mod tests {
             service: Service::default(),
             replies: HashMap::new(),
             pending: HashMap::new(),
-            nonce_path,
             last_tick: 0,
             poisoned: false,
+            reincarnate_from: None,
             journal: None,
         }
     }
@@ -1368,8 +1572,7 @@ mod tests {
     /// `Recovering`, addressed, and outside every configuration until a
     /// committed `Join` admits it.
     fn provision_joiner(name: &str, own: u32, genesis: &[u32]) -> Node {
-        let nonce_path = state_path(name);
-        initialize_nonce(&nonce_path).expect("nonce file");
+        boot_marker(&state_path(name)).expect("marker file");
         let replica = match joiner_replica(
             NodeId(own),
             genesis.iter().map(|id| NodeId(*id)).collect(),
@@ -1387,9 +1590,9 @@ mod tests {
             service: Service::default(),
             replies: HashMap::new(),
             pending: HashMap::new(),
-            nonce_path,
             last_tick: 0,
             poisoned: false,
+            reincarnate_from: None,
             journal: None,
         }
     }
@@ -2373,6 +2576,431 @@ mod tests {
                 lunet_lock_node_new(
                     b"ab:n1\x0020:n2\x0030:n3".len(),
                     b"ab:n1\x0020:n2\x0030:n3".as_ptr(),
+                    b"n1".len(),
+                    b"n1".as_ptr(),
+                    state_bytes.len(),
+                    state_bytes.as_ptr(),
+                    0,
+                    ptr::null(),
+                    0,
+                    &mut handle,
+                )
+            },
+            CONFIG
+        );
+        assert!(handle.is_null());
+    }
+
+    /// The bumped node of the reincarnation test: member id 30 restarted
+    /// dirty, its incarnation bumped to 1, identity derived into the high
+    /// band (`30 + 2^24`).
+    const BUMPED_ID: u32 = 30 + (1 << 24);
+
+    /// Routes like `route_until_quiet` but drops sends addressed to `dead`
+    /// — the dead old-identity socket, undeliverable exactly as the live
+    /// transport drops a datagram whose id has no endpoint row.
+    fn route_until_quiet_drop(nodes: &mut [Node], ids: &[u32], dead: u32) {
+        loop {
+            let mut moved = false;
+            for source in 0..nodes.len() {
+                let drained: VecDeque<Queued> = std::mem::take(&mut nodes[source].outputs);
+                let (sends, kept): (Vec<Queued>, Vec<Queued>) = drained
+                    .into_iter()
+                    .partition(|output| output.kind == OUTPUT_SEND);
+                nodes[source].outputs = kept.into_iter().collect();
+                for send in sends {
+                    if send.to == dead {
+                        continue;
+                    }
+                    moved = true;
+                    deliver_hop(nodes, ids, source, send);
+                }
+            }
+            if !moved {
+                return;
+            }
+        }
+    }
+
+    /// Drives a suspicion fence on `driver` and routes to quiescence,
+    /// dropping the dead socket's copies.
+    fn drive_fence_drop(nodes: &mut [Node], ids: &[u32], driver: usize, dead: u32) {
+        let at = nodes[driver].last_tick + PRIMARY_TIMEOUT_MS + 1;
+        assert_eq!(nodes[driver].drive_at(at, Input::Tick), OK);
+        route_until_quiet_drop(nodes, ids, dead);
+    }
+
+    /// Mirrors upstream's `tests/reincarnation.rs::reincarnate_backup`
+    /// (class B) plus the membership-discard (class E) and learner (class
+    /// F) classes, through the adapter ABI: a backup crashed while running
+    /// — the durable marker holds the running sentinel, so the restart is
+    /// dirty by construction — bumps its identity, announces the
+    /// `(old, new)` pair, and the leader drives the forced sequence one
+    /// batch per era until the new identity sits at weight 1 in the old
+    /// succession position and the old identity is evicted. The
+    /// reincarnated node reopens over the deployment's genesis (the honest
+    /// Volatile `restart_as`), stays fenced, and acquires nothing — the
+    /// learner's streamed catch-up is upstream §10 future work, so the
+    /// named drops are the proof of arrival and no lock state is
+    /// fabricated.
+    #[test]
+    fn reincarnation_abi_runs_the_two_era_resurrection() {
+        let third_path = state_path("reinc-three");
+        let mut nodes = vec![
+            provision("reinc-one", TEST_IDS[0], 3),
+            provision("reinc-two", TEST_IDS[1], 3),
+            provision_at(&third_path, TEST_IDS[2], 3),
+        ];
+        for node in &mut nodes {
+            assert_eq!(
+                node.replica.progress().status(),
+                vrr::progress::Status::Recovering,
+                "node boots fenced"
+            );
+            node.outputs.clear();
+        }
+        assert_eq!(nodes[0].drive(Input::Tick), OK);
+        route_until_quiet(&mut nodes, &TEST_IDS);
+        for node in &mut nodes {
+            assert_eq!(node.replica.observer().read().status, 0, "node is Normal");
+        }
+
+        // The node is RUNNING when the volatile state is lost: a committed
+        // operation, then the crash. The marker file holds the running
+        // sentinel, so the restart below is dirty by construction (§2).
+        let set_payload = serde_json::to_vec(&crate::locks::Request::Set {
+            message_id: Uuid::from_bytes([51; 16]),
+            client_id: 1,
+            request_num: 1,
+            lock_id: 9001,
+            lease: crate::locks::Lease {
+                lease_id: 1,
+                holder: Uuid::from_bytes([0xBB; 16]),
+                expiry: unix_millis().unwrap() + 60_000,
+            },
+        })
+        .unwrap();
+        assert_eq!(request(&mut nodes[0], &set_payload), OK);
+        route_until_quiet(&mut nodes, &TEST_IDS);
+        for node in &mut nodes {
+            assert_eq!(node.replica.observer().read().applied, 3);
+            node.outputs.clear();
+        }
+        let crashed = nodes.pop().expect("the third node");
+        drop(crashed);
+
+        // The dirty restart runs through the real ABI: the marker bumps
+        // (0 -> 1) and the identity is derived into the high band.
+        let state_bytes = third_path.as_os_str().as_encoded_bytes();
+        let members = b"10:n1\x0020:n2\x0030:n3";
+        let mut handle: *mut c_void = ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                lunet_lock_node_new(
+                    members.len(),
+                    members.as_ptr(),
+                    b"n3".len(),
+                    b"n3".as_ptr(),
+                    state_bytes.len(),
+                    state_bytes.as_ptr(),
+                    0,
+                    ptr::null(),
+                    0,
+                    &mut handle,
+                )
+            },
+            OK
+        );
+        let mut live_id = 0u32;
+        assert_eq!(unsafe { lunet_lock_node_own_id(handle, &mut live_id) }, OK);
+        assert_eq!(
+            live_id, BUMPED_ID,
+            "the bump derives the high-band identity"
+        );
+        let reincarnated = unsafe { *Box::from_raw(handle.cast::<Node>()) };
+        nodes.push(reincarnated);
+        let ids = [TEST_IDS[0], TEST_IDS[1], BUMPED_ID];
+
+        // The bumped node reopens over the deployment's genesis and is
+        // fenced; its boot announcement (the §4 entry ticket) goes to every
+        // member of the configuration it can name.
+        assert_eq!(
+            nodes[2].replica.progress().status(),
+            vrr::progress::Status::Recovering,
+            "the reincarnated node stays fenced"
+        );
+        let drained: VecDeque<Queued> = std::mem::take(&mut nodes[2].outputs);
+        let mut announced_to: Vec<u32> = Vec::new();
+        for output in &drained {
+            assert_eq!(output.kind, OUTPUT_SEND, "the boot announces only");
+            let message = Message::unpack_from(&output.bytes).expect("wire round trip");
+            assert_eq!(message.header.tag, vrr::wire::Tag::Reincarnation);
+            let Body::Reincarnation { old, new } = message.body else {
+                panic!("the announcement body")
+            };
+            assert_eq!(old, NodeId(TEST_IDS[2]), "the superseded identity");
+            assert_eq!(new, NodeId(BUMPED_ID), "the derived identity");
+            announced_to.push(output.to);
+        }
+        announced_to.sort_unstable();
+        assert_eq!(
+            announced_to,
+            vec![TEST_IDS[0], TEST_IDS[1], TEST_IDS[2]],
+            "cluster-wide: every member of the genesis configuration it can name"
+        );
+        nodes[2].outputs = drained;
+        // The copies to the live members are delivered attributed to the new
+        // identity; the copy addressed to the old identity's socket
+        // self-delivers through the transport's remap and is refused by
+        // name at the fenced node (a non-leader never arms the machine) —
+        // here it is asserted present and dropped with the dead socket.
+        let announce_one = pop_send(&mut nodes[2], TEST_IDS[0], vrr::wire::Tag::Reincarnation)
+            .expect("announce to the leader");
+        deliver_hop(&mut nodes, &ids, 2, announce_one);
+        let announce_two = pop_send(&mut nodes[2], TEST_IDS[1], vrr::wire::Tag::Reincarnation)
+            .expect("announce to the backup");
+        deliver_hop(&mut nodes, &ids, 2, announce_two);
+        assert!(
+            pop_send(&mut nodes[2], TEST_IDS[2], vrr::wire::Tag::Reincarnation).is_some(),
+            "the self-socket copy exists (transport remap; refused by name)"
+        );
+
+        // The leader arms the machine and proposes the FIRST forced batch —
+        // `[Decrement(old), Join(new)]` — as ONE establishing operation,
+        // stop-the-world (the core passes pivot None): the Prepare reaches
+        // every backup of the current configuration, the dead old-identity
+        // socket included.
+        let crossing = pop_send(&mut nodes[0], TEST_IDS[1], vrr::wire::Tag::Prepare)
+            .expect("the establishing Prepare");
+        assert!(
+            pop_send(&mut nodes[0], TEST_IDS[2], vrr::wire::Tag::Prepare).is_some(),
+            "the dead old-identity copy (undeliverable)"
+        );
+        assert_eq!(nodes[0].replica.progress().config().current().era, Era(1));
+        let Body::Prepare { entry, .. } = &Message::unpack_from(&crossing.bytes)
+            .expect("wire round trip")
+            .body
+        else {
+            panic!("the send is the establishing Prepare")
+        };
+        let Payload::System(SystemOperation::Batch(ops)) = &entry.payload else {
+            panic!("the establishing operation is a Batch")
+        };
+        assert_eq!(
+            ops.as_slice(),
+            &[
+                SystemOperation::Decrement(NodeId(TEST_IDS[2])),
+                SystemOperation::Join {
+                    node: NodeId(BUMPED_ID),
+                    position: 2,
+                },
+            ],
+            "the crossing batch: the new identity takes the old succession position"
+        );
+        deliver_hop(&mut nodes, &ids, 0, crossing);
+        let ok = pop_send(&mut nodes[1], TEST_IDS[0], vrr::wire::Tag::PrepareOk)
+            .expect("the voting backup acknowledges");
+        deliver_hop(&mut nodes, &ids, 1, ok);
+        assert_eq!(
+            nodes[0].replica.progress().config().current().era,
+            Era(2),
+            "the crossing batch commits era 2"
+        );
+        // The commit cascade folds era 2 at the incumbent backup (the
+        // old-identity copy is undeliverable; the learner's copy arrives
+        // and is dropped by name — its genesis table covers era 1 only).
+        route_until_quiet_drop(&mut nodes, &ids, TEST_IDS[2]);
+        let config = &nodes[0].replica.progress().config().current().config;
+        assert_eq!(
+            config
+                .order()
+                .iter()
+                .map(|member| member.node.0)
+                .collect::<Vec<_>>(),
+            vec![10, 20, BUMPED_ID, 30],
+            "era 2: the learner joined at weight 0 in the old succession position"
+        );
+        assert_eq!(
+            config
+                .order()
+                .iter()
+                .map(|member| member.weight.0)
+                .collect::<Vec<_>>(),
+            vec![1, 1, 0, 0]
+        );
+        assert_eq!(
+            nodes[0].replica.observer().read().status,
+            0,
+            "the leader keeps operating in its view"
+        );
+        assert!(nodes[2].outputs.is_empty(), "the learner emits nothing");
+
+        // The next forced batch waits for the view change into era 2, which
+        // the ordinary suspicion machinery drives (an idle primary fences
+        // itself). The fence lands view (2, 1) whose primary is member 20 —
+        // leadership rotates; the bumped node re-announces to the stable
+        // leader (§8) and the recompute proposes the remaining era.
+        drive_fence_drop(&mut nodes, &ids, 0, TEST_IDS[2]);
+        let snapshot = nodes[1].replica.observer().read();
+        assert_eq!(
+            (snapshot.status, snapshot.era, snapshot.view),
+            (0, 2, 1),
+            "member 20 leads the successor view"
+        );
+        assert_eq!(nodes[2].recover(), OK, "the fenced drive re-announces");
+        let reannounce = pop_send(&mut nodes[2], TEST_IDS[1], vrr::wire::Tag::Reincarnation)
+            .expect("the re-announce reaches the new leader");
+        deliver_hop(&mut nodes, &ids, 2, reannounce);
+        assert!(
+            pop_send(&mut nodes[2], TEST_IDS[0], vrr::wire::Tag::Reincarnation).is_some(),
+            "the re-announce reaches the former leader (dropped by name)"
+        );
+        assert!(
+            pop_send(&mut nodes[2], TEST_IDS[2], vrr::wire::Tag::Reincarnation).is_some(),
+            "the self-socket copy (refused by name)"
+        );
+        let promotion = pop_send(&mut nodes[1], TEST_IDS[0], vrr::wire::Tag::Prepare)
+            .expect("the leader proposes the remaining era");
+        assert!(
+            pop_send(&mut nodes[1], BUMPED_ID, vrr::wire::Tag::Prepare).is_some(),
+            "the learner receives a copy it cannot evaluate"
+        );
+        assert!(
+            pop_send(&mut nodes[1], TEST_IDS[2], vrr::wire::Tag::Prepare).is_some(),
+            "the dead old-identity copy (undeliverable)"
+        );
+        let Body::Prepare { entry, .. } = &Message::unpack_from(&promotion.bytes)
+            .expect("wire round trip")
+            .body
+        else {
+            panic!("the send is the establishing Prepare")
+        };
+        let Payload::System(SystemOperation::Batch(ops)) = &entry.payload else {
+            panic!("the establishing operation is a Batch")
+        };
+        assert_eq!(
+            ops.as_slice(),
+            &[
+                SystemOperation::Increment(NodeId(BUMPED_ID)),
+                SystemOperation::Leave(NodeId(TEST_IDS[2])),
+            ],
+            "the recompute from the intermediate era: promote, then the zero-weight departure"
+        );
+        deliver_hop(&mut nodes, &ids, 1, promotion);
+        let ok = pop_send(&mut nodes[0], TEST_IDS[1], vrr::wire::Tag::PrepareOk)
+            .expect("the voting member acknowledges");
+        deliver_hop(&mut nodes, &ids, 0, ok);
+        route_until_quiet_drop(&mut nodes, &ids, TEST_IDS[2]);
+        assert_eq!(
+            nodes[1].replica.progress().config().current().era,
+            Era(3),
+            "the promotion batch commits era 3"
+        );
+        let config = &nodes[1].replica.progress().config().current().config;
+        assert_eq!(
+            config
+                .order()
+                .iter()
+                .map(|member| member.node.0)
+                .collect::<Vec<_>>(),
+            vec![10, 20, BUMPED_ID],
+            "the rejoin: the old identity gone, the new identity at weight 1"
+        );
+        assert_eq!(
+            config
+                .order()
+                .iter()
+                .map(|member| member.weight.0)
+                .collect::<Vec<_>>(),
+            vec![1, 1, 1]
+        );
+        assert!(
+            config.weight_of(NodeId(TEST_IDS[2])).is_none(),
+            "the old identity is out of the configuration"
+        );
+
+        // Idempotence (§8): a further announcement recomputes an empty
+        // sequence — the machine clears, nothing is proposed.
+        assert_eq!(nodes[2].recover(), OK);
+        let reannounce_clear = pop_send(&mut nodes[2], TEST_IDS[1], vrr::wire::Tag::Reincarnation)
+            .expect("the re-announce");
+        deliver_hop(&mut nodes, &ids, 2, reannounce_clear);
+        let _ = pop_send(&mut nodes[2], TEST_IDS[0], vrr::wire::Tag::Reincarnation);
+        let _ = pop_send(&mut nodes[2], TEST_IDS[2], vrr::wire::Tag::Reincarnation);
+        assert!(
+            nodes[1].outputs.is_empty(),
+            "the complete sequence proposes nothing"
+        );
+
+        // Class E: the superseded identity is discarded by name — its
+        // messages are foreign once it is evicted.
+        let forged = Message {
+            header: vrr::wire::Header {
+                tag: vrr::wire::Tag::PrepareOk,
+                view: nodes[1].replica.progress().current(),
+                slot: Slot(4),
+            },
+            body: Body::PrepareOk {},
+        };
+        assert_eq!(
+            nodes[1].drive(Input::Peer {
+                from: NodeId(TEST_IDS[2]),
+                message: forged,
+            }),
+            OK,
+            "the discard never faults the drive"
+        );
+        assert!(
+            nodes[1].outputs.is_empty(),
+            "the forged vote queued nothing"
+        );
+
+        // Class F: the leader streams to the weight-0 learner; the learner
+        // receives its copy and drops it by name, while the voting members
+        // commit without it (era-3 arithmetic: threshold 2).
+        assert_eq!(
+            request(&mut nodes[1], &request_json(Uuid::from_bytes([52; 16]))),
+            OK
+        );
+        let stream = pop_send(&mut nodes[1], TEST_IDS[0], vrr::wire::Tag::Prepare)
+            .expect("the voter's copy");
+        let to_learner = pop_send(&mut nodes[1], BUMPED_ID, vrr::wire::Tag::Prepare)
+            .expect("the learner is in the fan-out");
+        deliver_hop(&mut nodes, &ids, 1, to_learner);
+        assert!(
+            nodes[2].outputs.is_empty(),
+            "the learner drops the stream by name: no acknowledgment, nothing queued"
+        );
+        deliver_hop(&mut nodes, &ids, 1, stream);
+        let ok = pop_send(&mut nodes[0], TEST_IDS[1], vrr::wire::Tag::PrepareOk)
+            .expect("the voter acknowledges");
+        deliver_hop(&mut nodes, &ids, 0, ok);
+        assert_eq!(
+            nodes[1].replica.progress().committed(),
+            Slot(6),
+            "the client operation commits without the learner (two forced batches occupied 4 and 5)"
+        );
+        let snapshot = nodes[2].replica.observer().read();
+        assert_eq!(snapshot.status, 2, "the learner stays fenced");
+        assert_eq!(
+            snapshot.applied, 2,
+            "the learner applies nothing beyond its genesis: no lock state fabricated"
+        );
+    }
+
+    #[test]
+    fn abi_refuses_high_band_descriptor_ids() {
+        let state = state_path("abi-high-band");
+        let state_bytes = state.as_os_str().as_encoded_bytes();
+        let mut handle: *mut c_void = ptr::null_mut();
+        // A member id outside the incarnation-0 low band would collide with
+        // the bump arithmetic's derived identities; the descriptor parser
+        // rejects it and so does the ABI.
+        assert_eq!(
+            unsafe {
+                lunet_lock_node_new(
+                    b"10:n1\x0016777215:n2".len(),
+                    b"10:n1\x0016777215:n2".as_ptr(),
                     b"n1".len(),
                     b"n1".as_ptr(),
                     state_bytes.len(),

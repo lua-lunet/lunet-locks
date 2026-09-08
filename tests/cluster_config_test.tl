@@ -109,20 +109,28 @@ tested.test(
 )
 
 tested.test(
-    "cluster_config ids must fit u32 and cannot take the reserved LEADER_UNKNOWN value",
+    "cluster_config ids are incarnation-0 ids in the low band the bump arithmetic reserves around",
     function()
-        local reserved = fails(
+        local reserved_derivation = fails(
             function(): boolean
                 cluster_config.parse_jsonl(
-                    '{"id":4294967295,"name":"n1","host":"127.0.0.1","port":7001,"genesis":true}\n'
+                    '{"id":16777215,"name":"n1","host":"127.0.0.1","port":7001,"genesis":true}\n'
                 )
                 return true
             end
         )
-        local overflow = fails(
+        local high_band = fails(
             function(): boolean
                 cluster_config.parse_jsonl(
-                    '{"id":4294967296,"name":"n1","host":"127.0.0.1","port":7001,"genesis":true}\n'
+                    '{"id":16777216,"name":"n1","host":"127.0.0.1","port":7001,"genesis":true}\n'
+                )
+                return true
+            end
+        )
+        local u32_overflow = fails(
+            function(): boolean
+                cluster_config.parse_jsonl(
+                    '{"id":4294967295,"name":"n1","host":"127.0.0.1","port":7001,"genesis":true}\n'
                 )
                 return true
             end
@@ -136,20 +144,28 @@ tested.test(
             end
         )
         local max_allowed = cluster_config.parse_jsonl(
-            '{"id":4294967294,"name":"n1","host":"127.0.0.1","port":7001,"genesis":true}\n'
+            '{"id":16777214,"name":"n1","host":"127.0.0.1","port":7001,"genesis":true}\n'
+        )
+        local zero_allowed = cluster_config.parse_jsonl(
+            '{"id":0,"name":"n1","host":"127.0.0.1","port":7001,"genesis":true}\n'
         )
         tested.assert(
             {
-                given = "ids above the u32 NodeId domain or equal to the reserved adapter sentinel",
-                should = "reject each and admit the largest legal u32 id",
-                expected = "true:true:true:4294967294",
-                actual = tostring(reserved)
+                given = "ids outside the incarnation-0 low band: the reserved-derivation id,"
+                    .. " the first high-band id, the reserved LEADER_UNKNOWN value, and a negative",
+                should = "reject each and admit both band edges",
+                expected = "true:true:true:true:16777214:0",
+                actual = tostring(reserved_derivation)
                     .. ":"
-                    .. tostring(overflow)
+                    .. tostring(high_band)
+                    .. ":"
+                    .. tostring(u32_overflow)
                     .. ":"
                     .. tostring(negative)
                     .. ":"
-                    .. tostring(max_allowed[1].id),
+                    .. tostring(max_allowed[1].id)
+                    .. ":"
+                    .. tostring(zero_allowed[1].id),
             }
         )
     end

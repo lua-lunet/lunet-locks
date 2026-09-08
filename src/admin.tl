@@ -70,33 +70,36 @@ end
 local function decode_verb(json: string): (boolean, Verb)
     local action = json:match('"action"%s*:%s*"([^"]*)"')
     if action ~= "join" and action ~= "increment" and action ~= "leave" then
-        return false, {
-            action = "",
-            message_id = "",
-            id = 0,
-            name = "",
-            endpoint = "",
-        }
+        return false,
+            {
+                action = "",
+                message_id = "",
+                id = 0,
+                name = "",
+                endpoint = "",
+            }
     end
     local message_id = json:match('"message_id"%s*:%s*"([^"]*)"')
     local id_text = json:match('"id"%s*:%s*(%d+)')
     if message_id == nil or not valid_uuid(message_id) then
-        return false, {
-            action = "",
-            message_id = "",
-            id = 0,
-            name = "",
-            endpoint = "",
-        }
+        return false,
+            {
+                action = "",
+                message_id = "",
+                id = 0,
+                name = "",
+                endpoint = "",
+            }
     end
     if id_text == nil or not valid_member_id(id_text) then
-        return false, {
-            action = "",
-            message_id = "",
-            id = 0,
-            name = "",
-            endpoint = "",
-        }
+        return false,
+            {
+                action = "",
+                message_id = "",
+                id = 0,
+                name = "",
+                endpoint = "",
+            }
     end
     local name = ""
     local endpoint = ""
@@ -104,32 +107,35 @@ local function decode_verb(json: string): (boolean, Verb)
         name = json:match('"name"%s*:%s*"([^"]*)"') or ""
         endpoint = json:match('"endpoint"%s*:%s*"([^"]*)"') or ""
         if name:match("^[%w_-]+$") == nil then
-            return false, {
-                action = "",
-                message_id = "",
-                id = 0,
-                name = "",
-                endpoint = "",
-            }
+            return false,
+                {
+                    action = "",
+                    message_id = "",
+                    id = 0,
+                    name = "",
+                    endpoint = "",
+                }
         end
         local ok = pcall(function() config.endpoint(endpoint) end)
         if not ok then
-            return false, {
-                action = "",
-                message_id = "",
-                id = 0,
-                name = "",
-                endpoint = "",
-            }
+            return false,
+                {
+                    action = "",
+                    message_id = "",
+                    id = 0,
+                    name = "",
+                    endpoint = "",
+                }
         end
     end
-    return true, {
-        action = action,
-        message_id = message_id,
-        id = tonumber(id_text) as integer,
-        name = name,
-        endpoint = endpoint,
-    }
+    return true,
+        {
+            action = action,
+            message_id = message_id,
+            id = tonumber(id_text) as integer,
+            name = name,
+            endpoint = endpoint,
+        }
 end
 
 local function u32_bytes(value: integer): string

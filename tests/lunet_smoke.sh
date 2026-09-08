@@ -145,16 +145,31 @@ request_lines 28102 "{\"op\":\"set\",\"message_id\":\"00000000-0000-0000-0000-00
 soon=$(perl -MTime::HiRes=time -e 'printf "%.0f", time() * 1000 + 3000')
 request_lines 28102 "{\"op\":\"set\",\"message_id\":\"00000000-0000-0000-0000-000000000007\",\"client_id\":3,\"request_num\":1,\"lock_id\":9001,\"lease\":{\"lease_id\":3,\"holder\":\"$holder1\",\"expiry\":$soon}}" '"granted":true'
 sleep 3.1
-takeover_expiry=$(perl -MTime::HiRes=time -e 'printf "%.0f", time() * 1000 + 5000')
+# The takeover set's own lease must outlive the post-restart resurrection
+# window (the get below runs ~10s later), so it is granted a minute; the
+# takeover itself is driven by the prior short lease's expiry above.
+takeover_expiry=$(perl -MTime::HiRes=time -e 'printf "%.0f", time() * 1000 + 60000')
 request_lines 28102 "{\"op\":\"set\",\"message_id\":\"00000000-0000-0000-0000-000000000008\",\"client_id\":4,\"request_num\":1,\"lock_id\":9001,\"lease\":{\"lease_id\":4,\"holder\":\"$holder3\",\"expiry\":$takeover_expiry}}" '"granted":true'
 
-# A restarted replica recovers against the still-live n1/n2 quorum. Kill only
-# n3's process, retain its nonce file, then prove the client path remains live.
+# A restarted replica reincarnates: the killed process left the running
+# sentinel in its durable state file, so the restart classifies dirty, the
+# incarnation bumps (303 -> 303 + 1 * 16777216 = 16777519), the bumped node
+# announces Reincarnation(303, 16777519) on the VRR channel, and the leader
+# drives the two-era resurrection — Batch([Decrement(303), Join(16777519)])
+# commits era 2, the leader's idle fence enters it, and
+# Batch([Increment(16777519), Leave(303)]) commits era 3: the new identity
+# sits at weight 1 in the old succession position and the old identity is
+# evicted. The rejoined node is a weight-0 learner whose streamed catch-up
+# is upstream §10 future work; the client path stays on the fully-caught-up
+# incumbents throughout, and the get below asserts the pre-restart lock
+# state — committed truth, nothing fabricated by the restart. The wait
+# covers the fence (~5s of primary idle after the first batch) plus the
+# re-announce cadence (2.5s).
 n3pid=$(cat "$work/n3.pid")
 stop_process "$n3pid"
 pids=$(printf '%s\n' "$pids" | sed "s/ $n3pid//")
 start n3 28103 27103
-sleep 3
+sleep 10
 request_lines 28102 "{\"op\":\"get\",\"message_id\":\"00000000-0000-0000-0000-000000000009\",\"client_id\":4,\"request_num\":2,\"lock_id\":9001}" '"op":"get"|33333333-3333-3333-3333-333333333333'
 
 completed=true

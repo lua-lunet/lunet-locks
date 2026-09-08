@@ -19,6 +19,7 @@ ffi.cdef(
     int32_t lunet_lock_node_idle(void* node);
     int32_t lunet_lock_node_leader_timeout(void* node);
     int32_t lunet_lock_node_recover(void* node);
+    int32_t lunet_lock_node_own_id(void* node, uint32_t* id);
     int32_t lunet_lock_node_status(
         void* node, uint32_t* status, uint32_t* leader,
         uint32_t* era, uint32_t* view);
@@ -68,6 +69,7 @@ local record Native
     lunet_lock_node_idle: function(any): number
     lunet_lock_node_leader_timeout: function(any): number
     lunet_lock_node_recover: function(any): number
+    lunet_lock_node_own_id: function(any, {number}): number
     lunet_lock_node_status: function(
         any, {number}, {number}, {number}, {number}
     ): number
@@ -127,6 +129,7 @@ local record advisory_lock
         idle: function(Node): boolean
         leader_timeout: function(Node): boolean
         recover: function(Node): boolean
+        own_id: function(Node): integer
         status: function(Node): Status
         leader_for_view: function(Node, integer, integer): integer
         outputs: function(Node): {Output}
@@ -228,9 +231,8 @@ end
 
 function Node:leader_timeout(): boolean
     return check(
-        (
-            tonumber(native.lunet_lock_node_leader_timeout(self._handle)) or -127
-        ) as integer
+        (tonumber(native.lunet_lock_node_leader_timeout(self._handle)) or -127)
+            as integer
     )
 end
 
@@ -238,6 +240,17 @@ function Node:recover(): boolean
     return check(
         (tonumber(native.lunet_lock_node_recover(self._handle)) or -127) as integer
     )
+end
+
+-- The node's live identity: the descriptor id at incarnation 0, the bumped
+-- high-band id after a dirty restart. The host compares leaders against it
+-- — after a bump the descriptor row still names the superseded id.
+function Node:own_id(): integer
+    check(
+        (tonumber(native.lunet_lock_node_own_id(self._handle, self._leader)) or -127)
+            as integer
+    )
+    return (tonumber(self._leader[0]) or -1) as integer
 end
 
 function Node:status(): Status
@@ -426,11 +439,31 @@ function M.new(
         idle = Node.idle,
         leader_timeout = Node.leader_timeout,
         recover = Node.recover,
+        own_id = Node.own_id,
         status = Node.status,
         leader_for_view = Node.leader_for_view,
         outputs = Node.outputs,
         close = Node.close,
     }
+end
+
+-- The two FFI calls with more than eight arguments are excluded from
+-- tracing: LuaJIT's arm64 JIT compiles their on-stack argument area
+-- incorrectly under GC pressure, which corrupts the callee's `out` pointer
+-- and crashes at an ~20-60% rate on identical binaries (SIGSEGV/SIGBUS in
+-- `lunet_lock_node_new+` and GC marking during `Node:outputs`). Trace exits
+-- fall back to the interpreter, where the calls measure clean. The jit
+-- module is a LuaJIT builtin with no Teal defs, so the type checker must
+-- not resolve it as a module dependency; it is loaded dynamically.
+local builtin = "ji" .. "t"
+local ok, jit_any = pcall(require, builtin)
+if ok then
+    local record JitApi
+        off: function(any, boolean)
+    end
+    local jit_module: JitApi = jit_any as JitApi
+    jit_module.off(M.new, true)
+    jit_module.off(Node.outputs, true)
 end
 
 return M

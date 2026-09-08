@@ -12,6 +12,19 @@
 --   never-recycled ids remain an operator invariant this module cannot
 --   enforce across runs (no persistent id allocator); it only rejects
 --   in-file duplicate ids and duplicate names.
+-- - The descriptor lists INCARNATION-0 ids: every entry's id is the
+--   identity the member's first process runs under. A restarted process
+--   reincarnates (the core's Crash-Stop-Self-Evict protocol): its durable
+--   state file bumps an incarnation counter k and the process derives its
+--   fresh identity as `incarnation-0 id + k * 16777216` — a high-band id
+--   that never appears in this file and can never alias a descriptor id,
+--   because the whole descriptor space is the low band. The bump
+--   arithmetic stays inside u32 and dodges the reserved LEADER_UNKNOWN
+--   value `4294967295` by construction: incarnation-0 ids are bounded to
+--   `[0, 16777214]` here (id 16777215 is rejected — at incarnation 255 it
+--   would derive exactly the reserved value), and the bump refuses at
+--   incarnation 255 instead of wrapping a superseded identity into
+--   circulation.
 -- - The `genesis` field marks the deployment's founding membership. The
 --   genesis lines (in line order) are the explicit genesis succession
 --   sequence the core folds as the founding configuration
@@ -21,12 +34,13 @@
 --   with `"genesis":false` — the descriptor relation between processes is a
 --   superset with the new member appended and identical line order for
 --   shared members. Running processes never reload the file; live members
---   learn a joining member's endpoint through the admin broadcast.
+--   learn a joining member's endpoint through the admin broadcast. A
+--   reincarnated replica needs no descriptor change and no broadcast: its
+--   peers learn the `old -> new` id remap from the `Reincarnation` wire
+--   body itself.
 -- - The membership fingerprint (config.tl) is over the genesis lines only:
 --   the deployment's identity is its founding membership, stable across
---   live superset growth.
--- - An id must fit the core's `NodeId(u32)` and cannot be 4294967295: the
---   native adapter reserves that value as its LEADER_UNKNOWN report.
+--   live superset growth and across reincarnations.
 --
 -- This module only reads/writes the deployment descriptor file; it never
 -- opens sockets and stays pure for the test suite.
@@ -97,10 +111,13 @@ local function parse_line(line: string, line_no: integer): ClusterNode
     local port = tonumber(port_text) as integer
     assert(id >= 0, "cluster_config: line " .. tostring(line_no) .. " id must be >= 0")
     assert(
-        id <= 4294967294,
+        id <= 16777214,
         "cluster_config: line "
             .. tostring(line_no)
-            .. " id must fit u32 and cannot be the reserved LEADER_UNKNOWN value 4294967295"
+            .. " id must be an incarnation-0 id in [0, 16777214]: a restarted process's"
+            .. " bumped identity is id + incarnation * 16777216 in the high band, and id"
+            .. " 16777215 at incarnation 255 would derive the reserved LEADER_UNKNOWN value"
+            .. " 4294967295"
     )
     assert(
         name_text:match("^[%w_-]+$") ~= nil,

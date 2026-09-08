@@ -297,6 +297,94 @@ tested.test(
     end
 )
 
+-- Big-endian u32 encoder for the wire fixtures below.
+local function be32(value: integer): string
+    return string.char(
+        math.floor(value / 16777216) % 256,
+        math.floor(value / 65536) % 256,
+        math.floor(value / 256) % 256,
+        value % 256
+    )
+end
+
+tested.test(
+    "transport decodes the Reincarnation announcement pair from its exact wire shape",
+    function()
+        -- 20-byte header (tag 13, era 2, view 1, slot 0) + 1-byte
+        -- discriminant 13 + old and new ids: the upstream codec's layout.
+        local announcement = be32(13)
+            .. be32(2)
+            .. be32(1)
+            .. "\0\0\0\0\0\0\0\0"
+            .. string.char(13)
+            .. be32(303)
+            .. be32(16777246)
+        local valid, old, new = transport.reincarnation_pair(announcement)
+        -- A wrong tag, a wrong body discriminant, a truncation, and a
+        -- longer ordinary datagram are all not announcements.
+        local wrong_tag = be32(9)
+            .. be32(2)
+            .. be32(1)
+            .. "\0\0\0\0\0\0\0\0"
+            .. string.char(13)
+            .. be32(303)
+            .. be32(16777246)
+        local wrong_discriminant = be32(13)
+            .. be32(2)
+            .. be32(1)
+            .. "\0\0\0\0\0\0\0\0"
+            .. string.char(9)
+            .. be32(303)
+            .. be32(16777246)
+        local truncated = announcement:sub(1, 28)
+        local longer = announcement .. "\0"
+        local tag_valid, tag_old, tag_new = transport.reincarnation_pair(wrong_tag)
+        local disc_valid, disc_old, disc_new = transport.reincarnation_pair(
+            wrong_discriminant
+        )
+        local trunc_valid, trunc_old, trunc_new = transport.reincarnation_pair(
+            truncated
+        )
+        local long_valid, long_old, long_new = transport.reincarnation_pair(longer)
+        tested.assert(
+            {
+                given = "a 29-byte Reincarnation announcement and four near-miss datagrams",
+                should = "decode the (old, new) pair from the exact shape and refuse every near miss",
+                expected = "true:303:16777246:false:0:0:false:0:0:false:0:0:false:0:0",
+                actual = tostring(valid)
+                    .. ":"
+                    .. tostring(old)
+                    .. ":"
+                    .. tostring(new)
+                    .. ":"
+                    .. tostring(tag_valid)
+                    .. ":"
+                    .. tostring(tag_old)
+                    .. ":"
+                    .. tostring(tag_new)
+                    .. ":"
+                    .. tostring(disc_valid)
+                    .. ":"
+                    .. tostring(disc_old)
+                    .. ":"
+                    .. tostring(disc_new)
+                    .. ":"
+                    .. tostring(trunc_valid)
+                    .. ":"
+                    .. tostring(trunc_old)
+                    .. ":"
+                    .. tostring(trunc_new)
+                    .. ":"
+                    .. tostring(long_valid)
+                    .. ":"
+                    .. tostring(long_old)
+                    .. ":"
+                    .. tostring(long_new),
+            }
+        )
+    end
+)
+
 tested.test(
     "a mismatched peer fingerprint permanently quarantines client operations",
     function()

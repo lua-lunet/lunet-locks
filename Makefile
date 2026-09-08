@@ -41,9 +41,12 @@ init:
 	$(MAKE) deps
 
 deps:
-	$(LUAROCKS) install cyan
-	$(LUAROCKS) install tested
-	$(LUAROCKS) install cerulean
+	# The versions are load-bearing pins: tested 0.4.0 changed its API to
+	# instance methods (the suite calls module-level `tested.test`), and
+	# cerulean 1.9.1 changed the formatting rules the tree is formatted to.
+	$(LUAROCKS) install cyan 0.4.1-1
+	$(LUAROCKS) install tested 0.3.0-1
+	$(LUAROCKS) install cerulean 1.9.0-1
 
 fmt:
 	$(CERU) src tests

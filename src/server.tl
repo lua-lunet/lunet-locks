@@ -1,8 +1,8 @@
 -- Runnable lunet entrypoint for the advisory-lock service.
 --
 -- This file intentionally owns only transport and client correlation.  Lock
--- ordering, duplicate suppression, clock sampling, and recovery nonces stay
--- in the native adapter.
+-- ordering, duplicate suppression, clock sampling, and the durable
+-- incarnation marker stay in the native adapter.
 --
 -- The reconfiguration admin verbs (join/increment/leave) ride the same TCP
 -- client channel, the same forward/redirect machinery, and the same peer
@@ -13,6 +13,15 @@
 -- learn an endpoint change through the application-level ADMIN broadcast
 -- (a join adds the addressing row before the commit, a leave removes it
 -- after).
+--
+-- A restarted replica reincarnates (the core's Crash-Stop-Self-Evict
+-- protocol): the native adapter classifies the durable state file dirty,
+-- bumps the identity, and announces the `Reincarnation(old, new)` pair on
+-- the VRR channel. The wire body IS the addressing notice — the receive
+-- loop remaps the old id's endpoint row to the new id when the pair arrives
+-- from the socket the deployment attributes to the old id, with no
+-- application-level broadcast. The genesis membership fingerprint is
+-- untouched: a restart changes no descriptor line.
 local record DebugInfo
     source: string
 end
@@ -216,7 +225,10 @@ local function main(options: Options)
     -- adapter speaks member ids on the ABI (`receive` from, send `to`,
     -- leader outs), and this table set is the id <-> endpoint view of the
     -- descriptor, grown at runtime by the admin broadcast (a joining
-    -- member's row is added, a departed member's rows are removed).
+    -- member's row is added, a departed member's rows are removed) and by
+    -- the reincarnation remap (a restarted member's row moves to its
+    -- bumped id). The live identity comes from the adapter — after a dirty
+    -- restart it is the bumped high-band id, not the descriptor row.
     local endpoint_by_id: {integer: string} = {}
     local id_by_endpoint: {string: integer} = {}
     local own_id = 0
@@ -228,7 +240,6 @@ local function main(options: Options)
         endpoint_by_id[member.id] = key
         id_by_endpoint[key] = member.id
         if member.name == options.node then
-            own_id = member.id
             own_rank = rank - 1
             udp_host = member.endpoint.host
             udp_port = member.endpoint.port
@@ -243,6 +254,7 @@ local function main(options: Options)
         options.event_journal_dir,
         options.event_journal_roll_bytes
     )
+    own_id = node:own_id()
     log_membership(membership_log)
     local peer, peer_error = udp.bind(udp_host, udp_port)
     assert(peer ~= nil, "server: UDP bind failed: " .. (peer_error or "unknown"))
@@ -363,11 +375,12 @@ local function main(options: Options)
             -- replica) is reported to the operator as a rejected verb, the
             -- same honesty the lock errors get: the operation never entered
             -- the log.
-            return true, '{"action":"'
-                .. action
-                .. '","id":'
-                .. tostring(id)
-                .. ',"accepted":false}'
+            return true,
+                '{"action":"'
+                    .. action
+                    .. '","id":'
+                    .. tostring(id)
+                    .. ',"accepted":false}'
         end
         if proposed == nil then
             -- NotPrimary: the one actionable refusal; the caller redirects.
@@ -416,6 +429,11 @@ local function main(options: Options)
             end
         end
     end
+
+    -- A bumped boot queued its `Reincarnation(old, new)` announcement at
+    -- construction (the wire phase always follows the bump); it goes out
+    -- here, before any loop runs.
+    flush(node:outputs() as {Output})
 
     local function forward_to(waiter: Pending, leader: integer, message_id: string)
         -- A booting/recovering cluster may have no known leader; leave the
@@ -625,6 +643,32 @@ local function main(options: Options)
                         end
                     elseif valid and kind == transport.PEER_VRR then
                         local replica = id_by_endpoint[source_endpoint]
+                        -- The reincarnation remap: a `Reincarnation(old,
+                        -- new)` announcement arriving from the socket the
+                        -- deployment attributes to `old` IS the restarted
+                        -- process's entry ticket — the wire body is the
+                        -- notice, no application broadcast. The row moves
+                        -- to the bumped id (every bumped identity lives in
+                        -- the high band the native adapter's bump
+                        -- arithmetic derives), and the announcement is
+                        -- delivered attributed to the new identity, where
+                        -- the core's own gates apply (only the leader acts;
+                        -- a forged or degenerate pair is dropped by name).
+                        local pair_valid, pair_old, pair_new = transport.reincarnation_pair(
+                            payload
+                        )
+                        if
+                            pair_valid
+                            and replica == pair_old
+                            and pair_old ~= pair_new
+                            and pair_new >= 16777216
+                            and endpoint_by_id[pair_new] == nil
+                        then
+                            endpoint_by_id[pair_new] = source_endpoint
+                            endpoint_by_id[pair_old] = nil
+                            id_by_endpoint[source_endpoint] = pair_new
+                            replica = pair_new
+                        end
                         if replica ~= nil then
                             if node:status().leader == replica then
                                 leader_elapsed_ms = 0
@@ -682,10 +726,12 @@ local function main(options: Options)
     local function recovery_loop()
         while true do
             lunet.sleep(options.recovery_ms)
-            -- Drive a recovery attempt only while the replica is recovering:
-            -- every node:recover() consumes one durable nonce (fsync+rename+
-            -- dir-sync) to stamp Input::Recover, so calling it in "normal" or
-            -- "view_change" would burn nonces for no protocol effect.
+            -- Drive a fenced-boot attempt only while the replica is
+            -- recovering: the drive ticks the core (the ms clock is the
+            -- only tick source) and, on a reincarnated node, re-announces
+            -- its `Reincarnation(old, new)` pair — the §8 re-announce,
+            -- which is what keeps a rotated leadership armed. Calling it
+            -- in "normal" or "view_change" would have no protocol effect.
             if node:status().state == "recovering" then
                 node:recover()
                 flush(node:outputs() as {Output})

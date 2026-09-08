@@ -121,6 +121,34 @@ local function valid_not_leader(
     return expected_source >= 0 and actual_source == expected_source
 end
 
+-- The Reincarnation announcement's exact wire shape (upstream
+-- `src/wire.rs` Tag::Reincarnation = 13, `src/message.rs`
+-- Body::Reincarnation): a 20-byte big-endian header (tag u32, era u32,
+-- view u32, slot u64) plus a 1-byte body discriminant plus two big-endian
+-- u32 member ids — 29 bytes total. This is the one VRR payload the host
+-- decodes: the (old, new) pair in the body IS the addressing notice for a
+-- restarted replica's identity bump, so the id<->endpoint tables can remap
+-- without an application-level broadcast.
+local REINCARNATION_TAG = 13
+local REINCARNATION_BYTES = 20 + 1 + 4 + 4
+
+local function reincarnation_pair(payload: string): (boolean, integer, integer)
+    if #payload ~= REINCARNATION_BYTES then
+        return false, 0, 0
+    end
+    if parse_u32(payload:sub(1, 4)) ~= REINCARNATION_TAG then
+        return false, 0, 0
+    end
+    -- The body discriminant must agree with the header tag (the core's
+    -- codec refuses a mismatched discriminant; so does this gate).
+    if (payload:byte(21) or 0) ~= REINCARNATION_TAG then
+        return false, 0, 0
+    end
+    local old = parse_u32(payload:sub(22, 25))
+    local new = parse_u32(payload:sub(26, 29))
+    return true, old, new
+end
+
 local function feed_ndjson(
     buffer: string, chunk: string, max_size: integer
 ): ({string}, string)
@@ -167,5 +195,6 @@ return {
     encode_not_leader = encode_not_leader,
     decode_not_leader = decode_not_leader,
     valid_not_leader = valid_not_leader,
+    reincarnation_pair = reincarnation_pair,
     feed_ndjson = feed_ndjson,
 }
