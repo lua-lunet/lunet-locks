@@ -35,6 +35,9 @@ supplied `lunet-run` is the project-local official `v0.8.0` runtime from
   reconfiguration, reincarnation on restart, and operational boundaries.
 - [Event journal](event-journal.md) documents the append-only lock-event
   journal, the lock-feed server, and the console catch-up model.
+- [Standby telemetry](telemetry-aof.md) documents the standby node's AOF
+  write-behind series: the async writer, 2 MiB erasure-block rolling, the
+  deferred fsync policy, and the console follow path.
 - [External client protocol](client-protocol.md) specifies GET, SET, and
   RELEASE, and the membership-administration verbs.
 - [Build and tests](build-and-tests.md) describes the pinned runtime and

@@ -315,6 +315,21 @@ See [the event journal reference](event-journal.md) for record and metafile
 byte layouts, file naming, resume-on-reopen semantics, corrupt-tail
 tolerance, and the full console catch-up model.
 
+## Standby telemetry: the AOF write-behind series
+
+A zero-voting-weight standby member can host the console's telemetry: it
+applies the replication stream like any member and writes its lock-event
+records to an async write-behind log (the AOF) instead of the blocking
+journal. The AOF writer never blocks or forces on the append path — events
+enqueue to a dedicated writer thread with drop-on-overflow, files roll at
+exactly 2 MiB (erasure-block aligned), and fsync happens only on a periodic
+timer, a checkpoint, or shutdown. The console's feed and SPA serve off the
+standby's own AOF series, never off a cluster replica's journal files, and
+the cluster's latency cadence is unaffected.
+
+See [standby telemetry](telemetry-aof.md) for the writer design, the rolling
+and reader-valid-prefix rules, and the headless console wiring.
+
 ## Time, reincarnation, and durability
 
 The adapter owns the tick clock: a monotonic nondecreasing

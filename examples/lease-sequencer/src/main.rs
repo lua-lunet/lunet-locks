@@ -236,6 +236,13 @@ struct Options {
     client: String,
     state: String,
     log: String,
+    /// The AOF series directory. Non-empty turns the node into the standby
+    /// telemetry host: the committed-transition hook feeds the async
+    /// write-behind writer instead of the blocking journal, and the lease
+    /// driver stays idle.
+    aof_dir: String,
+    /// The AOF's periodic-fsync knob (ms). 0 = only at roll and shutdown.
+    aof_flush_ms: u64,
     heartbeat_ms: u64,
     election_ms: u64,
     recovery_ms: u64,
@@ -248,6 +255,8 @@ fn parse_options() -> Options {
         client: String::new(),
         state: String::new(),
         log: String::new(),
+        aof_dir: String::new(),
+        aof_flush_ms: 1000,
         heartbeat_ms: 100,
         election_ms: 1000,
         recovery_ms: 1000,
@@ -266,6 +275,8 @@ fn parse_options() -> Options {
             "--client" => options.client = value.clone(),
             "--state" => options.state = value.clone(),
             "--log" => options.log = value.clone(),
+            "--aof-dir" => options.aof_dir = value.clone(),
+            "--aof-flush-ms" => options.aof_flush_ms = value.parse().unwrap_or(1000),
             "--heartbeat-ms" => options.heartbeat_ms = value.parse().unwrap_or(100),
             "--election-ms" => options.election_ms = value.parse().unwrap_or(1000),
             "--recovery-ms" => options.recovery_ms = value.parse().unwrap_or(1000),
@@ -284,7 +295,8 @@ fn parse_options() -> Options {
     {
         eprintln!(
             "usage: lease-sequencer --name NAME --config PATH --client IPv4:PORT \
-             --state PATH --log PATH [--heartbeat-ms N] [--election-ms N] [--recovery-ms N]"
+             --state PATH --log PATH [--aof-dir PATH] [--aof-flush-ms N] \
+             [--heartbeat-ms N] [--election-ms N] [--recovery-ms N]"
         );
         exit(2);
     }
@@ -614,11 +626,28 @@ fn main() {
     // per-node daily rolling file. The guard is held for the process
     // lifetime and flushes on an orderly shutdown.
     let _worker_guard = init_tracing(&options.log);
-    let node =
+    let standby = !options.aof_dir.is_empty();
+    let node = if standby {
+        // The standby telemetry host: the committed-transition hook feeds
+        // the async AOF writer (the LKE1 journal producer path, deferred
+        // durability target) and the lease driver stays idle.
+        Node::open_aof(
+            &members,
+            &options.name,
+            &options.state,
+            &options.aof_dir,
+            (options.aof_flush_ms > 0).then_some(options.aof_flush_ms),
+        )
+        .unwrap_or_else(|code| {
+            eprintln!("lease-sequencer: standby node boot failed with code {code}");
+            exit(2);
+        })
+    } else {
         Node::open(&members, &options.name, &options.state, None, 0).unwrap_or_else(|code| {
             eprintln!("lease-sequencer: node boot failed with code {code}");
             exit(2);
-        });
+        })
+    };
     let own_id = node.own_id();
     let incarnation = own_id.saturating_sub(own_desc_id) / (1 << 24);
 

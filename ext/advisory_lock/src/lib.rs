@@ -1,5 +1,6 @@
 //! Advisory locks over the external Viewstamped Replication core.
 
+pub mod aof;
 mod ffi;
 pub mod journal;
 pub mod locks;

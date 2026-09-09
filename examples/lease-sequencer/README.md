@@ -72,10 +72,40 @@ and `dc2-node2` with the increment verb; `dc3-node2` stays at weight 0 —
 the zero-voting-weight member the downstream design wants. The TCP client
 port is the descriptor's UDP peer port + 1000.
 
+## The standby telemetry node
+
+`check-standby.sh` runs the same six-node cluster with `dc1-node2` as the
+**standby telemetry node**: it enters at weight 0 through the join verb —
+first, so its learner fold is the clean one — is never promoted, and holds
+no vote. The `--aof-dir` option turns the node into the AOF host: its
+committed lock transitions enqueue to the async write-behind writer
+(dedicated thread, drop-on-overflow, `io_uring` on Linux / buffered
+`write_all` elsewhere, fsync only on the periodic `--aof-flush-ms` timer,
+at roll, and on shutdown) instead of the blocking journal, and the active
+file rolls at exactly 2 MiB (zero-padded, so every finalized file is one
+erasure block). The standby's lease driver still converses with the leader
+like every node's does — the round-trip traffic carries the era evidence
+that keeps the standby tracking the cluster while it applies the stream.
+
+The script also starts `lock-feed` against the standby's AOF directory and
+the console stack (static SPA + nginx edge with `/feed/` mapped to the
+feed), then asserts, headless (curl/grep only):
+
+1. committed events land in the standby's AOF files;
+2. the feed serves them (REST listing and file bytes);
+3. the console's data endpoint (`/feed/files` through the nginx edge,
+   basic-auth loopback) returns them;
+4. the cluster cadence is unaffected: the holder's renewal cadence is
+   ~250 ms and each non-holder polls at ~2x renewal, measured from the
+   voting nodes' logs while the standby's AOF writer and feed run.
+
+Every spawned process (nodes, feed, mock, nginx) is killed on exit.
+
 ## Running
 
 ```
-./run.sh     # the stability check (also as ./check.sh)
+./run.sh             # the stability check (also as ./check.sh)
+./check-standby.sh   # the standby AOF + console demo check
 ```
 
 `run.sh` builds the crate, starts the six nodes with fresh state (each
@@ -112,7 +142,9 @@ as this repo does:
 
 - `src/main.rs` — the node binary: host loop (heartbeat, election,
   fenced-boot recovery drive, output drain, receive pump), the TCP client
-  NDJSON server, and the lease driver.
+  NDJSON server, and the lease driver. `--aof-dir` switches the node to the
+  standby telemetry mode: the committed-transition hook feeds the async AOF
+  writer instead of the blocking journal and the lease driver stays idle.
 - `src/transport.rs` — the peer envelope, the membership/v3 genesis
   fingerprint, the `Reincarnation(old, new)` addressing notice, and the
   forward/redirect application channel.
@@ -120,3 +152,4 @@ as this repo does:
   (lock and admin verbs over a node's TCP port).
 - `config/cluster.jsonl` — the six-node deployment descriptor.
 - `run.sh`, `check.sh` — the stability check.
+- `check-standby.sh` — the standby AOF + console demo check.

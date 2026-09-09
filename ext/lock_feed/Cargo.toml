@@ -15,6 +15,11 @@ futures-util = { version = "0.3", default-features = false, features = ["sink"] 
 serde_json = "1"
 lunet_advisory_lock = { package = "lunet-advisory-lock", path = "../advisory_lock" }
 
+# The series follower is inotify-driven on Linux; the poll loop stays as the
+# safety net there and is the only follower elsewhere (macOS fallback).
+[target.'cfg(target_os = "linux")'.dependencies]
+inotify = "0.11"
+
 [dev-dependencies]
 tokio-tungstenite = "0.26"
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }

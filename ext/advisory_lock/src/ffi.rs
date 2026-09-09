@@ -142,6 +142,7 @@
 //! order, with post-genesis entries suffixed `:j` (see Identity above);
 //! `own_data` is the local member's name.
 
+use crate::aof::{AofConfig, AofWriter};
 use crate::journal::{self, Journal as LockJournal, JournalEvent};
 use crate::locks::{Service, Transition};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -152,7 +153,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, trace, warn};
 use vrr::configuration::{EraTable, INIT_SLOT, MAX_MEMBERS, SystemOperation, VOID_SLOT};
 use vrr::effects::{Effect, Stability};
@@ -323,9 +324,22 @@ pub struct Node {
     /// The last folded configuration era, for the folded-era-regression
     /// maybe.
     last_config_era: Option<u32>,
-    /// Append-only lock-event journal. `None` when journaling is disabled
-    /// (empty journal_dir at construction) or after a journal error.
-    journal: Option<LockJournal>,
+    /// The lock-event sink. `None` when journaling is disabled (empty
+    /// journal_dir at construction) or after a journal error.
+    ///
+    /// - `Blocking` writes the classic per-replica journal: blocking
+    ///   buffered appends on the apply path; an append error disables it.
+    /// - `Aof` enqueues to the async write-behind writer: producers never
+    ///   wait on disk, overflow drops (the writer's drop counter tracks
+    ///   it), and fsync happens only on the timer, at roll, at checkpoint,
+    ///   and at shutdown.
+    journal: Option<JournalSink>,
+}
+
+/// The committed-transition sink behind `Node`'s journal hook.
+enum JournalSink {
+    Blocking(LockJournal),
+    Aof(AofWriter),
 }
 
 impl Node {
@@ -546,59 +560,69 @@ impl Node {
                     (bytes, transition)
                 };
                 // Append a journal event for first-execution transitions
-                // only (never on cached duplicate replay). Journal errors
-                // disable journaling for the process; the node keeps serving.
+                // only (never on cached duplicate replay). A blocking-journal
+                // error disables journaling for the process; the node keeps
+                // serving. The AOF sink enqueues and never fails: overflow
+                // drops into the writer's drop counter.
                 if let Some(transition) = transition {
-                    if let Some(journal) = self.journal.as_mut() {
-                        let ts = unix_millis().unwrap_or(0);
-                        let event = match &transition {
-                            Transition::Hold {
-                                lock_id,
-                                lease_id,
-                                holder,
-                                expiry,
-                            } => JournalEvent {
-                                kind: journal::KIND_HOLD,
-                                ts,
-                                lock_id: *lock_id,
-                                lease_id: *lease_id,
-                                holder: *holder,
-                                expiry: *expiry,
-                            },
-                            Transition::Renew {
-                                lock_id,
-                                lease_id,
-                                holder,
-                                expiry,
-                            } => JournalEvent {
-                                kind: journal::KIND_RENEW,
-                                ts,
-                                lock_id: *lock_id,
-                                lease_id: *lease_id,
-                                holder: *holder,
-                                expiry: *expiry,
-                            },
-                            Transition::Release {
-                                lock_id,
-                                lease_id,
-                                holder,
-                                expiry,
-                            } => JournalEvent {
-                                kind: journal::KIND_RELEASE,
-                                ts,
-                                lock_id: *lock_id,
-                                lease_id: *lease_id,
-                                holder: *holder,
-                                expiry: *expiry,
-                            },
-                        };
-                        if let Err(e) = journal.append(&event) {
-                            eprintln!(
-                                "lunet-advisory-lock: journal append failed ({e}); \
-                                 journaling disabled for this process"
-                            );
-                            self.journal = None;
+                    let ts = unix_millis().unwrap_or(0);
+                    let event = match &transition {
+                        Transition::Hold {
+                            lock_id,
+                            lease_id,
+                            holder,
+                            expiry,
+                        } => JournalEvent {
+                            kind: journal::KIND_HOLD,
+                            ts,
+                            lock_id: *lock_id,
+                            lease_id: *lease_id,
+                            holder: *holder,
+                            expiry: *expiry,
+                        },
+                        Transition::Renew {
+                            lock_id,
+                            lease_id,
+                            holder,
+                            expiry,
+                        } => JournalEvent {
+                            kind: journal::KIND_RENEW,
+                            ts,
+                            lock_id: *lock_id,
+                            lease_id: *lease_id,
+                            holder: *holder,
+                            expiry: *expiry,
+                        },
+                        Transition::Release {
+                            lock_id,
+                            lease_id,
+                            holder,
+                            expiry,
+                        } => JournalEvent {
+                            kind: journal::KIND_RELEASE,
+                            ts,
+                            lock_id: *lock_id,
+                            lease_id: *lease_id,
+                            holder: *holder,
+                            expiry: *expiry,
+                        },
+                    };
+                    let mut disable_blocking = false;
+                    match self.journal.as_mut() {
+                        Some(JournalSink::Blocking(journal)) => {
+                            if let Err(e) = journal.append(&event) {
+                                eprintln!(
+                                    "lunet-advisory-lock: journal append failed ({e}); \
+                                     journaling disabled for this process"
+                                );
+                                disable_blocking = true;
+                            }
                         }
+                        Some(JournalSink::Aof(writer)) => writer.enqueue(event),
+                        None => {}
+                    }
+                    if disable_blocking {
+                        self.journal = None;
                     }
                 }
                 if let Some(message_id) = self.pending.remove(&operation_id) {
@@ -699,6 +723,34 @@ impl Node {
                 state.as_bytes(),
                 journal_dir.filter(|dir| !dir.is_empty()),
                 roll_bytes,
+            )
+        }))
+        .unwrap_or(Err(PANIC))
+    }
+
+    /// The standby telemetry variant: the committed-transition hook enqueues
+    /// to the AOF write-behind writer instead of the blocking journal. Same
+    /// member/own/state grammar as [`Node::open`]; `aof_dir` is the AOF
+    /// series directory (created or resumed); `flush_ms` is the periodic
+    /// fsync knob (`None` fsyncs only at roll and shutdown). The roll
+    /// threshold is fixed at the 2 MiB erasure block.
+    ///
+    /// The C ABI never takes this path; the ABI's journal surface is
+    /// unchanged.
+    pub fn open_aof(
+        members: &str,
+        own: &str,
+        state: &str,
+        aof_dir: &str,
+        flush_ms: Option<u64>,
+    ) -> Result<Node, i32> {
+        catch_unwind(AssertUnwindSafe(|| {
+            node_from_aof(
+                members.as_bytes(),
+                own.as_bytes(),
+                state.as_bytes(),
+                aof_dir,
+                flush_ms.map(Duration::from_millis),
             )
         }))
         .unwrap_or(Err(PANIC))
@@ -1287,6 +1339,55 @@ fn node_from_parts(
     journal_dir: Option<&str>,
     roll_bytes: u32,
 ) -> Result<Node, i32> {
+    let journal =
+        journal_dir.and_then(
+            |dir| match LockJournal::open(Path::new(dir), roll_bytes as u64) {
+                Ok(j) => Some(JournalSink::Blocking(j)),
+                Err(e) => {
+                    eprintln!(
+                        "lunet-advisory-lock: journal open failed ({e}); \
+                 journaling disabled for this process"
+                    );
+                    None
+                }
+            },
+        );
+    node_from_sink(members_data, own_data, state_data, journal)
+}
+
+/// The AOF-backed variant: the committed-transition hook enqueues to the
+/// async write-behind writer instead of the blocking journal. Same node
+/// construction; the C ABI never takes this path.
+fn node_from_aof(
+    members_data: &[u8],
+    own_data: &[u8],
+    state_data: &[u8],
+    aof_dir: &str,
+    flush_interval: Option<Duration>,
+) -> Result<Node, i32> {
+    let config = AofConfig {
+        flush_interval,
+        ..AofConfig::default()
+    };
+    let sink = match AofWriter::open(Path::new(aof_dir), config) {
+        Ok(writer) => Some(JournalSink::Aof(writer)),
+        Err(e) => {
+            eprintln!(
+                "lunet-advisory-lock: aof open failed ({e}); \
+                 telemetry disabled for this process"
+            );
+            None
+        }
+    };
+    node_from_sink(members_data, own_data, state_data, sink)
+}
+
+fn node_from_sink(
+    members_data: &[u8],
+    own_data: &[u8],
+    state_data: &[u8],
+    journal: Option<JournalSink>,
+) -> Result<Node, i32> {
     // Member entries are "<u32-id>:<name>"; a post-genesis (joined)
     // entry is "<u32-id>:<name>:j". The plain-entry order is the
     // descriptor's genesis succession sequence and each id is the
@@ -1424,20 +1525,6 @@ fn node_from_parts(
                 Err(_) => return Err(CONFIG),
             }
         }
-    };
-    let journal = if let Some(dir) = journal_dir {
-        match LockJournal::open(Path::new(dir), roll_bytes as u64) {
-            Ok(j) => Some(j),
-            Err(e) => {
-                eprintln!(
-                    "lunet-advisory-lock: journal open failed ({e}); \
-                     journaling disabled for this process"
-                );
-                None
-            }
-        }
-    } else {
-        None
     };
     let mut node = Node {
         replica,

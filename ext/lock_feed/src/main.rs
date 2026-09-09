@@ -532,17 +532,89 @@ where
 }
 
 // ---------------------------------------------------------------------------
+// Series follower: inotify-driven on Linux, poll-driven everywhere
+// ---------------------------------------------------------------------------
+
+/// The wake channel the rescan loop selects on: directory events from the
+/// inotify watcher on Linux, timer ticks from the poll loop everywhere.
+type WakeRx = tokio::sync::mpsc::Receiver<()>;
+
+/// Spawn the inotify watcher thread (Linux only): CREATE / MODIFY /
+/// MOVED_TO / CLOSE_WRITE on the series directory push wakeups into the
+/// rescan loop. The poll loop below stays as the safety net.
+#[cfg(target_os = "linux")]
+fn spawn_series_watcher(dir: &Path) -> WakeRx {
+    let (tx, rx) = tokio::sync::mpsc::channel::<()>(64);
+    let dir = dir.to_path_buf();
+    std::thread::Builder::new()
+        .name("aof-watcher".to_string())
+        .spawn(move || {
+            use inotify::{Inotify, WatchMask};
+
+            let mut watcher = match Inotify::init() {
+                Ok(w) => w,
+                Err(_) => return, // the poll loop covers the series
+            };
+            if watcher
+                .watches()
+                .add(
+                    &dir,
+                    WatchMask::CREATE
+                        | WatchMask::MODIFY
+                        | WatchMask::MOVED_TO
+                        | WatchMask::CLOSE_WRITE,
+                )
+                .is_err()
+            {
+                return;
+            }
+            let mut buf = [0u8; 4096];
+            loop {
+                // read_events is the blocking read: the thread sleeps in the
+                // kernel until the series directory changes.
+                match watcher.read_events(&mut buf) {
+                    Ok(events) => {
+                        if events.count() > 0 {
+                            let _ = tx.try_send(());
+                        }
+                    }
+                    Err(_) => return,
+                }
+            }
+        })
+        .expect("spawn aof-watcher");
+    rx
+}
+
+/// No watcher off Linux: the poll loop is the follower. The retained
+/// sender keeps the channel open so `recv` waits instead of spinning.
+#[cfg(not(target_os = "linux"))]
+fn spawn_series_watcher(_dir: &Path) -> WakeRx {
+    let (tx, rx) = tokio::sync::mpsc::channel::<()>(1);
+    std::mem::forget(tx);
+    rx
+}
+
+// ---------------------------------------------------------------------------
 // Rescan task
 // ---------------------------------------------------------------------------
 
-async fn rescan_task(dir: Arc<PathBuf>, tx: broadcast::Sender<FeedMsg>, poll_interval: Duration) {
+async fn rescan_task(
+    dir: Arc<PathBuf>,
+    tx: broadcast::Sender<FeedMsg>,
+    poll_interval: Duration,
+    mut wake: WakeRx,
+) {
     let mut current_open: Option<String> = None;
     let mut current_offset: u64 = 0;
     // Track rolled files we've already reported to avoid duplicates.
     let mut reported_rolled: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     loop {
-        tokio::time::sleep(poll_interval).await;
+        tokio::select! {
+            _ = tokio::time::sleep(poll_interval) => {}
+            _ = wake.recv() => {}
+        }
 
         let open_name = match find_open_file_name(&dir) {
             Some(n) => n,
@@ -684,8 +756,9 @@ async fn main() {
     let rescan_dir = Arc::clone(&dir);
     let rescan_tx = tx.clone();
     let poll_interval = Duration::from_millis(config.poll_ms);
+    let wake = spawn_series_watcher(&dir);
     tokio::spawn(async move {
-        rescan_task(rescan_dir, rescan_tx, poll_interval).await;
+        rescan_task(rescan_dir, rescan_tx, poll_interval, wake).await;
     });
 
     let listener = match TcpListener::bind(config.bind).await {
@@ -719,6 +792,7 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lunet_advisory_lock::aof::{AofConfig, AofWriter};
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -773,7 +847,7 @@ mod tests {
             data.extend_from_slice(&e.encode());
         }
         fs::write(dir.join(&name), &data).unwrap();
-        fs::write(dir.join(name.replace(".bin", ".meta")), &meta.encode()).unwrap();
+        fs::write(dir.join(name.replace(".bin", ".meta")), meta.encode()).unwrap();
         name
     }
 
@@ -891,7 +965,7 @@ mod tests {
     async fn test_files_get_exact_bytes() {
         let dir = temp_dir("files-get");
         let e1 = sample_event(journal::KIND_HOLD, 100, 1, 500);
-        let name = write_rolled_file(&dir, &[e1.clone()]);
+        let name = write_rolled_file(&dir, std::slice::from_ref(&e1));
 
         let dir_arc = Arc::new(dir.clone());
         let (tx, _) = broadcast::channel(16);
@@ -986,8 +1060,9 @@ mod tests {
 
         let rescan_dir = Arc::clone(&dir_arc);
         let rescan_tx = tx.clone();
+        let wake = spawn_series_watcher(&dir);
         tokio::spawn(async move {
-            rescan_task(rescan_dir, rescan_tx, Duration::from_millis(50)).await;
+            rescan_task(rescan_dir, rescan_tx, Duration::from_millis(50), wake).await;
         });
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -995,17 +1070,12 @@ mod tests {
         let serve_dir = Arc::clone(&dir_arc);
         let serve_tx = tx.clone();
         tokio::spawn(async move {
-            loop {
-                match listener.accept().await {
-                    Ok((stream, _)) => {
-                        let d = Arc::clone(&serve_dir);
-                        let t = serve_tx.clone();
-                        tokio::spawn(async move {
-                            handle_connection(stream, d, t).await;
-                        });
-                    }
-                    Err(_) => break,
-                }
+            while let Ok((stream, _)) = listener.accept().await {
+                let d = Arc::clone(&serve_dir);
+                let t = serve_tx.clone();
+                tokio::spawn(async move {
+                    handle_connection(stream, d, t).await;
+                });
             }
         });
 
@@ -1054,8 +1124,9 @@ mod tests {
 
         let rescan_dir = Arc::clone(&dir_arc);
         let rescan_tx = tx.clone();
+        let wake = spawn_series_watcher(&dir);
         tokio::spawn(async move {
-            rescan_task(rescan_dir, rescan_tx, Duration::from_millis(50)).await;
+            rescan_task(rescan_dir, rescan_tx, Duration::from_millis(50), wake).await;
         });
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1063,17 +1134,12 @@ mod tests {
         let serve_dir = Arc::clone(&dir_arc);
         let serve_tx = tx.clone();
         tokio::spawn(async move {
-            loop {
-                match listener.accept().await {
-                    Ok((stream, _)) => {
-                        let d = Arc::clone(&serve_dir);
-                        let t = serve_tx.clone();
-                        tokio::spawn(async move {
-                            handle_connection(stream, d, t).await;
-                        });
-                    }
-                    Err(_) => break,
-                }
+            while let Ok((stream, _)) = listener.accept().await {
+                let d = Arc::clone(&serve_dir);
+                let t = serve_tx.clone();
+                tokio::spawn(async move {
+                    handle_connection(stream, d, t).await;
+                });
             }
         });
 
@@ -1097,10 +1163,10 @@ mod tests {
             expiry_max: 500,
             count: 1,
         };
-        fs::write(dir.join("ev-100-100-500-500.meta"), &meta.encode()).unwrap();
+        fs::write(dir.join("ev-100-100-500-500.meta"), meta.encode()).unwrap();
         let e2 = sample_event(journal::KIND_RELEASE, 300, 3, 700);
         let new_open_name = "ev-open-2000.bin";
-        fs::write(dir.join(new_open_name), &e2.encode()).unwrap();
+        fs::write(dir.join(new_open_name), e2.encode()).unwrap();
 
         // Wait for rolled message.
         let val = ws_wait_for(&mut ws, Duration::from_secs(3), |v| v["type"] == "rolled").await;
@@ -1116,6 +1182,86 @@ mod tests {
         .await;
         assert_eq!(val["kind"], "release");
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Feed over the AOF series: the async write-behind writer produces the
+    /// file series, the follower tails it, and the server hands the events
+    /// to clients — no journal anywhere in the path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_feed_over_aof_series() {
+        let dir = temp_dir("aof-feed");
+        let writer = AofWriter::open(
+            &dir,
+            AofConfig {
+                flush_bytes: 1,
+                flush_interval: None,
+                queue_cap: 64,
+            },
+        )
+        .unwrap();
+
+        let dir_arc = Arc::new(dir.clone());
+        let (tx, _) = broadcast::channel(256);
+
+        let rescan_dir = Arc::clone(&dir_arc);
+        let rescan_tx = tx.clone();
+        let wake = spawn_series_watcher(&dir);
+        tokio::spawn(async move {
+            rescan_task(rescan_dir, rescan_tx, Duration::from_millis(50), wake).await;
+        });
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let serve_dir = Arc::clone(&dir_arc);
+        let serve_tx = tx.clone();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let d = Arc::clone(&serve_dir);
+                let t = serve_tx.clone();
+                tokio::spawn(async move {
+                    handle_connection(stream, d, t).await;
+                });
+            }
+        });
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let url = format!("ws://{addr}/ws");
+        let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+
+        // The writer lands bytes in the AOF; the feed picks them up.
+        writer.enqueue(sample_event(journal::KIND_HOLD, 700, 21, 1200));
+        writer.enqueue(sample_event(journal::KIND_RENEW, 800, 21, 1300));
+
+        let val = ws_wait_for(&mut ws, Duration::from_secs(5), |v| {
+            v["type"] == "event" && v["ts"] == 700
+        })
+        .await;
+        assert_eq!(val["kind"], "hold");
+
+        let val = ws_wait_for(&mut ws, Duration::from_secs(5), |v| {
+            v["type"] == "event" && v["ts"] == 800
+        })
+        .await;
+        assert_eq!(val["kind"], "renew");
+
+        // The REST listing serves the same AOF series.
+        let resp = http_get(addr, "/files").await;
+        assert_eq!(resp.status, 200);
+        let listing: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+        assert_eq!(listing.as_array().unwrap().len(), 1);
+        assert_eq!(listing[0]["open"], true);
+
+        // The file endpoint returns the raw AOF bytes.
+        let name = listing[0]["name"].as_str().unwrap().to_string();
+        let resp = http_get(addr, &format!("/files/{name}")).await;
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body.len(), 2 * RECORD_SIZE);
+
+        // Only two events through a 64-slot queue: nothing dropped.
+        assert_eq!(writer.drops(), 0);
+        drop(writer); // graceful shutdown: drains and fsyncs
         let _ = fs::remove_dir_all(&dir);
     }
 }

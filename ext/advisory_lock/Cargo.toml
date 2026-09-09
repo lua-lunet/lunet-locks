@@ -22,5 +22,15 @@ vrr = { package = "vrr-core", git = "https://github.com/lua-lunet/uvrr-core.git"
 [patch."https://github.com/lua-lunet/uvrr-core.git"]
 vrr-core = { path = "../uvrr-core" }
 
+[features]
+default = ["io-uring"]
+# Linux appends go through an io_uring ring (page-cached buffered writes;
+# no O_DIRECT/O_SYNC). On non-Linux targets the feature is inert and the
+# writer thread uses plain buffered write_all.
+io-uring = ["dep:io-uring"]
+
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = { version = "0.7", optional = true }
+
 [dev-dependencies]
 proptest = "1.11.0"
