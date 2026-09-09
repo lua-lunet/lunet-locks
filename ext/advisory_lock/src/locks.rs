@@ -92,6 +92,10 @@ pub enum Response {
         request_num: u64,
         lock_id: u64,
         lease: Option<Lease>,
+        /// The leader's execution tick (§7): the client interprets the
+        /// lease's expiry against the leader's timeline without assuming
+        /// synchronized clocks.
+        executed_at: u64,
     },
     Set {
         message_id: Uuid,
@@ -99,6 +103,8 @@ pub enum Response {
         lock_id: u64,
         granted: bool,
         lease: Option<Lease>,
+        /// The leader's execution tick (see `Get`).
+        executed_at: u64,
     },
     Release {
         message_id: Uuid,
@@ -106,6 +112,8 @@ pub enum Response {
         lock_id: u64,
         released: bool,
         lease: Option<Lease>,
+        /// The leader's execution tick (see `Get`).
+        executed_at: u64,
     },
 }
 
@@ -150,6 +158,7 @@ impl Service {
                     request_num,
                     lock_id,
                     lease: self.live(execution_time, lock_id),
+                    executed_at: execution_time,
                 },
                 None,
             ),
@@ -194,6 +203,7 @@ impl Service {
                         lock_id,
                         granted,
                         lease: if granted { Some(lease) } else { held },
+                        executed_at: execution_time,
                     },
                     transition,
                 )
@@ -231,6 +241,7 @@ impl Service {
                         lock_id,
                         released,
                         lease: if released { None } else { held },
+                        executed_at: execution_time,
                     },
                     transition,
                 )

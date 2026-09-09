@@ -16,7 +16,7 @@ mod transport;
 
 use lunet_advisory_lock::{
     NOT_LEADER, Node, OK, POSITION_APPEND, RECONFIGURE_DECREMENT, RECONFIGURE_INCREMENT,
-    RECONFIGURE_JOIN, RECONFIGURE_LEAVE, maybe_invariant,
+    RECONFIGURE_JOIN, RECONFIGURE_LEAVE, RecoveryFlush, maybe_invariant,
 };
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -128,6 +128,12 @@ struct Host {
     last_recovery: u64,
     last_status_note: u64,
     last_seen_leader: u32,
+    /// This node booted a dirty restart (incarnation >= 1): the §8
+    /// re-announce discipline drives `recover()` while the node is below
+    /// voting weight, not only while it is fenced — a leader change
+    /// mid-walk drops the armed forced-sequence machine (volatile leader
+    /// state), and only a fresh announcement re-arms the new leader.
+    reincarnated: bool,
     driver: Driver,
     forwarded_from: HashMap<[u8; 16], (SocketAddr, u64)>,
     conns: Vec<Conn>,
@@ -243,6 +249,11 @@ struct Options {
     aof_dir: String,
     /// The AOF's periodic-fsync knob (ms). 0 = only at roll and shutdown.
     aof_flush_ms: u64,
+    /// The E2 recovery-boundary flush variant (diskless | single |
+    /// double-ring). Non-diskless requires `recovery_scratch`.
+    recovery_flush: RecoveryFlush,
+    /// The scratch directory the recovery-boundary flush writes against.
+    recovery_scratch: String,
     heartbeat_ms: u64,
     election_ms: u64,
     recovery_ms: u64,
@@ -257,6 +268,8 @@ fn parse_options() -> Options {
         log: String::new(),
         aof_dir: String::new(),
         aof_flush_ms: 1000,
+        recovery_flush: RecoveryFlush::Diskless,
+        recovery_scratch: String::new(),
         heartbeat_ms: 100,
         election_ms: 1000,
         recovery_ms: 1000,
@@ -277,6 +290,16 @@ fn parse_options() -> Options {
             "--log" => options.log = value.clone(),
             "--aof-dir" => options.aof_dir = value.clone(),
             "--aof-flush-ms" => options.aof_flush_ms = value.parse().unwrap_or(1000),
+            "--recovery-flush" => {
+                options.recovery_flush = RecoveryFlush::parse(value).unwrap_or_else(|| {
+                    eprintln!(
+                        "lease-sequencer: --recovery-flush must be one of \
+                         diskless|single|double-ring"
+                    );
+                    exit(2);
+                })
+            }
+            "--recovery-scratch-dir" => options.recovery_scratch = value.clone(),
             "--heartbeat-ms" => options.heartbeat_ms = value.parse().unwrap_or(100),
             "--election-ms" => options.election_ms = value.parse().unwrap_or(1000),
             "--recovery-ms" => options.recovery_ms = value.parse().unwrap_or(1000),
@@ -296,6 +319,7 @@ fn parse_options() -> Options {
         eprintln!(
             "usage: lease-sequencer --name NAME --config PATH --client IPv4:PORT \
              --state PATH --log PATH [--aof-dir PATH] [--aof-flush-ms N] \
+             [--recovery-flush diskless|single|double-ring] [--recovery-scratch-dir PATH] \
              [--heartbeat-ms N] [--election-ms N] [--recovery-ms N]"
         );
         exit(2);
@@ -642,8 +666,31 @@ fn main() {
             eprintln!("lease-sequencer: standby node boot failed with code {code}");
             exit(2);
         })
-    } else {
+    } else if options.recovery_flush == RecoveryFlush::Diskless {
         Node::open(&members, &options.name, &options.state, None, 0).unwrap_or_else(|code| {
+            eprintln!("lease-sequencer: node boot failed with code {code}");
+            exit(2);
+        })
+    } else {
+        // The E2 variant boot: the recovery-boundary flush executes at the
+        // dirty-boot classification inside the adapter.
+        if options.recovery_scratch.is_empty() {
+            eprintln!(
+                "lease-sequencer: --recovery-flush {} requires --recovery-scratch-dir",
+                options.recovery_flush.label()
+            );
+            exit(2);
+        }
+        Node::open_with_recovery_flush(
+            &members,
+            &options.name,
+            &options.state,
+            None,
+            0,
+            options.recovery_flush,
+            &options.recovery_scratch,
+        )
+        .unwrap_or_else(|code| {
             eprintln!("lease-sequencer: node boot failed with code {code}");
             exit(2);
         })
@@ -705,6 +752,7 @@ fn main() {
         last_recovery: 0,
         last_status_note: 0,
         last_seen_leader: LEADER_UNKNOWN,
+        reincarnated: incarnation > 0,
         driver,
         forwarded_from: HashMap::new(),
         conns: Vec::new(),
@@ -755,12 +803,18 @@ fn timers(host: &mut Host, now: u64, rng: &mut Rng) {
     }
     if now.saturating_sub(host.last_status_note) >= 2000 {
         host.last_status_note = now;
+        // `voting` is the E1 runner's rejoin-serving signal: the
+        // reincarnated node is back at voting weight in the folded
+        // configuration once the leader's forced reconfiguration walk
+        // completes.
+        let voting = u32::from(host.node.voting_weight().unwrap_or(0) > 0);
         host.note(&format!(
-            "status state={} leader={} era={} view={}",
-            status.state, status.leader, status.era, status.view
+            "status state={} leader={} era={} view={} config_era={} voting={voting}",
+            status.state, status.leader, status.era, status.view, status.config_era
         ));
     }
-    if status.state == STATE_RECOVERING
+    if (status.state == STATE_RECOVERING
+        || (host.reincarnated && host.node.voting_weight().is_none_or(|weight| weight == 0)))
         && now.saturating_sub(host.last_recovery) >= host.recovery_ms
     {
         host.last_recovery = now;

@@ -248,6 +248,7 @@ fn release_requires_the_exact_live_lease_and_is_idempotent_after_expiry() {
             lock_id: LOCK_ID,
             released: false,
             lease: Some(incumbent),
+            executed_at: EXECUTION_TIME,
         }
     );
     assert_eq!(
@@ -258,6 +259,7 @@ fn release_requires_the_exact_live_lease_and_is_idempotent_after_expiry() {
             lock_id: LOCK_ID,
             released: true,
             lease: None,
+            executed_at: EXECUTION_TIME,
         }
     );
     assert_eq!(
@@ -268,6 +270,7 @@ fn release_requires_the_exact_live_lease_and_is_idempotent_after_expiry() {
             lock_id: LOCK_ID,
             released: true,
             lease: None,
+            executed_at: 200,
         }
     );
 }
@@ -364,6 +367,7 @@ fn service_matrix_is_complete_correlated_and_deterministic() {
                                     request_num: response_num,
                                     lock_id,
                                     lease,
+                                    ..
                                 },
                             ) => {
                                 assert_eq!(
@@ -384,6 +388,7 @@ fn service_matrix_is_complete_correlated_and_deterministic() {
                                     lock_id,
                                     granted,
                                     lease,
+                                    ..
                                 },
                             ) => {
                                 let granted_expected = expected_live
@@ -476,6 +481,7 @@ fn lock_isolation_and_u64_extrema_are_preserved() {
                 lock_id: value,
                 granted: value == u64::MIN,
                 lease: if value == u64::MIN { Some(lease) } else { None },
+                executed_at: value,
             }
         );
         assert_eq!(

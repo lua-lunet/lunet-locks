@@ -145,6 +145,7 @@
 use crate::aof::{AofConfig, AofWriter};
 use crate::journal::{self, Journal as LockJournal, JournalEvent};
 use crate::locks::{Service, Transition};
+use crate::recovery_flush::{self, FlushOutcome, RecoveryFlush};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{OsString, c_void};
 use std::fs::{self, File, OpenOptions};
@@ -756,6 +757,46 @@ impl Node {
         .unwrap_or(Err(PANIC))
     }
 
+    /// The E2 experiment variant: same grammar as [`Node::open`], plus the
+    /// recovery-boundary flush variant and its scratch directory. At the
+    /// dirty-boot classification point the variant's forced flush executes
+    /// against `scratch_dir` (variant 0 — [`RecoveryFlush::Diskless`] —
+    /// writes nothing); the measured latency lands in the node's log as a
+    /// `recovery-boundary flush executed` event. The C ABI never takes this
+    /// path: the ABI's boot stays variant 0.
+    pub fn open_with_recovery_flush(
+        members: &str,
+        own: &str,
+        state: &str,
+        journal_dir: Option<&str>,
+        roll_bytes: u32,
+        variant: RecoveryFlush,
+        scratch_dir: &str,
+    ) -> Result<Node, i32> {
+        catch_unwind(AssertUnwindSafe(|| {
+            let journal = journal_dir.filter(|dir| !dir.is_empty()).and_then(|dir| {
+                match LockJournal::open(Path::new(dir), roll_bytes as u64) {
+                    Ok(j) => Some(JournalSink::Blocking(j)),
+                    Err(e) => {
+                        eprintln!(
+                            "lunet-advisory-lock: journal open failed ({e}); \
+                         journaling disabled for this process"
+                        );
+                        None
+                    }
+                }
+            });
+            node_from_sink(
+                members.as_bytes(),
+                own.as_bytes(),
+                state.as_bytes(),
+                journal,
+                Some((variant, PathBuf::from(scratch_dir))),
+            )
+        }))
+        .unwrap_or(Err(PANIC))
+    }
+
     /// Propose a client request (the lock-verb JSON). `0` on acceptance —
     /// the correlated reply arrives later as a kind-2 `NodeOutput` keyed by
     /// the request's message_id; the ABI's negative codes otherwise.
@@ -970,6 +1011,19 @@ impl Node {
             view: snapshot.view,
             config_era: self.replica.progress().config().current().era.0,
         }
+    }
+
+    /// This node's voting weight in the current folded configuration
+    /// (`None` when it is not a member of it): the E1 runner's
+    /// "voting and serving" signal — a reincarnated node is walked back to
+    /// weight 1 by the leader's forced reconfiguration sequence, and the
+    /// host reports the weight in its status notes.
+    pub fn voting_weight(&self) -> Option<u32> {
+        let current = self.replica.progress().config().current();
+        current
+            .config
+            .weight_of(self.replica.own())
+            .map(|weight| weight.0)
     }
 
     /// Pop the next queued output, if any.
@@ -1260,7 +1314,20 @@ fn write_marker(path: &Path, incarnation: u64, marker: Marker) -> std::io::Resul
 /// marker is DIRTY: the incarnation bumps (refusing at exhaustion), the
 /// marker is rewritten `(new, flushed)` — the bump's commitment — and then
 /// `(new, unflushed)` as operating begins.
-fn boot_marker(path: &Path) -> Result<u64, i32> {
+///
+/// The DIRTY branch is the recovery boundary (the experiment design's §4):
+/// when a variant is configured, its forced flush executes right at the
+/// classification point — after the bump's commitment, before the
+/// reincarnated node rejoins serving — against the caller-provided scratch
+/// directory. Variant 0 (diskless) writes nothing. The flush carries fake
+/// data only and is never read back; its measured latency is returned so
+/// the boot can report it. A flush failure refuses the boot: the boundary
+/// is load-bearing for the measurement, and the marker's own fsync just
+/// succeeded, so a failure here means the disk is not usable.
+fn boot_marker(
+    path: &Path,
+    recovery: Option<(&RecoveryFlush, &Path)>,
+) -> Result<(u64, Option<FlushOutcome>), i32> {
     match OpenOptions::new().write(true).create_new(true).open(path) {
         Ok(mut file) => {
             let result = (|| {
@@ -1269,14 +1336,14 @@ fn boot_marker(path: &Path) -> Result<u64, i32> {
                 sync_parent(path)
             })();
             result.map_err(|_| CONFIG)?;
-            Ok(0)
+            Ok((0, None))
         }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             let (incarnation, marker) = read_marker(path).map_err(|_| CONFIG)?;
             match marker {
                 Marker::Flushed => {
                     write_marker(path, incarnation, Marker::Unflushed).map_err(|_| CONFIG)?;
-                    Ok(incarnation)
+                    Ok((incarnation, None))
                 }
                 Marker::Unflushed => {
                     let bumped = incarnation
@@ -1284,8 +1351,16 @@ fn boot_marker(path: &Path) -> Result<u64, i32> {
                         .filter(|next| *next <= INCARNATION_MAX)
                         .ok_or(CONFIG)?;
                     write_marker(path, bumped, Marker::Flushed).map_err(|_| CONFIG)?;
+                    let outcome = match recovery {
+                        None | Some((RecoveryFlush::Diskless, _)) => None,
+                        Some((variant, scratch)) => {
+                            let outcome = recovery_flush::execute(scratch, *variant, bumped)
+                                .map_err(|_| CONFIG)?;
+                            Some(outcome)
+                        }
+                    };
                     write_marker(path, bumped, Marker::Unflushed).map_err(|_| CONFIG)?;
-                    Ok(bumped)
+                    Ok((bumped, outcome))
                 }
             }
         }
@@ -1352,7 +1427,7 @@ fn node_from_parts(
                 }
             },
         );
-    node_from_sink(members_data, own_data, state_data, journal)
+    node_from_sink(members_data, own_data, state_data, journal, None)
 }
 
 /// The AOF-backed variant: the committed-transition hook enqueues to the
@@ -1379,7 +1454,7 @@ fn node_from_aof(
             None
         }
     };
-    node_from_sink(members_data, own_data, state_data, sink)
+    node_from_sink(members_data, own_data, state_data, sink, None)
 }
 
 fn node_from_sink(
@@ -1387,6 +1462,7 @@ fn node_from_sink(
     own_data: &[u8],
     state_data: &[u8],
     journal: Option<JournalSink>,
+    recovery: Option<(RecoveryFlush, PathBuf)>,
 ) -> Result<Node, i32> {
     // Member entries are "<u32-id>:<name>"; a post-genesis (joined)
     // entry is "<u32-id>:<name>:j". The plain-entry order is the
@@ -1445,12 +1521,28 @@ fn node_from_sink(
     };
     // The durable incarnation marker: first boot 0, a clean continue
     // keeps the incarnation, a dirty boot bumps it (see the module's
-    // Incarnation note and `boot_marker`).
+    // Incarnation note and `boot_marker`). The dirty branch is the
+    // recovery boundary: a configured E2 variant's forced flush executes
+    // there, against the caller-provided scratch directory.
     let state_path = PathBuf::from(state);
-    let incarnation = match boot_marker(&state_path) {
-        Ok(incarnation) => incarnation,
+    let (incarnation, flush_outcome) = match boot_marker(
+        &state_path,
+        recovery
+            .as_ref()
+            .map(|(variant, dir)| (variant, dir.as_path())),
+    ) {
+        Ok(boot) => boot,
         Err(_) => return Err(CONFIG),
     };
+    if let Some(outcome) = flush_outcome {
+        info!(
+            variant = outcome.variant,
+            bytes = outcome.bytes_written,
+            latency_us = outcome.latency.as_micros() as u64,
+            incarnation,
+            "recovery-boundary flush executed"
+        );
+    }
     let own_id = if incarnation == 0 {
         NodeId(own_member.id)
     } else {
@@ -1494,7 +1586,41 @@ fn node_from_sink(
         .iter()
         .map(|member| member.id)
         .collect::<HashSet<_>>();
-    let reincarnate_from = (incarnation > 0).then_some(NodeId(own_member.id));
+    // The superseded identity when this node booted a DIRTY restart: the
+    // bumped node re-announces `Reincarnation(old, new)` on every
+    // fenced-boot drive and, while it is below voting weight, on the host's
+    // §8 re-announce cadence. The old identity is the one the node LAST
+    // OPERATED AS — `low + (k-1) * INCARNATION_BASE` for the k-th bump —
+    // not the descriptor id: from the second bump on, the descriptor id was
+    // already evicted by the previous life's forced walk, so announcing it
+    // would name a non-member, the transport's remap could never chain
+    // (the previous bumped id is the row the peers still attribute the
+    // socket to), and the leader-side `from == new` gate would refuse the
+    // announcement forever.
+    let reincarnate_from = if incarnation > 0 {
+        match (own_member.id as u64)
+            .checked_add((incarnation - 1) * INCARNATION_BASE)
+            .and_then(|value| u32::try_from(value).ok())
+        {
+            Some(previous) => Some(NodeId(previous)),
+            None => return Err(CONFIG),
+        }
+    } else {
+        None
+    };
+    // Invariant (asserted, always): a reincarnated identity never reuses
+    // the old id — the bump moves the identity one band step past the
+    // previous life, disjoint from the whole descriptor space by
+    // construction.
+    assert!(
+        incarnation == 0
+            || (own_id.0 != own_member.id
+                && own_id.0 >= (1u32 << 24)
+                && Some(own_id.0) != reincarnate_from.map(|old| old.0)),
+        "reincarnated identity reuses the old id (old={:?}, new={})",
+        reincarnate_from.map(|old| old.0),
+        own_id.0
+    );
     let replica = match (incarnation > 0, own_member.joined) {
         // A bumped boot is a later life over the deployment's genesis —
         // the honest Volatile equivalent of upstream's `restart_as`
@@ -1861,19 +1987,19 @@ mod tests {
     #[test]
     fn incarnation_marker_is_created_then_bumps_and_continues() {
         let path = state_path("marker");
-        assert_eq!(boot_marker(&path).expect("first boot"), 0);
+        assert_eq!(boot_marker(&path, None).expect("first boot").0, 0);
         assert_eq!(fs::read_to_string(&path).unwrap(), "0 unflushed\n");
         // A restart over the running sentinel is dirty: the incarnation
         // bumps and the marker is rewritten (new, flushed), then
         // (new, unflushed) as operating begins.
-        assert_eq!(boot_marker(&path).expect("dirty boot bumps"), 1);
+        assert_eq!(boot_marker(&path, None).expect("dirty boot bumps").0, 1);
         assert_eq!(fs::read_to_string(&path).unwrap(), "1 unflushed\n");
-        assert_eq!(boot_marker(&path).expect("second bump"), 2);
+        assert_eq!(boot_marker(&path, None).expect("second bump").0, 2);
         assert_eq!(fs::read_to_string(&path).unwrap(), "2 unflushed\n");
         // A clean checkpoint (flushed) continues under the same incarnation:
         // the running sentinel replaces it, the identity never regresses.
         write_marker(&path, 7, Marker::Flushed).unwrap();
-        assert_eq!(boot_marker(&path).expect("clean continue"), 7);
+        assert_eq!(boot_marker(&path, None).expect("clean continue").0, 7);
         assert_eq!(fs::read_to_string(&path).unwrap(), "7 unflushed\n");
         fs::remove_file(path).unwrap();
     }
@@ -1882,22 +2008,60 @@ mod tests {
     fn incarnation_marker_refuses_malformed_and_exhausted_identities() {
         let path = state_path("marker-bad");
         fs::write(&path, "not a marker\n").unwrap();
-        assert_eq!(boot_marker(&path), Err(CONFIG));
+        assert_eq!(boot_marker(&path, None), Err(CONFIG));
         fs::write(&path, "999 unflushed\n").unwrap();
-        assert_eq!(boot_marker(&path), Err(CONFIG));
+        assert_eq!(boot_marker(&path, None), Err(CONFIG));
         fs::write(&path, "3 stale\n").unwrap();
-        assert_eq!(boot_marker(&path), Err(CONFIG));
+        assert_eq!(boot_marker(&path, None), Err(CONFIG));
         // The bump refuses at exhaustion instead of wrapping a superseded
         // identity into circulation (upstream `Incarnation::bump`,
         // reincarnation.rs:413-417).
         fs::write(&path, format!("{} unflushed\n", INCARNATION_MAX)).unwrap();
-        assert_eq!(boot_marker(&path), Err(CONFIG));
+        assert_eq!(boot_marker(&path, None), Err(CONFIG));
         fs::write(&path, format!("{} flushed\n", INCARNATION_MAX)).unwrap();
         assert_eq!(
-            boot_marker(&path).expect("the exhausted identity still continues"),
+            boot_marker(&path, None)
+                .expect("the exhausted identity still continues")
+                .0,
             255
         );
         fs::remove_file(path).unwrap();
+    }
+
+    /// The recovery boundary executes the configured variant's flush exactly
+    /// at the dirty-boot classification: the flush lands between the bump's
+    /// commitment and the running sentinel, its latency is reported, and a
+    /// clean continue never flushes.
+    #[test]
+    fn dirty_boot_executes_the_recovery_flush_clean_continue_does_not() {
+        use crate::recovery_flush::RecoveryFlush;
+        let path = state_path("marker-flush");
+        let scratch = state_path("marker-flush-scratch");
+        fs::remove_dir_all(&scratch).ok();
+        assert_eq!(boot_marker(&path, None).expect("first boot").1, None);
+        assert!(
+            !scratch.exists(),
+            "boot_marker with no variant writes nothing"
+        );
+        let (incarnation, outcome) =
+            boot_marker(&path, Some((&RecoveryFlush::SingleBlock, &scratch)))
+                .expect("dirty boot with the flush variant");
+        assert_eq!(incarnation, 1);
+        let outcome = outcome.expect("the dirty boot reports the flush");
+        assert_eq!(outcome.variant, "single");
+        assert_eq!(outcome.bytes_written, 4096);
+        assert!(outcome.latency.as_nanos() > 0);
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "1 unflushed\n",
+            "the marker discipline is unchanged by the flush"
+        );
+        let (incarnation, outcome) =
+            boot_marker(&path, Some((&RecoveryFlush::Diskless, &scratch))).expect("variant 0");
+        assert_eq!(incarnation, 2);
+        assert_eq!(outcome, None, "variant 0 writes nothing");
+        fs::remove_file(path).unwrap();
+        fs::remove_dir_all(&scratch).unwrap();
     }
 
     /// The sparse admin-assigned member ids every test cluster uses, in
@@ -1911,7 +2075,7 @@ mod tests {
     /// A provisioned node over an explicit state path, so the reincarnation
     /// test can restart the same durable marker file through the real ABI.
     fn provision_at(path: &Path, own: u32, members: u32) -> Node {
-        boot_marker(path).expect("marker file");
+        boot_marker(path, None).expect("marker file");
         let replica = Replica::provision(
             NodeId(own),
             TEST_IDS[..members as usize]
@@ -2092,7 +2256,7 @@ mod tests {
     /// `Recovering`, addressed, and outside every configuration until a
     /// committed `Join` admits it.
     fn provision_joiner(name: &str, own: u32, genesis: &[u32]) -> Node {
-        boot_marker(&state_path(name)).expect("marker file");
+        boot_marker(&state_path(name), None).expect("marker file");
         let replica = match joiner_replica(
             NodeId(own),
             genesis.iter().map(|id| NodeId(*id)).collect(),
