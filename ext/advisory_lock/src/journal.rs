@@ -188,17 +188,19 @@ impl Meta {
 }
 
 /// Rolling-window accumulator for the current open file's metadata.
+/// Shared with the AOF writer, which finalizes files with the same
+/// naming and metafile conventions.
 #[derive(Debug, Clone)]
-struct Window {
-    op_min: u64,
-    op_max: u64,
-    expiry_min: u64,
-    expiry_max: u64,
-    count: u32,
+pub(crate) struct Window {
+    pub(crate) op_min: u64,
+    pub(crate) op_max: u64,
+    pub(crate) expiry_min: u64,
+    pub(crate) expiry_max: u64,
+    pub(crate) count: u32,
 }
 
 impl Window {
-    fn new(event: &JournalEvent) -> Self {
+    pub(crate) fn new(event: &JournalEvent) -> Self {
         Self {
             op_min: event.ts,
             op_max: event.ts,
@@ -208,7 +210,7 @@ impl Window {
         }
     }
 
-    fn update(&mut self, event: &JournalEvent) {
+    pub(crate) fn update(&mut self, event: &JournalEvent) {
         self.op_min = self.op_min.min(event.ts);
         self.op_max = self.op_max.max(event.ts);
         self.expiry_min = self.expiry_min.min(event.expiry);
@@ -216,7 +218,7 @@ impl Window {
         self.count += 1;
     }
 
-    fn meta(&self) -> Meta {
+    pub(crate) fn meta(&self) -> Meta {
         Meta {
             op_min: self.op_min,
             op_max: self.op_max,
@@ -359,8 +361,9 @@ impl Journal {
     }
 }
 
-/// Find an existing `ev-open-*.bin` file in the directory.
-fn find_open_file(dir: &Path) -> io::Result<Option<fs::DirEntry>> {
+/// Find an existing `ev-open-*.bin` file in the directory. Shared with the
+/// AOF writer, which resumes its series with the same conventions.
+pub(crate) fn find_open_file(dir: &Path) -> io::Result<Option<fs::DirEntry>> {
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let name = entry.file_name();
@@ -390,8 +393,9 @@ fn create_open_file(dir: &Path, started_ms: u64) -> io::Result<(File, PathBuf)> 
     Ok((file, path))
 }
 
-/// Write a metafile atomically: tmp + fsync + rename + dir sync.
-fn write_meta_atomic(path: &Path, meta: &Meta) -> io::Result<()> {
+/// Write a metafile atomically: tmp + fsync + rename + dir sync. Shared
+/// with the AOF writer, which finalizes files with the same conventions.
+pub(crate) fn write_meta_atomic(path: &Path, meta: &Meta) -> io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let base = path.file_name().unwrap_or_default();
     let unique = current_millis_fallback();

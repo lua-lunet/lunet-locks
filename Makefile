@@ -30,7 +30,9 @@ LUNET_ARCHIVE_PATH := $(LUNET_ROOT)/$(LUNET_ARCHIVE)
 CHECK_SOURCES = tests/teal_learning_test.tl \
                 tests/advisory_lock_ffi_test.tl \
                 tests/advisory_lock_pure_test.tl \
-                tests/cluster_config_test.tl
+                tests/cluster_config_test.tl \
+                tests/admin_test.tl \
+                tests/remap_test.tl
 
 .PHONY: init deps build check test smoke simulation simulation-test lunet-runtime docs clean ext ext-check ext-test fmt lint hooks docker-build docker-simulation package package-verify
 
@@ -40,9 +42,12 @@ init:
 	$(MAKE) deps
 
 deps:
-	$(LUAROCKS) install cyan
-	$(LUAROCKS) install tested
-	$(LUAROCKS) install cerulean
+	# The versions are load-bearing pins: tested 0.4.0 changed its API to
+	# instance methods (the suite calls module-level `tested.test`), and
+	# cerulean 1.9.1 changed the formatting rules the tree is formatted to.
+	$(LUAROCKS) install cyan 0.4.1-1
+	$(LUAROCKS) install tested 0.3.0-1
+	$(LUAROCKS) install cerulean 1.9.0-1
 
 fmt:
 	$(CERU) src tests
@@ -96,9 +101,10 @@ simulation-test: tools/lease_failover_sim.rs
 simulation: lunet-runtime build $(SIM_BIN)
 	SIM_ROOT=$(CURDIR) LUNET_RUN=$(abspath $(LUNET_RUN)) $(SIM_BIN) --duration $(SIM_DURATION)
 
-# Follow vrr-core's conventional plain multi-stage `docker build` model. A
-# disposable vendored context avoids BuildKit SSH mounts while retaining the
-# exact private dependency revision.
+# Plain multi-stage `docker build`. The prepared context carries the vendored
+# dependency sources and the ext/uvrr-core submodule source (the manifest's
+# [patch] section resolves vrr-core to the submodule), so nothing is fetched
+# over the network inside Docker and no BuildKit mounts are needed.
 DOCKER_IMAGE ?= lunet-advisory-lock
 DOCKER_PLATFORM ?= native
 docker-build: build lunet-runtime

@@ -10,15 +10,21 @@ local MAX_U32 = 4294967295
 local MEMBERSHIP_FINGERPRINT_HEX_BYTES = 16
 local PEER_HEADER_BYTES = #PEER_MAGIC + 1 + MEMBERSHIP_FINGERPRINT_HEX_BYTES
 
+local cluster_config = require("cluster_config")
+
 local function endpoint_key(host: string, port: integer): string
     return host .. ":" .. tostring(port)
 end
 
-local function source_is_member(host: string, port: integer, members: {string}): boolean
+-- Peer sources are authenticated against the deployment descriptor's
+-- endpoints: a datagram from an unlisted host:port never reaches the
+-- fingerprint gate.
+local function source_is_member(
+    host: string, port: integer, members: {cluster_config.ClusterNode}
+): boolean
     local source = endpoint_key(host, port)
     for _, member in ipairs(members) do
-        local _, address = member:match("^([^=]+)=(.+)$")
-        if address == source then
+        if member.host .. ":" .. tostring(member.port) == source then
             return true
         end
     end
@@ -61,8 +67,8 @@ local function decode_peer(packet: string): (boolean, string, string, string)
 end
 
 -- A redirect is deliberately a small fixed-size application packet. It carries
--- no leader index: every fixed ordered membership maps the supplied era+view
--- to its leader through the local replica adapter.
+-- no leader id: every replica maps the supplied era+view to its leader id
+-- through the local replica adapter and the deployment descriptor.
 local function u32_bytes(value: integer): string
     return string.char(
         math.floor(value / 16777216) % 256,
@@ -115,6 +121,67 @@ local function valid_not_leader(
     return expected_source >= 0 and actual_source == expected_source
 end
 
+-- The Reincarnation announcement's exact wire shape (upstream
+-- `src/wire.rs` Tag::Reincarnation = 13, `src/message.rs`
+-- Body::Reincarnation): a 20-byte big-endian header (tag u32, era u32,
+-- view u32, slot u64) plus a 1-byte body discriminant plus two big-endian
+-- u32 member ids — 29 bytes total. This is the one VRR payload the host
+-- decodes: the (old, new) pair in the body IS the addressing notice for a
+-- restarted replica's identity bump, so the id<->endpoint tables can remap
+-- without an application-level broadcast.
+local REINCARNATION_TAG = 13
+local REINCARNATION_BYTES = 20 + 1 + 4 + 4
+
+local function reincarnation_pair(payload: string): (boolean, integer, integer)
+    if #payload ~= REINCARNATION_BYTES then
+        return false, 0, 0
+    end
+    if parse_u32(payload:sub(1, 4)) ~= REINCARNATION_TAG then
+        return false, 0, 0
+    end
+    -- The body discriminant must agree with the header tag (the core's
+    -- codec refuses a mismatched discriminant; so does this gate).
+    if (payload:byte(21) or 0) ~= REINCARNATION_TAG then
+        return false, 0, 0
+    end
+    local old = parse_u32(payload:sub(22, 25))
+    local new = parse_u32(payload:sub(26, 29))
+    return true, old, new
+end
+
+-- The identity band where every bumped (reincarnated) id lives: the
+-- k-th incarnation's id is `descriptor-id + k * 2^24`, so a bumped id is
+-- at least 2^24 and can never alias a descriptor id (the low band is the
+-- whole descriptor space).
+local REINCARNATION_ID_BAND = 16777216
+
+-- The reincarnation remap over the live addressing tables (the restarted
+-- replica's entry ticket): the row for the bumped id is ADDED at the
+-- source endpoint and the source socket is attributed to the new identity
+-- from here on; the OLD id's row STAYS. The old identity is still named
+-- by the serving configuration every peer's core folded — its send
+-- targets the same socket the new identity binds, and dropping the row
+-- would turn every pre-eviction send into an unaddressable replica. The
+-- row leaves only with the identity it names: the reincarnation forced
+-- steps evict the old identity from the serving configuration, and after
+-- that eviction the core addresses nothing to it. Applied exactly once
+-- per (old, new) pair: a second announcement of the same pair is a
+-- no-op, and a bumped id that already has a row is refused.
+local function apply_reincarnation_remap(
+    endpoint_by_id: {integer: string},
+    id_by_endpoint: {string: integer},
+    source_endpoint: string,
+    old: integer,
+    new: integer
+): boolean
+    if old == new or new < REINCARNATION_ID_BAND or endpoint_by_id[new] ~= nil then
+        return false
+    end
+    endpoint_by_id[new] = source_endpoint
+    id_by_endpoint[source_endpoint] = new
+    return true
+end
+
 local function feed_ndjson(
     buffer: string, chunk: string, max_size: integer
 ): ({string}, string)
@@ -161,5 +228,7 @@ return {
     encode_not_leader = encode_not_leader,
     decode_not_leader = decode_not_leader,
     valid_not_leader = valid_not_leader,
+    reincarnation_pair = reincarnation_pair,
+    apply_reincarnation_remap = apply_reincarnation_remap,
     feed_ndjson = feed_ndjson,
 }

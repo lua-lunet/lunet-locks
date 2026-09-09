@@ -77,9 +77,7 @@ start_node() {
         "$image" \
         --node "$name" --client "0.0.0.0:2910${name#n}" \
         --state "/var/lib/lunet-lock/${name}.nonce" \
-        --member n1=172.30.77.11:29111 \
-        --member n2=172.30.77.12:29112 \
-        --member n3=172.30.77.13:29113 >/dev/null
+        --cluster /app/docker/cluster.jsonl >/dev/null
     containers="$containers ${network}-${name}"
 }
 

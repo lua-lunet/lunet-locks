@@ -2,6 +2,22 @@
 
 Local guidance for this repo. Keep it short, factual, and unsurprising.
 
+## Subagent delegation
+
+- Prefer the subagent delegation skill: work a numbered todo list
+  (`item00`, `item01`, …), write each item's spec to the gitignored
+  `.tmp/delegation/` scratch as `itemNN.md`, launch one agent per spec,
+  gate commits on verified-green work, and use a `wip:` prefix until the
+  feature set is complete. Where doing so does not overwrite any other
+  instruction here or the user's stated preferences.
+
+## Read boundary
+
+- Agents are FORBIDDEN from reading outside this repo. A dependency's code is
+  a git dependency: read it at its GitHub repository (e.g.
+  `https://github.com/lua-lunet/uvrr-core` / raw.githubusercontent.com at the
+  pinned ref), never a sibling checkout on disk and never cargo's home cache.
+
 ## Scope
 
 - `src/` is the shipped Teal source tree.
@@ -25,15 +41,14 @@ Local guidance for this repo. Keep it short, factual, and unsurprising.
   release. Run `make lunet-runtime` or `make smoke`; do not use a `lunet-run`
   from `PATH`. Its authoritative shipped LuaCATS/Teal docs are under
   `.lunet/v0.8.0/types/`.
-- The authoritative vrr-core source is the pinned tag v0.2.0
-  (`6cbc1f36fb3a8bfa3aa7a66d12d697d3539b8ff0`). The sibling local checkout
-  may be ahead of the tag; check it out at the tag (or read via
-  `git show v0.2.0:...`) before using it as API authority. Do not revalidate
-  or change it unless a concrete adapter API need requires it.
-  A serious correctness, safety, or replication bug is a stop-and-report issue.
-  A small focused additive ergonomic change may be staged locally (never
-  committed or pushed) only with a corresponding upstream GitHub issue; report
-  it to the coordinator.
+- The authoritative uvrr-core source is the vendored submodule
+  `ext/uvrr-core`, branch `lunet-locks/learner-era-fold`: upstream commit
+  `0fc6380` plus the learner-acquisition and fence-under-load patch
+  commits. The adapter manifest's `[patch]` section builds the dependency
+  from the submodule, so this tree always builds against that branch. Do
+  not revalidate or change the submodule unless a concrete adapter API need
+  requires it. A serious correctness, safety, or replication bug is a
+  stop-and-report issue; report upstream engagement to the coordinator.
 
 ## Teal no-surprises recap
 

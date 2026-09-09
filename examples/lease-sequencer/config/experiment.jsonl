@@ -1,0 +1,3 @@
+{"id":1,"name":"dc1-node1","host":"127.0.0.1","port":41201,"genesis":true}
+{"id":2,"name":"dc2-node1","host":"127.0.0.1","port":41202,"genesis":true}
+{"id":3,"name":"dc3-node1","host":"127.0.0.1","port":41203,"genesis":true}

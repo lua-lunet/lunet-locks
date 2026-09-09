@@ -1,12 +1,15 @@
 # Plain multi-stage Docker build, intentionally compatible with Colima's legacy
 # builder: it uses no BuildKit-only mounts, secrets, or cache directives.
-# `tools/docker_prepare_context.sh` vendors the pinned vrr-core v0.2.0 source
-# into the build context, so no git fetch happens inside Docker.
+# `tools/docker_prepare_context.sh` vendors the transitive dependency sources
+# and the uvrr-core submodule source (the lunet-locks/learner-era-fold patch
+# branch the manifest's [patch] section names), so no git fetch happens inside
+# Docker.
 FROM rust:1.85-slim AS native
 
 WORKDIR /app/ext/advisory_lock
 COPY .cargo/config.toml /usr/local/cargo/config.toml
 COPY vendor /app/vendor
+COPY ext/uvrr-core /app/ext/uvrr-core
 COPY ext/advisory_lock /app/ext/advisory_lock
 RUN cargo build --release --locked
 
@@ -32,6 +35,7 @@ RUN apt-get update \
 COPY --from=native /app/ext/advisory_lock/target/release/liblunet_advisory_lock.so /app/lib/
 COPY build /app/build
 COPY docker/entrypoint.sh /app/docker/entrypoint.sh
+COPY docker/cluster.jsonl /app/docker/cluster.jsonl
 RUN chmod 755 /app/docker/entrypoint.sh
 
 ENV LUNET_ADVISORY_LOCK_LIB=/app/lib/liblunet_advisory_lock.so

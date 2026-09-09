@@ -1,3 +1,4 @@
+local cluster_config = require("cluster_config")
 local ffi = require("ffi")
 
 ffi.cdef(
@@ -11,11 +12,14 @@ ffi.cdef(
         void** out);
     void lunet_lock_node_free(void* node);
     int32_t lunet_lock_node_request(void* node, size_t json_len, const uint8_t* json);
+    int32_t lunet_lock_node_reconfigure(
+        void* node, uint32_t op, uint32_t member, uint32_t position);
     int32_t lunet_lock_node_receive(
         void* node, uint32_t from, size_t len, const uint8_t* data);
     int32_t lunet_lock_node_idle(void* node);
     int32_t lunet_lock_node_leader_timeout(void* node);
     int32_t lunet_lock_node_recover(void* node);
+    int32_t lunet_lock_node_own_id(void* node, uint32_t* id);
     int32_t lunet_lock_node_status(
         void* node, uint32_t* status, uint32_t* leader,
         uint32_t* era, uint32_t* view);
@@ -34,6 +38,15 @@ ffi.cdef(
 local MAX_DATAGRAM = 65507
 local MESSAGE_ID_BYTES = 16
 local NOT_LEADER = -8
+-- `lunet_lock_node_reconfigure` operation codes: Join at weight 0, weight
+-- Increment (learner to voter), Decrement (voter to learner), Leave (only
+-- at weight 0, per the core's rules). The position sentinel means "append
+-- at the core's succession end".
+local RECONFIGURE_JOIN = 1
+local RECONFIGURE_INCREMENT = 2
+local RECONFIGURE_LEAVE = 3
+local RECONFIGURE_DECREMENT = 4
+local POSITION_APPEND = 4294967295
 
 local errors: {integer: string} = {
     [-1] = "invalid argument",
@@ -53,10 +66,12 @@ local record Native
     ): number
     lunet_lock_node_free: function(any)
     lunet_lock_node_request: function(any, integer, any): number
+    lunet_lock_node_reconfigure: function(any, integer, integer, integer): number
     lunet_lock_node_receive: function(any, integer, integer, any): number
     lunet_lock_node_idle: function(any): number
     lunet_lock_node_leader_timeout: function(any): number
     lunet_lock_node_recover: function(any): number
+    lunet_lock_node_own_id: function(any, {number}): number
     lunet_lock_node_status: function(
         any, {number}, {number}, {number}, {number}
     ): number
@@ -111,10 +126,12 @@ local record advisory_lock
         _leader: {number}
 
         request: function(Node, string): boolean, string
+        reconfigure: function(Node, string, integer): boolean, string
         receive: function(Node, integer, string): boolean
         idle: function(Node): boolean
         leader_timeout: function(Node): boolean
         recover: function(Node): boolean
+        own_id: function(Node): integer
         status: function(Node): Status
         leader_for_view: function(Node, integer, integer): integer
         outputs: function(Node): {Output}
@@ -138,7 +155,7 @@ local record advisory_lock
         view: integer
     end
 
-    new: function({string}, string, string, string, integer): Node
+    new: function({cluster_config.ClusterNode}, string, string, string, integer): Node
 end
 
 local Node = advisory_lock.Node
@@ -171,6 +188,36 @@ function Node:request(json: string): boolean, string
     return check(rc)
 end
 
+-- Proposes a membership reconfiguration on this node. Leader-only: the
+-- adapter drives `Input::Reconfigure` through the ordinary pipeline, the
+-- era advances exactly at the establishing operation's commit, and every
+-- refusal except NotPrimary reports as a raised error (NotPrimary returns
+-- the non-raising "not_leader" so the caller re-forwards to the named
+-- primary, exactly as for lock requests).
+function Node:reconfigure(action: string, id: integer): boolean, string
+    local op: integer
+    if action == "join" then
+        op = RECONFIGURE_JOIN
+    elseif action == "increment" then
+        op = RECONFIGURE_INCREMENT
+    elseif action == "decrement" then
+        op = RECONFIGURE_DECREMENT
+    elseif action == "leave" then
+        op = RECONFIGURE_LEAVE
+    else
+        error("advisory_lock: unknown reconfigure action " .. action, 2)
+    end
+    local rc = (
+        tonumber(
+            native.lunet_lock_node_reconfigure(self._handle, op, id, POSITION_APPEND)
+        ) or -127
+    ) as integer
+    if rc == NOT_LEADER then
+        return nil, "not_leader"
+    end
+    return check(rc)
+end
+
 function Node:receive(from: integer, bytes: string): boolean
     return check(
         (
@@ -188,9 +235,8 @@ end
 
 function Node:leader_timeout(): boolean
     return check(
-        (
-            tonumber(native.lunet_lock_node_leader_timeout(self._handle)) or -127
-        ) as integer
+        (tonumber(native.lunet_lock_node_leader_timeout(self._handle)) or -127)
+            as integer
     )
 end
 
@@ -198,6 +244,17 @@ function Node:recover(): boolean
     return check(
         (tonumber(native.lunet_lock_node_recover(self._handle)) or -127) as integer
     )
+end
+
+-- The node's live identity: the descriptor id at incarnation 0, the bumped
+-- high-band id after a dirty restart. The host compares leaders against it
+-- — after a bump the descriptor row still names the superseded id.
+function Node:own_id(): integer
+    check(
+        (tonumber(native.lunet_lock_node_own_id(self._handle, self._leader)) or -127)
+            as integer
+    )
+    return (tonumber(self._leader[0]) or -1) as integer
 end
 
 function Node:status(): Status
@@ -299,8 +356,17 @@ end
 
 local M: advisory_lock = {}
 
+-- The ABI member buffer carries explicit admin ids, one NUL-separated
+-- "<id>:<name>" entry per genesis member, in deployment-descriptor order:
+-- that order is the genesis succession sequence and each id is the member's
+-- live NodeId. A member that joined a live cluster carries a ":j" suffix —
+-- it sits outside the genesis order, and a node whose own name matches such
+-- an entry boots the joiner way (a later life over the deployment's
+-- genesis, fenced until the stream proves currency). `own` is matched by
+-- name; every peer address on the ABI (receive `from`, send `to`, leader
+-- outs) is a member id.
 function M.new(
-    members: {string},
+    members: {cluster_config.ClusterNode},
     own: string,
     state_path: string,
     journal_dir: string,
@@ -308,8 +374,12 @@ function M.new(
 ): Node
     assert(#members >= 3, "advisory_lock: at least three members are required")
     for _, member in ipairs(members) do
+        local entry = tostring(member.id) .. ":" .. member.name
+        if not member.genesis then
+            entry = entry .. ":j"
+        end
         assert(
-            member:find("\0", 1, true) == nil, "advisory_lock: membership contains NUL"
+            entry:find("\0", 1, true) == nil, "advisory_lock: membership contains NUL"
         )
     end
     assert(own:find("\0", 1, true) == nil, "advisory_lock: own member contains NUL")
@@ -325,7 +395,15 @@ function M.new(
         journal_roll_bytes >= 0,
         "advisory_lock: journal roll bytes must be non-negative"
     )
-    local packed = table.concat(members, "\0")
+    local entries: {string} = {}
+    for _, member in ipairs(members) do
+        local entry = tostring(member.id) .. ":" .. member.name
+        if not member.genesis then
+            entry = entry .. ":j"
+        end
+        table.insert(entries, entry)
+    end
+    local packed = table.concat(entries, "\0")
     local out = ffi.new("void*[1]") as {any}
     check(
         (
@@ -360,15 +438,36 @@ function M.new(
         _status = ffi.new("uint32_t[1]") as {number},
         _leader = ffi.new("uint32_t[1]") as {number},
         request = Node.request,
+        reconfigure = Node.reconfigure,
         receive = Node.receive,
         idle = Node.idle,
         leader_timeout = Node.leader_timeout,
         recover = Node.recover,
+        own_id = Node.own_id,
         status = Node.status,
         leader_for_view = Node.leader_for_view,
         outputs = Node.outputs,
         close = Node.close,
     }
+end
+
+-- The two FFI calls with more than eight arguments are excluded from
+-- tracing: LuaJIT's arm64 JIT compiles their on-stack argument area
+-- incorrectly under GC pressure, which corrupts the callee's `out` pointer
+-- and crashes at an ~20-60% rate on identical binaries (SIGSEGV/SIGBUS in
+-- `lunet_lock_node_new+` and GC marking during `Node:outputs`). Trace exits
+-- fall back to the interpreter, where the calls measure clean. The jit
+-- module is a LuaJIT builtin with no Teal defs, so the type checker must
+-- not resolve it as a module dependency; it is loaded dynamically.
+local builtin = "ji" .. "t"
+local ok, jit_any = pcall(require, builtin)
+if ok then
+    local record JitApi
+        off: function(any, boolean)
+    end
+    local jit_module: JitApi = jit_any as JitApi
+    jit_module.off(M.new, true)
+    jit_module.off(Node.outputs, true)
 end
 
 return M

@@ -85,15 +85,17 @@ The hook point is a pure Teal module, `src/telemetry_log.tl`, called from
 the Teal service layer *after* a request has been committed and applied
 (i.e. downstream of the code that turns `Node:request()` /
 `Node:receive()` / `Node:idle()` results into client replies) — never inside
-`src/advisory_lock.tl`'s FFI boundary, and never inside the pinned vrr-core
-dependency itself.
+`src/advisory_lock.tl`'s FFI boundary, and never inside the vendored
+uvrr-core submodule itself.
 
-**vrr-core boundary**: telemetry only observes already-committed outputs; it
-does not need vrr-core to expose anything beyond what it already returns.
-If a revision of this format ever needs replication slot/era/view captured per
-record, that requires a vrr-core adapter surface — per `AGENTS.md`, any such
-change is staged locally only, never committed or pushed, backed by an
-upstream GitHub issue, and reported to the coordinator.
+**Core boundary**: telemetry only observes already-committed outputs; it
+needs nothing from the core beyond what the adapter surface already
+reports. The adapter's output drain reports each queued send's era, view,
+and slot from the encoded message's wire header, and the status surface
+reports the current era, view, and leader from the core's folded
+configuration — so a revision of this format that needs replication
+slot/era/view captured per record reads them at the existing adapter
+surface, without a core change.
 
 ## nginx read path
 
