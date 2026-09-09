@@ -33,6 +33,21 @@ test -d "$root/ext/uvrr-core/src" || {
 mkdir -p "$context/ext/uvrr-core"
 cp "$root/ext/uvrr-core/Cargo.toml" "$context/ext/uvrr-core/Cargo.toml"
 cp -R "$root/ext/uvrr-core/src" "$context/ext/uvrr-core/src"
+# The diagnosis-kit stage builds the demo crate (the lease-sequencer node,
+# the lease-client control client, the lease-load traffic generator) and the
+# std-only rtt_probe. Its dependency closure comes from the demo crate's own
+# Cargo.lock, vendored beside the advisory-lock closure (the two locks
+# resolve different versions, so they cannot share one vendor directory).
+mkdir -p "$context/examples/lease-sequencer" "$context/tools"
+cp "$root/examples/lease-sequencer/Cargo.toml" "$root/examples/lease-sequencer/Cargo.lock" \
+    "$context/examples/lease-sequencer/"
+cp -R "$root/examples/lease-sequencer/src" "$context/examples/lease-sequencer/src"
+cp -R "$root/examples/lease-sequencer/config" "$context/examples/lease-sequencer/config"
+cp "$root/tools/rtt_probe.rs" "$context/tools/rtt_probe.rs"
+cargo vendor --manifest-path "$root/examples/lease-sequencer/Cargo.toml" --locked --versioned-dirs \
+    "$context/vendor-demo" >"$context/.cargo/config-demo.toml.generated"
+sed "s|directory = \".*\"|directory = \"/app/vendor-demo\"|" \
+    "$context/.cargo/config-demo.toml.generated" >"$context/.cargo/config-demo.toml"
 cp -R "$root/build" "$context/build"
 mkdir -p "$context/docker"
 cp "$root/docker/Dockerfile" "$root/docker/entrypoint.sh" "$root/docker/cluster.jsonl" "$context/docker/"
