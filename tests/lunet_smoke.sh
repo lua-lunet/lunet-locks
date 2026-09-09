@@ -10,6 +10,11 @@ work=$(mktemp -d "$root/.tmp/lunet-smoke.XXXXXX")
 pids=""
 completed=false
 
+fail() {
+    echo "lunet smoke: $*" >&2
+    exit 1
+}
+
 stop_process() {
     pid=$1
     if kill -0 "$pid" 2>/dev/null; then
@@ -50,7 +55,6 @@ test -x "$cyan" || {
     echo "lunet smoke: Cyan is required at $cyan (or set CYAN)" >&2
     exit 127
 }
-
 cd "$root"
 cargo build --release --manifest-path ext/advisory_lock/Cargo.toml
 "$cyan" build --prune
@@ -98,7 +102,7 @@ request_lines() {
     expected=$3
     deadline=${4:-5}
     output=$work/client.out
-    printf '%s' "$input" | perl -MIO::Select -MIO::Socket::INET -e '
+    if ! printf '%s' "$input" | perl -MIO::Select -MIO::Socket::INET -e '
         my $port = shift;
         my $deadline = shift;
         sub connect_socket {
@@ -121,6 +125,11 @@ request_lines() {
             syswrite STDOUT, $reply or die "stdout: $!\n";
         }
     ' "$port" "$deadline" >"$output"
+    then
+        echo "lunet smoke: the client exchange failed (connect, write, or reply deadline)" >&2
+        cat "$output" >&2
+        return 1
+    fi
     oldifs=$IFS
     IFS='|'
     set -- $expected
@@ -152,16 +161,19 @@ request_lines 28102 "{\"op\":\"set\",\"message_id\":\"00000000-0000-0000-0000-00
 {\"op\":\"release\",\"message_id\":\"00000000-0000-0000-0000-000000000004\",\"client_id\":1,\"request_num\":3,\"lock_id\":9001,\"holder\":\"$holder1\",\"lease_id\":1}
 {\"op\":\"set\",\"message_id\":\"00000000-0000-0000-0000-000000000005\",\"client_id\":2,\"request_num\":2,\"lock_id\":9001,\"lease\":{\"lease_id\":2,\"holder\":\"$holder2\",\"expiry\":$future}}
 {\"op\":\"release\",\"message_id\":\"00000000-0000-0000-0000-000000000006\",\"client_id\":2,\"request_num\":3,\"lock_id\":9001,\"holder\":\"$holder2\",\"lease_id\":2}
-" '"granted":true|"op":"get"|"granted":false|"released":true|"granted":true|"released":true'
+" '"granted":true|"op":"get"|"granted":false|"released":true|"granted":true|"released":true' \
+    || fail "the lock exchange failed"
 
 soon=$(perl -MTime::HiRes=time -e 'printf "%.0f", time() * 1000 + 3000')
-request_lines 28102 "{\"op\":\"set\",\"message_id\":\"00000000-0000-0000-0000-000000000007\",\"client_id\":3,\"request_num\":1,\"lock_id\":9001,\"lease\":{\"lease_id\":3,\"holder\":\"$holder1\",\"expiry\":$soon}}" '"granted":true'
+request_lines 28102 "{\"op\":\"set\",\"message_id\":\"00000000-0000-0000-0000-000000000007\",\"client_id\":3,\"request_num\":1,\"lock_id\":9001,\"lease\":{\"lease_id\":3,\"holder\":\"$holder1\",\"expiry\":$soon}}" '"granted":true' \
+    || fail "the short-lease grant failed"
 sleep 3.1
 # The takeover set's own lease must outlive the post-restart resurrection
 # window (the get below runs ~10s later), so it is granted a minute; the
 # takeover itself is driven by the prior short lease's expiry above.
 takeover_expiry=$(perl -MTime::HiRes=time -e 'printf "%.0f", time() * 1000 + 60000')
-request_lines 28102 "{\"op\":\"set\",\"message_id\":\"00000000-0000-0000-0000-000000000008\",\"client_id\":4,\"request_num\":1,\"lock_id\":9001,\"lease\":{\"lease_id\":4,\"holder\":\"$holder3\",\"expiry\":$takeover_expiry}}" '"granted":true'
+request_lines 28102 "{\"op\":\"set\",\"message_id\":\"00000000-0000-0000-0000-000000000008\",\"client_id\":4,\"request_num\":1,\"lock_id\":9001,\"lease\":{\"lease_id\":4,\"holder\":\"$holder3\",\"expiry\":$takeover_expiry}}" '"granted":true' \
+    || fail "the takeover grant failed"
 
 # A restarted replica reincarnates: the killed process left the running
 # sentinel in its durable state file, so the restart classifies dirty, the
@@ -171,18 +183,29 @@ request_lines 28102 "{\"op\":\"set\",\"message_id\":\"00000000-0000-0000-0000-00
 # commits era 2, the leader's idle fence enters it, and
 # Batch([Increment(16777519), Leave(303)]) commits era 3: the new identity
 # sits at weight 1 in the old succession position and the old identity is
-# evicted. The rejoined node is a weight-0 learner whose streamed catch-up
-# is upstream §10 future work; the client path stays on the fully-caught-up
-# incumbents throughout, and the get below asserts the pre-restart lock
-# state — committed truth, nothing fabricated by the restart. The wait
-# covers the fence (~5s of primary idle after the first batch) plus the
-# re-announce cadence (2.5s).
+# evicted. The rejoined node is a weight-0 learner whose admitting era — the
+# first forced-step era, one past its boot fold — reaches it with the
+# era's StartView: the offer is retained, the fetch is served, the
+# acquisition folds the admitting era, and the stream carries era 3. The
+# remap notice adds the bumped id's addressing row at every peer and keeps
+# the old id's row until the eviction, so the pre-eviction era's traffic to
+# the old identity is never unaddressable. The client path stays on the
+# fully-caught-up incumbents throughout, and the get below asserts the
+# pre-restart lock state — committed truth, nothing fabricated by the
+# restart. The wait covers the fence (~5s of primary idle after the first
+# batch) plus the re-announce cadence (2.5s).
 n3pid=$(cat "$work/n3.pid")
 stop_process "$n3pid"
 pids=$(printf '%s\n' "$pids" | sed "s/ $n3pid//")
 start n3 28103 27103
 sleep 10
-request_lines 28102 "{\"op\":\"get\",\"message_id\":\"00000000-0000-0000-0000-000000000009\",\"client_id\":4,\"request_num\":2,\"lock_id\":9001}" '"op":"get"|33333333-3333-3333-3333-333333333333'
+request_lines 28102 "{\"op\":\"get\",\"message_id\":\"00000000-0000-0000-0000-000000000009\",\"client_id\":4,\"request_num\":2,\"lock_id\":9001}" '"op":"get"|33333333-3333-3333-3333-333333333333' \
+    || fail "the post-restart read failed"
+# The restart's remap window: a healthy reincarnation addresses every
+# datagram — the old id's row stays until the forced steps evict the
+# identity, so no send is dropped for lack of a row.
+flood=$(grep -h "cannot address replica" "$work"/*.err "$work"/*.out 2>/dev/null | wc -l | tr -d ' ')
+[ "$flood" -eq 0 ] || fail "the restart's remap window dropped $flood datagrams for unaddressable replicas"
 
 # ---------------------------------------------------------------------------
 # Live reconfiguration: while a client keeps acquiring, renewing, releasing
@@ -215,11 +238,9 @@ now_ms() {
 # anything entering the log. Refusals are the expected settling shape, so
 # the loop retries within a budget. An acknowledgment is only trusted when
 # it arrives inside the leader's 30s era-poll window: at the window's end
-# the leader emits the same accepted:true body without a committed era.
-# This stage is observational: an exhausted budget or a timeout
-# acknowledgment is logged with its logs and the stage continues — the
-# stream timeline below is the record, and strictness of these outcomes
-# returns with the hardening milestone.
+# the leader emits the same accepted:true body without a committed era. A
+# verb is accepted only when its establishing commit advanced the leader's
+# era inside the retry budget — an exhausted budget fails the run.
 drive_admin() {
     label=$1
     template=$2
@@ -259,6 +280,7 @@ cat >"$work/stream.pl" <<'EOF'
 use strict;
 use warnings;
 use Time::HiRes qw(time sleep);
+use IO::Select;
 use IO::Socket::INET;
 
 my $port = shift @ARGV;
@@ -289,6 +311,8 @@ sub request {
     my ($json, $marker, $what) = @_;
     my $t0 = now_ms();
     print {$sock} $json, "\n" or die "STREAM ERROR: write ($what): $!\n";
+    IO::Select->new($sock)->can_read(60)
+        or die "STREAM ERROR: timeout awaiting $what reply\n";
     my $reply = <$sock>;
     defined $reply or die "STREAM ERROR: connection closed awaiting $what reply\n";
     chomp $reply;
@@ -340,22 +364,26 @@ sleep 2
 # then reaches the weight-0 joiner, which folds its admitting era there. The
 # promotion's own success is downstream proof of the join's commit: a drive
 # for a member the configuration does not know is refused.
-drive_admin join "{\"action\":\"join\",\"message_id\":\"%s\",\"id\":404,\"name\":\"n4\",\"endpoint\":\"127.0.0.1:27104\"}" a || true
+drive_admin join "{\"action\":\"join\",\"message_id\":\"%s\",\"id\":404,\"name\":\"n4\",\"endpoint\":\"127.0.0.1:27104\"}" a \
+    || fail "the live join was not accepted"
 t_join_start=$(cat "$work/join.start")
 t_join_done=$(cat "$work/join.done" 2>/dev/null || printf '%s' "$t_join_start")
 sleep 2
 
-drive_admin increment "{\"action\":\"increment\",\"message_id\":\"%s\",\"id\":404}" b || true
+drive_admin increment "{\"action\":\"increment\",\"message_id\":\"%s\",\"id\":404}" b \
+    || fail "the live increment was not accepted"
 t_inc_start=$(cat "$work/increment.start")
 t_inc_done=$(cat "$work/increment.done" 2>/dev/null || printf '%s' "$t_inc_start")
 sleep 2
 
-drive_admin decrement "{\"action\":\"decrement\",\"message_id\":\"%s\",\"id\":404}" c || true
+drive_admin decrement "{\"action\":\"decrement\",\"message_id\":\"%s\",\"id\":404}" c \
+    || fail "the live decrement was not accepted"
 t_dec_start=$(cat "$work/decrement.start")
 t_dec_done=$(cat "$work/decrement.done" 2>/dev/null || printf '%s' "$t_dec_start")
 sleep 2
 
-drive_admin leave "{\"action\":\"leave\",\"message_id\":\"%s\",\"id\":404}" d || true
+drive_admin leave "{\"action\":\"leave\",\"message_id\":\"%s\",\"id\":404}" d \
+    || fail "the live leave was not accepted"
 t_leave_start=$(cat "$work/leave.start")
 t_leave_done=$(cat "$work/leave.done" 2>/dev/null || printf '%s' "$t_leave_start")
 sleep 2
@@ -374,14 +402,15 @@ request_lines 28102 "{\"op\":\"release\",\"message_id\":\"00000000-0000-0000-000
 stop_process "$stream_pid"
 pids=$(printf '%s\n' "$pids" | sed "s/ $stream_pid//")
 t_stream_end=$(now_ms)
-# Observational stage: a stream error across the live reconfiguration is
-# logged in full but does not fail the run — the timeline below is the
-# record for the hardening milestone.
+# The stream survives every transition window: any unexpected reply, stall
+# past the deadline, dropped connection, or timeout is a stream error and
+# fails the run.
 if grep -q "STREAM ERROR" "$work/stream.err"; then
-    echo "lunet smoke: the lock stream errored across the live reconfiguration (observational):" >&2
+    echo "lunet smoke: the lock stream errored across the live reconfiguration:" >&2
     cat "$work/stream.err" >&2
+    fail "the lock stream did not survive the live reconfiguration"
 fi
-test -s "$work/stream.out" || echo "lunet smoke: the lock stream produced no replies (observational)" >&2
+test -s "$work/stream.out" || fail "the lock stream produced no replies"
 
 # The transition record: request counts and worst-case per-request latency
 # inside each admin-verb window, then the whole stage. The stream's own

@@ -100,8 +100,9 @@
 //! - **Timers.** The tag has a single liveness input, `Input::Tick`; both
 //!   `node_idle` (heartbeat) and `node_leader_timeout` (election) drive it.
 //!   `ViewChangeKnobs::primary_timeout` is `PRIMARY_TIMEOUT_MS` below;
-//!   `view_change_budget` is `MAX_DATAGRAM` so a core-built suffix never
-//!   exceeds one datagram.
+//!   `view_change_budget` is `EVIDENCE_BUDGET` — the largest core-built
+//!   suffix or chunk this host puts on one datagram, sized to what a
+//!   default UDP socket actually delivers (see the constant's note).
 //! - **Peer payload gate.** The core carries operation payloads opaque and
 //!   validates none of them (B2), so the adapter re-checks every peer-carried
 //!   operation entry (Prepare / DoViewChange / StartView / NewState) with
@@ -234,6 +235,22 @@ const MAX_DATAGRAM: usize = 65507;
 /// next view. Host policy; correctness never depends on it.
 const PRIMARY_TIMEOUT_MS: u64 = 5000;
 
+/// The host's evidence-and-transfer datagram budget (W5): the largest
+/// core-built suffix or chunk this host will put on one datagram. The
+/// core's own cap is `MAX_DATAGRAM` (one UDP datagram), but the wire path
+/// here is the LAL peer envelope over a host UDP socket, and a default
+/// socket's send buffer caps a single send well below that limit — on
+/// macOS the default is 9216 bytes, and a send past it fails with
+/// `EMSGSIZE` and the datagram silently never arrives. A view-change
+/// evidence or `StartView` suffix sized past that budget would then
+/// strand the very view change it carries: the designated primary waits
+/// forever on evidence that was sent and lost. 8192 leaves headroom for
+/// the envelope under every default UDP send buffer this stack runs on;
+/// the transfer machinery resumes whatever does not fit through the
+/// fetch cursor (§13.1 step 5), so correctness never depends on the
+/// number — only liveness does.
+const EVIDENCE_BUDGET: usize = 8192;
+
 /// Leader/primary unknown (era outside the core's three-era retention
 /// window, or the void configuration): the value status and
 /// leader-for-view report in that case.
@@ -347,15 +364,26 @@ impl Node {
     /// A drive whose outer input's tick the caller already chose (fenced
     /// boot nonce ticks); feedback inputs inside the loop still sample the
     /// clock.
+    ///
+    /// The feedback queue drains FIRST-IN-FIRST-OUT: the core's §11.1
+    /// acknowledgement refuses any `Input::Applied` report but the next
+    /// expected slot, and a publish whose effects apply several operations
+    /// (a gap-served chunk, a view-change install — the live shapes any
+    /// client stream produces) must report its completions in the slot
+    /// order the effects were emitted in. A last-in-first-out drain
+    /// reports the newest slot first, refuses against its own publish, and
+    /// abandons the drive after it — with the install already published
+    /// and the applied frontier stranded behind it.
     fn drive_at(&mut self, at: u64, event: Input) -> i32 {
         if self.poisoned {
             return SERVICE;
         }
-        let mut pending = vec![TimedInput {
+        let mut pending: VecDeque<TimedInput> = VecDeque::new();
+        pending.push_back(TimedInput {
             at: Tick(at),
             event,
-        }];
-        while let Some(input) = pending.pop() {
+        });
+        while let Some(input) = pending.pop_front() {
             if self.poisoned {
                 return SERVICE;
             }
@@ -452,7 +480,11 @@ impl Node {
         self.last_config_era = Some(config_era);
     }
 
-    fn apply_effect(&mut self, effect: Effect, pending: &mut Vec<TimedInput>) -> Result<(), i32> {
+    fn apply_effect(
+        &mut self,
+        effect: Effect,
+        pending: &mut VecDeque<TimedInput>,
+    ) -> Result<(), i32> {
         match effect {
             Effect::Send { to, message, .. } => {
                 let size = message.packed_len();
@@ -584,7 +616,7 @@ impl Node {
                     });
                 }
                 let at = self.tick()?;
-                pending.push(TimedInput {
+                pending.push_back(TimedInput {
                     at: Tick(at),
                     event: Input::Applied { slot },
                 });
@@ -845,7 +877,28 @@ impl Node {
             RECONFIGURE_LEAVE => SystemOperation::Leave(NodeId(member)),
             _ => return INVALID,
         };
-        let pivot = self.derived_pivot(&system);
+        // The host's pivot policy (W5 is sizing; this is its transition
+        // sibling): the non-stop overlap path is probed only for the
+        // weight-moves it has been proven through. A membership change
+        // — Join or Leave — drives the stop-the-world fallback with
+        // `pivot: None`, a latency outcome, never an error: the
+        // establishing era then completes through the ordinary fence the
+        // stop-the-world exemption arms (the same proven path every
+        // stop-the-world transition takes). The probed non-stop machine
+        // for a weight-0 departure is the one liveness hole the
+        // upstream-issue draft records: its solicited evidence races the
+        // proposer's own establishing commit, the answer that arrives
+        // first is dropped UnevaluableEra (the proposer's table has not
+        // folded the establishing era yet), the one-shot solicitation
+        // never re-fires, and with the machine armed the
+        // stop-the-world exemption does not gate the primary's baseline —
+        // the stream keeps the fence from arming and the transition sits
+        // half-committed forever. The stop-the-world path has no such
+        // window.
+        let pivot = match op {
+            RECONFIGURE_JOIN | RECONFIGURE_LEAVE => None,
+            _ => self.derived_pivot(&system),
+        };
         self.drive(Input::Reconfigure { op: system, pivot })
     }
 
@@ -1287,7 +1340,7 @@ fn node_from_parts(
         .collect();
     let knobs = ViewChangeKnobs {
         primary_timeout: PRIMARY_TIMEOUT_MS,
-        view_change_budget: MAX_DATAGRAM,
+        view_change_budget: EVIDENCE_BUDGET,
     };
     // The durable incarnation marker: first boot 0, a clean continue
     // keeps the incarnation, a dirty boot bumps it (see the module's
@@ -1783,7 +1836,7 @@ mod tests {
             Stability::Volatile,
             ViewChangeKnobs {
                 primary_timeout: PRIMARY_TIMEOUT_MS,
-                view_change_budget: MAX_DATAGRAM,
+                view_change_budget: EVIDENCE_BUDGET,
             },
         )
         .expect("provision");
@@ -1958,7 +2011,7 @@ mod tests {
             genesis.iter().map(|id| NodeId(*id)).collect(),
             ViewChangeKnobs {
                 primary_timeout: PRIMARY_TIMEOUT_MS,
-                view_change_budget: MAX_DATAGRAM,
+                view_change_budget: EVIDENCE_BUDGET,
             },
         ) {
             Ok(replica) => replica,
@@ -2382,40 +2435,50 @@ mod tests {
             "the learner's weight is not needed"
         );
 
-        // Leave the zero-weight member: the adapter's derived pivot places
-        // the departing learner inside qI, so the establishing Prepare goes
-        // only to `qII - {L}` = {id 10}; the commit advances the era to 3
-        // and the departed identity is gone from the folded configuration.
+        // Leave the zero-weight member: the host's pivot policy drives
+        // membership changes stop-the-world (`pivot: None`) — the probed
+        // non-stop machine for a weight-0 departure is the liveness hole
+        // the upstream-issue draft records (its solicited evidence races
+        // the proposer's own establishing commit and the one-shot
+        // solicitation never re-fires). The establishing Prepare reaches
+        // every backup, and the commit advances the era to 3: the
+        // departed identity is gone from the folded configuration.
         assert_eq!(reconfigure(&mut nodes[1], RECONFIGURE_LEAVE, 40, 0), OK);
         let prepare = pop_send(&mut nodes[1], TEST_IDS[0], vrr::wire::Tag::Prepare)
-            .expect("the pivot routes the establishing Prepare");
+            .expect("the stop-the-world fallback reaches every backup");
+        let prepare_three = pop_send(&mut nodes[1], TEST_IDS[2], vrr::wire::Tag::Prepare)
+            .expect("the stop-the-world fallback reaches every backup");
+        let prepare_learner = pop_send(&mut nodes[1], 40, vrr::wire::Tag::Prepare)
+            .expect("the stop-the-world fallback reaches every backup");
         assert!(
-            pop_send(&mut nodes[1], TEST_IDS[2], vrr::wire::Tag::Prepare).is_none()
-                && pop_send(&mut nodes[1], 40, vrr::wire::Tag::Prepare).is_none(),
-            "the pivot routes to qII - {{L}} only"
+            pop_send(
+                &mut nodes[1],
+                TEST_IDS[1],
+                vrr::wire::Tag::PlannedViewChange
+            )
+            .is_none(),
+            "membership changes solicit nothing: the fallback is stop-the-world"
         );
         deliver_hop(&mut nodes, &ids, 1, prepare);
-        let ok = pop_send(&mut nodes[0], TEST_IDS[1], vrr::wire::Tag::PrepareOk)
-            .expect("the qII member acknowledges");
-        deliver_hop(&mut nodes, &ids, 0, ok);
-        // The commit folds era 3 and solicits planned evidence from
-        // `qI - {L}` = {id 40}: the caught-up learner answers, the planned
-        // quorum completes, and the switch to v' is ONE published
-        // transition — StartView(v') to every member of config(e+1).
+        deliver_hop(&mut nodes, &ids, 1, prepare_three);
+        deliver_hop(&mut nodes, &ids, 1, prepare_learner);
+        // One voter's acknowledgment alongside the primary's own vote
+        // commits (weights [1,1,1,0], total 3, threshold 2).
+        let ok_one = pop_send(&mut nodes[0], TEST_IDS[1], vrr::wire::Tag::PrepareOk)
+            .expect("the voter acknowledges");
+        deliver_hop(&mut nodes, &ids, 0, ok_one);
         route_until_quiet(&mut nodes, &ids);
         assert_eq!(
             nodes[1].replica.progress().config().current().era,
             Era(3),
             "the leave commits era 3"
         );
-        // The planned machine stalls: the departing learner sits inside
-        // qI, and once the leave commits the §6 membership discard blocks
-        // every message FROM the departed identity — its planned answer
-        // can never count. The leader's view stands still.
+        // The era the leave established awaits the ordinary view change
+        // (§8.7.8); the fence completes the entry.
         assert_eq!(
             nodes[1].replica.observer().read().view,
             1,
-            "the planned quorum waits on the discarded departed identity"
+            "the era-3 entry awaits the ordinary fence"
         );
         assert!(
             nodes[1]
@@ -2435,13 +2498,17 @@ mod tests {
         let snapshot = nodes[2].replica.observer().read();
         assert_eq!((snapshot.status, snapshot.era, snapshot.view), (0, 3, 2));
         // The departed learner: it folded the era that departs it (the
-        // commit cascade reached it before the fan-out excluded it) and
-        // stays fenced at its last era — its future messages are foreign.
+        // establishing entry's fold at its own accept made the entry era
+        // evaluable), so the era-3 fence reaches it while it is still a
+        // member of the establishing configuration — it fences into the
+        // era-3 view change and holds there: the era-3 configuration no
+        // longer names it, so no StartView is ever addressed to it. Its
+        // future messages are foreign.
         let snapshot = nodes[3].replica.observer().read();
         assert_eq!(
             (snapshot.status, snapshot.era, snapshot.view),
-            (0, 2, 1),
-            "the departed identity holds its last caught-up view"
+            (1, 3, 2),
+            "the departed identity fences into the era its own fold opened and stays there"
         );
     }
 
@@ -2881,21 +2948,33 @@ mod tests {
         );
 
         // The leave: the weight-0 member departs. Driven on the era-4
-        // primary (view 6 selects id 30 under the succession order). The
-        // derived pivot places the departing member inside qI — the
-        // establishing Prepare goes only to `qII - {L}` = {id 10}.
-        assert_eq!(reconfigure(&mut nodes[2], RECONFIGURE_LEAVE, 40, 0), OK);
-        let prepare = pop_send(&mut nodes[2], TEST_IDS[0], vrr::wire::Tag::Prepare)
-            .expect("the pivot routes the establishing Prepare");
+        // primary (view 6 selects id 10 under the voter-only succession:
+        // the voters are {10, 20}, view 6 picks the first). The host's
+        // pivot policy drives membership changes stop-the-world
+        // (`pivot: None`): the establishing Prepare reaches every backup
+        // and the commit folds era 5.
+        assert_eq!(reconfigure(&mut nodes[0], RECONFIGURE_LEAVE, 40, 0), OK);
+        let prepare_one = pop_send(&mut nodes[0], TEST_IDS[1], vrr::wire::Tag::Prepare)
+            .expect("the stop-the-world fallback reaches every backup");
+        let prepare_three = pop_send(&mut nodes[0], TEST_IDS[2], vrr::wire::Tag::Prepare)
+            .expect("the stop-the-world fallback reaches every backup");
+        let prepare_learner = pop_send(&mut nodes[0], 40, vrr::wire::Tag::Prepare)
+            .expect("the stop-the-world fallback reaches every backup");
         assert!(
-            pop_send(&mut nodes[2], TEST_IDS[1], vrr::wire::Tag::Prepare).is_none()
-                && pop_send(&mut nodes[2], 40, vrr::wire::Tag::Prepare).is_none(),
-            "the pivot routes to qII - {{L}} only: the departing member sits inside qI"
+            pop_send(
+                &mut nodes[0],
+                TEST_IDS[0],
+                vrr::wire::Tag::PlannedViewChange
+            )
+            .is_none(),
+            "membership changes solicit nothing: the fallback is stop-the-world"
         );
-        deliver_hop(&mut nodes, &ids, 2, prepare);
-        let ok = pop_send(&mut nodes[0], TEST_IDS[2], vrr::wire::Tag::PrepareOk)
-            .expect("the qII member acknowledges");
-        deliver_hop(&mut nodes, &ids, 0, ok);
+        deliver_hop(&mut nodes, &ids, 0, prepare_one);
+        deliver_hop(&mut nodes, &ids, 0, prepare_three);
+        deliver_hop(&mut nodes, &ids, 0, prepare_learner);
+        let ok = pop_send(&mut nodes[1], TEST_IDS[0], vrr::wire::Tag::PrepareOk)
+            .expect("the voter acknowledges");
+        deliver_hop(&mut nodes, &ids, 1, ok);
         route_until_quiet(&mut nodes, &ids);
 
         // The commit folds era 5: the departed identity is out of the
@@ -2930,18 +3009,15 @@ mod tests {
                 snapshot.view,
                 snapshot.committed
             ),
-            (0, 4, 6, 5),
-            "the departed learner holds its last caught-up view"
+            (0, 4, 6, 6),
+            "the departed learner commits the leave that departs it (the commit cascade              reached it before the fan-out excluded it)"
         );
-        // The leave-planned-quorum tension: the departing member sits
-        // inside qI, and once the leave commits the §6 membership discard
-        // blocks every message FROM the departed identity — its planned
-        // answer, which the solicitation explicitly solicits, can never be
-        // counted. The leader's view stands still.
+        // The era the leave established awaits the ordinary view change
+        // (§8.7.8): the leader's view stands still until the fence.
         assert_eq!(
             nodes[2].replica.observer().read().view,
             6,
-            "the planned quorum waits on the discarded departed identity"
+            "the era-5 entry awaits the ordinary fence"
         );
         // The era the leave established awaits the ordinary view change
         // (§8.7.8): the fence completes the entry — the latency outcome
@@ -2958,9 +3034,10 @@ mod tests {
         let snapshot = nodes[3].replica.observer().read();
         assert_eq!(
             (snapshot.status, snapshot.era, snapshot.view),
-            (0, 4, 6),
-            "the departed identity stays fenced at its last caught-up view: its future \
-             messages are foreign"
+            (1, 5, 7),
+            "the departed identity fences into the era its own accepting fold opened and \
+             stays there: the era-5 configuration no longer names it, so no StartView is \
+             ever addressed to it and its future messages are foreign"
         );
     }
 

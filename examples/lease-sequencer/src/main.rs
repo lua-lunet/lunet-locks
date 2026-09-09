@@ -774,7 +774,12 @@ fn handle_packet(
     if kind == transport::PEER_VRR {
         // The reincarnation remap: a `Reincarnation(old, new)` announcement
         // arriving from the socket the deployment attributes to `old` IS the
-        // restarted process's entry ticket; the row moves to the bumped id.
+        // restarted process's entry ticket; the row for the bumped id is
+        // ADDED at the source socket and the old id's row STAYS — the old
+        // era's configuration still names it, its send targets the same
+        // socket the new identity binds, and the row leaves only when the
+        // reincarnation forced steps evict the old identity from the
+        // serving configuration.
         if let Some((old, new)) = transport::reincarnation_pair(payload)
             && old == replica
             && old != new
@@ -782,7 +787,6 @@ fn handle_packet(
             && !host.peers.contains_key(&new)
         {
             host.peers.insert(new, addr);
-            host.peers.remove(&old);
             host.addr_to_id.insert(addr, new);
             host.note(&format!("remap old={old} new={new}"));
             replica = new;

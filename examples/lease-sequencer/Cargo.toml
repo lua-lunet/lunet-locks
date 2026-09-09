@@ -11,3 +11,12 @@ tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
+
+# The [patch] section is honored only in a workspace root's manifest — a
+# dependency's own [patch] is ignored — so the consumer restates it here.
+# Without this the example resolves vrr-core from the git dependency at
+# 0fc6380 and builds without the learner-acquisition serving rule or the
+# voter-only succession: the joined learner's fetch is then refused
+# UnknownSender live while the same shape converges in-process.
+[patch."https://github.com/lua-lunet/uvrr-core.git"]
+vrr-core = { path = "../../ext/uvrr-core" }

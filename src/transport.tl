@@ -149,6 +149,39 @@ local function reincarnation_pair(payload: string): (boolean, integer, integer)
     return true, old, new
 end
 
+-- The identity band where every bumped (reincarnated) id lives: the
+-- k-th incarnation's id is `descriptor-id + k * 2^24`, so a bumped id is
+-- at least 2^24 and can never alias a descriptor id (the low band is the
+-- whole descriptor space).
+local REINCARNATION_ID_BAND = 16777216
+
+-- The reincarnation remap over the live addressing tables (the restarted
+-- replica's entry ticket): the row for the bumped id is ADDED at the
+-- source endpoint and the source socket is attributed to the new identity
+-- from here on; the OLD id's row STAYS. The old identity is still named
+-- by the serving configuration every peer's core folded — its send
+-- targets the same socket the new identity binds, and dropping the row
+-- would turn every pre-eviction send into an unaddressable replica. The
+-- row leaves only with the identity it names: the reincarnation forced
+-- steps evict the old identity from the serving configuration, and after
+-- that eviction the core addresses nothing to it. Applied exactly once
+-- per (old, new) pair: a second announcement of the same pair is a
+-- no-op, and a bumped id that already has a row is refused.
+local function apply_reincarnation_remap(
+    endpoint_by_id: {integer: string},
+    id_by_endpoint: {string: integer},
+    source_endpoint: string,
+    old: integer,
+    new: integer
+): boolean
+    if old == new or new < REINCARNATION_ID_BAND or endpoint_by_id[new] ~= nil then
+        return false
+    end
+    endpoint_by_id[new] = source_endpoint
+    id_by_endpoint[source_endpoint] = new
+    return true
+end
+
 local function feed_ndjson(
     buffer: string, chunk: string, max_size: integer
 ): ({string}, string)
@@ -196,5 +229,6 @@ return {
     decode_not_leader = decode_not_leader,
     valid_not_leader = valid_not_leader,
     reincarnation_pair = reincarnation_pair,
+    apply_reincarnation_remap = apply_reincarnation_remap,
     feed_ndjson = feed_ndjson,
 }

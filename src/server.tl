@@ -18,10 +18,12 @@
 -- protocol): the native adapter classifies the durable state file dirty,
 -- bumps the identity, and announces the `Reincarnation(old, new)` pair on
 -- the VRR channel. The wire body IS the addressing notice — the receive
--- loop remaps the old id's endpoint row to the new id when the pair arrives
--- from the socket the deployment attributes to the old id, with no
--- application-level broadcast. The genesis membership fingerprint is
--- untouched: a restart changes no descriptor line.
+-- loop adds the new id's endpoint row when the pair arrives from the
+-- socket the deployment attributes to the old id, with no application-level
+-- broadcast; the old id's row stays until the reincarnation forced steps
+-- evict the old identity from the serving configuration. The genesis
+-- membership fingerprint is untouched: a restart changes no descriptor
+-- line.
 --
 -- Admin verbs carry the same host robustness the lock path gets from the
 -- native adapter's exactly-once handling, at the Teal layer: the leader
@@ -92,10 +94,8 @@ local record Pending
     done: boolean
     forwarded_to: integer
     -- Admin-verb forwarder state: the replica id the verb was last
-    -- forwarded to (-1 until the first forward) and the heartbeat attempts
-    -- since that forward (a silent-leader window advances the rotation).
+    -- forwarded to (-1 until the first forward).
     verb_cursor: integer
-    verb_age_attempts: integer
 end
 
 local record Output
@@ -542,11 +542,19 @@ local function main(options: Options)
             -- members discipline the lock path gets from the adapter. The
             -- forwarder never re-submits a message_id while its redirect/
             -- ack is in flight; a NOT_LEADER redirect (handled in the
-            -- receive loop) or a silent-leader window advances the
-            -- rotation.
-            local stale = waiter.verb_age_attempts * options.heartbeat_ms >= options.election_ms
+            -- receive loop) advances the rotation, and so does a
+            -- silent-leader window. The rotation is keyed on the
+            -- forwarded-to leader's SILENCE — the same clock the election
+            -- loop drives, reset by every datagram from the leader — and
+            -- never on the verb's age: an establishing verb's
+            -- acknowledgment is legitimately slow (the poll waits for the
+            -- establishing era's commit and its view entry), and an
+            -- age-keyed rotation abandons the in-flight forward, whose
+            -- acknowledgment then fails the source correlation and the
+            -- accepted verb is answered with the client's deadline
+            -- instead.
+            local stale = leader_elapsed_ms >= options.election_ms
             if waiter.verb_cursor < 0 or stale then
-                waiter.verb_age_attempts = 0
                 if
                     not stale
                     and status.leader ~= own_id
@@ -747,7 +755,6 @@ local function main(options: Options)
                                         -- An admin verb's redirect just
                                         -- advances the ordered rotation
                                         -- over the live member list.
-                                        waiter.verb_age_attempts = 0
                                         waiter.verb_cursor = admin.next_in_rotation(
                                             rotation_candidates(), waiter.verb_cursor
                                         )
@@ -772,26 +779,34 @@ local function main(options: Options)
                         -- new)` announcement arriving from the socket the
                         -- deployment attributes to `old` IS the restarted
                         -- process's entry ticket — the wire body is the
-                        -- notice, no application broadcast. The row moves
-                        -- to the bumped id (every bumped identity lives in
-                        -- the high band the native adapter's bump
-                        -- arithmetic derives), and the announcement is
-                        -- delivered attributed to the new identity, where
-                        -- the core's own gates apply (only the leader acts;
-                        -- a forged or degenerate pair is dropped by name).
+                        -- notice, no application broadcast. The row for
+                        -- the bumped id is ADDED at the source endpoint
+                        -- (every bumped identity lives in the high band
+                        -- the native adapter's bump arithmetic derives)
+                        -- and the announcement is delivered attributed to
+                        -- the new identity, where the core's own gates
+                        -- apply (only the leader acts; a forged or
+                        -- degenerate pair is dropped by name). The old
+                        -- id's row STAYS: the serving configuration every
+                        -- peer's core folded still names it, its send
+                        -- targets the same socket the new identity binds,
+                        -- and the row leaves only when the identity does
+                        -- — the reincarnation forced steps evict it and
+                        -- the core stops addressing it.
                         local pair_valid, pair_old, pair_new = transport.reincarnation_pair(
                             payload
                         )
                         if
                             pair_valid
                             and replica == pair_old
-                            and pair_old ~= pair_new
-                            and pair_new >= 16777216
-                            and endpoint_by_id[pair_new] == nil
+                            and transport.apply_reincarnation_remap(
+                                endpoint_by_id,
+                                id_by_endpoint,
+                                source_endpoint,
+                                pair_old,
+                                pair_new
+                            )
                         then
-                            endpoint_by_id[pair_new] = source_endpoint
-                            endpoint_by_id[pair_old] = nil
-                            id_by_endpoint[source_endpoint] = pair_new
                             replica = pair_new
                         end
                         if replica ~= nil then
@@ -879,7 +894,6 @@ local function main(options: Options)
                 done = false,
                 forwarded_to = -1,
                 verb_cursor = -1,
-                verb_age_attempts = 0,
             }
             pending[message_id] = waiter
         end
@@ -905,7 +919,6 @@ local function main(options: Options)
                 slept = slept + POLL_MS
             end
             attempts = attempts + 1
-            waiter.verb_age_attempts = waiter.verb_age_attempts + 1
         end
         if pending[message_id] == waiter then
             pending[message_id] = nil

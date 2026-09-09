@@ -273,6 +273,8 @@ MEAN_RENEW=$(printf '%s\n' "$cadence" | awk '/^MEASURED renew /{printf "%.0f", $
 echo "measured renewal cadence: ${MEAN_RENEW} ms"
 
 overlap=$(awk '
+    { for (i = 1; i <= NF; i++) if (index($i, "ts=") == 1) print substr($i, 4), $0 }
+' "$RUN"/logs/*.log* | sort -n | cut -d' ' -f2- | awk '
     /grant node=/{
         ts = 0; node = 0; expiry = 0
         for (i = 1; i <= NF; i++) {
@@ -287,7 +289,7 @@ overlap=$(awk '
         if (expiry > live[node]) live[node] = expiry
     }
     END { exit bad ? 1 : 0 }
-' "$RUN"/logs/*.log*) || fail "overlapping lease windows: $overlap"
+') || fail "overlapping lease windows: $overlap"
 echo "overlap check: no two holders' windows overlap across $(cat "$RUN"/logs/*.log* | grep -c 'grant node=') grants"
 
 # ------------------------------------------------------- kill cycles ----
@@ -325,7 +327,7 @@ while [ "$cycle" -le 3 ]; do
                     else if (index($i, "incarnation=") == 1) inc = substr($i, 13) + 0
                 }
                 if (ts > after && inc >= 1 && own != desc) { print own; exit }
-            }' "$RUN/logs/$hname.log"*)
+            }' "$RUN/logs/$hname."*".log"*)
         [ -n "$bumped" ] && break
         sleep 0.3
     done
@@ -342,7 +344,7 @@ while [ "$cycle" -le 3 ]; do
     [ "$remaps" -ge 2 ] || fail "cycle $cycle: remap notice old=$hid new=$bumped seen at only $remaps peers"
     echo "cycle $cycle: remap notice seen at $remaps peers"
 
-    held_again=$(grep -h "grant node=" "$RUN"/logs/$hname.log* | awk -v bumped="$bumped" '
+    held_again=$(grep -h "grant node=" "$RUN"/logs/$hname.*.log | awk -v bumped="$bumped" '
         {
             node = 0
             for (i = 1; i <= NF; i++) if (index($i, "node=") == 1) node = substr($i, 6) + 0
