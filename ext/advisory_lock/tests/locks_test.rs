@@ -11,10 +11,16 @@ fn set(message: u8, client: u64, request_num: u64, holder: u8, expiry: u64) -> R
         client_id: client,
         request_num,
         lock_id: 7,
+        name: None,
+        labels: None,
         lease: Lease {
             lease_id: 9,
             holder: id(holder),
             expiry,
+            name: None,
+            labels: None,
+            taken_at_ms: 0,
+            renew_count: 0,
         },
     }
 }

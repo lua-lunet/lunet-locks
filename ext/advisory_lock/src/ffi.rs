@@ -607,6 +607,19 @@ impl Node {
                             holder: *holder,
                             expiry: *expiry,
                         },
+                        Transition::Break {
+                            lock_id,
+                            lease_id,
+                            holder,
+                            expiry,
+                        } => JournalEvent {
+                            kind: journal::KIND_BREAK,
+                            ts,
+                            lock_id: *lock_id,
+                            lease_id: *lease_id,
+                            holder: *holder,
+                            expiry: *expiry,
+                        },
                     };
                     let mut disable_blocking = false;
                     match self.journal.as_mut() {
@@ -3872,7 +3885,13 @@ mod tests {
                 lease_id: 1,
                 holder: Uuid::from_bytes([0xBB; 16]),
                 expiry: unix_millis().unwrap() + 60_000,
+                name: None,
+                labels: None,
+                taken_at_ms: 0,
+                renew_count: 0,
             },
+            name: None,
+            labels: None,
         })
         .unwrap();
         assert_eq!(request(&mut nodes[0], &set_payload), OK);
@@ -4337,7 +4356,13 @@ mod tests {
                     lease_id,
                     holder,
                     expiry: unix_millis().unwrap() + 60_000,
+                    name: None,
+                    labels: None,
+                    taken_at_ms: 0,
+                    renew_count: 0,
                 },
+                name: None,
+                labels: None,
             })
             .unwrap();
             assert_eq!(

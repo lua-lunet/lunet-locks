@@ -429,4 +429,41 @@ tested.test(
     end
 )
 
+tested.test(
+    "transport frames an extended SET line with a full-cap identity intact",
+    function()
+        -- The issue-#9 extended SET: a 128-byte display name and eight
+        -- 32-byte labels ride the same NDJSON frame under the client line
+        -- bound, and the frame the adapter receives is byte-for-byte the
+        -- frame the client sent.
+        local name = "/cluster/members/" .. string.rep("a", 111)
+        assert(#name == 128, "the test's name must sit at the 128-byte cap")
+        local labels = {}
+        for index = 1, 8 do
+            labels[index] = string.rep("l", 31) .. tostring(index % 10)
+        end
+        local json = '{"op":"set","message_id":"01010101-0101-0101-0101-010101010101",'
+            .. '"client_id":42,"request_num":8,"lock_id":9001,"name":"'
+            .. name
+            .. '","labels":["'
+            .. table.concat(labels, '","')
+            .. '"],"lease":{"lease_id":3,"holder":"02020202-0202-0202-0202-020202020202","expiry":1722600001000}}'
+        local limit = transport.MAX_DATAGRAM - transport.PEER_HEADER_BYTES - 1 - transport.MESSAGE_ID_BYTES
+        assert(#json <= limit, "the test's extended SET must fit the client line bound")
+        local messages, tail = transport.feed_ndjson("", json .. "\n", limit)
+        tested.assert(
+            {
+                given = "one extended SET line at the name and label caps",
+                should = "frame it as exactly one intact request with no tail",
+                expected = "1:" .. #json .. ":",
+                actual = tostring(#messages)
+                    .. ":"
+                    .. tostring(#messages[1])
+                    .. ":"
+                    .. tail,
+            }
+        )
+    end
+)
+
 return tested

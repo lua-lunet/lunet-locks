@@ -39,7 +39,13 @@ fn set_request(
             lease_id: 13,
             holder,
             expiry,
+            name: None,
+            labels: None,
+            taken_at_ms: 0,
+            renew_count: 0,
         },
+        name: None,
+        labels: None,
     }
 }
 

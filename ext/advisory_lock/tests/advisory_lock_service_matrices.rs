@@ -33,11 +33,19 @@ impl Incumbent {
                 lease_id: 11,
                 holder,
                 expiry: EXECUTION_TIME + 1,
+                name: None,
+                labels: None,
+                taken_at_ms: EXECUTION_TIME,
+                renew_count: 0,
             }),
             Self::Expired => Some(Lease {
                 lease_id: 11,
                 holder,
                 expiry: EXECUTION_TIME,
+                name: None,
+                labels: None,
+                taken_at_ms: EXECUTION_TIME,
+                renew_count: 0,
             }),
         }
     }
@@ -126,7 +134,13 @@ fn request(operation: Operation, holder: Uuid, expiry: u64) -> Request {
                 lease_id: 13,
                 holder,
                 expiry,
+                name: None,
+                labels: None,
+                taken_at_ms: 0,
+                renew_count: 0,
             },
+            name: None,
+            labels: None,
         },
     }
 }
@@ -152,6 +166,8 @@ fn install(service: &mut Service, lease: Lease) {
         request_num: 9,
         lock_id: LOCK_ID,
         lease,
+        name: None,
+        labels: None,
     };
     assert!(execute(service, &request).is_ok(), "incumbent installs");
 }
@@ -183,7 +199,7 @@ fn observed_lease_at(service: &mut Service, lock_id: u64, execution_time: u64) -
     .unwrap();
     match response {
         Response::Get { lease, .. } => lease,
-        Response::Set { .. } | Response::Release { .. } => {
+        Response::Set { .. } | Response::Release { .. } | Response::Break { .. } => {
             unreachable!("GET must produce a GET response")
         }
     }
@@ -196,9 +212,13 @@ fn release_requires_the_exact_live_lease_and_is_idempotent_after_expiry() {
         lease_id: 13,
         holder,
         expiry: 200,
+        name: None,
+        labels: None,
+        taken_at_ms: EXECUTION_TIME,
+        renew_count: 0,
     };
     let mut service = Service::default();
-    install(&mut service, incumbent);
+    install(&mut service, incumbent.clone());
 
     let mismatch = Request::Release {
         message_id: id(2),
@@ -304,10 +324,10 @@ fn service_matrix_is_complete_correlated_and_deterministic() {
 
                         let candidate_holder = holder.candidate(incumbent_holder);
                         let request = request(operation, candidate_holder, expiry.expiry());
-                        let candidate_lease = match request {
-                            Request::Set { lease, .. } => Some(lease),
+                        let candidate_lease = match &request {
+                            Request::Set { lease, .. } => Some(lease.clone()),
                             Request::Get { .. } => None,
-                            Request::Release { .. } => {
+                            Request::Release { .. } | Request::Break { .. } => {
                                 unreachable!("matrix only creates GET and SET")
                             }
                         };
@@ -392,6 +412,7 @@ fn service_matrix_is_complete_correlated_and_deterministic() {
                                 },
                             ) => {
                                 let granted_expected = expected_live
+                                    .as_ref()
                                     .is_none_or(|current| current.holder == candidate_holder)
                                     && expiry.expiry() > EXECUTION_TIME;
                                 assert_eq!(
@@ -403,22 +424,38 @@ fn service_matrix_is_complete_correlated_and_deterministic() {
                                     granted, granted_expected,
                                     "SET grant failed for {case:?}"
                                 );
+                                // A granted SET stores the state machine's
+                                // record: the counters are tracked, never
+                                // echoed from the request.
+                                let granted_reply_lease =
+                                    candidate_lease.clone().map(|mut lease| {
+                                        lease.taken_at_ms = EXECUTION_TIME;
+                                        lease.renew_count = if expected_live
+                                            .as_ref()
+                                            .is_some_and(|live| live.holder == candidate_holder)
+                                        {
+                                            1
+                                        } else {
+                                            0
+                                        };
+                                        lease
+                                    });
                                 assert_eq!(
                                     lease,
                                     if granted {
-                                        candidate_lease
+                                        granted_reply_lease.clone()
                                     } else {
-                                        expected_live
+                                        expected_live.clone()
                                     },
                                     "SET response lease failed for {case:?}"
                                 );
                                 assert_eq!(
                                     observed_lease(&mut first, LOCK_ID),
                                     if granted {
-                                        candidate_lease
+                                        granted_reply_lease
                                             .filter(|lease| lease.expiry > EXECUTION_TIME)
                                     } else {
-                                        expected_live
+                                        expected_live.clone()
                                     },
                                     "SET state failed for {case:?}"
                                 );
@@ -451,13 +488,19 @@ fn lock_isolation_and_u64_extrema_are_preserved() {
             lease_id: value,
             holder: id(12),
             expiry: if value == u64::MIN { 1 } else { u64::MAX },
+            name: None,
+            labels: None,
+            taken_at_ms: 0,
+            renew_count: 0,
         };
         let set = Request::Set {
             message_id: id(13),
             client_id: value,
             request_num: value,
             lock_id: value,
-            lease,
+            lease: lease.clone(),
+            name: None,
+            labels: None,
         };
         let (message_id, client_id, request_num) = set.ids();
         let response: Response = serde_json::from_slice(
@@ -480,13 +523,21 @@ fn lock_isolation_and_u64_extrema_are_preserved() {
                 request_num: value,
                 lock_id: value,
                 granted: value == u64::MIN,
-                lease: if value == u64::MIN { Some(lease) } else { None },
+                lease: if value == u64::MIN {
+                    Some(lease.clone())
+                } else {
+                    None
+                },
                 executed_at: value,
             }
         );
         assert_eq!(
             observed_lease_at(&mut service, value, value),
-            if value == u64::MIN { Some(lease) } else { None }
+            if value == u64::MIN {
+                Some(lease.clone())
+            } else {
+                None
+            }
         );
         assert_eq!(
             observed_lease_at(&mut service, value ^ 1, value),

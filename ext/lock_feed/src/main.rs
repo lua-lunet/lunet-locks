@@ -127,6 +127,7 @@ impl EventJson {
             journal::KIND_HOLD => "hold",
             journal::KIND_RENEW => "renew",
             journal::KIND_RELEASE => "release",
+            journal::KIND_BREAK => "break",
             _ => "unknown",
         };
         Self {
@@ -818,6 +819,24 @@ mod tests {
             holder: [0xAA; 16],
             expiry,
         }
+    }
+
+    #[test]
+    fn from_event_maps_break_kind() {
+        let event = sample_event(journal::KIND_BREAK, 300, 7, 800);
+        let mapped = EventJson::from_event(&event);
+        assert_eq!(mapped.kind, "break");
+        assert_eq!(mapped.ts, 300);
+        assert_eq!(mapped.lease_id, 42);
+        let value = mapped.to_json_value();
+        assert_eq!(value["kind"], "break");
+        assert_eq!(value["type"], "event");
+    }
+
+    #[test]
+    fn from_event_maps_unknown_kind() {
+        let event = sample_event(99, 300, 7, 800);
+        assert_eq!(EventJson::from_event(&event).kind, "unknown");
     }
 
     fn write_rolled_file(dir: &Path, events: &[JournalEvent]) -> String {

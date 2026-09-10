@@ -297,7 +297,8 @@ id at incarnation 0, the bumped high-band id after a dirty restart.
 ## Lock-event journal and console feed
 
 Each replica optionally maintains an append-only binary journal of committed
-lock transitions (hold, renew, release) under a per-replica directory. The
+lock transitions (hold, renew, release, break) under a per-replica directory.
+The
 journal is observability data: it never participates in replication or
 recovery, and a journal error disables journaling without affecting the
 service path. Files roll by byte threshold and are never deleted by any

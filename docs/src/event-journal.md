@@ -9,9 +9,9 @@ journal failure never affects the service path.
 ## What is journaled
 
 The journal records only committed lock transitions produced by the lock state
-machine: **hold**, **renew**, and **release**. Denied SETs, GETs, and any
-other client operation that does not result in a committed transition are not
-journaled. Duplicate applies of the same committed operation (the core may
+machine: **hold**, **renew**, **release**, and **break**. Denied SETs, GETs,
+and any other client operation that does not result in a committed transition
+are not journaled. Duplicate applies of the same committed operation (the core may
 re-deliver an already-applied slot during recovery replay) never re-append a
 record; the adapter journals each committed transition exactly once.
 
@@ -34,14 +34,14 @@ Field semantics:
 - **magic**: the ASCII bytes `LKE1`.
 - **len**: payload length in bytes after the magic and length fields, before
   the CRC. Fixed at 53 for v1; retained for forward compatibility.
-- **kind**: `1` = hold, `2` = renew, `3` = release.
+- **kind**: `1` = hold, `2` = renew, `3` = release, `4` = break.
 - **ts**: milliseconds since the Unix epoch at the moment the applying
   replica executed the transition.
 - **lock_id**: the lock identifier.
 - **lease_id**: the lease identifier within that lock.
 - **holder**: 16-byte opaque holder identity.
 - **expiry**: absolute expiry in milliseconds since the Unix epoch. Release
-  records carry the released lease's holder, lease_id, and expiry.
+  and break records carry the removed lease's holder, lease_id, and expiry.
 - **crc32**: CRC-32 IEEE over the 49 bytes from `kind` through `expiry`
   inclusive.
 
@@ -101,10 +101,20 @@ accumulation or create duplicate open files.
 The parser (`parse_file`) reads records sequentially from the front of a file
 buffer and stops cleanly at the first invalid or short record. A record is
 rejected if the buffer is too short, the magic does not match `LKE1`, the
-CRC-32 does not verify, or the kind discriminant is not one of hold, renew, or
-release. Valid records preceding the corruption are returned; the corrupt tail
-is silently discarded. This means a partial write at crash time loses at most
-the trailing incomplete record, and readers never fail on a torn file.
+CRC-32 does not verify, or the kind discriminant is not one of hold, renew,
+release, or break. Valid records preceding the corruption are returned; the
+corrupt tail is silently discarded. This means a partial write at crash time
+loses at most the trailing incomplete record, and readers never fail on a
+torn file.
+
+## What the records do not carry
+
+The record shape is fixed and carries no lock display name, labels, or
+lease-age counters. Those ride the client protocol's lease-bearing replies
+(see [the client protocol](client-protocol.md)); a journal consumer pairs the
+events with the lease data the client channel reports. The break record's
+`lease_id`, `holder`, and `expiry` are the broken lease's values as they
+were, exactly like a release record.
 
 ## Durability posture
 
@@ -153,10 +163,10 @@ WebSocket endpoint:
 - `GET /ws` — upgrades to a WebSocket. On connect, the server sends the
   backlog of events from the current open file, then streams live events as
   they are appended. Messages are JSON objects with `"type": "event"` or
-  `"type": "rolled"`. Event messages carry `kind`, `ts`, `lockId`, `leaseId`,
-  `holder` (hex-encoded 16 bytes), and `expiry`. Rolled messages carry `file`,
-  `opMin`, `opMax`, `expiryMin`, `expiryMax`, `count`, and `next` (the new
-  open file name).
+  `"type": "rolled"`. Event messages carry `kind` (`hold`, `renew`,
+  `release`, or `break`), `ts`, `lockId`, `leaseId`, `holder` (hex-encoded
+  16 bytes), and `expiry`. Rolled messages carry `file`, `opMin`, `opMax`,
+  `expiryMin`, `expiryMax`, `count`, and `next` (the new open file name).
 
 A background rescan task polls the journal directory at a configurable interval
 (default 200 ms). It detects rolls by watching for a changed open-file name,
@@ -197,12 +207,12 @@ historical file pulls from the worker and live WebSocket events.
 
 Because file pulls and live events can arrive out of order relative to each
 other, the merge engine implements a **tombstone-ahead** rule: when a release
-event arrives for a `(lockId, leaseId)` pair whose acquisition has not yet
-been seen, the release is stored as a pending tombstone. When the matching
-hold event later arrives from a file pull, the pending tombstone is consumed
-and the lock is immediately removed from the active set rather than being
-added. This ensures the active-lock view is correct regardless of ingestion
-order.
+or break event arrives for a `(lockId, leaseId)` pair whose acquisition has
+not yet been seen, the event is stored as a pending tombstone. When the
+matching hold event later arrives from a file pull, the pending tombstone is
+consumed and the lock is immediately removed from the active set rather than
+being added. This ensures the active-lock view is correct regardless of
+ingestion order.
 
 ### Session-storage live buffer
 

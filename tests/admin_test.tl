@@ -114,6 +114,28 @@ tested.test(
 )
 
 tested.test(
+    "the break op is a lock verb for the adapter, not an admin verb",
+    function()
+        -- The privileged break rides the lock path: the Teal edge must not
+        -- classify it as a membership verb, or it would drive a
+        -- reconfiguration instead of submitting the op to the adapter.
+        local valid = admin.decode_verb(
+            '{"op":"break","message_id":"'
+                .. UUID
+                .. '","client_id":42,"request_num":9,"lock_id":9001}'
+        )
+        tested.assert(
+            {
+                given = "a well-formed break op line",
+                should = "decode as a lock verb, never as a membership verb",
+                expected = "false",
+                actual = tostring(valid),
+            }
+        )
+    end
+)
+
+tested.test(
     "admin frames the join and leave broadcasts and decodes them losslessly",
     function()
         local join = admin.encode_join(400, "n4", "127.0.0.1:7004")

@@ -13,9 +13,9 @@
 //! lease_id u64 | holder [u8;16] | expiry u64 | crc32 u32
 //! ```
 //!
-//! - `kind`: 1 = hold, 2 = renew, 3 = release.
+//! - `kind`: 1 = hold, 2 = renew, 3 = release, 4 = break.
 //! - `ts`: unix ms at apply.
-//! - Release records carry the released lease's holder/lease_id/expiry.
+//! - Release and break records carry the removed lease's holder/lease_id/expiry.
 //! - `crc32` (IEEE, over bytes from `kind` through `expiry` inclusive).
 //! - All records are fixed-length; the `len` field is kept for forward
 //!   compatibility.
@@ -55,6 +55,7 @@ const RECORD_PAYLOAD_LEN: u32 = 53;
 pub const KIND_HOLD: u8 = 1;
 pub const KIND_RENEW: u8 = 2;
 pub const KIND_RELEASE: u8 = 3;
+pub const KIND_BREAK: u8 = 4;
 
 /// A single lock-event journal entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,7 +103,7 @@ pub fn parse_record(data: &[u8]) -> Option<(JournalEvent, usize)> {
         return None;
     }
     let kind = data[8];
-    if !matches!(kind, KIND_HOLD | KIND_RENEW | KIND_RELEASE) {
+    if !matches!(kind, KIND_HOLD | KIND_RENEW | KIND_RELEASE | KIND_BREAK) {
         return None;
     }
     let ts = u64::from_be_bytes(data[9..17].try_into().ok()?);
@@ -513,6 +514,36 @@ mod tests {
         let (decoded, consumed) = parse_record(&encoded).expect("valid record");
         assert_eq!(consumed, RECORD_SIZE);
         assert_eq!(decoded, event);
+    }
+
+    #[test]
+    fn break_record_roundtrip() {
+        let event = sample_event(KIND_BREAK, 1000, 7, 2000);
+        let encoded = event.encode();
+        assert_eq!(encoded.len(), RECORD_SIZE);
+        let (decoded, consumed) = parse_record(&encoded).expect("valid break record");
+        assert_eq!(consumed, RECORD_SIZE);
+        assert_eq!(decoded, event);
+    }
+
+    #[test]
+    fn parse_file_covers_break_records() {
+        let e1 = sample_event(KIND_HOLD, 100, 1, 200);
+        let e2 = sample_event(KIND_BREAK, 200, 1, 200);
+        let mut data = Vec::new();
+        data.extend_from_slice(&e1.encode());
+        data.extend_from_slice(&e2.encode());
+        let events = parse_file(&data);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].kind, KIND_BREAK);
+        assert_eq!(events[1], e2);
+    }
+
+    #[test]
+    fn unknown_kind_rejected() {
+        let mut buf = sample_event(KIND_HOLD, 1000, 7, 2000).encode();
+        buf[8] = 5;
+        assert!(parse_record(&buf).is_none());
     }
 
     #[test]
