@@ -8,7 +8,9 @@ docs/site/
 target/
 # Native crates are internal FFI components, not independent releases.
 ext/*/Cargo.lock
-examples/*/Cargo.lock
+# The examples/lease-sequencer lock IS committed: the vendored Docker context
+# needs it for `cargo vendor --locked`, and an example that ships is an
+# application whose lockfile belongs in the record.
 examples/lease-sequencer/run/
 
 # Lock Admin console scratch (pids, logs, rendered nginx conf, credentials)
