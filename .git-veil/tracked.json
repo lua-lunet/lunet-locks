@@ -1,6 +1,7 @@
 {
   "files": [
     "secrets/fake-jumpbox.txt",
-    "secrets/jumpbox.txt"
+    "secrets/jumpbox.txt",
+    "secrets/waw-rig.txt"
   ]
 }

@@ -17,3 +17,4 @@ examples/lease-sequencer/run/
 console/tmp/
 secrets/fake-jumpbox.txt
 secrets/jumpbox.txt
+secrets/waw-rig.txt
