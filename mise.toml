@@ -2,3 +2,4 @@
 python = "3.13"
 
 "aqua:astral-sh/uv" = "latest"
+"github:prompt-cult/git-veil" = "v0.3.0"
