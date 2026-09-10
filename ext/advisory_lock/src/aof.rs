@@ -64,7 +64,7 @@ fn write_all_at(file: &mut File, offset: u64, bytes: &[u8]) -> io::Result<()> {
 
 #[cfg(windows)]
 fn write_all_at(file: &mut File, offset: u64, bytes: &[u8]) -> io::Result<()> {
-    FileExt::seek_write(file, bytes, offset)
+    FileExt::seek_write(file, bytes, offset).map(|_| ())
 }
 
 #[cfg(not(any(unix, windows)))]
