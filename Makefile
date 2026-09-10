@@ -109,7 +109,7 @@ DOCKER_IMAGE ?= lunet-advisory-lock
 DOCKER_PLATFORM ?= native
 docker-build: build lunet-runtime
 	@context=$$(mktemp -d "$(CURDIR)/.tmp/docker-context.XXXXXX"); \
-	tools/docker_prepare_context.sh "$$context"; \
+	tools/docker_prepare_context.sh "$$context" || exit 1; \
 	server=$$(docker version --format '{{.Server.Os}}/{{.Server.Arch}}'); \
 	[ "$(DOCKER_PLATFORM)" = native ] || [ "$$server" = "$(DOCKER_PLATFORM)" ] || { \
 		echo "ERROR: docker daemon is $$server; cross-platform builds are not supported" >&2; exit 1; \
