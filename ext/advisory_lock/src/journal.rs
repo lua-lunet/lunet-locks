@@ -399,7 +399,9 @@ pub(crate) fn write_meta_atomic(path: &Path, meta: &Meta) -> io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let base = path.file_name().unwrap_or_default();
     let unique = current_millis_fallback();
-    let tmp_name = format!(".{base:?}.tmp-{unique}");
+    // to_string_lossy, NOT Debug format: `{:?}` on an OsStr wraps the name
+    // in double quotes, and Windows rejects `"` in filenames (os error 123).
+    let tmp_name = format!(".{}.tmp-{unique}", base.to_string_lossy());
     let tmp_path = parent.join(tmp_name);
     let encoded = meta.encode();
     let mut file = OpenOptions::new()
