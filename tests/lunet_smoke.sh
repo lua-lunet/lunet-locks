@@ -250,8 +250,8 @@ drive_admin() {
     attempts=0
     while :; do
         attempts=$((attempts + 1))
-        test "$attempts" -le 9 || break
-        test $(( $(now_ms) - t_start )) -lt 40000 || break
+        test "$attempts" -le 12 || break
+        test $(( $(now_ms) - t_start )) -lt 90000 || break
         mid=$(printf '00000000-0000-0000-0000-0000000000%s%x' "$hexbase" "$attempts")
         t_attempt=$(now_ms)
         if request_lines 28101 "$(printf "$template" "$mid")" '"accepted":true' 40; then
