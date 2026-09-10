@@ -56,6 +56,7 @@ local cluster_config = require("cluster_config")
 local config = require("config")
 local lunet = require("lunet")
 local membership_guard = require("membership_guard")
+local snapshot = require("snapshot")
 local socket = require("lunet.socket")
 local udp = require("lunet.udp")
 local transport = require("transport")
@@ -69,6 +70,14 @@ local POLL_MS = 10
 -- The leader's per-process verb dedup cache bound (settled entries evict
 -- first-in-first-out; in-flight drives are never evicted).
 local ADMIN_CACHE_LIMIT = 1024
+-- The membership snapshot protocol's host cadence (all advisory evidence,
+-- never a gate): the boot-time discovery loop re-requests across the
+-- remembered set on the heartbeat-ish round cadence, gives up after the
+-- bounded deadline (the ordinary fenced boot proceeds regardless), and the
+-- adopted membership facts write behind on the routine write-behind tick.
+local DISCOVERY_ROUND_TICKS = 20
+local DISCOVERY_DEADLINE_TICKS = 1500
+local WRITE_BEHIND_MS = 500
 local MAX_CLIENT_REQUEST = transport.MAX_DATAGRAM - transport.PEER_HEADER_BYTES - 1 - MESSAGE_ID_BYTES
 -- The native adapter reports u32::MAX when no leader is known for an era/view
 -- (booting or recovering cluster, or an era outside the retention window).
@@ -96,6 +105,11 @@ local record Pending
     -- Admin-verb forwarder state: the replica id the verb was last
     -- forwarded to (-1 until the first forward).
     verb_cursor: integer
+end
+
+local record DiscoveryTally
+    ids: {integer: boolean}
+    weight: integer
 end
 
 local record Output
@@ -291,8 +305,245 @@ local function main(options: Options)
     local active_clients: {string: any} = {}
     local admin_cache = admin.new_cache(ADMIN_CACHE_LIMIT)
     local leader_elapsed_ms = 0
+    -- Forward declarations: the discovery loop and the admin drive are
+    -- defined before the send helpers they route through.
+    local send_endpoint: function(string, string)
+    local flush: function({Output})
+
     local guard = membership_guard.new(fingerprint)
     local listener_open = true
+
+    -- The membership model: advisory evidence, never a consensus
+    -- mechanism. It boots from the membership sidecar next to the
+    -- incarnation marker, else from the descriptor, and moves only
+    -- forward: a snapshot with a newer (era, slot) is adopted in memory,
+    -- teaches the addressing rows its membership names, and writes behind
+    -- on the routine tick. The core's folded configuration remains the
+    -- commit truth; nothing here bypasses a gate.
+    local model_era = 0
+    local model_slot = 0
+    local model_members: {snapshot.SnapshotMember} = {}
+    local membership_dirty = false
+    local membership_write_failed = false
+
+    local function add_member_row(id: integer, endpoint: string)
+        if endpoint_by_id[id] == nil then
+            endpoint_by_id[id] = endpoint
+            id_by_endpoint[endpoint] = id
+        end
+    end
+
+    local function adopt_snapshot(snap: snapshot.Snapshot, origin: string): boolean
+        if not snapshot.newer(snap.era, snap.slot, model_era, model_slot) then
+            return false
+        end
+        model_era = snap.era
+        model_slot = snap.slot
+        model_members = snap.members
+        for _, member in ipairs(snap.members) do
+            add_member_row(member.id, member.endpoint)
+        end
+        membership_dirty = true
+        log_membership(
+            "advisory-lock membership snapshot adopted era="
+                .. tostring(model_era)
+                .. " slot="
+                .. tostring(model_slot)
+                .. " members="
+                .. tostring(#model_members)
+                .. " source="
+                .. origin
+        )
+        return true
+    end
+
+    -- The membership sidecar: the lazy write-behind copy of the adopted
+    -- facts, next to the incarnation marker (whose bump semantics are
+    -- untouched). A sidecar that does not parse is ignored entirely: the
+    -- model falls back to the descriptor and discovery re-learns.
+    local sidecar_path = options.state .. ".membership"
+    local boot_source = "descriptor"
+    local sidecar_file = io.open(sidecar_path, "r")
+    if sidecar_file ~= nil then
+        local sidecar_text = sidecar_file:read("a")
+        sidecar_file:close()
+        local sidecar_valid, sidecar = snapshot.decode_sidecar(sidecar_text)
+        if sidecar_valid then
+            model_era = sidecar.era
+            model_slot = sidecar.slot
+            model_members = sidecar.members
+            boot_source = "sidecar"
+        end
+    end
+    if boot_source == "descriptor" then
+        local model = snapshot.descriptor_model(options.nodes)
+        model_era = model.era
+        model_slot = model.slot
+        model_members = model.members
+    end
+    log_membership(
+        "advisory-lock membership model era="
+            .. tostring(model_era)
+            .. " slot="
+            .. tostring(model_slot)
+            .. " members="
+            .. tostring(#model_members)
+            .. " source="
+            .. boot_source
+    )
+
+    -- Boot-time era-qualified discovery. The loop requests a snapshot from
+    -- every node it remembers (its addressing tables; no leader has to be
+    -- known first), needs a quorum within what it thought was the old
+    -- cluster, escalates on any newer (era, slot) -- every escalation
+    -- drops the older-era responses and re-requests across that era's
+    -- membership -- and stops at a weighted quorum of agreeing snapshots.
+    -- Bounded: a timeout abandons discovery and the ordinary fenced boot
+    -- proceeds regardless (snapshots never gate the boot).
+    local discovery_done = false
+    local discovery_era = model_era
+    local discovery_slot = model_slot
+    local discovery_tallies: {string: DiscoveryTally} = {}
+
+    local function agreement_key(snap: snapshot.Snapshot): string
+        local key = tostring(snap.era) .. ":" .. tostring(snap.slot)
+        for _, member in ipairs(snap.members) do
+            key = key
+                .. "|"
+                .. tostring(member.id)
+                .. ":"
+                .. tostring(member.weight)
+                .. ":"
+                .. member.endpoint
+        end
+        return key
+    end
+
+    -- One snapshot response, from a discovery answer or from the leader's
+    -- post-commit dissemination (the same wire shape serves both). While
+    -- discovery is running the response only escalates the era or tallies
+    -- agreement within it -- the model adopts at a quorum, not from one
+    -- node's word. Afterwards the dissemination semantics apply: only the
+    -- up-to-dateness check, newer (era, slot) adopted immediately, equal
+    -- or older ignored everywhere.
+    local function handle_snapshot_response(
+        source_endpoint: string, snap: snapshot.Snapshot
+    )
+        local attributed = id_by_endpoint[source_endpoint]
+        if attributed == nil then
+            return
+        end
+        if not discovery_done then
+            if snapshot.newer(snap.era, snap.slot, discovery_era, discovery_slot) then
+                discovery_era = snap.era
+                discovery_slot = snap.slot
+                discovery_tallies = {}
+                for _, member in ipairs(snap.members) do
+                    add_member_row(member.id, member.endpoint)
+                end
+            elseif snap.era == discovery_era and snap.slot == discovery_slot then
+                local key = agreement_key(snap)
+                local tally = discovery_tallies[key]
+                if tally == nil then
+                    tally = {ids = {}, weight = 0}
+                    discovery_tallies[key] = tally
+                end
+                local weight = snapshot.member_weight(snap.members, attributed)
+                if weight >= 0 and not tally.ids[attributed] then
+                    tally.ids[attributed] = true
+                    tally.weight = tally.weight + weight
+                    if snapshot.quorum_reached(snap.members, tally.ids) then
+                        adopt_snapshot(snap, "discovery")
+                        discovery_done = true
+                    end
+                end
+            end
+        else
+            adopt_snapshot(snap, "dissemination")
+        end
+    end
+
+    local function discovery_loop()
+        local ticks = 0
+        while
+            not guard.dirty and not discovery_done and ticks < DISCOVERY_DEADLINE_TICKS
+        do
+            local targets: {string} = {}
+            for id, endpoint in pairs(endpoint_by_id) do
+                if id ~= own_id then
+                    table.insert(targets, endpoint)
+                end
+            end
+            for _, endpoint in ipairs(targets) do
+                pcall(
+                    function()
+                        send_endpoint(
+                            endpoint,
+                            transport.encode_peer(
+                                transport.PEER_SNAPSHOT,
+                                fingerprint,
+                                snapshot.encode_request()
+                            )
+                        )
+                    end
+                )
+            end
+            local round = 0
+            while
+                round < DISCOVERY_ROUND_TICKS and not guard.dirty and not discovery_done
+            do
+                lunet.sleep(POLL_MS)
+                round = round + 1
+                ticks = ticks + 1
+            end
+        end
+        discovery_done = true
+    end
+
+    -- The lazy write-behind: adopted membership facts persist on this
+    -- routine tick, never on the message path. The sidecar is rewritten
+    -- atomically (temporary file, rename) with no fsync -- the same
+    -- documented loss window the AOF writer carries, and nothing depends
+    -- on the file for safety.
+    local function write_behind_loop()
+        while true do
+            lunet.sleep(WRITE_BEHIND_MS)
+            if membership_dirty and not membership_write_failed and not guard.dirty then
+                local written = pcall(
+                    function()
+                        local temporary = io.open(sidecar_path .. ".new", "w")
+                        assert(
+                            temporary ~= nil,
+                            "server: cannot write membership sidecar " .. sidecar_path
+                        )
+                        temporary:write(
+                            snapshot.encode_sidecar(
+                                {
+                                    era = model_era,
+                                    slot = model_slot,
+                                    members = model_members,
+                                }
+                            )
+                        )
+                        temporary:close()
+                        assert(
+                            os.rename(sidecar_path .. ".new", sidecar_path),
+                            "server: membership sidecar rename failed"
+                        )
+                    end
+                )
+                if written then
+                    membership_dirty = false
+                else
+                    membership_write_failed = true
+                    log_membership(
+                        "advisory-lock membership sidecar write failed;"
+                            .. " write-behind disabled for this process"
+                    )
+                end
+            end
+        end
+    end
 
     local function close_client(client: any)
         pcall(function() socket.close(client) end)
@@ -322,7 +573,7 @@ local function main(options: Options)
         end
     end
 
-    local function send_endpoint(endpoint: string, payload: string)
+    function send_endpoint(endpoint: string, payload: string)
         local host, port = split_endpoint(endpoint)
         local ok, send_error = udp.send(peer, host, port, payload)
         assert(ok ~= nil, "server: UDP send failed: " .. (send_error or "unknown"))
@@ -418,6 +669,20 @@ local function main(options: Options)
             -- NotPrimary: the one actionable refusal; the caller redirects.
             return false, leader_error or "not_leader"
         end
+        -- The establishing operation's entry slot is the slot at which the
+        -- new configuration was chosen: the reconfiguration drive's sends
+        -- are the establishing Prepare(s), all stamped with that entry
+        -- slot. The drive and the scan run in the same coroutine slice
+        -- (no yield between them), so the capture races nothing; the
+        -- drained outputs are routed on to their destinations.
+        local outputs = node:outputs() as {Output}
+        local establishing_slot = 0
+        for _, output in ipairs(outputs) do
+            if output.kind == "send" and output.slot > establishing_slot then
+                establishing_slot = output.slot
+            end
+        end
+        flush(outputs)
         if action == "join" then
             broadcast_member(admin.encode_join(id, name, endpoint))
         end
@@ -428,12 +693,58 @@ local function main(options: Options)
             waited = waited + POLL_MS
         end
         if node:status().era > era then
+            -- Post-commit dissemination: the leader's membership model
+            -- takes the committed verb's change, moves to its next
+            -- generation at the establishing slot, and sends the
+            -- as-at-new-generation snapshot to the (new) membership.
+            -- Recipients only check up-to-dateness (era plus slot); a
+            -- lower-era snapshot is ignored everywhere.
+            local change_ok, changed = snapshot.apply_change(
+                model_members, action, id, endpoint
+            )
+            if change_ok then
+                model_members = changed
+                model_era = model_era + 1
+                model_slot = establishing_slot
+                membership_dirty = true
+            end
             if action == "leave" then
                 broadcast_member(admin.encode_leave(id))
                 local departed = endpoint_by_id[id]
                 endpoint_by_id[id] = nil
                 if departed ~= nil then
                     id_by_endpoint[departed] = nil
+                end
+            end
+            if change_ok then
+                -- The as-at-new-generation snapshot goes to the (new)
+                -- membership: the departed member's addressing row is
+                -- already gone for a leave, the joining member's row was
+                -- added before the drive.
+                local disseminated = snapshot.encode_response(
+                    {
+                        era = model_era,
+                        slot = model_slot,
+                        members = model_members,
+                    }
+                )
+                local targets: {string} = {}
+                for replica, member_endpoint in pairs(endpoint_by_id) do
+                    if replica ~= own_id then
+                        table.insert(targets, member_endpoint)
+                    end
+                end
+                for _, member_endpoint in ipairs(targets) do
+                    pcall(
+                        function()
+                            send_endpoint(
+                                member_endpoint,
+                                transport.encode_peer(
+                                    transport.PEER_SNAPSHOT, fingerprint, disseminated
+                                )
+                            )
+                        end
+                    )
                 end
             end
             return true, admin.encode_ack(action, id)
@@ -458,7 +769,7 @@ local function main(options: Options)
         return ids
     end
 
-    local function flush(outputs: {Output})
+    function flush(outputs: {Output})
         for _, output in ipairs(outputs) do
             if output.kind == "send" then
                 -- The core emits one unicast send per destination; route as
@@ -597,11 +908,52 @@ local function main(options: Options)
             local packet, host, port = udp.recv(peer)
             if packet ~= nil and host ~= nil and port ~= nil then
                 local source_endpoint = host .. ":" .. tostring(port)
-                if transport.source_is_member(host, port, options.nodes) then
+                -- Peer sources are authenticated against the descriptor's
+                -- endpoints and against the addressing rows the live
+                -- cluster taught this process (the admin broadcast, the
+                -- reincarnation remap, and an adopted snapshot's
+                -- membership): a datagram from an unlisted host:port never
+                -- reaches the fingerprint gate.
+                if
+                    transport.source_is_member(host, port, options.nodes)
+                    or id_by_endpoint[source_endpoint] ~= nil
+                then
                     local valid, kind, received_fingerprint, payload = transport.decode_peer(
                         packet
                     )
-                    if valid and not guard:accept_fingerprint(received_fingerprint) then
+                    if valid and kind == transport.PEER_SNAPSHOT then
+                        -- Membership snapshots are advisory evidence: a
+                        -- foreign deployment's fingerprint drops the
+                        -- datagram without ceremony (no quarantine), and
+                        -- a quarantined node neither answers nor adopts.
+                        if received_fingerprint == fingerprint and not guard.dirty then
+                            if snapshot.decode_request(payload) then
+                                send_endpoint(
+                                    source_endpoint,
+                                    transport.encode_peer(
+                                        transport.PEER_SNAPSHOT,
+                                        fingerprint,
+                                        snapshot.encode_response(
+                                            {
+                                                era = model_era,
+                                                slot = model_slot,
+                                                members = model_members,
+                                            }
+                                        )
+                                    )
+                                )
+                            else
+                                local response_valid, response = snapshot.decode_response(
+                                    payload
+                                )
+                                if response_valid then
+                                    handle_snapshot_response(source_endpoint, response)
+                                end
+                            end
+                        end
+                    elseif
+                        valid and not guard:accept_fingerprint(received_fingerprint)
+                    then
                         quarantine(received_fingerprint)
                     elseif valid and kind == transport.PEER_APPLICATION then
                         local direction = payload:sub(1, 1)
@@ -968,6 +1320,8 @@ local function main(options: Options)
     lunet.spawn(heartbeat_loop)
     lunet.spawn(election_loop)
     lunet.spawn(recovery_loop)
+    lunet.spawn(discovery_loop)
+    lunet.spawn(write_behind_loop)
     while true do
         if not guard:allows_client_operation() or not listener_open then
             lunet.sleep(1000)

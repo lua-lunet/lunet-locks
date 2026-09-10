@@ -2,6 +2,10 @@ local MAX_DATAGRAM = 65507
 local PEER_MAGIC = "\0LUNET_ADVISORY_LOCK_PEER\0"
 local PEER_VRR = "\1"
 local PEER_APPLICATION = "\2"
+-- The membership snapshot pair (era-qualified boot-time discovery and
+-- post-commit dissemination): the request is one tag byte, the response
+-- era+slot+members. See `snapshot.tl` for the payload shapes.
+local PEER_SNAPSHOT = "\3"
 local FORWARD_REQUEST = "\1"
 local FORWARD_RESPONSE = "\2"
 local FORWARD_NOT_LEADER = "\3"
@@ -38,7 +42,7 @@ end
 
 local function encode_peer(kind: string, fingerprint: string, payload: string): string
     assert(
-        kind == PEER_VRR or kind == PEER_APPLICATION,
+        kind == PEER_VRR or kind == PEER_APPLICATION or kind == PEER_SNAPSHOT,
         "transport: invalid peer packet kind"
     )
     assert(valid_fingerprint(fingerprint), "transport: invalid membership fingerprint")
@@ -58,7 +62,7 @@ local function decode_peer(packet: string): (boolean, string, string, string)
         #PEER_MAGIC + 2, #PEER_MAGIC + 1 + MEMBERSHIP_FINGERPRINT_HEX_BYTES
     )
     if
-        (kind ~= PEER_VRR and kind ~= PEER_APPLICATION)
+        (kind ~= PEER_VRR and kind ~= PEER_APPLICATION and kind ~= PEER_SNAPSHOT)
         or not valid_fingerprint(fingerprint)
     then
         return false, "", "", ""
@@ -216,6 +220,7 @@ return {
     PEER_MAGIC = PEER_MAGIC,
     PEER_VRR = PEER_VRR,
     PEER_APPLICATION = PEER_APPLICATION,
+    PEER_SNAPSHOT = PEER_SNAPSHOT,
     PEER_HEADER_BYTES = PEER_HEADER_BYTES,
     FORWARD_REQUEST = FORWARD_REQUEST,
     FORWARD_RESPONSE = FORWARD_RESPONSE,

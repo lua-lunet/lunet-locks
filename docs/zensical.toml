@@ -7,6 +7,7 @@ site_author = "Simon Massey"
 nav = [
   { "Overview" = "index.md" },
   { "Architecture" = "architecture.md" },
+  { "Membership snapshots" = "membership-snapshots.md" },
   { "Event journal" = "event-journal.md" },
   { "Standby telemetry" = "telemetry-aof.md" },
   { "External client protocol" = "client-protocol.md" },

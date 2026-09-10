@@ -33,6 +33,9 @@ supplied `lunet-run` is the project-local official `v0.8.0` runtime from
 
 - [Architecture](architecture.md) describes client forwarding, live
   reconfiguration, reincarnation on restart, and operational boundaries.
+- [Membership snapshots](membership-snapshots.md) documents the
+  era-qualified configuration discovery, the leader's post-commit
+  dissemination, and the lazy membership sidecar.
 - [Event journal](event-journal.md) documents the append-only lock-event
   journal, the lock-feed server, and the console catch-up model.
 - [Standby telemetry](telemetry-aof.md) documents the standby node's AOF

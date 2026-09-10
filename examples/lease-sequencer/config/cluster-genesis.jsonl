@@ -1,0 +1,10 @@
+# The 7th node's acceptance descriptor: the deployment's GENESIS founding
+# membership only (three genesis lines, in line order) plus the joining
+# node's own line appended as non-genesis, so the process boots the joiner
+# way over the genesis and learns the live configuration through
+# era-qualified discovery. The live cluster's descriptor (cluster.jsonl) is
+# the superset: shared lines identical, the joined members appended.
+{"id":1,"name":"dc1-node1","host":"127.0.0.1","port":41101,"genesis":true}
+{"id":2,"name":"dc2-node1","host":"127.0.0.1","port":41102,"genesis":true}
+{"id":3,"name":"dc3-node1","host":"127.0.0.1","port":41103,"genesis":true}
+{"id":7,"name":"dc3-node3","host":"127.0.0.1","port":41107,"genesis":false}

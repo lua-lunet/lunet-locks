@@ -6,6 +6,10 @@
 pub const PEER_MAGIC: &[u8] = b"\x00LUNET_ADVISORY_LOCK_PEER\x00";
 pub const PEER_VRR: u8 = 1;
 pub const PEER_APPLICATION: u8 = 2;
+/// The membership snapshot pair (era-qualified boot-time discovery and
+/// post-commit dissemination); the payload shapes live in
+/// `membership.rs`, mirrored byte for byte from `src/snapshot.tl`.
+pub const PEER_SNAPSHOT: u8 = 3;
 pub const FORWARD_REQUEST: u8 = 1;
 pub const FORWARD_RESPONSE: u8 = 2;
 pub const FORWARD_NOT_LEADER: u8 = 3;
@@ -31,7 +35,7 @@ pub fn decode_peer(packet: &[u8]) -> Option<(u8, &str, &[u8])> {
         return None;
     }
     let kind = packet[PEER_MAGIC.len()];
-    if kind != PEER_VRR && kind != PEER_APPLICATION {
+    if kind != PEER_VRR && kind != PEER_APPLICATION && kind != PEER_SNAPSHOT {
         return None;
     }
     let fingerprint_start = PEER_MAGIC.len() + 1;

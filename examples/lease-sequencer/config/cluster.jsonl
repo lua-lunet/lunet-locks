@@ -9,3 +9,4 @@
 {"id":4,"name":"dc1-node2","host":"127.0.0.1","port":41104,"genesis":false}
 {"id":5,"name":"dc2-node2","host":"127.0.0.1","port":41105,"genesis":false}
 {"id":6,"name":"dc3-node2","host":"127.0.0.1","port":41106,"genesis":false}
+{"id":7,"name":"dc3-node3","host":"127.0.0.1","port":41107,"genesis":false}

@@ -72,6 +72,11 @@ and `dc2-node2` with the increment verb; `dc3-node2` stays at weight 0 —
 the zero-voting-weight member the downstream design wants. The TCP client
 port is the descriptor's UDP peer port + 1000.
 
+`config/cluster-genesis.jsonl` is the 7th node's acceptance descriptor:
+the founding membership plus its own appended line — a boot on the
+genesis descriptor against a live, reconfigured cluster, the shape the
+membership snapshots serve.
+
 ## The standby telemetry node
 
 `check-standby.sh` runs the same six-node cluster with `dc1-node2` as the
@@ -106,6 +111,7 @@ Every spawned process (nodes, feed, mock, nginx) is killed on exit.
 ```
 ./run.sh             # the stability check (also as ./check.sh)
 ./check-standby.sh   # the standby AOF + console demo check
+./run-acceptance.sh  # the membership-snapshot acceptance run
 ```
 
 `run.sh` builds the crate, starts the six nodes with fresh state (each
@@ -119,6 +125,17 @@ cycles: SIGKILL the current holder, wait 2000 ms, assert a survivor steals
 the lease, restart the killed leader on the same state file, assert the
 reincarnation rejoin (identity bump, the peers' remap notice), and assert
 the cluster re-stabilizes. Every spawned process is killed on exit.
+
+`run-acceptance.sh` boots a 7th node on the GENESIS descriptor
+(`config/cluster-genesis.jsonl` — the founding membership and the
+joining node's own line only) while the live cluster is at era 6, after
+the three joins and the two increments. The node escalates through the
+era chain with era-qualified discovery, adopts a quorum of agreeing
+snapshots in memory, joins through the ordinary fenced boot, and writes
+the adopted facts behind; the run asserts all of it from the node's log
+and the membership sidecar's exact content, through the leader's
+post-commit disseminations. See
+[membership snapshots](../../docs/src/membership-snapshots.md) for the protocol.
 
 ## Downstream consumption
 

@@ -12,6 +12,7 @@
 //! Every attempt is logged as
 //! `lease-attempt ts=<ms> node=<id> op=set|renew|get|steal expiry=<ms>`.
 
+mod membership;
 mod transport;
 
 use lunet_advisory_lock::{
@@ -92,6 +93,7 @@ struct Pending {
     deadline: u64,
 }
 
+#[derive(Clone)]
 enum TcpPending {
     Lock {
         message_id: [u8; 16],
@@ -100,7 +102,12 @@ enum TcpPending {
     Admin {
         action: String,
         id: u32,
+        endpoint: String,
         era0: u32,
+        /// The establishing operation's choosing slot, captured from the
+        /// reconfiguration drive's own sends: the slot at which the new
+        /// configuration was chosen.
+        slot: u64,
         deadline: u64,
     },
 }
@@ -137,6 +144,30 @@ struct Host {
     driver: Driver,
     forwarded_from: HashMap<[u8; 16], (SocketAddr, u64)>,
     conns: Vec<Conn>,
+    /// The membership model: advisory evidence, never a consensus
+    /// mechanism. It boots from the membership sidecar next to the
+    /// incarnation marker, else from the descriptor, and moves only
+    /// forward — a snapshot with a newer (era, slot) is adopted in memory,
+    /// teaches the addressing rows its membership names, and writes behind
+    /// on the lazy writer.
+    model: membership::Model,
+    sidecar: membership::SidecarWriter,
+    discovery: Discovery,
+}
+
+/// The boot-time era-qualified discovery state: request to every node the
+/// process remembers, quorum within what it thought was the old cluster,
+/// escalation on any newer (era, slot) — every escalation drops the
+/// older-era responses and re-requests across that era's membership — and
+/// a stop at a weighted quorum of agreeing snapshots. Bounded: on the
+/// deadline the ordinary fenced boot proceeds regardless.
+struct Discovery {
+    era: u32,
+    slot: u64,
+    tallies: HashMap<String, membership::Tally>,
+    deadline_ms: u64,
+    next_request_ms: u64,
+    active: bool,
 }
 
 fn millis() -> u64 {
@@ -370,9 +401,13 @@ impl Host {
         self.send_application(addr, &payload);
     }
 
-    fn flush_outputs(&mut self, now: u64, rng: &mut Rng) {
+    fn flush_outputs(&mut self, now: u64, rng: &mut Rng) -> u64 {
+        let mut established_slot = 0u64;
         while let Some(out) = self.node.next_output() {
             if out.kind == OUTPUT_SEND {
+                if out.slot > established_slot {
+                    established_slot = out.slot;
+                }
                 let Some(&addr) = self.peers.get(&out.to) else {
                     // The maybe: a send to an unaddressable replica. Not
                     // provably impossible (the peer may be down mid-remap —
@@ -425,6 +460,98 @@ impl Host {
                         }
                     }
                 }
+            }
+        }
+        established_slot
+    }
+
+    /// Adds the addressing rows an adopted snapshot's membership names:
+    /// rows grow additively and never regress (a departed member's rows
+    /// leave through the leave verb's flow, never through a snapshot).
+    fn add_member_rows(&mut self, members: &[membership::SnapshotMember]) {
+        for member in members {
+            if self.peers.contains_key(&member.id) {
+                continue;
+            }
+            if let Ok(mut addrs) = member.endpoint.to_socket_addrs()
+                && let Some(addr) = addrs.next()
+            {
+                self.peers.insert(member.id, addr);
+                self.addr_to_id.insert(addr, member.id);
+            }
+        }
+    }
+
+    /// Adopts a newer (era, slot) snapshot into the model: rows, lazy
+    /// write-behind, and the operator-visible record. An equal or older
+    /// snapshot is a no-op.
+    fn adopt(&mut self, snapshot: membership::Snapshot, source: &str) {
+        if !self.model.adopt(snapshot.clone()) {
+            return;
+        }
+        self.add_member_rows(&snapshot.members);
+        self.sidecar.enqueue(&snapshot);
+        self.note(&format!(
+            "membership snapshot adopted era={} slot={} members={} source={source}",
+            snapshot.era,
+            snapshot.slot,
+            snapshot.members.len()
+        ));
+    }
+
+    /// The leader's post-commit dissemination: the as-at-new-generation
+    /// snapshot goes to the (new) membership — the departed member's row
+    /// is already gone for a leave, the joining member's row was added at
+    /// proposal time — and the committed fact writes behind. Recipients
+    /// only check up-to-dateness (era plus slot); a lower-era snapshot is
+    /// ignored everywhere.
+    fn disseminate(&mut self) {
+        let snapshot = self.model.snapshot();
+        let payload = membership::encode_response(&snapshot);
+        let targets: Vec<SocketAddr> = self
+            .peers
+            .iter()
+            .filter(|(id, _)| **id != self.own_id)
+            .map(|(_, addr)| *addr)
+            .collect();
+        for addr in targets {
+            let packet =
+                transport::encode_peer(transport::PEER_SNAPSHOT, &self.fingerprint, &payload);
+            let _ = self.sock.send_to(&packet, addr);
+        }
+        self.sidecar.enqueue(&snapshot);
+        self.note(&format!(
+            "membership snapshot disseminated era={} slot={} members={}",
+            snapshot.era,
+            snapshot.slot,
+            snapshot.members.len()
+        ));
+    }
+
+    /// The boot-time discovery round: one request per remembered peer, on
+    /// the fixed cadence, until the deadline or the quorum.
+    fn discovery_step(&mut self, now: u64) {
+        if !self.discovery.active {
+            return;
+        }
+        if now >= self.discovery.deadline_ms {
+            self.discovery.active = false;
+            self.note("discovery deadline reached; the ordinary fenced boot proceeds");
+            return;
+        }
+        if now >= self.discovery.next_request_ms {
+            self.discovery.next_request_ms = now + 100;
+            let targets: Vec<SocketAddr> = self
+                .peers
+                .iter()
+                .filter(|(id, _)| **id != self.own_id)
+                .map(|(_, addr)| *addr)
+                .collect();
+            let payload = membership::encode_request();
+            for addr in targets {
+                let packet =
+                    transport::encode_peer(transport::PEER_SNAPSHOT, &self.fingerprint, &payload);
+                let _ = self.sock.send_to(&packet, addr);
             }
         }
     }
@@ -725,6 +852,33 @@ fn main() {
         .iter()
         .position(|node| node.name == options.name)
         .unwrap_or_default() as u64;
+    // The membership model boots from the membership sidecar next to the
+    // incarnation marker (the node's last-known adopted facts), else from
+    // the descriptor. A sidecar that does not parse is ignored entirely:
+    // the descriptor is the fallback and discovery re-learns.
+    let mut model_source = "descriptor";
+    let (model_era, model_slot, model_rows) = match membership::load_sidecar(&options.state) {
+        Some(snapshot) => {
+            model_source = "sidecar";
+            (snapshot.era, snapshot.slot, snapshot.members)
+        }
+        None => {
+            let rows: Vec<(u32, String, u16, bool)> = nodes
+                .iter()
+                .map(|node| (node.id, node.host.clone(), node.port, node.genesis))
+                .collect();
+            (1, 0, membership::descriptor_model(&rows))
+        }
+    };
+    let model = membership::Model {
+        era: model_era,
+        slot: model_slot,
+        members: model_rows,
+    };
+    let sidecar = membership::SidecarWriter::open(&options.state).unwrap_or_else(|e| {
+        eprintln!("lease-sequencer: membership sidecar open failed: {e}");
+        exit(2);
+    });
     let driver = Driver {
         client_id: own_desc_id as u64,
         request_num: 0,
@@ -756,12 +910,29 @@ fn main() {
         driver,
         forwarded_from: HashMap::new(),
         conns: Vec::new(),
+        model,
+        sidecar,
+        discovery: Discovery {
+            era: model_era,
+            slot: model_slot,
+            tallies: HashMap::new(),
+            deadline_ms: millis() + 15000,
+            next_request_ms: 0,
+            active: true,
+        },
     };
     host.note(&format!(
         "boot name={} descriptor-id={own_desc_id} own={own_id} incarnation={incarnation}",
         options.name
     ));
     host.note(&format!("membership fingerprint={}", host.fingerprint));
+    host.note(&format!(
+        "membership model era={} slot={} members={} source={}",
+        host.model.era,
+        host.model.slot,
+        host.model.members.len(),
+        model_source
+    ));
     let now = millis();
     let mut rng = Rng::new(millis() ^ (own_desc_id as u64) ^ (std::process::id() as u64));
     host.flush_outputs(now, &mut rng);
@@ -771,6 +942,7 @@ fn main() {
         pump_udp(&mut host, now, &mut rng);
         pump_tcp(&mut host, now, &mut rng);
         timers(&mut host, now, &mut rng);
+        host.discovery_step(now);
         host.driver_step(now, &mut rng);
         host.flush_outputs(now, &mut rng);
         std::thread::sleep(Duration::from_millis(TICK_MS));
@@ -809,8 +981,14 @@ fn timers(host: &mut Host, now: u64, rng: &mut Rng) {
         // completes.
         let voting = u32::from(host.node.voting_weight().unwrap_or(0) > 0);
         host.note(&format!(
-            "status state={} leader={} era={} view={} config_era={} voting={voting}",
-            status.state, status.leader, status.era, status.view, status.config_era
+            "status state={} leader={} era={} view={} config_era={} voting={voting} \
+             sidecar_drops={}",
+            status.state,
+            status.leader,
+            status.era,
+            status.view,
+            status.config_era,
+            host.sidecar.drops()
         ));
     }
     if (status.state == STATE_RECOVERING
@@ -850,8 +1028,15 @@ fn handle_packet(
     };
     if fingerprint != host.fingerprint {
         // Unexpected but survivable: a datagram from outside the
-        // deployment's genesis fingerprint.
+        // deployment's genesis fingerprint. Membership snapshots are
+        // advisory evidence, so a foreign deployment's snapshot drops
+        // without ceremony (here: for every packet kind this host
+        // carries, and never a quarantine).
         host.note("dirty-fingerprint; datagram dropped");
+        return;
+    }
+    if kind == transport::PEER_SNAPSHOT {
+        handle_snapshot_packet(host, addr, payload);
         return;
     }
     if kind == transport::PEER_VRR {
@@ -947,6 +1132,61 @@ fn handle_packet(
     }
 }
 
+/// One PEER_SNAPSHOT packet: the request is answered from this node's
+/// current membership model (no leader has to be known first), and a
+/// response — from a discovery answer or from the leader's post-commit
+/// dissemination, the same wire shape serving both — is fed to the
+/// discovery state machine. While discovery is running a response only
+/// escalates the era or tallies agreement within it: the model adopts at a
+/// weighted quorum, never from one node's word. Afterwards the
+/// dissemination semantics apply: only the up-to-dateness check, newer
+/// (era, slot) adopted immediately, equal or older ignored everywhere.
+fn handle_snapshot_packet(host: &mut Host, addr: SocketAddr, payload: &[u8]) {
+    if membership::decode_request(payload) {
+        let response = membership::encode_response(&host.model.snapshot());
+        let packet = transport::encode_peer(transport::PEER_SNAPSHOT, &host.fingerprint, &response);
+        let _ = host.sock.send_to(&packet, addr);
+        return;
+    }
+    let Some(snap) = membership::decode_response(payload) else {
+        return;
+    };
+    // The responder is attributed through the addressing tables; an
+    // unattributed source contributes nothing (its weight is unknown).
+    let Some(&responder) = host.addr_to_id.get(&addr) else {
+        return;
+    };
+    if host.discovery.active {
+        if membership::newer(snap.era, snap.slot, host.discovery.era, host.discovery.slot) {
+            host.discovery.era = snap.era;
+            host.discovery.slot = snap.slot;
+            host.discovery.tallies.clear();
+            host.add_member_rows(&snap.members);
+            host.note(&format!(
+                "discovery escalate era={} slot={}; older-era responses dropped",
+                snap.era, snap.slot
+            ));
+        } else if snap.era == host.discovery.era && snap.slot == host.discovery.slot {
+            let key = membership::agreement_key(&snap);
+            let tally = host.discovery.tallies.entry(key).or_default();
+            tally.record(
+                responder,
+                membership::member_weight(&snap.members, responder),
+            );
+            if tally.agrees_with(&snap.members) {
+                host.discovery.active = false;
+                host.adopt(snap, "discovery");
+                host.note(&format!(
+                    "discovery quorum reached at era={} slot={}",
+                    host.model.era, host.model.slot
+                ));
+            }
+        }
+    } else {
+        host.adopt(snap, "dissemination");
+    }
+}
+
 fn pump_tcp(host: &mut Host, now: u64, rng: &mut Rng) {
     while let Ok((stream, _)) = host.listener.accept() {
         let _ = stream.set_nonblocking(true);
@@ -1025,20 +1265,30 @@ fn pop_line(conn: &mut Conn) -> Option<Vec<u8>> {
 /// The pending verb's deadline discipline (the admin ack's era-advance wait,
 /// the lock reply's client deadline); false closes the connection.
 fn pending_deadline(host: &mut Host, index: usize, now: u64) -> bool {
-    let Some(pending) = &host.conns[index].pending else {
+    let Some(pending) = host.conns[index].pending.clone() else {
         return true;
     };
     match pending {
         TcpPending::Admin {
             action,
             id,
+            endpoint,
             era0,
+            slot,
             deadline,
         } => {
             let status = host.node.status();
-            let reply = if status.era > *era0 {
+            let reply = if status.era > era0 {
+                // Post-commit dissemination: the leader's membership model
+                // takes the committed verb's change, moves to its next
+                // generation at the establishing slot, and sends the
+                // as-at-new-generation snapshot to the (new) membership.
+                if host.model.apply_change(&action, id, &endpoint) {
+                    host.model.advance(slot);
+                    host.disseminate();
+                }
                 format!("\"action\":\"{action}\",\"id\":{id},\"accepted\":true")
-            } else if now < *deadline {
+            } else if now < deadline {
                 return true;
             } else {
                 format!(
@@ -1052,7 +1302,7 @@ fn pending_deadline(host: &mut Host, index: usize, now: u64) -> bool {
             let _ = conn.stream.flush();
             true
         }
-        TcpPending::Lock { deadline, .. } => now < *deadline,
+        TcpPending::Lock { deadline, .. } => now < deadline,
     }
 }
 
@@ -1126,17 +1376,24 @@ fn handle_client_line(host: &mut Host, index: usize, line: &str, now: u64, rng: 
         return true;
     }
     let rc = host.node.reconfigure(op, id, POSITION_APPEND);
-    host.flush_outputs(now, rng);
+    // The reconfiguration drive's sends are the establishing Prepare(s),
+    // all stamped with the entry slot at which the new configuration was
+    // chosen; the max send slot is the establishing slot. The drive and
+    // the drain run in the same loop slice, so the capture races nothing.
+    let establishing_slot = host.flush_outputs(now, rng);
     if rc != OK {
         let reply = format!("{{\"action\":\"{action}\",\"id\":{id},\"accepted\":false}}\n");
         let _ = host.conns[index].stream.write_all(reply.as_bytes());
         let _ = host.conns[index].stream.flush();
         return true;
     }
+    let endpoint = value["endpoint"].as_str().unwrap_or_default().to_string();
     host.conns[index].pending = Some(TcpPending::Admin {
         action,
         id,
+        endpoint,
         era0: status.era,
+        slot: establishing_slot,
         deadline: now + ADMIN_DEADLINE_MS,
     });
     true

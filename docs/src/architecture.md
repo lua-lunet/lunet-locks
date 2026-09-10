@@ -27,8 +27,8 @@ flowchart LR
 The **LAL Peer Protocol** is this service's UDP framing and forwarding layer.
 It is not a replacement for VRR and it does not define replication state.
 Its jobs are to guard the deployment at the transport boundary and to carry
-service-specific forwarding, membership-administration, and reincarnation
-packets alongside opaque VRR datagrams.
+service-specific forwarding, membership-administration, membership-snapshot,
+and reincarnation packets alongside opaque VRR datagrams.
 
 The Rust adapter retains the lock state machine, the tick clock, exactly-once
 reply correlation, and the durable incarnation marker. Teal owns sockets, TCP
@@ -208,7 +208,8 @@ port exactly match a descriptor endpoint. It then decodes this outer envelope:
 \0LUNET_ADVISORY_LOCK_PEER\0 | kind | membership fingerprint | payload
 ```
 
-`kind` is either opaque VRR traffic or a service application packet. The
+`kind` is either opaque VRR traffic, a service application packet, or a
+membership snapshot. The
 fingerprint is the first 16 lowercase hexadecimal characters of SHA-256 over a
 domain-separated, length-delimited encoding of the **genesis** membership in
 descriptor line order (id, name, IPv4 endpoint, and port). The deployment's
@@ -277,9 +278,30 @@ sequenceDiagram
 
 Only the replica to which a request was most recently forwarded may redirect
 that request. An unknown primary simply leaves the request pending until
-normal discovery/retry succeeds; the adapter reports "primary unknown" for an
-era outside the core's three-era retention window or a booting cluster. A node
+normal discovery/retry succeeds; the adapter reports "primary unknown" for
+an era outside the core's three-era retention window or a booting cluster. A node
 that is not primary never executes the forwarded application command.
+
+## Membership snapshots
+
+A node whose configuration knowledge is stale — including one booting on
+the genesis descriptor while the live cluster has reconfigured — learns
+the live membership through era-qualified membership snapshots, the
+third LAL peer kind. They are advisory evidence and never a consensus
+mechanism: the model they feed is in-memory, feeds the ordinary
+fenced-boot path, and never bypasses a gate. The boot-time discovery
+loop requests a snapshot from every node the process remembers,
+escalates across any newer era (each escalation dropping the older-era
+responses), and adopts a configuration only at a weighted quorum of
+agreeing snapshots. When the leader's reconfiguration command commits,
+it disseminates the as-at-new-generation snapshot to the new membership;
+recipients check only up-to-dateness, era plus slot. Adopted facts
+persist lazily on a routine tick in a membership sidecar next to the
+incarnation marker.
+
+See [membership snapshots](membership-snapshots.md) for the wire shapes,
+the discovery and dissemination rules, the quorum arithmetic, and the
+sidecar format.
 
 ## Status surface
 
@@ -345,7 +367,11 @@ reincarnated node, re-announces its `(old, new)` pair.
 
 The `--state` file is the durable incarnation marker, the only bytes this
 service ever fsyncs. It holds one line, `<incarnation> <flushed|unflushed>`,
-written atomically (write, fsync, rename, parent-directory sync). The marker
+written atomically (write, fsync, rename, parent-directory sync). The
+adopted membership facts keep a lazy, never-fsynced copy beside it — the
+membership sidecar described under
+[membership snapshots](membership-snapshots.md) — and the marker's boot
+classification reads the marker alone. The marker
 classifies the boot: `flushed` is a clean start under the same identity;
 `unflushed` is the running sentinel every operating process leaves behind,
 so a restart of a process that has been running classifies **dirty**.
