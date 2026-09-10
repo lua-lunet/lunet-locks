@@ -41,12 +41,37 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
+#[cfg(not(any(unix, windows)))]
+use std::io::{Seek, SeekFrom, Write};
+#[cfg(unix)]
 use std::os::unix::fs::FileExt;
+#[cfg(windows)]
+use std::os::windows::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
 use std::time::{Duration, Instant};
+
+/// Positional write, portable across the platforms the crate builds on:
+/// `write_all_at` on unix and windows (both use the file's own position
+/// table, not the shared handle cursor), and an explicit seek-plus-write
+/// everywhere else. Callers never rely on the handle cursor.
+#[cfg(unix)]
+fn write_all_at(file: &mut File, offset: u64, bytes: &[u8]) -> io::Result<()> {
+    FileExt::write_all_at(file, bytes, offset)
+}
+
+#[cfg(windows)]
+fn write_all_at(file: &mut File, offset: u64, bytes: &[u8]) -> io::Result<()> {
+    FileExt::seek_write(file, bytes, offset)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn write_all_at(file: &mut File, offset: u64, bytes: &[u8]) -> io::Result<()> {
+    file.seek(SeekFrom::Start(offset))?;
+    file.write_all(bytes)
+}
 
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
 use tracing::warn;
@@ -202,7 +227,7 @@ impl FileSink {
     }
 
     fn write_all_blocking(&mut self, bytes: &[u8]) -> io::Result<()> {
-        self.file.write_all_at(bytes, self.offset)?;
+        write_all_at(&mut self.file, self.offset, bytes)?;
         self.offset += bytes.len() as u64;
         Ok(())
     }
