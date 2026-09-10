@@ -1,5 +1,6 @@
 {
   "files": [
-    "secrets/fake-jumpbox.txt"
+    "secrets/fake-jumpbox.txt",
+    "secrets/jumpbox.txt"
   ]
 }
