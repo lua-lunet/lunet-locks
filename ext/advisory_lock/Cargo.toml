@@ -13,12 +13,12 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"
 uuid = { version = "1", features = ["serde"] }
-vrr = { package = "vrr-core", git = "https://github.com/lua-lunet/uvrr-core.git", rev = "0fc6380aa36f45c92b3b7c8df679d7f7991803aa" } # commit 0fc6380, upstream main at time of bump
+vrr = { package = "vrr-core", git = "https://github.com/lua-lunet/uvrr-core.git", tag = "v0.3.0" } # released upstream 2026-09-10, includes the learner-acquisition + fence-under-load patches (squash of PR #12)
 
-# The §10 learner-era-fold patch branch: the submodule under ext/uvrr-core
-# carries the upstream commit plus the learner acquisition rule, so the
-# demo's joined learner converges. See ext/uvrr-core's branch
-# lunet-locks/learner-era-fold and the drafted upstream issue.
+# The [patch] resolves the tagged dependency to the vendored submodule copy
+# (ext/uvrr-core, pinned to the same v0.3.0 commit), so every build lane —
+# including Docker with no network fetch — builds hermetically against
+# content byte-identical to the released tag.
 [patch."https://github.com/lua-lunet/uvrr-core.git"]
 vrr-core = { path = "../uvrr-core" }
 

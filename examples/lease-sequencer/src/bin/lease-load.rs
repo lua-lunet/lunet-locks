@@ -334,11 +334,11 @@ fn contender(options: &Options, shared: &Arc<Mutex<Vec<Sample>>>, index: usize) 
     let renew_margin = (options.lease_ms as f64 * (1.0 - options.renew_fraction)) as u64;
     loop {
         let now = wall_ms();
-        if let Some(at) = next_action {
-            if now < at {
-                std::thread::sleep(Duration::from_millis((at - now).clamp(1, 20)));
-                continue;
-            }
+        if let Some(at) = next_action
+            && now < at
+        {
+            std::thread::sleep(Duration::from_millis((at - now).clamp(1, 20)));
+            continue;
         }
         let (op, request) = match next_action {
             None => {
