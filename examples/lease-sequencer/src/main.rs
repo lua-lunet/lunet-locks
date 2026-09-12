@@ -1437,14 +1437,17 @@ fn main() {
         model_source
     ));
     // The boot trace (item22): every node's startup decision —
-    // Restarting on a dirty restart (incarnation bump), otherwise
-    // Joining — lands in its AOF with the outbound messages that follow
-    // while the gate is ON (the boot Recovering/Joining phase), whatever
-    // the node's future weight.
+    // Restarting on a dirty restart (incarnation bump), Recovering when
+    // the core boots into the recovering state, Joining for a fresh
+    // member already Normal — lands in its AOF with the outbound messages
+    // that follow while the gate is ON, whatever the node's future
+    // weight.
     {
         let status = host.node.status();
         let decision = if incarnation > 0 {
             "restarting"
+        } else if status.state == STATE_RECOVERING {
+            "recovering"
         } else {
             "joining"
         };

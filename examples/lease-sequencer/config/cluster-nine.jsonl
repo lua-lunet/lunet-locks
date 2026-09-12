@@ -1,0 +1,9 @@
+{"id":1,"name":"dc1-node1","host":"127.0.0.1","port":41101,"genesis":true}
+{"id":2,"name":"dc2-node1","host":"127.0.0.1","port":41102,"genesis":true}
+{"id":3,"name":"dc3-node1","host":"127.0.0.1","port":41103,"genesis":true}
+{"id":4,"name":"dc1-node2","host":"127.0.0.1","port":41104,"genesis":true}
+{"id":5,"name":"dc2-node2","host":"127.0.0.1","port":41105,"genesis":true}
+{"id":6,"name":"dc3-node2","host":"127.0.0.1","port":41106,"genesis":true}
+{"id":7,"name":"dc1-tel","host":"127.0.0.1","port":41107,"genesis":false}
+{"id":8,"name":"dc2-tel","host":"127.0.0.1","port":41108,"genesis":false}
+{"id":9,"name":"dc3-tel","host":"127.0.0.1","port":41109,"genesis":false}
