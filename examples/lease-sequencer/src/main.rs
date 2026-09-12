@@ -615,6 +615,23 @@ impl Host {
                 phi::addr_text(addr),
                 interval
             ));
+            // The sampled-estimate evidence (marker 5): the arrival's
+            // learned interval AND when it was sampled — the exported
+            // phi-samples kind. One record per learned interval.
+            self.record_telemetry(Record::telemetry(
+                Marker::TelemetryIntervalSample,
+                local_ns(),
+                format!(
+                    "{{\"node\":{},\"era\":{},\"leader\":{},\"addr\":\"{}\",\"dt_ms\":{},\"ts_ms\":{}}}",
+                    self.own_id,
+                    trailer.era,
+                    trailer.leader,
+                    phi::addr_text(addr),
+                    interval,
+                    now
+                )
+                .as_bytes(),
+            ));
         }
     }
 
@@ -1637,6 +1654,9 @@ fn handle_packet(
         // message bytes. Strip it here so the core sees the exact-length
         // message its W3 contract demands, and feed the arrival to the
         // sketch when the sender is the leader this monitor watches.
+        // The wire bytes AS THE NETWORK CARRIED THEM, trailer and all:
+        // the telemetry record's evidence for the leader's send clock.
+        let wire_bytes = payload;
         let (payload, trailer) = match phi::Trailer::strip_from(payload) {
             Some((front, trailer)) => (front, Some(trailer)),
             None => (payload, None),
@@ -1645,14 +1665,16 @@ fn handle_packet(
             host.observe_heartbeat(replica, addr, trailer, now);
         }
         // The telemetry AOF stream (item22): EVERY VRR datagram this node
-        // sees is one `Wire` envelope record — the trailer-stripped wire
-        // message, exactly what the core receives, with the local
-        // nanosecond clock in the envelope header — appended while the
-        // lifecycle gate is active (weight 0 / boot phase). An append
-        // failure disables the stream for the process and logs once —
-        // telemetry must never poison the replication path.
+        // sees is one `Wire` envelope record — the datagram's VRR payload
+        // byte-identical to what the network carried (the phi trailer's
+        // sent_at_ms stays in the record: the export's leader-timestamp
+        // evidence), with the local nanosecond clock in the envelope
+        // header — appended while the lifecycle gate is active (weight 0 /
+        // boot phase). An append failure disables the stream for the
+        // process and logs once — telemetry must never poison the
+        // replication path. The STRIPPED bytes are what the core receives.
         if host.telemetry.is_some() {
-            host.record_telemetry(Record::wire(local_ns(), payload));
+            host.record_telemetry(Record::wire(local_ns(), wire_bytes));
         }
         if let Some((old, new)) = transport::reincarnation_pair(payload)
             && old == replica

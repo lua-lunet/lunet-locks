@@ -207,6 +207,7 @@ impl BridgeMetrics {
             Marker::TelemetryTimeoutDecision => "timeout_decision",
             Marker::TelemetryStateTransition => "state_transition",
             Marker::TelemetryOutbound => "outbound",
+            Marker::TelemetryIntervalSample => "interval_sample",
         }
     }
 

@@ -28,6 +28,7 @@ local MARKER_WIRE = 1
 local MARKER_TIMEOUT = 2
 local MARKER_TRANSITION = 3
 local MARKER_OUTBOUND = 4
+local MARKER_INTERVAL = 5
 
 -- The uVRR wire tags (marker-1 payload header, big-endian).
 local TAG_NAMES: {number: string} = {
@@ -308,12 +309,405 @@ local function main(argv: {string}): number
     return 0
 end
 
+-- -------------------------------------------------------------- export ----
+-- The trace of what happened, as record tables: the ts at the AOF (the
+-- standby's local ns clock), the ts at the leader (the phi trailer's
+-- sent_at_ms, carried on every leader Commit), the command, the result.
+
+local TRAILER_MAGIC = {0xc0, 0x0b}
+local TRAILER_BYTES = 22
+
+local SYS_NAMES: {number: string} = {
+    [1] = "Void", [2] = "Init", [3] = "Increment", [4] = "Decrement",
+    [5] = "Double", [6] = "Halve", [7] = "Join", [8] = "Leave", [9] = "Batch",
+}
+
+-- All byte readers are 1-INDEXED like the string: the ffi cast is
+-- 0-indexed, so every lookup lands at `at - 1`.
+local function be_u32(buf: string, at: number): number
+    local b = ffi.cast("const uint8_t*", buf)
+    return b[at - 1] * 16777216 + b[at] * 65536 + b[at + 1] * 256 + b[at + 2]
+end
+
+local function be_u64(buf: string, at: number): any
+    local v = ffi.new("uint64_t", 0)
+    local b = ffi.cast("const uint8_t*", buf)
+    for i = 0, 7 do
+        v = v * 256 + b[at - 1 + i]
+    end
+    return v
+end
+
+-- little-endian u64 from the tail (the trailer's sent_at_ms)
+local function le_u64(buf: string, at: number): any
+    local v = ffi.new("uint64_t", 0)
+    local b = ffi.cast("const uint8_t*", buf)
+    for i = 7, 0, -1 do
+        v = v * 256 + b[at - 1 + i]
+    end
+    return v
+end
+
+local function split_trailer(frame: string): (string, any)
+    if #frame >= TRAILER_BYTES then
+        local m1 = frame:byte(#frame - TRAILER_BYTES + 1)
+        local m2 = frame:byte(#frame - TRAILER_BYTES + 2)
+        if m1 == TRAILER_MAGIC[1] and m2 == TRAILER_MAGIC[2] then
+            return frame:sub(1, #frame - TRAILER_BYTES), le_u64(frame, #frame - 7)
+        end
+    end
+    return frame, nil
+end
+
+-- One SystemOperation: (command string, bytes consumed) or (nil, 0).
+local function parse_system(buf: string): (string, number)
+    if #buf == 0 then
+        return nil, 0
+    end
+    local disc = buf:byte(1)
+    local name = SYS_NAMES[disc]
+    if name == nil then
+        return nil, 0
+    end
+    if disc == 1 or disc == 5 or disc == 6 then
+        return name, 1
+    end
+    if disc == 3 or disc == 4 or disc == 8 then
+        if #buf < 5 then
+            return nil, 0
+        end
+        return ("%s node=%d"):format(name, be_u32(buf, 2)), 5
+    end
+    if disc == 7 then
+        if #buf < 9 then
+            return nil, 0
+        end
+        return ("Join node=%d position=%d"):format(be_u32(buf, 2), be_u32(buf, 6)), 9
+    end
+    if disc == 2 then
+        if #buf < 5 then
+            return nil, 0
+        end
+        local count = be_u32(buf, 2)
+        if #buf < 5 + 4 * count then
+            return nil, 0
+        end
+        local nodes: {string} = {}
+        for i = 0, count - 1 do
+            nodes[#nodes + 1] = tostring(be_u32(buf, 6 + 4 * i))
+        end
+        return ("Init order=%s"):format(table.concat(nodes, ",")), 5 + 4 * count
+    end
+    if disc == 9 then
+        if #buf < 5 then
+            return nil, 0
+        end
+        local count = be_u32(buf, 2)
+        local cursor = 6
+        local parts: {string} = {}
+        for _ = 0, count - 1 do
+            local sub, consumed = parse_system(buf:sub(cursor))
+            if sub == nil then
+                return nil, 0
+            end
+            parts[#parts + 1] = sub
+            cursor = cursor + consumed
+        end
+        return ("Batch[%s]"):format(table.concat(parts, "; ")), cursor - 1
+    end
+    return nil, 0
+end
+
+-- One uVRR wire frame: (kind, tag, era, view, slot, entry, committed)
+-- where entry is ("operation", payload-json) or ("system", command).
+local function parse_wire(frame: string): (string, number, number, number, any, ({string, string} | {string, any}), any)
+    if #frame < 21 then
+        return nil, nil, nil, nil, nil, nil, nil
+    end
+    local tag = be_u32(frame, 1)
+    local era = be_u32(frame, 5)
+    local view = be_u32(frame, 9)
+    local slot = be_u64(frame, 13)
+    local disc = frame:byte(21)
+    if disc ~= tag % 256 then
+        return nil, nil, nil, nil, nil, nil, nil
+    end
+    if tag == 2 then
+        if #frame < 21 + 8 + 4 + 1 then
+            return nil, nil, nil, nil, nil, nil, nil
+        end
+        local entry_slot = be_u64(frame, 22)
+        local entry_era = be_u32(frame, 30)
+        local payload_disc = frame:byte(34)
+        local entry: {string, string}
+        local cursor = 35
+        if payload_disc == 1 then
+            if #frame < cursor + 16 + 4 then
+                return nil, nil, nil, nil, nil, nil, nil
+            end
+            local jlen = be_u32(frame, cursor + 16)
+            cursor = cursor + 16 + 4
+            if #frame < cursor + jlen then
+                return nil, nil, nil, nil, nil, nil, nil
+            end
+            entry = {"operation", frame:sub(cursor, cursor + jlen - 1)}
+            cursor = cursor + jlen
+        elseif payload_disc == 2 then
+            local command, consumed = parse_system(frame:sub(cursor))
+            if command == nil then
+                return nil, nil, nil, nil, nil, nil, nil
+            end
+            entry = {"system", command}
+            cursor = cursor + consumed
+        else
+            return nil, nil, nil, nil, nil, nil, nil
+        end
+        -- committed = the 8 bytes at cursor..cursor+7 (1-indexed inclusive)
+        if #frame < cursor + 7 then
+            return nil, nil, nil, nil, nil, nil, nil
+        end
+        local committed = be_u64(frame, cursor)
+        _ = entry_slot
+        _ = entry_era
+        return "prepare", tag, era, view, slot, entry, committed
+    elseif tag == 4 then
+        if #frame < 21 + 8 - 1 then
+            return nil, nil, nil, nil, nil, nil, nil
+        end
+        return "commit", tag, era, view, slot, nil, be_u64(frame, 22)
+    elseif tag == 3 or tag == 5 or tag == 8 then
+        return "empty", tag, era, view, slot, nil, nil
+    end
+    return "other", tag, era, view, slot, nil, nil
+end
+
+-- The lock-op fields out of the tagged JSON (the same shapes the python
+-- twin's json.loads extracts; both tools read the same bytes).
+local function json_num(json: string, key: string): any
+    local raw = json:match('"' .. key .. '":%s*(-?%d+%.?%d*)')
+    if raw ~= nil then
+        return tonumber(raw)
+    end
+    return nil
+end
+
+local function json_str(json: string, key: string): string
+    return json:match('"' .. key .. '":%s*"([^"]*)"')
+end
+
+local LOCK_OPS: {string: boolean} = {
+    ["get"] = true, ["set"] = true, ["release"] = true, ["break"] = true,
+}
+
+local function lock_fields(json: string): ({string: any} | nil)
+    local op = json:match('"op":%s*"([a-z]+)"')
+    if op == nil or LOCK_OPS[op] ~= true then
+        return nil
+    end
+    return {
+        op = op,
+        lock_id = json_num(json, "lock_id"),
+        message_id = json_str(json, "message_id"),
+        client_id = json_num(json, "client_id"),
+        request_num = json_num(json, "request_num"),
+    }
+end
+
+local function json_payload(frame: string): string
+    -- the envelope: marker(1) + ns(8) + payload → the JSON starts at 10
+    return frame:sub(10)
+end
+
+-- The JSONL line for one event: fixed key order (the parity contract).
+local function json_escape(s: string): string
+    local out = s:gsub("\\", "\\\\")
+    out = out:gsub('"', '\\"')
+    return out
+end
+
+local function ev_json(e: {string: any}): string
+    local parts: {string} = {}
+    local order: {string} = {"kind", "aof_ns", "leader_ms", "slot", "result",
+                             "op", "lock_id", "message_id", "client_id",
+                             "request_num", "command", "phi", "now_ms",
+                             "prev_wait_ms", "next_wait_ms", "node", "era",
+                             "leader", "addr", "dt_ms", "ts_ms"}
+    for _, key in ipairs(order) do
+        local v = e[key]
+        if v ~= nil then
+            if v == true or v == false then
+                parts[#parts + 1] = ('"%s": %s'):format(key, tostring(v))
+            elseif type(v) == "string" then
+                parts[#parts + 1] = ('"%s": "%s"'):format(key, json_escape(v))
+            else
+                parts[#parts + 1] = ('"%s": %s'):format(key, tostring(v))
+            end
+        end
+    end
+    return "{" .. table.concat(parts, ", ") .. "}"
+end
+
+local function kind_wanted(kinds: string, kind: string): boolean
+    if kinds == "all" then
+        return true
+    end
+    if kinds == "both" then
+        return kind == "locks" or kind == "reconfig"
+    end
+    return kinds == kind
+end
+
+local function export_series(dir_path: string, kinds: string): {{string: any}}
+    local wanted_names: {string} = {}
+    local p = io.popen("ls -1 " .. dir_path .. "/*.aof 2>/dev/null")
+    for f in p:lines() do
+        wanted_names[#wanted_names + 1] = f
+    end
+    p:close()
+    table.sort(wanted_names)
+    local events: {{string: any}} = {}
+    local pending: {number: {string: any}} = {}
+    for _, path in ipairs(wanted_names) do
+        local it = iter_open(path)
+        while true do
+            local rc = native.lunet_aof_iter_next(it, buffer, RECORD_MAX, len_out, op_out)
+            if rc <= 0 then
+                native.lunet_aof_iter_close(it)
+                break
+            end
+            local frame = ffi.string(buffer, len_out[0])
+            local aof_ns = ns_of(frame)
+            local marker = frame:byte(1)
+            if marker == MARKER_TIMEOUT then
+                if kind_wanted(kinds, "phi") then
+                    local e: {string: any} = {kind = "phi", aof_ns = tonumber(aof_ns)}
+                    local j = json_payload(frame)
+                    e.phi = json_num(j, "phi")
+                    e.now_ms = json_num(j, "now_ms")
+                    e.prev_wait_ms = json_num(j, "prev_wait_ms")
+                    e.next_wait_ms = json_num(j, "next_wait_ms")
+                    e.leader = json_num(j, "leader")
+                    e.era = json_num(j, "era")
+                    e.view = json_num(j, "view")
+                    events[#events + 1] = e
+                end
+            elseif marker == MARKER_INTERVAL then
+                if kind_wanted(kinds, "phi-samples") then
+                    local e: {string: any} = {kind = "phi-samples", aof_ns = tonumber(aof_ns)}
+                    local j = json_payload(frame)
+                    e.node = json_num(j, "node")
+                    e.era = json_num(j, "era")
+                    e.leader = json_num(j, "leader")
+                    e.addr = json_str(j, "addr")
+                    e.dt_ms = json_num(j, "dt_ms")
+                    e.ts_ms = json_num(j, "ts_ms")
+                    events[#events + 1] = e
+                end
+            elseif marker == MARKER_WIRE then
+                local wire_frame, leader_ms = split_trailer(json_payload(frame))
+                local kind, _tag, _era, _view, slot, entry, committed = parse_wire(wire_frame)
+                if kind == "prepare" and entry ~= nil then
+                    if entry[1] == "operation" then
+                        local fields = lock_fields(entry[2])
+                        if fields ~= nil then
+                            pending[tonumber(slot)] = fields
+                        end
+                    elseif entry[1] == "system" then
+                        pending[tonumber(slot)] = {
+                            kind = "reconfig",
+                            command = entry[2],
+                        }
+                    end
+                    local frontier = tonumber(committed)
+                    for s, fields in pairs(pending) do
+                        if s <= frontier then
+                            pending[s] = nil
+                            if fields.op ~= nil then
+                                if kind_wanted(kinds, "locks") then
+                                    local e: {string: any} = {
+                                        kind = "locks", aof_ns = tonumber(aof_ns),
+                                        leader_ms = leader_ms and tonumber(leader_ms),
+                                        slot = s, result = "committed",
+                                    }
+                                    for k, v in pairs(fields) do
+                                        e[k] = v
+                                    end
+                                    events[#events + 1] = e
+                                end
+                            elseif kind_wanted(kinds, "reconfig") then
+                                local e: {string: any} = {
+                                    aof_ns = tonumber(aof_ns),
+                                    leader_ms = leader_ms and tonumber(leader_ms),
+                                    slot = s, result = "committed",
+                                }
+                                for k, v in pairs(fields) do
+                                    e[k] = v
+                                end
+                                events[#events + 1] = e
+                            end
+                        end
+                    end
+                elseif kind == "commit" then
+                    local frontier = tonumber(committed)
+                    for s, fields in pairs(pending) do
+                        if s <= frontier then
+                            pending[s] = nil
+                            if fields.op ~= nil then
+                                if kind_wanted(kinds, "locks") then
+                                    local e: {string: any} = {
+                                        kind = "locks", aof_ns = tonumber(aof_ns),
+                                        leader_ms = leader_ms and tonumber(leader_ms),
+                                        slot = s, result = "committed",
+                                    }
+                                    for k, v in pairs(fields) do
+                                        e[k] = v
+                                    end
+                                    events[#events + 1] = e
+                                end
+                            elseif kind_wanted(kinds, "reconfig") then
+                                local e: {string: any} = {
+                                    aof_ns = tonumber(aof_ns),
+                                    leader_ms = leader_ms and tonumber(leader_ms),
+                                    slot = s, result = "committed",
+                                }
+                                for k, v in pairs(fields) do
+                                    e[k] = v
+                                end
+                                events[#events + 1] = e
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return events
+end
+
+local function export_to(out_path: string, series_dir: string, kinds: string): number
+    local events = export_series(series_dir, kinds)
+    local handle = io.open(out_path, "w")
+    if handle == nil then
+        error("cannot write " .. out_path)
+    end
+    for _, e in ipairs(events) do
+        handle:write(ev_json(e) .. "\n")
+    end
+    handle:close()
+    return #events
+end
+
 return {
     iterate = nil,
     ns_of = ns_of,
+    parse_wire = parse_wire,
+    split_trailer = split_trailer,
+    lock_fields = lock_fields,
     summarize = summarize_one,
     summarize_series = summarize_series,
     summarize_series_json = summarize_series_json,
+    export_series = export_series,
+    export_to = export_to,
     fixture_dir = fixture_dir,
     open_writer = open_writer,
     append = append,

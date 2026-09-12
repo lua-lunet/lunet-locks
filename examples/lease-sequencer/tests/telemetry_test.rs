@@ -204,6 +204,49 @@ fn marker_bytes_table() {
 
 // -------------------------------------------------- phi timeout (M3) -------
 
+/// The sampled heartbeat arrival + learned interval lands as an
+/// IntervalSample record through the gated log (the exported phi-sample
+/// kind's evidence).
+#[test]
+fn interval_sample_record_passes_the_gate() {
+    let dir = temp_dir("interval-sample");
+    let mut log = TelemetryLog::open(&dir, 1000, 4 * 1024 * 1024, 10 * 1024 * 1024)
+        .expect("open");
+    let json = br#"{"node":88,"era":4,"leader":33,"addr":"127.0.0.1:41101","dt_ms":22,"ts_ms":1789214915000}"#;
+    log.append(lunet_locks_aof::envelope::Record::telemetry(
+        lunet_locks_aof::envelope::Marker::TelemetryIntervalSample,
+        77,
+        json,
+    ));
+    log.teardown().expect("teardown flushes and closes");
+    // Read the gated series back through the vendored iterator and find
+    // the interval-sample record.
+    let mut found: Option<Record> = None;
+    let files: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.to_string_lossy().ends_with(".aof"))
+        .collect();
+    for file in files {
+        let mut iter =
+            unsafe { lunet_locks_aof::ffi::RawIter::open(file.to_string_lossy().as_bytes()) }
+                .expect("iter");
+        while let Some(entry) = iter.next_entry().expect("read") {
+            if let Some(record) = lunet_locks_aof::envelope::Record::decode(&entry.bytes) {
+                if record.marker == Marker::TelemetryIntervalSample {
+                    found = Some(record);
+                    break;
+                }
+            }
+        }
+    }
+    let record = found.expect("the interval-sample record is in the gated series");
+    assert_eq!(record.ns, 77);
+    let value: serde_json::Value = serde_json::from_slice(&record.payload).unwrap();
+    assert_eq!(value["node"], 88);
+    assert_eq!(value["dt_ms"], 22);
+}
+
 /// The phi-informed wait: `safety * max(heartbeat, learned mean)`, clamped
 /// to the [min, max] knobs. A settled but fast sketch clamps UP to min.
 #[test]

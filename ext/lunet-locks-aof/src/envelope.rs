@@ -42,6 +42,10 @@ pub enum Marker {
     TelemetryStateTransition = 3,
     /// The payload is one outbound message's JSON.
     TelemetryOutbound = 4,
+    /// The payload is one sampled heartbeat arrival's JSON: the monitor's
+    /// node id, era, leader, address, the learned inter-arrival `dt_ms`,
+    /// and the sample's `ts_ms` — the estimate-and-when evidence.
+    TelemetryIntervalSample = 5,
 }
 
 impl Marker {
@@ -53,6 +57,7 @@ impl Marker {
             2 => Some(Marker::TelemetryTimeoutDecision),
             3 => Some(Marker::TelemetryStateTransition),
             4 => Some(Marker::TelemetryOutbound),
+            5 => Some(Marker::TelemetryIntervalSample),
             _ => None,
         }
     }

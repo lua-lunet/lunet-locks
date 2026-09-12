@@ -88,6 +88,21 @@ fn telemetry_record_decodes_to_json() {
     assert_eq!(value["phi"], 1.5);
 }
 
+/// The interval-sample subsystem (the sampled heartbeat arrival + the
+/// learned interval + when it was sampled): round-trips and decodes to
+/// its JSON.
+#[test]
+fn interval_sample_record_round_trips() {
+    let json = br#"{"node":88,"era":4,"leader":33,"addr":"127.0.0.1:41101","dt_ms":22,"ts_ms":1789214915000}"#;
+    let record = Record::telemetry(Marker::TelemetryIntervalSample, 77, json);
+    let encoded = record.encode();
+    assert_eq!(encoded[0], Marker::TelemetryIntervalSample as u8);
+    let decoded = Record::decode(&encoded).expect("decodes");
+    assert_eq!(decoded.marker, Marker::TelemetryIntervalSample);
+    assert_eq!(decoded.ns, 77);
+    assert_eq!(decoded.payload, json.to_vec());
+}
+
 /// A truncated buffer (shorter than the header) is rejected, not panicked.
 #[test]
 fn truncated_buffer_rejected() {

@@ -88,5 +88,75 @@ class AcceptanceRealTrace(unittest.TestCase):
         self.assertIn("span_s", py)
 
 
+class ExportMode(unittest.TestCase):
+    def setUp(self):
+        d = tool.FixtureDir()
+        self.dir = d
+        self.addCleanup(d.cleanup)
+        path = d / "fixture.aof"
+        f = tool.open_writer(path, LIB)
+        # A Set at slot 5, then a Commit closing it, trailer attached
+        # (the leader's send clock rides every leader Commit).
+        set_op = ('{"op":"set","message_id":"11111111-2222-3333-4444-555555555555",'
+                  '"client_id":1,"request_num":1,"lock_id":7}')
+        prepare = (struct.pack(">IIIQ", 2, 4, 1, 5)  # Prepare, era 4, view 1, slot 5
+                   + bytes([2])          # body disc = Prepare
+                   + struct.pack(">Q", 5)   # LogEntry.slot
+                   + struct.pack(">I", 4)   # LogEntry.era
+                   + bytes([1])              # payload disc = Operation
+                   + struct.pack(">QQ", 0x1111, 0x2222)  # op id msb/lsb
+                   + struct.pack(">I", len(set_op)) + set_op.encode()
+                   + struct.pack(">Q", 0))   # committed frontier = 0
+        commit = (struct.pack(">IIIQ", 4, 4, 1, 5)
+                  + bytes([4])
+                  + struct.pack(">Q", 5))
+        trailer = b"\xc0\x0b" + struct.pack("<IIIQ", 4, 33, 9, 1789214915000)
+        tool.append(f, envelope(1, 2000, prepare))
+        tool.append(f, envelope(1, 2500, commit + trailer))
+        tool.append(f, envelope(2, 3000, b'{"phi":1.7,"now_ms":100,"prev_wait_ms":900,"next_wait_ms":1000,"leader":33,"era":4,"view":1,"mean":22.0}'))
+        tool.append(f, envelope(5, 4000, b'{"node":88,"era":4,"leader":33,"addr":"127.0.0.1:1","dt_ms":22,"ts_ms":1789214915000}'))
+        # a Join reconfig: System payload disc 2, op disc 7, node 77, pos 255
+        join = (struct.pack(">IIIQ", 2, 4, 1, 6)
+                + bytes([2])
+                + struct.pack(">Q", 6)
+                + struct.pack(">I", 4)
+                + bytes([2, 7])
+                + struct.pack(">I", 77)
+                + struct.pack(">I", 255)
+                + struct.pack(">Q", 0))
+        tool.append(f, envelope(1, 5000, join))
+        # the Join commits: a Commit covering slot 6 with its own trailer
+        commit6 = (struct.pack(">IIIQ", 4, 4, 1, 6) + bytes([4])
+                   + struct.pack(">Q", 6))
+        tool.append(f, envelope(1, 5500, commit6 + trailer))
+        tool.close(f)
+
+    def test_export_all_kinds(self):
+        out = tool.export_series(self.dir, LIB, kinds="all")
+        kinds = [line["kind"] for line in out]
+        self.assertEqual(kinds, ["locks", "phi", "phi-samples", "reconfig"])
+        locks = [l for l in out if l["kind"] == "locks"][0]
+        self.assertEqual(locks["op"], "set")
+        self.assertEqual(locks["lock_id"], 7)
+        self.assertEqual(locks["result"], "committed")
+        self.assertEqual(locks["leader_ms"], 1789214915000)
+        self.assertEqual(locks["aof_ns"], 2500, "the commit observation ns")
+        reconf = [l for l in out if l["kind"] == "reconfig"][0]
+        self.assertEqual(reconf["command"], "Join node=77 position=255")
+        self.assertEqual(reconf["leader_ms"], 1789214915000)
+
+    def test_export_filters_one_kind(self):
+        out = tool.export_series(self.dir, LIB, kinds="locks")
+        self.assertEqual([l["kind"] for l in out], ["locks"])
+        out = tool.export_series(self.dir, LIB, kinds="phi")
+        self.assertEqual([l["kind"] for l in out], ["phi"])
+        out = tool.export_series(self.dir, LIB, kinds="phi-samples")
+        self.assertEqual([l["kind"] for l in out], ["phi-samples"])
+
+    def test_both_means_reconfig_and_locks(self):
+        out = tool.export_series(self.dir, LIB, kinds="both")
+        self.assertEqual([l["kind"] for l in out], ["locks", "reconfig"])
+
+
 if __name__ == "__main__":
     unittest.main()
