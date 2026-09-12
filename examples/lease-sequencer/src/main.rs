@@ -187,9 +187,10 @@ struct Host {
     /// fresh era or a new leader re-arms; an arriving heartbeat from the
     /// SAME leader does not — one detection per key.
     phi_detected_key: Option<(u32, u32)>,
-    /// When each (era, leader) key was first watched: the bootstrap
-    /// deadline for a sketch that never learns two intervals.
-    phi_key_born: std::collections::HashMap<(u32, u32), u64>,
+    /// The currently watched (config era, leader) key and when it became
+    /// the watched one: the bootstrap deadline for a sketch that never
+    /// learns two intervals. Re-stamped on every leader change.
+    phi_watch: Option<((u32, u32), u64)>,
 }
 
 /// The boot-time era-qualified discovery state: request to every node the
@@ -509,12 +510,22 @@ impl Host {
         // at all, the dead primary no heartbeat ever reaches — gets the
         // bootstrap verdict: the elected leader's first two heartbeats
         // are due within a few real intervals of election, so
-        // `bootstrap_after_ms` of silence past the key's birth is a dead
-        // primary no detector math can express yet. The floor stays
-        // conservative (half a second, well past any live leader's
-        // first-heartbeat lag) so a slow-start primary is never suspected.
-        let first_seen = self.phi_key_born.entry((key.era, key.leader)).or_insert(now);
+        // `bootstrap_after_ms` of silence past the key's BIRTH is a dead
+        // primary no detector math can express yet. The birth stamp is
+        // the CURRENT watched key's: a leader change re-stamps it, so a
+        // re-elected id can never inherit an old deadline and fire in a
+        // loop. The floor stays conservative (half a second, well past
+        // any live leader's first-heartbeat lag) so a slow-start primary
+        // is never suspected.
         let bootstrap_after = (6 * u64::from(self.phi_cfg.heartbeat_ms)).max(500);
+        let watched = (key.era, key.leader);
+        let born = match self.phi_watch {
+            Some((held, born)) if held == watched => born,
+            _ => {
+                self.phi_watch = Some((watched, now));
+                now
+            }
+        };
         let sketch_ref = self
             .phi_monitor
             .as_ref()
@@ -526,9 +537,9 @@ impl Host {
                 phi::decide(sketch, now, &self.phi_cfg),
             ),
             _ => {
-                let bootstrapped = now.saturating_sub(*first_seen) > bootstrap_after;
+                let bootstrapped = now.saturating_sub(born) > bootstrap_after;
                 (
-                    *first_seen,
+                    born,
                     if bootstrapped { f64::INFINITY } else { 0.0 },
                     bootstrapped,
                 )
@@ -1183,7 +1194,7 @@ fn main() {
         heartbeat_request_num: 0,
         phi_last_era: None,
         phi_detected_key: None,
-        phi_key_born: std::collections::HashMap::new(),
+        phi_watch: None,
     };
     host.note(&format!(
         "boot name={} descriptor-id={own_desc_id} own={own_id} incarnation={incarnation}",
