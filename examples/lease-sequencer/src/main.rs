@@ -187,6 +187,9 @@ struct Host {
     /// fresh era or a new leader re-arms; an arriving heartbeat from the
     /// SAME leader does not — one detection per key.
     phi_detected_key: Option<(u32, u32)>,
+    /// When each (era, leader) key was first watched: the bootstrap
+    /// deadline for a sketch that never learns two intervals.
+    phi_key_born: std::collections::HashMap<(u32, u32), u64>,
 }
 
 /// The boot-time era-qualified discovery state: request to every node the
@@ -480,7 +483,12 @@ impl Host {
             self.phi_detected_key = None;
         }
         self.phi_last_era = Some(status.config_era);
-        if status.state != STATE_NORMAL || status.leader == self.own_id {
+        // Detection stays armed in EVERY state: the §14.2 forced view
+        // change can name a primary that never arrives, and the cluster
+        // wedges in the pending state with the tick gate unable to
+        // advance — the detector must keep watching the (dead) leader
+        // from inside the limbo and force the next view itself.
+        if status.leader == self.own_id {
             return;
         }
         if status.leader == LEADER_UNKNOWN {
@@ -496,12 +504,28 @@ impl Host {
             monitor: self.own_id,
         };
         // Read the sketch's verdict first (immutable borrow ends), then
-        // act on it — the drive borrows the node mutably.
+        // act on it — the drive borrows the node mutably. A sketch that
+        // has never learned two intervals gets the bootstrap verdict: the
+        // elected leader's first two heartbeats are due within a few
+        // real intervals of election, so `bootstrap_after_ms` of silence
+        // past the key's birth is a dead primary no detector math can
+        // express yet.
+        let first_seen = self.phi_key_born.entry((key.era, key.leader)).or_insert(now);
+        let bootstrap_after =
+            6 * u64::from(self.phi_cfg.heartbeat_ms);
         let verdict = self
             .phi_monitor
             .as_ref()
             .and_then(|m| m.get(&key))
             .map(|sketch| {
+                if sketch.sample_count() < 2 {
+                    let bootstrapped = now.saturating_sub(*first_seen) > bootstrap_after;
+                    return (
+                        *first_seen,
+                        if bootstrapped { f64::INFINITY } else { 0.0 },
+                        bootstrapped,
+                    );
+                }
                 (
                     sketch.last_arrival(),
                     sketch.phi(now),
@@ -1162,6 +1186,7 @@ fn main() {
         heartbeat_request_num: 0,
         phi_last_era: None,
         phi_detected_key: None,
+        phi_key_born: std::collections::HashMap::new(),
     };
     host.note(&format!(
         "boot name={} descriptor-id={own_desc_id} own={own_id} incarnation={incarnation}",
