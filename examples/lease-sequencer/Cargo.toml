@@ -13,6 +13,9 @@ test = false
 
 [dependencies]
 lunet-advisory-lock = { path = "../../ext/advisory_lock" }
+# The vendored TigerBeetle AOF (item21): the standby's commit/heartbeat
+# stream rides the real TB-format write-behind log through its Zig C ABI.
+lunet-locks-aof = { path = "../../ext/lunet-locks-aof" }
 serde_json = "1"
 tracing = "0.1"
 tracing-appender = "0.2"

@@ -127,13 +127,19 @@ docker-simulation: docker-build $(SIM_BIN)
 # Native extensions: one Rust crate per directory under ext/.
 ext: ext-test
 	cargo build --release --manifest-path ext/advisory_lock/Cargo.toml
+	cargo build --release --manifest-path ext/lunet-locks-aof/Cargo.toml
 
 ext-check:
 	cargo fmt --manifest-path ext/advisory_lock/Cargo.toml -- --check
 	cargo clippy --manifest-path ext/advisory_lock/Cargo.toml --all-targets -- -D warnings
+	cargo fmt --manifest-path ext/lunet-locks-aof/Cargo.toml -- --check
+	cargo clippy --manifest-path ext/lunet-locks-aof/Cargo.toml --all-targets -- -D warnings
+	mise exec -- zig fmt --check ext/lunet-locks-aof/zig/src
 
 ext-test: ext-check
 	cargo test --manifest-path ext/advisory_lock/Cargo.toml
+	cargo test --manifest-path ext/lunet-locks-aof/Cargo.toml
+	cd ext/lunet-locks-aof/zig && mise exec -- zig build test
 
 # Release packaging (tagged CI builds). Target keys match the CI matrix;
 # the archive layout is documented in tests/package_release.sh.

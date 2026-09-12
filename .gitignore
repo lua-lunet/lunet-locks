@@ -18,3 +18,7 @@ console/tmp/
 secrets/fake-jumpbox.txt
 secrets/jumpbox.txt
 secrets/waw-rig.txt
+
+# The vendored AOF subcrate: zig build artifacts and the cdylib output.
+ext/lunet-locks-aof/zig/.zig-cache/
+ext/lunet-locks-aof/zig/zig-out/

@@ -27,6 +27,18 @@ fetches no git dependencies.
 
 | Path | Upstream | Version | Licence |
 |---|---|---|---|
+| `ext/lunet-locks-aof/zig/src/` | [tigerbeetle/tigerbeetle](https://github.com/tigerbeetle/tigerbeetle) | release tag `0.17.9` (the AOF strip; file map in `ext/lunet-locks-aof/VENDORED.md`) | Apache-2.0 (see `ext/lunet-locks-aof/LICENSE-TigerBeetle`) |
+
+The vendored tree carries only the AOF code path and its minimal
+dependency closure, compiled to a C-ABI cdylib behind the safe Rust
+wrapper (`ext/lunet-locks-aof`, `links = "lunet_locks_aof"`). Upstream
+licence facts verified against the pinned ref's `LICENSE` (Apache License
+2.0). The system description, attribution block, and the licence
+correction to the item spec's AGPL premise are in
+`ext/lunet-locks-aof/AOF.md`.
+
+| Path | Upstream | Version | Licence |
+|---|---|---|---|
 | `console/assets/styles.css` | [Nocturne](https://github.com/typora/theme.typora.io) (Typora Themes directory) | upstream source style | GNU Public License (per the upstream README: "The contents of this repository are licensed under the GNU Public License.") |
 
 `console/assets/styles.css` is a derived work of the Nocturne theme, as

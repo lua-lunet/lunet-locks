@@ -191,6 +191,14 @@ struct Host {
     /// the watched one: the bootstrap deadline for a sketch that never
     /// learns two intervals. Re-stamped on every leader change.
     phi_watch: Option<((u32, u32), u64)>,
+    /// The vendored TigerBeetle AOF (item21): the standby learner appends
+    /// every leader heartbeat/commit record it receives to the active
+    /// `{epoch}.aof`, WITHOUT a forced flush — the writes are the AOF's own
+    /// amortized page-cached appends, fsync'd on explicit flush and when
+    /// the vendored entry-window cap fills. `None` when the node is not
+    /// the standby, or after an append failure disabled the stream for the
+    /// process (telemetry contract: never poison the replication path).
+    aof: Option<lunet_locks_aof::AofFile>,
 }
 
 /// The boot-time era-qualified discovery state: request to every node the
@@ -332,6 +340,9 @@ struct Options {
     aof_dir: String,
     /// The AOF's periodic-fsync knob (ms). 0 = only at roll and shutdown.
     aof_flush_ms: u64,
+    /// The vendored TigerBeetle AOF's retention threshold, in MiB of
+    /// `{epoch}.aof` series on disk (item21). Default 10.
+    aof_retention_mib: u64,
     /// The E2 recovery-boundary flush variant (diskless | single |
     /// double-ring). Non-diskless requires `recovery_scratch`.
     recovery_flush: RecoveryFlush,
@@ -357,6 +368,7 @@ fn parse_options() -> Options {
         log: String::new(),
         aof_dir: String::new(),
         aof_flush_ms: 1000,
+        aof_retention_mib: 10,
         recovery_flush: RecoveryFlush::Diskless,
         recovery_scratch: String::new(),
         heartbeat_ms: 10,
@@ -381,6 +393,7 @@ fn parse_options() -> Options {
             "--log" => options.log = value.clone(),
             "--aof-dir" => options.aof_dir = value.clone(),
             "--aof-flush-ms" => options.aof_flush_ms = value.parse().unwrap_or(1000),
+            "--aof-retention-mib" => options.aof_retention_mib = value.parse().unwrap_or(10),
             "--recovery-flush" => {
                 options.recovery_flush = RecoveryFlush::parse(value).unwrap_or_else(|| {
                     eprintln!(
@@ -412,6 +425,7 @@ fn parse_options() -> Options {
         eprintln!(
             "usage: lease-sequencer --name NAME --config PATH --client IPv4:PORT \
              --state PATH --log PATH [--aof-dir PATH] [--aof-flush-ms N] \
+             [--aof-retention-mib N] \
              [--recovery-flush diskless|single|double-ring] [--recovery-scratch-dir PATH] \
              [--heartbeat-ms N] [--election-ms N] [--recovery-ms N] \
              [--phi-threshold F] [--phi-safety F]"
@@ -1039,6 +1053,38 @@ fn main() {
     // lifetime and flushes on an orderly shutdown.
     let _worker_guard = init_tracing(&options.log);
     let standby = !options.aof_dir.is_empty();
+    // The vendored TigerBeetle AOF (item21): on standby startup the
+    // wrapper applies the retention sweep and opens the NEW
+    // `{epoch}.aof` active file, force OFF — amortized buffered writes,
+    // flush at the vendored window cap or on explicit flush. An open
+    // failure logs and disables the stream for the process; the node
+    // keeps serving (the telemetry contract).
+    let aof = if standby {
+        match lunet_locks_aof::AofFile::open_with(
+            std::path::Path::new(&options.aof_dir),
+            lunet_locks_aof::Options {
+                force_flush: false,
+                retention_bytes: options.aof_retention_mib * 1024 * 1024,
+            },
+        ) {
+            Ok(aof) => {
+                eprintln!(
+                    "lease-sequencer: standby tb-aof active file {}",
+                    aof.path().display()
+                );
+                Some(aof)
+            }
+            Err(error) => {
+                eprintln!(
+                    "lease-sequencer: standby tb-aof open failed ({error}); \
+                     the commit/heartbeat stream is disabled for this process"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
     let node = if standby {
         // The standby telemetry host: the committed-transition hook feeds
         // the async AOF writer (the LKE1 journal producer path, deferred
@@ -1195,6 +1241,7 @@ fn main() {
         phi_last_era: None,
         phi_detected_key: None,
         phi_watch: None,
+        aof,
     };
     host.note(&format!(
         "boot name={} descriptor-id={own_desc_id} own={own_id} incarnation={incarnation}",
@@ -1337,6 +1384,29 @@ fn handle_packet(
         };
         if let Some(trailer) = &trailer {
             host.observe_heartbeat(replica, addr, trailer, now);
+        }
+        // The vendored TigerBeetle AOF stream (item21): every Commit
+        // datagram on the peer channel — the leader's heartbeat/commit
+        // stream plus the commit cascades — appends one entry to the
+        // active `{epoch}.aof`, WITHOUT a forced flush: the writes are the
+        // vendored AOF's own amortized page-cached appends, fsync'd when
+        // the entry-window cap fills. The bytes recorded are the
+        // trailer-stripped wire message, exactly what the core receives.
+        // An append failure disables the stream for the process and logs
+        // once — telemetry must never poison the replication path.
+        if is_commit(payload) {
+            match host.aof.as_mut() {
+                Some(aof) => {
+                    if let Err(error) = aof.append(payload) {
+                        eprintln!(
+                            "lease-sequencer: standby tb-aof append failed ({error}); \
+                             the commit/heartbeat stream is disabled for this process"
+                        );
+                        host.aof = None;
+                    }
+                }
+                None => {}
+            }
         }
         if let Some((old, new)) = transport::reincarnation_pair(payload)
             && old == replica

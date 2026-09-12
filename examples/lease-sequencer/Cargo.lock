@@ -463,6 +463,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "lunet-advisory-lock",
+ "lunet-locks-aof",
  "phi-accrual-detector",
  "serde_json",
  "tokio",
@@ -510,6 +511,10 @@ dependencies = [
  "uuid",
  "vrr-core",
 ]
+
+[[package]]
+name = "lunet-locks-aof"
+version = "0.1.0"
 
 [[package]]
 name = "matchers"

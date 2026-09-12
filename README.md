@@ -81,3 +81,20 @@ lets a stop-the-world era transition complete under the leader's own client
 stream. The adapter manifest pins upstream `0fc6380` and its `[patch]`
 section builds the dependency from the submodule, so this tree always
 builds against the patched branch.
+
+## The vendored TigerBeetle AOF
+
+`ext/lunet-locks-aof` vendors the AOF (append-only write-behind log) from
+[tigerbeetle/tigerbeetle](https://github.com/tigerbeetle/tigerbeetle)
+release tag 0.17.9 as a stripped Zig source tree behind a C ABI and this
+safe Rust wrapper: the standby learner streams the leader's
+heartbeat/commit records into a hash-chained, checksum-validated
+`{unixepoch}.aof` series with an optional force knob (default OFF) and a
+10 MiB startup retention sweep. Upstream licence: Apache-2.0 — permissive,
+no copyleft obligation on the combined work (this corrects the item spec's
+AGPL-3.0 premise; the pinned release's `LICENSE` is Apache-2.0). For
+telemetry alone this is overkill — it is built for full disaster recovery
+of a database — and it is incubated here because downstream uvrr-core
+applications will want exactly this standby/DR shape. Full system
+description, attribution, and the licence facts:
+[`ext/lunet-locks-aof/AOF.md`](ext/lunet-locks-aof/AOF.md).

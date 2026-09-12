@@ -1,0 +1,16 @@
+[package]
+name = "lunet-locks-aof"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+links = "lunet_locks_aof"
+build = "build.rs"
+
+description = "Safe Rust binding over the vendored TigerBeetle AOF (append-only write-behind log, Zig C ABI)"
+license = "Apache-2.0"
+
+[lib]
+name = "lunet_locks_aof"
+crate-type = ["rlib"]
+
+[dependencies]
