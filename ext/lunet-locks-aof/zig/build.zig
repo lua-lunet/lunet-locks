@@ -31,6 +31,7 @@ pub fn build(b: *std.Build) void {
     });
     srcs_module.addImport("stdx", stdx_module);
     srcs_module.addOptions("vsr_options", vsr_options);
+    srcs_module.link_libc = true;
 
     const cdylib = b.addSharedLibrary(.{
         .name = "lunet_locks_aof",
