@@ -2016,6 +2016,18 @@ fn handle_client_line(host: &mut Host, index: usize, line: &str, now: u64, rng: 
         return true;
     }
     let endpoint = value["endpoint"].as_str().unwrap_or_default().to_string();
+    // The joining member's addressing row is learned AT PROPOSAL TIME
+    // from the verb's own endpoint: without it the leader cannot fan out
+    // to the new member at all, and a standby never folds (its datagrams
+    // die as unregistered-endpoint drops). Rows grow additively and the
+    // snapshot path's dedupe keeps a double-learn harmless.
+    if action == "join"
+        && let Ok(mut addrs) = endpoint.to_socket_addrs()
+        && let Some(addr) = addrs.next()
+    {
+        host.peers.insert(id, addr);
+        host.addr_to_id.insert(addr, id);
+    }
     host.conns[index].pending = Some(TcpPending::Admin {
         action,
         id,

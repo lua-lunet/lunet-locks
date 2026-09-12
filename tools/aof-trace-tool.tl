@@ -44,6 +44,9 @@ local TAG_NAMES: {number: string} = {
     [13] = "13 Reincarnation",
 }
 
+-- The sentinel a saturated field carries through to the JSON as null.
+local JSON_NULL = "json-null"
+
 local record Native
     lunet_aof_iter_open: function(cdata, number, {any}): number
     lunet_aof_iter_next: function(any, cdata, number, {any}, {any}): number
@@ -488,6 +491,11 @@ local function json_num(json: string, key: string): any
     if raw ~= nil then
         return tonumber(raw)
     end
+    -- the detector's bare `inf`/`nan` saturations are not JSON: null
+    if json:match('"' .. key .. '":%s*[-+]?inf') ~= nil
+        or json:match('"' .. key .. '":%s*nan') ~= nil then
+        return JSON_NULL
+    end
     return nil
 end
 
@@ -530,15 +538,21 @@ local function ev_json(e: {string: any}): string
     local order: {string} = {"kind", "aof_ns", "leader_ms", "slot", "result",
                              "op", "lock_id", "message_id", "client_id",
                              "request_num", "command", "phi", "now_ms",
-                             "prev_wait_ms", "next_wait_ms", "node", "era",
-                             "leader", "addr", "dt_ms", "ts_ms"}
+                             "prev_wait_ms", "next_wait_ms", "mean_interval_ms",
+                             "min_ms", "max_ms", "node", "era", "leader",
+                             "view", "addr", "dt_ms", "ts_ms"}
     for _, key in ipairs(order) do
         local v = e[key]
         if v ~= nil then
-            if v == true or v == false then
+            if v == JSON_NULL then
+                parts[#parts + 1] = ('"%s": null'):format(key)
+            elseif v == true or v == false then
                 parts[#parts + 1] = ('"%s": %s'):format(key, tostring(v))
             elseif type(v) == "string" then
                 parts[#parts + 1] = ('"%s": "%s"'):format(key, json_escape(v))
+            elseif ffi.istype("uint64_t", v) then
+                -- exact past 2^53: the cdata formats itself, no ULL suffix
+                parts[#parts + 1] = ('"%s": %s'):format(key, string.format("%d", v))
             else
                 parts[#parts + 1] = ('"%s": %s'):format(key, tostring(v))
             end
@@ -580,12 +594,16 @@ local function export_series(dir_path: string, kinds: string): {{string: any}}
             local marker = frame:byte(1)
             if marker == MARKER_TIMEOUT then
                 if kind_wanted(kinds, "phi") then
-                    local e: {string: any} = {kind = "phi", aof_ns = tonumber(aof_ns)}
+                    local e: {string: any} = {kind = "phi", aof_ns = aof_ns}
                     local j = json_payload(frame)
+                    -- the detector saturates: bare `inf` (not JSON) → null
                     e.phi = json_num(j, "phi")
                     e.now_ms = json_num(j, "now_ms")
                     e.prev_wait_ms = json_num(j, "prev_wait_ms")
                     e.next_wait_ms = json_num(j, "next_wait_ms")
+                    e.mean_interval_ms = json_num(j, "mean_interval_ms")
+                    e.min_ms = json_num(j, "min_ms")
+                    e.max_ms = json_num(j, "max_ms")
                     e.leader = json_num(j, "leader")
                     e.era = json_num(j, "era")
                     e.view = json_num(j, "view")
@@ -593,7 +611,7 @@ local function export_series(dir_path: string, kinds: string): {{string: any}}
                 end
             elseif marker == MARKER_INTERVAL then
                 if kind_wanted(kinds, "phi-samples") then
-                    local e: {string: any} = {kind = "phi-samples", aof_ns = tonumber(aof_ns)}
+                    local e: {string: any} = {kind = "phi-samples", aof_ns = aof_ns}
                     local j = json_payload(frame)
                     e.node = json_num(j, "node")
                     e.era = json_num(j, "era")
@@ -625,8 +643,8 @@ local function export_series(dir_path: string, kinds: string): {{string: any}}
                             if fields.op ~= nil then
                                 if kind_wanted(kinds, "locks") then
                                     local e: {string: any} = {
-                                        kind = "locks", aof_ns = tonumber(aof_ns),
-                                        leader_ms = leader_ms and tonumber(leader_ms),
+                                        kind = "locks", aof_ns = aof_ns,
+                                        leader_ms = leader_ms,
                                         slot = s, result = "committed",
                                     }
                                     for k, v in pairs(fields) do
@@ -636,8 +654,8 @@ local function export_series(dir_path: string, kinds: string): {{string: any}}
                                 end
                             elseif kind_wanted(kinds, "reconfig") then
                                 local e: {string: any} = {
-                                    aof_ns = tonumber(aof_ns),
-                                    leader_ms = leader_ms and tonumber(leader_ms),
+                                    aof_ns = aof_ns,
+                                    leader_ms = leader_ms,
                                     slot = s, result = "committed",
                                 }
                                 for k, v in pairs(fields) do
@@ -655,8 +673,8 @@ local function export_series(dir_path: string, kinds: string): {{string: any}}
                             if fields.op ~= nil then
                                 if kind_wanted(kinds, "locks") then
                                     local e: {string: any} = {
-                                        kind = "locks", aof_ns = tonumber(aof_ns),
-                                        leader_ms = leader_ms and tonumber(leader_ms),
+                                        kind = "locks", aof_ns = aof_ns,
+                                        leader_ms = leader_ms,
                                         slot = s, result = "committed",
                                     }
                                     for k, v in pairs(fields) do
@@ -666,8 +684,8 @@ local function export_series(dir_path: string, kinds: string): {{string: any}}
                                 end
                             elseif kind_wanted(kinds, "reconfig") then
                                 local e: {string: any} = {
-                                    aof_ns = tonumber(aof_ns),
-                                    leader_ms = leader_ms and tonumber(leader_ms),
+                                    aof_ns = aof_ns,
+                                    leader_ms = leader_ms,
                                     slot = s, result = "committed",
                                 }
                                 for k, v in pairs(fields) do

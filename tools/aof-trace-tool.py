@@ -200,6 +200,10 @@ SYS_DOUBLE, SYS_HALVE, SYS_JOIN, SYS_LEAVE, SYS_BATCH = 5, 6, 7, 8, 9
 # The lock-op JSON kinds that count as committed lock work.
 LOCK_OPS = {"get", "set", "release", "break"}
 
+# Bare infinity in a telemetry JSON (the detector's saturation) is not
+# JSON; decode it as null.
+_INF_RE = __import__("re").compile(r"(:\s*)([-+]?inf\b|NaN)")
+
 
 def split_trailer(frame: bytes):
     """(frame_without_trailer, leader_ms or None)."""
@@ -336,13 +340,16 @@ def export_series(dir_path, lib=None, kinds="all"):
             if marker == 2:
                 if "phi" in wanted:
                     line = {"kind": "phi", "aof_ns": aof_ns}
-                    line.update(json.loads(record[9:].decode("utf-8", "replace")))
+                    # The detector saturates: some emitters write bare `inf`
+                    # (not JSON). Decode tolerantly, never guessing fields.
+                    text = record[9:].decode("utf-8", "replace")
+                    line.update(json.loads(_INF_RE.sub(r"\1null", text)))
                     events.append(line)
                 continue
             if marker == 5:
                 if "phi-samples" in wanted:
                     line = {"kind": "phi-samples", "aof_ns": aof_ns}
-                    line.update(json.loads(record[9:].decode("utf-8", "replace")))
+                    line.update(json.loads(_INF_RE.sub(r"\1null", record[9:].decode("utf-8", "replace"))))
                     events.append(line)
                 continue
             if marker != 1:
