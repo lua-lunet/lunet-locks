@@ -16,6 +16,9 @@ lunet-advisory-lock = { path = "../../ext/advisory_lock" }
 # The vendored TigerBeetle AOF (item21): the standby's commit/heartbeat
 # stream rides the real TB-format write-behind log through its Zig C ABI.
 lunet-locks-aof = { path = "../../ext/lunet-locks-aof" }
+# The bridge (item23) decodes Wire records through the core's own
+# `Message::unpack_from`; the [patch] below resolves it to the submodule.
+vrr = { package = "vrr-core", git = "https://github.com/lua-lunet/uvrr-core.git", tag = "v0.3.0" }
 serde_json = "1"
 signal-hook = "0.3"
 tracing = "0.1"

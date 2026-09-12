@@ -5,6 +5,21 @@ import { fmtClock } from "./util.mjs";
 
 export const config = JSON.parse(document.getElementById("la-config").textContent);
 
+// Data-source switch (item23): config carries `dataSource` ("mock" | "bridge",
+// default mock) and `bridgeBase` (the bridge's /api/v1 URL). A query param
+// overrides both, so the same static assets serve either backend:
+//   index.html                          → mock (development default)
+//   index.html?dataSource=bridge        → the aof-console-bridge
+//   index.html?dataSource=bridge&bridgeBase=http://127.0.0.1:8619/api/v1
+{
+  const params = new URLSearchParams(location.search);
+  const dataSource = params.get("dataSource");
+  if (dataSource === "bridge" || dataSource === "mock") config.dataSource = dataSource;
+  const bridgeBase = params.get("bridgeBase");
+  if (bridgeBase) config.bridgeBase = bridgeBase;
+}
+export const isBridge = config.dataSource === "bridge";
+
 const SAVED_KEY = "lock-admin";
 const saved = JSON.parse(sessionStorage.getItem(SAVED_KEY) ?? "{}");
 

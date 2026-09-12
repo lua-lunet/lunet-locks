@@ -472,6 +472,7 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "uuid",
+ "vrr-core",
 ]
 
 [[package]]

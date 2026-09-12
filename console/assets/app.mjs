@@ -9,7 +9,7 @@ import "./components/la-charts.mjs";
 import "./components/la-log-view.mjs";
 import "./components/la-app.mjs";
 
-import { store, config } from "./lib/state.mjs";
+import { store, config, isBridge } from "./lib/state.mjs";
 import { api } from "./lib/api.mjs";
 import { db } from "./lib/db.mjs";
 import { parseClock } from "./lib/util.mjs";
@@ -25,6 +25,15 @@ function report(name, err) {
 }
 
 async function refreshCluster() {
+  if (isBridge) {
+    // The bridge replays one standby's committed stream; it carries no
+    // live membership. The header says so instead of polling a 404.
+    store.set({
+      cluster: { era: "—", view: "—", leader: "aof bridge", nodes: [] },
+    });
+    report("cluster", null);
+    return;
+  }
   try {
     const cluster = await api.cluster();
     store.set({ cluster });
@@ -138,9 +147,12 @@ guard("cacheTail", cacheTail);
 // ---- Journal data layer ----
 // Spins up the loader worker, live WS, and merge engine. The worker fetches
 // rolled .bin files; the WS tails the open file; the merge engine unifies both
-// into the store's journal* fields.
+// into the store's journal* fields. The bridge data source serves the OpenAPI
+// surface only (no LKE1 .bin series), so the journal layer stays mock-only.
 
 (async () => {
+  if (isBridge) return;
+
   const { loadedNames } = await initMerge();
 
   // Create the loader worker.

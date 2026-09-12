@@ -1,9 +1,16 @@
 // Thin fetch client for the admin API (see ../../openapi.yaml).
 
-import { config } from "./state.mjs";
+import { config, isBridge } from "./state.mjs";
+
+// The data source decides the base: the nginx edge's /api/v1 (mock or live
+// cluster behind it) or the aof-console-bridge's absolute URL. Both speak
+// the same OpenAPI shapes.
+function base() {
+  return isBridge ? config.bridgeBase : config.apiBase;
+}
 
 async function call(method, path, params, body) {
-  const url = new URL(config.apiBase + path, location.origin);
+  const url = new URL(base() + path, location.origin);
   for (const [k, v] of Object.entries(params ?? {})) {
     if (v !== undefined && v !== null && v !== "") url.searchParams.set(k, String(v));
   }
