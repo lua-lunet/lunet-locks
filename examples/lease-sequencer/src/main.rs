@@ -541,13 +541,10 @@ impl Host {
             return;
         }
         self.phi_detected_key = Some(detected_key);
-        let floor = phi::floor_ms(
-            self.phi_monitor
-                .as_ref()
-                .and_then(|m| m.get(&key))
-                .expect("the verdict came from this sketch"),
-            &self.phi_cfg,
-        ) as u64;
+        let floor = match self.phi_monitor.as_ref().and_then(|m| m.get(&key)) {
+            Some(sketch) => phi::floor_ms(sketch, &self.phi_cfg) as u64,
+            None => (self.phi_cfg.safety_multiple * self.phi_cfg.heartbeat_ms as f64) as u64,
+        };
         self.note(&format!(
             "phi-detect node={} era={} leader={} phi={:.3} silence={} floor={} addr={}",
             self.own_id,
