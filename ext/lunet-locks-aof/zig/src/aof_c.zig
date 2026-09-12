@@ -43,6 +43,12 @@ pub const AofFile = struct {
     io: *IO,
     pool: *MessagePool,
     op: u64,
+    /// The open path, OWNED: the vendored AOF keeps the caller's slice
+    /// verbatim, but a C-ABI caller's buffer may die immediately after
+    /// `lunet_aof_open` returns (any FFI host, not just Rust) — the
+    /// close-time checkpoint stats `self.path`, so the copy must outlive
+    /// the handle.
+    owned_path: []u8,
     /// Records appended since the last durable flush. The vendored write
     /// path keeps its own window counter with the same cap; this shadow
     /// drives the wrap-side flush when the force knob is off.
@@ -93,13 +99,20 @@ export fn lunet_aof_open(
         return SERVICE;
     };
 
+    const owned_path = std.heap.c_allocator.dupe(u8, path) catch {
+        std.heap.c_allocator.destroy(pool);
+        std.heap.c_allocator.destroy(io);
+        return SERVICE;
+    };
     const file = std.heap.c_allocator.create(AofFile) catch {
+        std.heap.c_allocator.free(owned_path);
         std.heap.c_allocator.destroy(pool);
         std.heap.c_allocator.destroy(io);
         return SERVICE;
     };
     file.* = .{
-        .aof = AOF.init(io, path) catch {
+        .aof = AOF.init(io, owned_path) catch {
+            std.heap.c_allocator.free(owned_path);
             std.heap.c_allocator.destroy(file);
             std.heap.c_allocator.destroy(pool);
             std.heap.c_allocator.destroy(io);
@@ -109,6 +122,7 @@ export fn lunet_aof_open(
         .pool = pool,
         .op = 0,
         .unflushed = 0,
+        .owned_path = owned_path,
         .force_flush = force_flush != 0,
     };
     out.* = file;
@@ -206,6 +220,7 @@ export fn lunet_aof_close(file: *AofFile) i32 {
     // Graceful close: the checkpoint flush lands, then the fd releases.
     const rc = flush(file);
     file.aof.close();
+    std.heap.c_allocator.free(file.owned_path);
     std.heap.c_allocator.destroy(file);
     if (rc != OK) return rc;
     return OK;
