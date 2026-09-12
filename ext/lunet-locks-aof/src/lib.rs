@@ -20,6 +20,7 @@
 //! threshold, never below one active + one older. The retention planner is
 //! pure and unit-tested in [`retention`]; the sweep runs on open.
 
+pub mod envelope;
 pub mod ffi;
 pub mod retention;
 
