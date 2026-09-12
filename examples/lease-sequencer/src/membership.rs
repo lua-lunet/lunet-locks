@@ -83,7 +83,7 @@ pub fn decode_request(payload: &[u8]) -> bool {
 /// (u32), and length-delimited endpoint — members in canonical strictly
 /// ascending id order, one shape per membership.
 pub fn encode_response(snapshot: &Snapshot) -> Vec<u8> {
-    assert!(snapshot.era <= u32::MAX, "snapshot: era is a u32");
+    let _ = u32::MAX; // era is a u32 by construction; the assert was vacuous
     assert!(
         !snapshot.members.is_empty() && snapshot.members.len() <= MAX_MEMBERS,
         "snapshot: membership must carry 1..=16 members"
@@ -118,7 +118,7 @@ pub fn decode_response(payload: &[u8]) -> Option<Snapshot> {
     let era = u32::from_be_bytes(payload[1..5].try_into().ok()?);
     let slot = u64::from_be_bytes(payload[5..13].try_into().ok()?);
     let count = u16::from_be_bytes(payload[13..15].try_into().ok()?) as usize;
-    if count < 1 || count > MAX_MEMBERS {
+    if !(1..=MAX_MEMBERS).contains(&count) {
         return None;
     }
     let mut members = Vec::with_capacity(count);
@@ -373,10 +373,10 @@ pub fn decode_sidecar(text: &str) -> Option<Snapshot> {
         if !valid_endpoint(endpoint) {
             return None;
         }
-        if let Some(previous) = members.last() {
-            if id <= previous.id {
-                return None;
-            }
+        if let Some(previous) = members.last()
+            && id <= previous.id
+        {
+            return None;
         }
         members.push(SnapshotMember {
             id,

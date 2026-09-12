@@ -200,7 +200,7 @@ fn safety_floor_tracks_the_learned_interval_not_the_configured_one() {
     sk.observe(t);
     for _ in 0..50 {
         t += 22;
-        let _ = sk.observe(t);
+        sk.observe(t);
     }
     assert!((sk.mean_interval_ms() - 22.0).abs() < 1.0, "learned ~22 ms");
     // Ordinary jitter: a 30 ms gap (< 2x22=44) must NOT fire, though phi

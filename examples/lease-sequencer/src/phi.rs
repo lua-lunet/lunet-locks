@@ -167,7 +167,9 @@ impl Sketch {
             self.last_arrival_ms = at_ms;
             self.seed = true;
             #[cfg(feature = "phi")]
-            ffi::observe(self.detector, at_ms as i64);
+            unsafe {
+                ffi::observe(self.detector, at_ms as i64)
+            };
             return;
         }
         let interval = at_ms.saturating_sub(self.last_arrival_ms);
@@ -178,7 +180,9 @@ impl Sketch {
         }
         self.last_arrival_ms = at_ms;
         #[cfg(feature = "phi")]
-        ffi::observe(self.detector, at_ms as i64);
+        unsafe {
+            ffi::observe(self.detector, at_ms as i64)
+        };
     }
 
     /// The count of learned intervals (0 for a fresh sketch).
@@ -203,7 +207,7 @@ impl Sketch {
             return 0.0;
         }
         #[cfg(feature = "phi")]
-        return ffi::value(self.detector, now_ms as i64);
+        return unsafe { ffi::value(self.detector, now_ms as i64) };
         #[cfg(not(feature = "phi"))]
         {
             let _ = now_ms;
@@ -255,6 +259,15 @@ impl Table {
             .as_ref()
             .filter(|(k, _)| *k == *key)
             .map(|(_, s)| s)
+    }
+
+    /// The table's live sketch and its key, whatever era it was learned
+    /// under. The consumer (the host's detector step) matches on the
+    /// LEADER id — a lagging node's folded configuration era can trail the
+    /// leader's trailer era, and demanding era equality would make every
+    /// sketch look never-observed.
+    pub fn live(&self) -> Option<(&SketchKey, &Sketch)> {
+        self.live.as_ref().map(|(key, sketch)| (key, sketch))
     }
 
     pub fn observe(&mut self, key: &SketchKey, at_ms: u64) -> Option<u64> {
@@ -326,7 +339,7 @@ pub mod ffi {
         Local
             .timestamp_millis_opt(unix_ms)
             .single()
-            .unwrap_or_else(|| Local::now())
+            .unwrap_or_else(Local::now)
     }
 
     /// Rust-side constructor for the host loop (the same allocator the
@@ -335,18 +348,32 @@ pub mod ffi {
         phi_detector_new(window)
     }
 
-    pub fn observe(handle: DetectorHandle, at_ms: i64) -> i32 {
+    /// # Safety
+    ///
+    /// `handle` must be a live `phi_detector_new` handle.
+    pub unsafe fn observe(handle: DetectorHandle, at_ms: i64) -> i32 {
         unsafe { phi_observe(handle, at_ms) }
     }
 
-    pub fn value(handle: DetectorHandle, now_ms: i64) -> f64 {
+    /// # Safety
+    ///
+    /// `handle` must be a live `phi_detector_new` handle.
+    pub unsafe fn value(handle: DetectorHandle, now_ms: i64) -> f64 {
         let mut out = f64::NAN;
         let code = unsafe { phi_value(handle, now_ms, &mut out) };
         if code == 0 { out } else { 0.0 }
     }
 
     /// The learned mean interval and sample count (the mirror's view).
-    pub fn query(handle: DetectorHandle, out_mean_ms: &mut f64, out_samples: &mut u32) -> i32 {
+    /// # Safety
+    ///
+    /// `handle` must be a live `phi_detector_new` handle; both out
+    /// pointers must be writable.
+    pub unsafe fn query(
+        handle: DetectorHandle,
+        out_mean_ms: &mut f64,
+        out_samples: &mut u32,
+    ) -> i32 {
         unsafe { phi_query(handle, out_mean_ms, out_samples) }
     }
 
@@ -369,6 +396,10 @@ pub mod ffi {
     /// One heartbeat arrival at epoch-ms `at_ms`.
     ///
     /// Returns 0 on success, 1 on a null handle or a negative stamp.
+    ///
+    /// # Safety
+    ///
+    /// `handle` must be a live `phi_detector_new` handle.
     #[unsafe(no_mangle)]
     pub unsafe extern "C" fn phi_observe(handle: PhiHandle, at_ms: i64) -> i32 {
         let Some(repr) = (unsafe { handle.as_ref() }) else {
@@ -397,6 +428,11 @@ pub mod ffi {
     /// The learned mean arrival interval and the interval-sample count.
     ///
     /// Returns 0 on success, 1 on a null argument.
+    ///
+    /// # Safety
+    ///
+    /// `handle` must be a live `phi_detector_new` handle; both out
+    /// pointers must be writable.
     #[unsafe(no_mangle)]
     pub unsafe extern "C" fn phi_query(
         handle: PhiHandle,
@@ -428,6 +464,11 @@ pub mod ffi {
     /// The phi value at `now_ms` into `out_phi`.
     ///
     /// Returns 0 on success, 1 on a null argument or a negative stamp.
+    ///
+    /// # Safety
+    ///
+    /// `handle` must be a live `phi_detector_new` handle; `out_phi` must
+    /// be writable.
     #[unsafe(no_mangle)]
     pub unsafe extern "C" fn phi_value(handle: PhiHandle, now_ms: i64, out_phi: *mut f64) -> i32 {
         let Some(repr) = (unsafe { handle.as_ref() }) else {
@@ -439,10 +480,9 @@ pub mod ffi {
         let Ok(repr) = repr.lock() else {
             return 1;
         };
-        let value = match runtime().block_on(repr.detector.phi(local(now_ms))) {
-            Ok(value) => value,
-            Err(_) => 0.0,
-        };
+        let value = runtime()
+            .block_on(repr.detector.phi(local(now_ms)))
+            .unwrap_or(0.0);
         // A NaN phi (the crate's empty-window arithmetic) is no evidence.
         let value = if value.is_nan() { 0.0 } else { value };
         unsafe { *out_phi = value };
@@ -450,6 +490,10 @@ pub mod ffi {
     }
 
     /// Frees a handle. Null is a no-op.
+    ///
+    /// # Safety
+    ///
+    /// `handle` must be a live `phi_detector_new` handle or null.
     #[unsafe(no_mangle)]
     pub unsafe extern "C" fn phi_detector_free(handle: PhiHandle) {
         if !handle.is_null() {

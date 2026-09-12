@@ -17,6 +17,7 @@ lunet-advisory-lock = { path = "../../ext/advisory_lock" }
 # stream rides the real TB-format write-behind log through its Zig C ABI.
 lunet-locks-aof = { path = "../../ext/lunet-locks-aof" }
 serde_json = "1"
+signal-hook = "0.3"
 tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

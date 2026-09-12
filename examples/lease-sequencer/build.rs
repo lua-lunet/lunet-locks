@@ -6,11 +6,11 @@
 //! AOF crate's build script).
 
 fn main() {
-    if let Ok(metadata) = std::env::var("DEP_LUNET_LOCKS_AOF_METADATA") {
-        if let Some(lib_dir) = metadata.split_whitespace().find_map(|entry| {
-            entry.strip_prefix("lib_dir=").map(|path| path.to_string())
-        }) {
-            println!("cargo:rustc-link-arg-bins=-Wl,-rpath,{lib_dir}");
-        }
+    if let Ok(metadata) = std::env::var("DEP_LUNET_LOCKS_AOF_METADATA")
+        && let Some(lib_dir) = metadata
+            .split_whitespace()
+            .find_map(|entry| entry.strip_prefix("lib_dir=").map(|path| path.to_string()))
+    {
+        println!("cargo:rustc-link-arg-bins=-Wl,-rpath,{lib_dir}");
     }
 }

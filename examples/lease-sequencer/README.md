@@ -92,6 +92,40 @@ erasure block). The standby's lease driver still converses with the leader
 like every node's does — the round-trip traffic carries the era evidence
 that keeps the standby tracking the cluster while it applies the stream.
 
+## The telemetry AOF (the envelope series)
+
+Any node can carry a **telemetry AOF** — `--telemetry-aof-dir`, falling
+back to `--aof-dir` — a `{epoch}.aof` series written through the vendored
+TigerBeetle AOF (item21) with the typed record envelope (item22) from
+`ext/lunet-locks-aof`: every record is `marker(1) | local-clock-ns(8) |
+payload`, and the marker names the subsystem — `Wire` (the raw uVRR wire
+message, its serialization reused as-is), `TelemetryTimeoutDecision`,
+`TelemetryStateTransition`, or `TelemetryOutbound` (JSON). The wire
+protocol itself is untouched.
+
+The series follows the node's **voting weight** (the hard requirement):
+weight 0 — or the boot Recovering/Joining phase, where the weight is not
+yet known — keeps the AOF ON; weight > 0 turns it OFF; 1→0 re-arms it (a
+trace gap since the disarm is expected). While ON, the node writes its
+boot trace (the Recovering/Restarting/Joining decision and every outbound
+message), every VRR datagram it receives as a Wire record, and the
+phi-informed timeout decisions; the same weight sequence on a voting node
+leaves just the boot trace. A background flush fsyncs every
+`--aof-flush-ms` (default 1000) and earlier whenever the vendored
+entry-window cap fills — and it STOPS when the gate disarms. A clean stop
+(SIGTERM/SIGINT) writes the teardown record LAST and flushes
+unconditionally; SIGKILL loses the last unflushed window. The active file
+rolls at `--telemetry-rollover-mib` (default 4) and the series keeps
+exactly the current file plus one closed old.
+
+The phi-informed election wait: the host tick loop derives the
+election/suspicion wait from the current leader's sketch — `safety *
+max(heartbeat, learned mean interval)`, clamped to
+`--phi-timeout-min-ms` / `--phi-timeout-max-ms` (defaults 500 / 1000) —
+falling back to the clamped fixed gate while the sketch has fewer than
+two intervals. Every changed wait logs one `TelemetryTimeoutDecision`
+record (phi, now, previous wait, next wait) plus the tracing line.
+
 The script also starts `lock-feed` against the standby's AOF directory and
 the console stack (static SPA + nginx edge with `/feed/` mapped to the
 feed), then asserts, headless (curl/grep only):

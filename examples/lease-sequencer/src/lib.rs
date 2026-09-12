@@ -3,3 +3,4 @@
 //! tests and external embedders need.
 
 pub mod phi;
+pub mod telemetry;

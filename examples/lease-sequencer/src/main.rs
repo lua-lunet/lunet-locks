@@ -14,12 +14,14 @@
 
 mod membership;
 pub mod phi;
+pub mod telemetry;
 mod transport;
 
 use lunet_advisory_lock::{
     NOT_LEADER, Node, OK, POSITION_APPEND, RECONFIGURE_DECREMENT, RECONFIGURE_INCREMENT,
     RECONFIGURE_JOIN, RECONFIGURE_LEAVE, RecoveryFlush, maybe_invariant,
 };
+use lunet_locks_aof::envelope::{Marker, Record, local_ns};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
@@ -191,14 +193,28 @@ struct Host {
     /// the watched one: the bootstrap deadline for a sketch that never
     /// learns two intervals. Re-stamped on every leader change.
     phi_watch: Option<((u32, u32), u64)>,
-    /// The vendored TigerBeetle AOF (item21): the standby learner appends
-    /// every leader heartbeat/commit record it receives to the active
-    /// `{epoch}.aof`, WITHOUT a forced flush — the writes are the AOF's own
-    /// amortized page-cached appends, fsync'd on explicit flush and when
-    /// the vendored entry-window cap fills. `None` when the node is not
-    /// the standby, or after an append failure disabled the stream for the
-    /// process (telemetry contract: never poison the replication path).
-    aof: Option<lunet_locks_aof::AofFile>,
+    /// The last replication state the transition recorder saw; a change
+    /// emits a `TelemetryStateTransition` record.
+    last_state: u32,
+    /// The last voting weight the transition recorder saw; a change emits
+    /// a `TelemetryStateTransition` record (the AOF on/off story).
+    last_weight: Option<u32>,
+    /// The election wait the tick loop currently runs (ms): the
+    /// phi-informed estimate (M3), re-derived each tick and re-armed when
+    /// it changes.
+    election_wait_armed: u64,
+    /// The phi-timeout clamp knobs (M3).
+    timeout_knobs: telemetry::TimeoutKnobs,
+    /// The telemetry AOF (item22): the envelope record layer over the
+    /// vendored TigerBeetle AOF, gated by the node's voting weight —
+    /// weight 0 (or the boot Recovering/Joining phase) = ON, weight > 0 =
+    /// OFF. Carries the boot trace (state transitions + outbound), every
+    /// received VRR message as a Wire record while active, and the
+    /// phi-informed timeout decisions. `None` when no `--telemetry-aof-dir`
+    /// (or `--aof-dir` fallback) is configured, or after an append failure
+    /// disabled the stream for the process (telemetry contract: never
+    /// poison the replication path).
+    telemetry: Option<telemetry::TelemetryLog>,
 }
 
 /// The boot-time era-qualified discovery state: request to every node the
@@ -343,6 +359,18 @@ struct Options {
     /// The vendored TigerBeetle AOF's retention threshold, in MiB of
     /// `{epoch}.aof` series on disk (item21). Default 10.
     aof_retention_mib: u64,
+    /// The telemetry AOF's series directory (item22). Empty = fall back to
+    /// `aof_dir`. Every node can carry one: voting nodes log the boot
+    /// trace, then the gate disarms at weight > 0; standbys stay ON.
+    telemetry_aof_dir: String,
+    /// The telemetry active file's rollover threshold, in MiB (item22).
+    /// Default 4; the series keeps exactly the current file + one closed
+    /// old.
+    telemetry_rollover_mib: u64,
+    /// The phi-informed election-wait clamp's floor, in ms (item22 M3).
+    phi_timeout_min_ms: u64,
+    /// The phi-informed election-wait clamp's ceiling, in ms (item22 M3).
+    phi_timeout_max_ms: u64,
     /// The E2 recovery-boundary flush variant (diskless | single |
     /// double-ring). Non-diskless requires `recovery_scratch`.
     recovery_flush: RecoveryFlush,
@@ -369,6 +397,10 @@ fn parse_options() -> Options {
         aof_dir: String::new(),
         aof_flush_ms: 1000,
         aof_retention_mib: 10,
+        telemetry_aof_dir: String::new(),
+        telemetry_rollover_mib: 4,
+        phi_timeout_min_ms: 500,
+        phi_timeout_max_ms: 1000,
         recovery_flush: RecoveryFlush::Diskless,
         recovery_scratch: String::new(),
         heartbeat_ms: 10,
@@ -394,6 +426,12 @@ fn parse_options() -> Options {
             "--aof-dir" => options.aof_dir = value.clone(),
             "--aof-flush-ms" => options.aof_flush_ms = value.parse().unwrap_or(1000),
             "--aof-retention-mib" => options.aof_retention_mib = value.parse().unwrap_or(10),
+            "--telemetry-aof-dir" => options.telemetry_aof_dir = value.clone(),
+            "--telemetry-rollover-mib" => {
+                options.telemetry_rollover_mib = value.parse().unwrap_or(4)
+            }
+            "--phi-timeout-min-ms" => options.phi_timeout_min_ms = value.parse().unwrap_or(500),
+            "--phi-timeout-max-ms" => options.phi_timeout_max_ms = value.parse().unwrap_or(1000),
             "--recovery-flush" => {
                 options.recovery_flush = RecoveryFlush::parse(value).unwrap_or_else(|| {
                     eprintln!(
@@ -425,7 +463,8 @@ fn parse_options() -> Options {
         eprintln!(
             "usage: lease-sequencer --name NAME --config PATH --client IPv4:PORT \
              --state PATH --log PATH [--aof-dir PATH] [--aof-flush-ms N] \
-             [--aof-retention-mib N] \
+             [--aof-retention-mib N] [--telemetry-aof-dir PATH] \
+             [--telemetry-rollover-mib N] [--phi-timeout-min-ms N] [--phi-timeout-max-ms N] \
              [--recovery-flush diskless|single|double-ring] [--recovery-scratch-dir PATH] \
              [--heartbeat-ms N] [--election-ms N] [--recovery-ms N] \
              [--phi-threshold F] [--phi-safety F]"
@@ -438,6 +477,112 @@ fn parse_options() -> Options {
 impl Host {
     fn note(&self, body: &str) {
         info!("{} ts={}", body, millis());
+    }
+
+    /// One telemetry record into the gated AOF (a no-op without a series
+    /// or with the gate disarmed — telemetry never touches the
+    /// replication path).
+    fn record_telemetry(&mut self, record: Record) {
+        if let Some(log) = self.telemetry.as_mut() {
+            log.record(record);
+        }
+    }
+
+    /// One `TelemetryStateTransition` record: the boot decisions
+    /// (Recovering/Restarting/Joining), the replication state changes,
+    /// and the voting-weight moves — the node's own story, with the local
+    /// nanosecond clock in the envelope header.
+    fn record_state_transition(&mut self, fields: String) {
+        let ns = local_ns();
+        self.record_telemetry(Record::telemetry(
+            Marker::TelemetryStateTransition,
+            ns,
+            fields.as_bytes(),
+        ));
+    }
+
+    /// One `TelemetryOutbound` record: what this node decided to send
+    /// (peer, era/view/slot, byte length), so the trace shows what the
+    /// node decided it was.
+    fn record_outbound(&mut self, out: &lunet_advisory_lock::NodeOutput) {
+        let json = format!(
+            "{{\"to\":{},\"era\":{},\"view\":{},\"slot\":{},\"bytes\":{}}}",
+            out.to,
+            out.era,
+            out.view,
+            out.slot,
+            out.bytes.len()
+        );
+        let ns = local_ns();
+        self.record_telemetry(Record::telemetry(
+            Marker::TelemetryOutbound,
+            ns,
+            json.as_bytes(),
+        ));
+    }
+
+    /// The phi-informed election wait (M3): the leader's sketch's learned
+    /// mean drives `safety * max(heartbeat, mean)`, clamped to the
+    /// [min, max] knobs; an unsettled sketch (<2 intervals) falls back to
+    /// the clamped fixed gate. Every CHANGED armed wait emits one
+    /// `TelemetryTimeoutDecision` record (phi, now, previous wait, next
+    /// wait) while the AOF gate is active, plus the tracing note.
+    fn election_wait(&mut self, now: u64) -> u64 {
+        let status = self.node.status();
+        let watchable = status.leader != LEADER_UNKNOWN && status.leader != self.own_id;
+        let (mean_ms, phi_now) = if watchable {
+            // The live sketch, matched on the leader id (see phi_step:
+            // the folded configuration era can trail the leader's trailer
+            // era on a lagging node — demanding era equality would make
+            // every learned sketch look never-observed).
+            let sketch = self
+                .phi_monitor
+                .as_ref()
+                .and_then(|m| m.live())
+                .filter(|(key, _)| key.leader == status.leader)
+                .map(|(_, sketch)| sketch)
+                .filter(|sketch| sketch.sample_count() >= 2);
+            let mean = sketch.map(|sketch| sketch.mean_interval_ms());
+            let phi = sketch.map(|sketch| sketch.phi(now)).unwrap_or(0.0);
+            (mean, phi)
+        } else {
+            (None, 0.0)
+        };
+        let wait = telemetry::phi_wait_ms(
+            mean_ms,
+            self.heartbeat_ms,
+            self.phi_cfg.safety_multiple,
+            &self.timeout_knobs,
+        )
+        .unwrap_or(self.election_ms);
+        if wait != self.election_wait_armed {
+            let previous = self.election_wait_armed;
+            self.election_wait_armed = wait;
+            self.note(&format!(
+                "phi-wait leader={} phi={phi_now:.3} prev_wait={previous} next_wait={wait}",
+                status.leader
+            ));
+            let json = format!(
+                "{{\"leader\":{},\"era\":{},\"view\":{},\"phi\":{phi_now:.3},\
+                 \"mean_interval_ms\":{},\"prev_wait_ms\":{previous},\
+                 \"next_wait_ms\":{wait},\"min_ms\":{},\"max_ms\":{}}}",
+                status.leader,
+                status.era,
+                status.view,
+                mean_ms
+                    .map(|m| format!("{m:.1}"))
+                    .unwrap_or_else(|| "null".into()),
+                self.timeout_knobs.min_ms,
+                self.timeout_knobs.max_ms
+            );
+            let ns = local_ns();
+            self.record_telemetry(Record::telemetry(
+                Marker::TelemetryTimeoutDecision,
+                ns,
+                json.as_bytes(),
+            ));
+        }
+        wait
     }
 
     /// One heartbeat arrival with a phi trailer: feed the (era, leader,
@@ -484,25 +629,15 @@ impl Host {
             return;
         }
         let status = self.node.status();
-        if self
-            .phi_last_era
-            .is_some_and(|era| era != status.config_era)
-        {
-            self.note(&format!(
-                "phi-era-reset node={} era={}",
-                self.own_id, status.config_era
-            ));
-            // Era/config change: the sketch table is fresh. Dropping the
-            // live key forces the next observation to rebuild.
-            self.phi_monitor = Some(phi::Table::new(self.phi_cfg.clone()));
-            self.phi_detected_key = None;
+        // Detection stands down in the establishing-era window: a
+        // committed reconfiguration's new era awaits the view that enters
+        // it (§8.7.8), and inside that window a forced view restarts the
+        // fence instead of letting it close. The driver already holds the
+        // client stream for this bounded window; the detector stands down
+        // with it and re-arms when the era folds.
+        if status.config_era != status.era {
+            return;
         }
-        self.phi_last_era = Some(status.config_era);
-        // Detection stays armed in EVERY state: the §14.2 forced view
-        // change can name a primary that never arrives, and the cluster
-        // wedges in the pending state with the tick gate unable to
-        // advance — the detector must keep watching the (dead) leader
-        // from inside the limbo and force the next view itself.
         if status.leader == self.own_id {
             return;
         }
@@ -512,12 +647,26 @@ impl Host {
         let Some(&addr) = self.peers.get(&status.leader) else {
             return;
         };
-        let key = phi::SketchKey {
-            era: status.config_era,
-            leader: status.leader,
-            leader_addr: phi::addr_text(addr),
-            monitor: self.own_id,
-        };
+        // The live sketch is matched on the LEADER id, whatever era its
+        // trailers carry: a lagging node's folded configuration era can
+        // trail the leader's view era, and demanding era equality would
+        // make every learned sketch look never-observed (the churn the
+        // nine-process run surfaced). The live key's (era, leader) pair
+        // still watches — a leader change re-keys the table and re-stamps
+        // the watch.
+        let watched_sketch = self
+            .phi_monitor
+            .as_ref()
+            .and_then(|m| m.live())
+            .filter(|(key, _)| key.leader == status.leader)
+            .map(|(_, sketch)| sketch);
+        let watched_era = self
+            .phi_monitor
+            .as_ref()
+            .and_then(|m| m.live())
+            .filter(|(key, _)| key.leader == status.leader)
+            .map(|(key, _)| key.era)
+            .unwrap_or(status.config_era);
         // Read the sketch's verdict first (immutable borrow ends), then
         // act on it — the drive borrows the node mutably. A sketch that
         // has never learned two intervals — INCLUDING one never observed
@@ -531,8 +680,8 @@ impl Host {
         // loop. The floor stays conservative (half a second, well past
         // any live leader's first-heartbeat lag) so a slow-start primary
         // is never suspected.
-        let bootstrap_after = (6 * u64::from(self.phi_cfg.heartbeat_ms)).max(500);
-        let watched = (key.era, key.leader);
+        let bootstrap_after = (6 * self.phi_cfg.heartbeat_ms).max(500);
+        let watched = (watched_era, status.leader);
         let born = match self.phi_watch {
             Some((held, born)) if held == watched => born,
             _ => {
@@ -540,17 +689,13 @@ impl Host {
                 now
             }
         };
-        let sketch_ref = self
-            .phi_monitor
-            .as_ref()
-            .and_then(|m| m.get(&key));
-        let verdict = match sketch_ref {
-            Some(sketch) if sketch.sample_count() >= 2 => (
+        let verdict = match watched_sketch.filter(|sketch| sketch.sample_count() >= 2) {
+            Some(sketch) => (
                 sketch.last_arrival(),
                 sketch.phi(now),
                 phi::decide(sketch, now, &self.phi_cfg),
             ),
-            _ => {
+            None => {
                 let bootstrapped = now.saturating_sub(born) > bootstrap_after;
                 (
                     born,
@@ -562,11 +707,18 @@ impl Host {
         let (last_arrival, phi_now, fires) = verdict;
         let silence = now.saturating_sub(last_arrival);
         let detected_key = (status.config_era, status.leader);
-        if self.phi_detected_key == Some(detected_key) || !fires {
+        // One detection per (era, leader) — but only while THIS node is
+        // Normal: inside the limbo (the §14.2 forced view can name a
+        // primary that never arrives) the latch must not hold, or the
+        // wedged cluster has no driver left and sits in view_change
+        // forever. In the limbo the detection re-fires on each bootstrap
+        // window until a live primary takes the view.
+        let latched = self.phi_detected_key == Some(detected_key) && status.state == STATE_NORMAL;
+        if latched || !fires {
             return;
         }
         self.phi_detected_key = Some(detected_key);
-        let floor = match self.phi_monitor.as_ref().and_then(|m| m.get(&key)) {
+        let floor = match watched_sketch {
             Some(sketch) => phi::floor_ms(sketch, &self.phi_cfg) as u64,
             None => (self.phi_cfg.safety_multiple * self.phi_cfg.heartbeat_ms as f64) as u64,
         };
@@ -583,9 +735,18 @@ impl Host {
         // The phi-accrual actuation: the §14.2 host-forced view change —
         // no timed-tick suspicion gate, the detector's verdict drives it
         // directly. Falls back to the ordinary suspicion tick on refusal.
-        let forced = self.node.force_view(status.era, status.view + 1);
-        if forced != 0 {
-            let _ = self.node.leader_timeout();
+        // A node below voting weight (or below its folded configuration's
+        // era) does not drive: a lagging learner's verdict is noise (its
+        // sketches are degenerate, its leader stream is UnevaluableEra-
+        // truncated), and its local view churn wedges its own catch-up —
+        // the promotion walk then never completes. The detection note
+        // above still lands; only the drive is gated.
+        let drives = self.node.voting_weight().is_some_and(|weight| weight > 0);
+        if drives {
+            let forced = self.node.force_view(status.era, status.view + 1);
+            if forced != 0 {
+                let _ = self.node.leader_timeout();
+            }
         }
         self.flush_outputs(now, rng);
     }
@@ -598,6 +759,7 @@ impl Host {
         let status = self.node.status();
         if status.state != STATE_NORMAL
             || status.leader != self.own_id
+            || status.config_era != status.era
             || now.saturating_sub(self.last_leader_commit_ms) < self.heartbeat_ms
         {
             return;
@@ -705,6 +867,10 @@ impl Host {
                 let packet =
                     transport::encode_peer(transport::PEER_VRR, &self.fingerprint, &payload);
                 let _ = self.sock.send_to(&packet, addr);
+                // The outbound trace (item22): what this node decided it
+                // was — one TelemetryOutbound record per sent datagram
+                // while the AOF gate is active.
+                self.record_outbound(&out);
             } else if out.kind == OUTPUT_REPLY {
                 if let Some((dest, _)) = self.forwarded_from.remove(&out.message_id) {
                     self.send_forward_response(dest, &out.message_id, &out.bytes);
@@ -1053,37 +1219,44 @@ fn main() {
     // lifetime and flushes on an orderly shutdown.
     let _worker_guard = init_tracing(&options.log);
     let standby = !options.aof_dir.is_empty();
-    // The vendored TigerBeetle AOF (item21): on standby startup the
-    // wrapper applies the retention sweep and opens the NEW
-    // `{epoch}.aof` active file, force OFF — amortized buffered writes,
-    // flush at the vendored window cap or on explicit flush. An open
-    // failure logs and disables the stream for the process; the node
-    // keeps serving (the telemetry contract).
-    let aof = if standby {
-        match lunet_locks_aof::AofFile::open_with(
-            std::path::Path::new(&options.aof_dir),
-            lunet_locks_aof::Options {
-                force_flush: false,
-                retention_bytes: options.aof_retention_mib * 1024 * 1024,
-            },
+    // The telemetry AOF (item22): the envelope record layer over the
+    // vendored TigerBeetle AOF, gated by the node's voting weight. The
+    // series directory is `--telemetry-aof-dir`, falling back to
+    // `--aof-dir` (the standby's). EVERY node can carry one: the boot
+    // Recovering/Restarting/Joining trace always logs; once the node's
+    // voting weight exceeds 0 the gate disarms (the flusher stops, the
+    // trace pauses), and 1→0 re-arms it. An open failure logs and
+    // disables the stream for the process; the node keeps serving (the
+    // telemetry contract).
+    let telemetry_dir = if options.telemetry_aof_dir.is_empty() {
+        options.aof_dir.clone()
+    } else {
+        options.telemetry_aof_dir.clone()
+    };
+    let telemetry = if telemetry_dir.is_empty() {
+        None
+    } else {
+        match telemetry::TelemetryLog::open(
+            std::path::Path::new(&telemetry_dir),
+            options.aof_flush_ms,
+            options.telemetry_rollover_mib * 1024 * 1024,
+            options.aof_retention_mib * 1024 * 1024,
         ) {
-            Ok(aof) => {
+            Ok(log) => {
                 eprintln!(
-                    "lease-sequencer: standby tb-aof active file {}",
-                    aof.path().display()
+                    "lease-sequencer: telemetry aof active file {}",
+                    log.active_path().display()
                 );
-                Some(aof)
+                Some(log)
             }
             Err(error) => {
                 eprintln!(
-                    "lease-sequencer: standby tb-aof open failed ({error}); \
-                     the commit/heartbeat stream is disabled for this process"
+                    "lease-sequencer: telemetry aof open failed ({error}); \
+                     the telemetry stream is disabled for this process"
                 );
                 None
             }
         }
-    } else {
-        None
     };
     let node = if standby {
         // The standby telemetry host: the committed-transition hook feeds
@@ -1241,7 +1414,15 @@ fn main() {
         phi_last_era: None,
         phi_detected_key: None,
         phi_watch: None,
-        aof,
+        last_state: STATE_RECOVERING,
+        last_weight: None,
+        election_wait_armed: options.election_ms,
+        timeout_knobs: telemetry::TimeoutKnobs {
+            min_ms: options.phi_timeout_min_ms,
+            max_ms: options.phi_timeout_max_ms,
+            fixed_ms: options.election_ms,
+        },
+        telemetry,
     };
     host.note(&format!(
         "boot name={} descriptor-id={own_desc_id} own={own_id} incarnation={incarnation}",
@@ -1255,11 +1436,42 @@ fn main() {
         host.model.members.len(),
         model_source
     ));
+    // The boot trace (item22): every node's startup decision —
+    // Restarting on a dirty restart (incarnation bump), otherwise
+    // Joining — lands in its AOF with the outbound messages that follow
+    // while the gate is ON (the boot Recovering/Joining phase), whatever
+    // the node's future weight.
+    {
+        let status = host.node.status();
+        let decision = if incarnation > 0 {
+            "restarting"
+        } else {
+            "joining"
+        };
+        host.record_state_transition(format!(
+            "{{\"event\":\"boot\",\"decision\":\"{decision}\",\"incarnation\":{incarnation},\
+             \"state\":{},\"leader\":{},\"era\":{},\"view\":{},\"config_era\":{}}}",
+            status.state, status.leader, status.era, status.view, status.config_era
+        ));
+    }
     let now = millis();
     let mut rng = Rng::new(millis() ^ (own_desc_id as u64) ^ (std::process::id() as u64));
     host.flush_outputs(now, &mut rng);
 
+    // SIGTERM/SIGINT (the clean-stop path): the flag flips, the loop
+    // exits through the teardown discipline — the boot-marker/teardown
+    // record LAST, then the unconditional flush. SIGKILL skips all of it
+    // and loses the last unflushed window (documented).
+    let stopped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    for signal in [signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT] {
+        signal_hook::flag::register(signal, stopped.clone()).expect("signal flag registration");
+    }
+
     loop {
+        if stopped.load(std::sync::atomic::Ordering::Relaxed) {
+            host.note("sigterm: clean stop");
+            break;
+        }
         let now = millis();
         pump_udp(&mut host, now, &mut rng);
         pump_tcp(&mut host, now, &mut rng);
@@ -1267,7 +1479,20 @@ fn main() {
         host.discovery_step(now);
         host.driver_step(now, &mut rng);
         host.flush_outputs(now, &mut rng);
+        // The AOF lifecycle gate + the 1000 ms forced flusher + the
+        // rollover (item22 M2): the gate follows the node's voting
+        // weight, the flusher runs only while the AOF is ON.
+        if let Some(log) = host.telemetry.as_mut() {
+            log.on_weight(host.node.voting_weight(), now);
+            log.tick(now);
+        }
         std::thread::sleep(Duration::from_millis(TICK_MS));
+    }
+    // Clean stop: the teardown record LAST and the unconditional flush.
+    if let Some(log) = host.telemetry.as_mut()
+        && let Err(error) = log.teardown()
+    {
+        eprintln!("lease-sequencer: telemetry aof teardown failed ({error})");
     }
 }
 
@@ -1291,11 +1516,42 @@ fn timers(host: &mut Host, now: u64, rng: &mut Rng) {
         host.leader_elapsed = 0;
     } else {
         host.leader_elapsed += TICK_MS;
-        if host.leader_elapsed >= host.election_ms + host.stagger_ms {
+        // The phi-informed election wait (item22 M3): the host tick loop
+        // owns the timeout. It consults the current leader's phi sketch,
+        // clamps the derived wait to [min, max] (never earlier than a
+        // settled phi allows, never later than the old fixed gate), logs
+        // one TelemetryTimeoutDecision record per changed wait, and the
+        // drive still happens: leader_timeout, the core's ordinary
+        // suspicion input.
+        let wait = host.election_wait(now);
+        if host.leader_elapsed >= wait + host.stagger_ms {
             host.leader_elapsed = 0;
             let _ = host.node.leader_timeout();
             host.flush_outputs(now, rng);
         }
+    }
+    // The state-transition trace (item22): Recovering/Restarting/Joining
+    // decisions and the voting-weight moves land in the AOF while its
+    // gate is active.
+    if status.state != host.last_state {
+        host.last_state = status.state;
+        host.record_state_transition(format!(
+            "{{\"event\":\"state\",\"state\":{},\"leader\":{},\"era\":{},\"view\":{},\
+             \"config_era\":{}}}",
+            status.state, status.leader, status.era, status.view, status.config_era
+        ));
+    }
+    let weight_now = host.node.voting_weight();
+    if weight_now != host.last_weight {
+        host.last_weight = weight_now;
+        host.record_state_transition(format!(
+            "{{\"event\":\"weight\",\"weight\":{},\"era\":{},\"view\":{}}}",
+            weight_now
+                .map(|w| w.to_string())
+                .unwrap_or_else(|| "null".into()),
+            status.era,
+            status.view
+        ));
     }
     if now.saturating_sub(host.last_status_note) >= 2000 {
         host.last_status_note = now;
@@ -1385,28 +1641,15 @@ fn handle_packet(
         if let Some(trailer) = &trailer {
             host.observe_heartbeat(replica, addr, trailer, now);
         }
-        // The vendored TigerBeetle AOF stream (item21): every Commit
-        // datagram on the peer channel — the leader's heartbeat/commit
-        // stream plus the commit cascades — appends one entry to the
-        // active `{epoch}.aof`, WITHOUT a forced flush: the writes are the
-        // vendored AOF's own amortized page-cached appends, fsync'd when
-        // the entry-window cap fills. The bytes recorded are the
-        // trailer-stripped wire message, exactly what the core receives.
-        // An append failure disables the stream for the process and logs
-        // once — telemetry must never poison the replication path.
-        if is_commit(payload) {
-            match host.aof.as_mut() {
-                Some(aof) => {
-                    if let Err(error) = aof.append(payload) {
-                        eprintln!(
-                            "lease-sequencer: standby tb-aof append failed ({error}); \
-                             the commit/heartbeat stream is disabled for this process"
-                        );
-                        host.aof = None;
-                    }
-                }
-                None => {}
-            }
+        // The telemetry AOF stream (item22): EVERY VRR datagram this node
+        // sees is one `Wire` envelope record — the trailer-stripped wire
+        // message, exactly what the core receives, with the local
+        // nanosecond clock in the envelope header — appended while the
+        // lifecycle gate is active (weight 0 / boot phase). An append
+        // failure disables the stream for the process and logs once —
+        // telemetry must never poison the replication path.
+        if host.telemetry.is_some() {
+            host.record_telemetry(Record::wire(local_ns(), payload));
         }
         if let Some((old, new)) = transport::reincarnation_pair(payload)
             && old == replica
