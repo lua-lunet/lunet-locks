@@ -505,36 +505,36 @@ impl Host {
         };
         // Read the sketch's verdict first (immutable borrow ends), then
         // act on it — the drive borrows the node mutably. A sketch that
-        // has never learned two intervals gets the bootstrap verdict: the
-        // elected leader's first two heartbeats are due within a few
-        // real intervals of election, so `bootstrap_after_ms` of silence
-        // past the key's birth is a dead primary no detector math can
-        // express yet.
+        // has never learned two intervals — INCLUDING one never observed
+        // at all, the dead primary no heartbeat ever reaches — gets the
+        // bootstrap verdict: the elected leader's first two heartbeats
+        // are due within a few real intervals of election, so
+        // `bootstrap_after_ms` of silence past the key's birth is a dead
+        // primary no detector math can express yet. The floor stays
+        // conservative (half a second, well past any live leader's
+        // first-heartbeat lag) so a slow-start primary is never suspected.
         let first_seen = self.phi_key_born.entry((key.era, key.leader)).or_insert(now);
-        let bootstrap_after =
-            6 * u64::from(self.phi_cfg.heartbeat_ms);
-        let verdict = self
+        let bootstrap_after = (6 * u64::from(self.phi_cfg.heartbeat_ms)).max(500);
+        let sketch_ref = self
             .phi_monitor
             .as_ref()
-            .and_then(|m| m.get(&key))
-            .map(|sketch| {
-                if sketch.sample_count() < 2 {
-                    let bootstrapped = now.saturating_sub(*first_seen) > bootstrap_after;
-                    return (
-                        *first_seen,
-                        if bootstrapped { f64::INFINITY } else { 0.0 },
-                        bootstrapped,
-                    );
-                }
+            .and_then(|m| m.get(&key));
+        let verdict = match sketch_ref {
+            Some(sketch) if sketch.sample_count() >= 2 => (
+                sketch.last_arrival(),
+                sketch.phi(now),
+                phi::decide(sketch, now, &self.phi_cfg),
+            ),
+            _ => {
+                let bootstrapped = now.saturating_sub(*first_seen) > bootstrap_after;
                 (
-                    sketch.last_arrival(),
-                    sketch.phi(now),
-                    phi::decide(sketch, now, &self.phi_cfg),
+                    *first_seen,
+                    if bootstrapped { f64::INFINITY } else { 0.0 },
+                    bootstrapped,
                 )
-            });
-        let Some((last_arrival, phi_now, fires)) = verdict else {
-            return;
+            }
         };
+        let (last_arrival, phi_now, fires) = verdict;
         let silence = now.saturating_sub(last_arrival);
         let detected_key = (status.config_era, status.leader);
         if self.phi_detected_key == Some(detected_key) || !fires {
