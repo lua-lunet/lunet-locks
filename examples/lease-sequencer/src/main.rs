@@ -923,6 +923,30 @@ impl Host {
         established_slot
     }
 
+    /// Learns the addressing row for a member the model already names
+    /// when that member's socket speaks for the first time (a changed
+    /// leader re-learns a joined standby from the standby's own first
+    /// datagram; the standby's identity comes from the model's endpoint
+    /// match, never guessed from the wire). `true` when a row was added.
+    fn learn_member_row(&mut self, addr: SocketAddr) -> bool {
+        for member in self.model.members.iter() {
+            if let Ok(mut addrs) = member.endpoint.to_socket_addrs()
+                && let Some(member_addr) = addrs.next()
+                && member_addr == addr
+                && !self.peers.contains_key(&member.id)
+            {
+                self.peers.insert(member.id, addr);
+                self.addr_to_id.insert(addr, member.id);
+                self.note(&format!(
+                    "member row learned id={} endpoint={}",
+                    member.id, member.endpoint
+                ));
+                return true;
+            }
+        }
+        false
+    }
+
     /// Adds the addressing rows an adopted snapshot's membership names:
     /// rows grow additively and never regress (a departed member's rows
     /// leave through the leave verb's flow, never through a snapshot).
@@ -1608,7 +1632,23 @@ fn pump_udp(host: &mut Host, now: u64, rng: &mut Rng) {
             return;
         };
         let Some(&replica) = host.addr_to_id.get(&addr) else {
-            tracing::warn!(source = %addr, len, "datagram from an unregistered endpoint dropped");
+            // An unregistered endpoint whose socket matches a member the
+            // model already names IS that member: learn the row (the join
+            // verb's proposal-time row only lives on the leader that
+            // accepted the verb — a changed leader re-learns it here from
+            // the member's own first datagram, whose fingerprint the
+            // transport already validated). The AOF standby never speaks
+            // until it is spoken to, so the first learn rides whatever it
+            // sent.
+            if !host.learn_member_row(addr) {
+                tracing::warn!(source = %addr, len, "datagram from an unregistered endpoint dropped");
+                continue;
+            }
+            let Some(&replica) = host.addr_to_id.get(&addr) else {
+                tracing::warn!(source = %addr, len, "datagram from an unregistered endpoint dropped");
+                continue;
+            };
+            handle_packet(host, replica, addr, &buf[..len], now, rng);
             continue;
         };
         handle_packet(host, replica, addr, &buf[..len], now, rng);

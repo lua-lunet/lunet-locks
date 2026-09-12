@@ -493,7 +493,8 @@ local function json_num(json: string, key: string): any
     end
     -- the detector's bare `inf`/`nan` saturations are not JSON: null
     if json:match('"' .. key .. '":%s*[-+]?inf') ~= nil
-        or json:match('"' .. key .. '":%s*nan') ~= nil then
+        or json:match('"' .. key .. '":%s*[Nn]a[Nn]') ~= nil
+        or json:match('"' .. key .. '":%s*null') ~= nil then
         return JSON_NULL
     end
     return nil
