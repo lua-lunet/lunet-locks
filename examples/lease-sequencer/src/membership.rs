@@ -46,6 +46,9 @@ pub struct Snapshot {
 
 /// An endpoint is literal `IPv4:port` — the same rule `config.tl` enforces
 /// for every addressing row.
+/// An endpoint is an IPv4 `dotted.dotted.dotted:port` or a bracketed IPv6
+/// `[addr]:port` literal — the bracket form is how the rig's IPv6-only
+/// benchmark nodes appear in descriptors and snapshots.
 fn valid_endpoint(endpoint: &str) -> bool {
     let Some((host, port)) = endpoint.rsplit_once(':') else {
         return false;
@@ -55,6 +58,9 @@ fn valid_endpoint(endpoint: &str) -> bool {
     };
     if port == 0 {
         return false;
+    }
+    if let Some(v6) = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+        return !v6.is_empty() && v6.split(':').count() >= 3;
     }
     let octets: Vec<&str> = host.split('.').collect();
     octets.len() == 4

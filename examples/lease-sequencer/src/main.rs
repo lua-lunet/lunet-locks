@@ -13,6 +13,7 @@
 //! `lease-attempt ts=<ms> node=<id> op=set|renew|get|steal expiry=<ms>`.
 
 mod membership;
+pub mod phi;
 mod transport;
 
 use lunet_advisory_lock::{
@@ -48,6 +49,18 @@ const OUTPUT_SEND: u32 = 1;
 const OUTPUT_REPLY: u32 = 2;
 const STATE_NORMAL: u32 = 0;
 const STATE_RECOVERING: u32 = 2;
+
+/// Upstream `src/wire.rs` Tag::Commit; the adapter mirrors the tag the
+/// same way it mirrors Tag::Reincarnation in `transport.rs`.
+const VRR_COMMIT_TAG: u32 = 4;
+
+/// Whether one VRR payload is a `Commit` datagram: the 20-byte header's
+/// tag field is a big-endian `u32` at offset 0 (the same offset
+/// `transport::reincarnation_pair` reads).
+fn is_commit(payload: &[u8]) -> bool {
+    payload.len() >= 21
+        && u32::from_be_bytes(payload[0..4].try_into().expect("4 bytes")) == VRR_COMMIT_TAG
+}
 
 struct ClusterNode {
     id: u32,
@@ -153,6 +166,27 @@ struct Host {
     model: membership::Model,
     sidecar: membership::SidecarWriter,
     discovery: Discovery,
+    /// The phi-accrual monitor (item19): per-(era, leader, addr, monitor)
+    /// sketches over the leader's heartbeat Commit arrivals. `None` when
+    /// phi is disabled (`--phi-threshold 0`).
+    phi_monitor: Option<phi::Table>,
+    /// The phi policy (threshold, heartbeat, safety multiple, window).
+    phi_cfg: phi::PhiConfig,
+    /// The heartbeat sequence the leader stamps into trailers.
+    heartbeat_seq: u32,
+    /// The last Commit-send time this leader produced — "when otherwise
+    /// idle" is measured against it.
+    last_leader_commit_ms: u64,
+    /// The keepalive proposer's own client identity and request counter.
+    heartbeat_client_id: u64,
+    heartbeat_request_num: u64,
+    /// The last config era the phi monitor saw (era change = fresh
+    /// sketch).
+    phi_last_era: Option<u32>,
+    /// The (config era, leader) the current detection is latched for. A
+    /// fresh era or a new leader re-arms; an arriving heartbeat from the
+    /// SAME leader does not — one detection per key.
+    phi_detected_key: Option<(u32, u32)>,
 }
 
 /// The boot-time era-qualified discovery state: request to every node the
@@ -175,6 +209,20 @@ fn millis() -> u64 {
         .duration_since(UNIX_EPOCH)
         .expect("clock before epoch")
         .as_millis() as u64
+}
+
+/// The phi monitor's construction: `None` when phi is disabled
+/// (`--phi-threshold 0`), otherwise a table with the node's policy knobs.
+fn phi_monitor(options: &Options) -> Option<phi::Table> {
+    if options.phi_threshold <= 0.0 {
+        return None;
+    }
+    Some(phi::Table::new(phi::PhiConfig {
+        phi_threshold: options.phi_threshold,
+        heartbeat_ms: options.heartbeat_ms,
+        safety_multiple: options.phi_safety,
+        window: 100,
+    }))
 }
 
 /// The tracing subscriber stack. `--log` names the per-node file; its stem
@@ -288,6 +336,12 @@ struct Options {
     heartbeat_ms: u64,
     election_ms: u64,
     recovery_ms: u64,
+    /// The phi threshold a leader-failure sketch must cross before its
+    /// monitor acts (item19). 0 disables phi monitoring entirely.
+    phi_threshold: f64,
+    /// The hard safety multiple: no detection fires before
+    /// `safety * heartbeat_ms` of leader silence, whatever phi says.
+    phi_safety: f64,
 }
 
 fn parse_options() -> Options {
@@ -301,9 +355,11 @@ fn parse_options() -> Options {
         aof_flush_ms: 1000,
         recovery_flush: RecoveryFlush::Diskless,
         recovery_scratch: String::new(),
-        heartbeat_ms: 100,
+        heartbeat_ms: 10,
         election_ms: 1000,
         recovery_ms: 1000,
+        phi_threshold: 1.0,
+        phi_safety: 2.0,
     };
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut index = 0;
@@ -331,9 +387,11 @@ fn parse_options() -> Options {
                 })
             }
             "--recovery-scratch-dir" => options.recovery_scratch = value.clone(),
-            "--heartbeat-ms" => options.heartbeat_ms = value.parse().unwrap_or(100),
+            "--heartbeat-ms" => options.heartbeat_ms = value.parse().unwrap_or(10),
             "--election-ms" => options.election_ms = value.parse().unwrap_or(1000),
             "--recovery-ms" => options.recovery_ms = value.parse().unwrap_or(1000),
+            "--phi-threshold" => options.phi_threshold = value.parse().unwrap_or(1.0),
+            "--phi-safety" => options.phi_safety = value.parse().unwrap_or(2.0),
             other => {
                 eprintln!("lease-sequencer: unknown option {other}");
                 exit(2);
@@ -351,7 +409,8 @@ fn parse_options() -> Options {
             "usage: lease-sequencer --name NAME --config PATH --client IPv4:PORT \
              --state PATH --log PATH [--aof-dir PATH] [--aof-flush-ms N] \
              [--recovery-flush diskless|single|double-ring] [--recovery-scratch-dir PATH] \
-             [--heartbeat-ms N] [--election-ms N] [--recovery-ms N]"
+             [--heartbeat-ms N] [--election-ms N] [--recovery-ms N] \
+             [--phi-threshold F] [--phi-safety F]"
         );
         exit(2);
     }
@@ -361,6 +420,152 @@ fn parse_options() -> Options {
 impl Host {
     fn note(&self, body: &str) {
         info!("{} ts={}", body, millis());
+    }
+
+    /// One heartbeat arrival with a phi trailer: feed the (era, leader,
+    /// addr, monitor) sketch, and lazily log the arrival-interval sample
+    /// the normal-distribution chart plots.
+    fn observe_heartbeat(
+        &mut self,
+        _sender: u32,
+        addr: SocketAddr,
+        trailer: &phi::Trailer,
+        now: u64,
+    ) {
+        let Some(monitor) = &mut self.phi_monitor else {
+            return;
+        };
+        let key = phi::SketchKey {
+            era: trailer.era,
+            leader: trailer.leader,
+            leader_addr: phi::addr_text(addr),
+            monitor: self.own_id,
+        };
+        let interval = monitor.observe(&key, now);
+        self.phi_last_era = Some(trailer.era);
+        if let Some(interval) = interval {
+            self.note(&format!(
+                "phi-interval node={} era={} leader={} addr={} dt={}",
+                self.own_id,
+                trailer.era,
+                trailer.leader,
+                phi::addr_text(addr),
+                interval
+            ));
+        }
+    }
+
+    /// One monitor tick: evaluate the current leader's sketch against the
+    /// threshold and the safety floor. On a crossing the host logs the
+    /// detection and drives the existing view-change path
+    /// (`leader_timeout`, the core's ordinary suspicion input); the core
+    /// self-gates the actual fence on its own primary-timeout knob, so
+    /// the drive is issued, not forced.
+    fn phi_step(&mut self, now: u64, rng: &mut Rng) {
+        if self.phi_monitor.is_none() {
+            return;
+        }
+        let status = self.node.status();
+        if self
+            .phi_last_era
+            .is_some_and(|era| era != status.config_era)
+        {
+            self.note(&format!(
+                "phi-era-reset node={} era={}",
+                self.own_id, status.config_era
+            ));
+            // Era/config change: the sketch table is fresh. Dropping the
+            // live key forces the next observation to rebuild.
+            self.phi_monitor = Some(phi::Table::new(self.phi_cfg.clone()));
+            self.phi_detected_key = None;
+        }
+        self.phi_last_era = Some(status.config_era);
+        if status.state != STATE_NORMAL || status.leader == self.own_id {
+            return;
+        }
+        if status.leader == LEADER_UNKNOWN {
+            return;
+        }
+        let Some(&addr) = self.peers.get(&status.leader) else {
+            return;
+        };
+        let key = phi::SketchKey {
+            era: status.config_era,
+            leader: status.leader,
+            leader_addr: phi::addr_text(addr),
+            monitor: self.own_id,
+        };
+        // Read the sketch's verdict first (immutable borrow ends), then
+        // act on it — the drive borrows the node mutably.
+        let verdict = self
+            .phi_monitor
+            .as_ref()
+            .and_then(|m| m.get(&key))
+            .map(|sketch| {
+                (
+                    sketch.last_arrival(),
+                    sketch.phi(now),
+                    phi::decide(sketch, now, &self.phi_cfg),
+                )
+            });
+        let Some((last_arrival, phi_now, fires)) = verdict else {
+            return;
+        };
+        let silence = now.saturating_sub(last_arrival);
+        let detected_key = (status.config_era, status.leader);
+        if self.phi_detected_key == Some(detected_key) || !fires {
+            return;
+        }
+        self.phi_detected_key = Some(detected_key);
+        let floor = phi::floor_ms(
+            self.phi_monitor
+                .as_ref()
+                .and_then(|m| m.get(&key))
+                .expect("the verdict came from this sketch"),
+            &self.phi_cfg,
+        ) as u64;
+        self.note(&format!(
+            "phi-detect node={} era={} leader={} phi={:.3} silence={} floor={} addr={}",
+            self.own_id,
+            status.config_era,
+            status.leader,
+            phi_now,
+            silence,
+            floor,
+            phi::addr_text(addr)
+        ));
+        // The phi-accrual actuation: the §14.2 host-forced view change —
+        // no timed-tick suspicion gate, the detector's verdict drives it
+        // directly. Falls back to the ordinary suspicion tick on refusal.
+        let forced = self.node.force_view(status.era, status.view + 1);
+        if forced != 0 {
+            let _ = self.node.leader_timeout();
+        }
+        self.flush_outputs(now, rng);
+    }
+
+    /// The leader's idle heartbeat: when otherwise idle — no Commit left
+    /// this node in the last interval — the leader proposes a read-only
+    /// `get`, whose commit fan-out emits the heartbeat Commit every
+    /// follower's phi sketch observes.
+    fn heartbeat_op(&mut self, now: u64, rng: &mut Rng) {
+        let status = self.node.status();
+        if status.state != STATE_NORMAL
+            || status.leader != self.own_id
+            || now.saturating_sub(self.last_leader_commit_ms) < self.heartbeat_ms
+        {
+            return;
+        }
+        self.heartbeat_request_num += 1;
+        let message_id = *uuid::Uuid::new_v4().as_bytes();
+        let mid = uuid::Uuid::from_bytes(message_id).to_string();
+        let json = format!(
+            "{{\"op\":\"get\",\"message_id\":\"{mid}\",\"client_id\":{},\"request_num\":{},\"lock_id\":{LOCK_ID}}}",
+            self.heartbeat_client_id, self.heartbeat_request_num
+        );
+        let _ = self.node.request(json.as_bytes());
+        self.flush_outputs(now, rng);
+        let _ = rng;
     }
 
     fn lease_attempt(&self, node_id: u32, op: &str, expiry: u64) {
@@ -427,8 +632,32 @@ impl Host {
                     );
                     continue;
                 };
+                // The phi trailer (item19) rides only the leader's Commit
+                // datagrams: the stream followers' sketches observe. The
+                // trailer lives OUTSIDE the core's message bytes — the
+                // receiving host strips it before node.receive() — so the
+                // core's exact-length wire contract (W3) is untouched.
+                let status = self.node.status();
+                let payload = if status.state == STATE_NORMAL
+                    && status.leader == self.own_id
+                    && is_commit(&out.bytes)
+                {
+                    self.last_leader_commit_ms = now;
+                    self.heartbeat_seq = self.heartbeat_seq.wrapping_add(1);
+                    let trailer = phi::Trailer {
+                        era: status.era,
+                        leader: status.leader,
+                        seq: self.heartbeat_seq,
+                        sent_at_ms: now,
+                    };
+                    let mut payload = out.bytes.clone();
+                    trailer.append_to(&mut payload);
+                    payload
+                } else {
+                    out.bytes.clone()
+                };
                 let packet =
-                    transport::encode_peer(transport::PEER_VRR, &self.fingerprint, &out.bytes);
+                    transport::encode_peer(transport::PEER_VRR, &self.fingerprint, &payload);
                 let _ = self.sock.send_to(&packet, addr);
             } else if out.kind == OUTPUT_REPLY {
                 if let Some((dest, _)) = self.forwarded_from.remove(&out.message_id) {
@@ -920,6 +1149,19 @@ fn main() {
             next_request_ms: 0,
             active: true,
         },
+        phi_monitor: phi_monitor(&options),
+        phi_cfg: phi::PhiConfig {
+            phi_threshold: options.phi_threshold,
+            heartbeat_ms: options.heartbeat_ms,
+            safety_multiple: options.phi_safety,
+            window: 100,
+        },
+        heartbeat_seq: 0,
+        last_leader_commit_ms: 0,
+        heartbeat_client_id: 0x0BEEF000 + own_desc_id as u64,
+        heartbeat_request_num: 0,
+        phi_last_era: None,
+        phi_detected_key: None,
     };
     host.note(&format!(
         "boot name={} descriptor-id={own_desc_id} own={own_id} incarnation={incarnation}",
@@ -962,7 +1204,9 @@ fn timers(host: &mut Host, now: u64, rng: &mut Rng) {
         host.last_heartbeat = now;
         let _ = host.node.idle();
         host.flush_outputs(now, rng);
+        host.heartbeat_op(now, rng);
     }
+    host.phi_step(now, rng);
     if status.state == STATE_NORMAL && status.leader == host.own_id {
         host.leader_elapsed = 0;
     } else {
@@ -1048,6 +1292,19 @@ fn handle_packet(
         // socket the new identity binds, and the row leaves only when the
         // reincarnation forced steps evict the old identity from the
         // serving configuration.
+        //
+        // Before anything else: the phi trailer (item19) rides at the BACK
+        // of the leader's heartbeat Commits, entirely OUTSIDE the core's
+        // message bytes. Strip it here so the core sees the exact-length
+        // message its W3 contract demands, and feed the arrival to the
+        // sketch when the sender is the leader this monitor watches.
+        let (payload, trailer) = match phi::Trailer::strip_from(payload) {
+            Some((front, trailer)) => (front, Some(trailer)),
+            None => (payload, None),
+        };
+        if let Some(trailer) = &trailer {
+            host.observe_heartbeat(replica, addr, trailer, now);
+        }
         if let Some((old, new)) = transport::reincarnation_pair(payload)
             && old == replica
             && old != new

@@ -4,6 +4,13 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.88" # let-chains in src/main.rs; the shipped adapter crate stays at its 1.85 floor
 
+# The test target: the integration tests link the phi module (and any
+# future pure pieces) through this thin lib facade over the binary.
+[lib]
+name = "lease_sequencer"
+path = "src/lib.rs"
+test = false
+
 [dependencies]
 lunet-advisory-lock = { path = "../../ext/advisory_lock" }
 serde_json = "1"
@@ -11,6 +18,16 @@ tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
+# The phi-accrual embed (item19): the crate and its executor ride the
+# `phi` feature only — flag-out (`--no-default-features`) builds with no
+# dependency, no symbol, no cost.
+chrono = { version = "0.4", optional = true }
+phi-accrual-detector = { version = "0.3.1", optional = true }
+tokio = { version = "1", default-features = false, features = ["rt"], optional = true }
+
+[features]
+default = ["phi"]
+phi = ["dep:chrono", "dep:phi-accrual-detector", "dep:tokio"]
 
 # The [patch] section is honored only in a workspace root's manifest — a
 # dependency's own [patch] is ignored — so the consumer restates it here.
@@ -20,3 +37,6 @@ uuid = { version = "1", features = ["v4"] }
 # UnknownSender live while the same shape converges in-process.
 [patch."https://github.com/lua-lunet/uvrr-core.git"]
 vrr-core = { path = "../../ext/uvrr-core" }
+
+[dev-dependencies]
+serde_json = "1"

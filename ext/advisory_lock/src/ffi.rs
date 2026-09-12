@@ -924,6 +924,20 @@ impl Node {
         self.drive(Input::Tick)
     }
 
+    /// Host-forced view change (§14.2): the phi-accrual detector's
+    /// conclusion that the primary is dead. `era` must be the node's
+    /// current era and `view` must strictly advance the view number — the
+    /// core refuses anything sideways or backwards.
+    pub fn force_view(&mut self, era: u32, view: u32) -> i32 {
+        trace!(era, view, "node force view entry");
+        self.drive(Input::AdminForceView {
+            target: ViewId {
+                era: Era(era),
+                view: View(view),
+            },
+        })
+    }
+
     /// One fenced-boot drive. The core has no recovery protocol: a fenced
     /// node starts clean, and the only protocol lever is `Input::Tick` —
     /// the genesis primary self-promotes on it, and the primary's messages
@@ -1874,6 +1888,19 @@ pub unsafe extern "C" fn lunet_lock_node_leader_timeout(node: *mut c_void) -> i3
     })
 }
 
+/// §14.2 host-forced view change: the phi-accrual detector's conclusion
+/// that the primary is dead (`era` the node's current era, `view` strictly
+/// ahead). Returns [`OK`], [`SERVICE`] (poisoned), or [`CONFIG`]-class
+/// refusals for a target that does not advance.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lunet_lock_node_force_view(node: *mut c_void, era: u32, view: u32) -> i32 {
+    guarded(|| unsafe {
+        node.cast::<Node>()
+            .as_mut()
+            .map_or(INVALID, |node| node.force_view(era, view))
+    })
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lunet_lock_node_recover(node: *mut c_void) -> i32 {
     guarded(|| unsafe { node.cast::<Node>().as_mut().map_or(INVALID, Node::recover) })
@@ -2262,6 +2289,44 @@ mod tests {
         let at = nodes[driver].last_tick + PRIMARY_TIMEOUT_MS + 1;
         assert_eq!(nodes[driver].drive_at(at, Input::Tick), OK);
         route_until_quiet(nodes, ids);
+    }
+
+    /// The phi-accrual actuation surface: the host detector that has
+    /// concluded the primary is dead drives `Node::force_view` — no timed
+    /// tick, no `PRIMARY_TIMEOUT_MS` wait. The dead primary is node 0; the
+    /// first backup forces one view past its last known view, the fence
+    /// choreography routes to quiescence skipping the dead socket, and the
+    /// surviving quorum installs a primary that is not the dead id.
+    #[test]
+    fn force_view_abi_actuates_the_phi_detection() {
+        let mut nodes = boot_cluster();
+        for node in nodes.iter_mut() {
+            assert_eq!(node.recover(), OK);
+        }
+        route_until_quiet(&mut nodes, &TEST_IDS);
+        let before = nodes[1].replica.observer().read();
+        assert_eq!(before.status, 0, "the cluster converged");
+
+        // The primary dies: every subsequent route skips its socket. The
+        // backup's detector fires at ~16 ms (item19) — here, zero wait.
+        let target = ViewId {
+            era: Era(before.era),
+            view: View(before.view + 1),
+        };
+        assert_eq!(nodes[1].force_view(target.era.0, target.view.0), OK);
+        route_until_quiet_drop(&mut nodes, &TEST_IDS, TEST_IDS[0]);
+
+        let after = nodes[1].replica.observer().read();
+        assert_eq!(
+            (after.status, after.era, after.view),
+            (0, before.era, before.view + 1),
+            "the forced view installed"
+        );
+        assert_ne!(
+            nodes[1].status().leader,
+            TEST_IDS[0],
+            "the dead id is not the primary"
+        );
     }
 
     /// The joiner member of the four-node tests: id 40, booted the joiner
