@@ -225,6 +225,49 @@ const pub = (l) => {
   return rest;
 };
 
+// --- phi telemetry trace (bulk /api/v1/telemetry/phi body) -------------------
+// One synthetic 90 s trace per process: ~10 ms heartbeat arrivals with
+// jitter, era 4 drifting to era 5 near the end, and a few threshold-
+// crossing decisions at deliberately missed beats.
+const phiTrace = (() => {
+  const start = Date.now() - 90e3;
+  const spikes = [start + 21e3, start + 55e3, start + 86e3];
+  const samples = [];
+  const decisions = [];
+  let ts = start;
+  let spikeIdx = 0;
+  let first = true;
+  while (ts < start + 90e3) {
+    const era = ts - start > 78e3 ? 5 : 4;
+    let dt = 8 + Math.floor(rnd() * 5);
+    let phi = first ? 0 : Math.round((dt / 32) * 1000) / 1000;
+    if (spikeIdx < spikes.length && ts >= spikes[spikeIdx]) {
+      dt = 45 + Math.floor(rnd() * 20);
+      phi = Math.round((dt / 32) * 1000) / 1000;
+      spikeIdx++;
+      decisions.push({
+        leader,
+        era,
+        view,
+        phi,
+        mean_interval_ms: 10,
+        prev_wait_ms: dt,
+        next_wait_ms: 10,
+        min_ms: 8,
+        max_ms: dt,
+      });
+    }
+    samples.push([ts, dt, leader, era, phi]);
+    first = false;
+    ts += dt;
+  }
+  return {
+    samples,
+    decisions,
+    span: { first_ms: samples[0][0], last_ms: samples[samples.length - 1][0] },
+  };
+})();
+
 // --- routes -------------------------------------------------------------------
 Bun.serve({
   hostname: "127.0.0.1",
@@ -336,6 +379,10 @@ Bun.serve({
         if (b) b.held = s.held; // last sample in the bucket wins
       }
       return json(200, { bucketMs, buckets });
+    }
+
+    if (p === "/api/v1/telemetry/phi") {
+      return json(200, phiTrace);
     }
 
     return json(404, { error: "not found" });
