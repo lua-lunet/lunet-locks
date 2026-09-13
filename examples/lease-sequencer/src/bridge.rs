@@ -231,6 +231,47 @@ pub struct Replay {
     pub events: Vec<LockEvent>,
     pub state: LockState,
     pub metrics: BridgeMetrics,
+    /// The phi telemetry: interval samples (marker 5) and timeout
+    /// decisions (marker 2), the ECharts tab's data source.
+    pub phi: PhiTrace,
+}
+
+/// One learned heartbeat-arrival interval (marker 5): when it was
+/// sampled, the learned delta, and the phi estimate at that arrival.
+#[derive(Debug, Clone, Default)]
+pub struct PhiSample {
+    pub ts_ms: u64,
+    pub dt_ms: u64,
+    pub leader: u32,
+    pub era: u32,
+    pub phi: f64,
+}
+
+/// The bulk phi telemetry, endpoint-shaped.
+#[derive(Debug, Clone, Default)]
+pub struct PhiTrace {
+    pub samples: Vec<PhiSample>,
+    pub decisions: Vec<serde_json::Value>,
+}
+
+impl PhiTrace {
+    /// The `/api/v1/telemetry/phi` body: samples as `[[ts_ms, dt_ms,
+    /// leader, era, phi]…]` (the scatter/candle columns), decisions as
+    /// the parsed marker-2 objects, and the span in ms from the
+    /// envelope's ns timestamps.
+    pub fn to_json(&self, first_ns: Option<u64>, last_ns: Option<u64>) -> serde_json::Value {
+        let floor_ms = |ns: u64| ns / 1_000_000;
+        json!({
+            "samples": self.samples.iter()
+                .map(|s| json!([s.ts_ms, s.dt_ms, s.leader, s.era, s.phi]))
+                .collect::<Vec<_>>(),
+            "decisions": self.decisions,
+            "span": {
+                "first_ms": first_ns.map(floor_ms),
+                "last_ms": last_ns.map(floor_ms),
+            },
+        })
+    }
 }
 
 /// One decoded committed op: everything the replay needs.
@@ -742,11 +783,52 @@ impl Server {
 /// A fresh full replay of one series directory.
 fn replay_snapshot(dir: &Path) -> Replay {
     let (events, state, metrics) = replay_series(dir);
+    let phi = phi_trace(dir);
     Replay {
         events,
         state,
         metrics,
+        phi,
     }
+}
+
+/// The phi telemetry pass: decode every marker-5/marker-2 record's
+/// payload, stating what refused to parse rather than guessing.
+fn phi_trace(dir: &Path) -> PhiTrace {
+    let mut metrics = BridgeMetrics::default();
+    let mut samples = Vec::new();
+    let mut decisions = Vec::new();
+    for file in series_files(dir) {
+        for record in read_file_records(&file, &mut metrics) {
+            match record.marker {
+                Marker::TelemetryIntervalSample => {
+                    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&record.payload)
+                    {
+                        let get = |key: &str| value.get(key).and_then(|v| v.as_u64());
+                        if let (Some(ts_ms), Some(dt_ms), Some(leader), Some(era)) = (
+                            get("ts_ms"), get("dt_ms"), get("leader"), get("era"),
+                        ) {
+                            samples.push(PhiSample {
+                                ts_ms,
+                                dt_ms,
+                                leader: leader as u32,
+                                era: era as u32,
+                                phi: value.get("phi").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                            });
+                        }
+                    }
+                }
+                Marker::TelemetryTimeoutDecision => {
+                    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&record.payload)
+                    {
+                        decisions.push(value);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    PhiTrace { samples, decisions }
 }
 
 /// One connection's HTTP lifecycle. WebSocket upgrades park the socket in
@@ -835,6 +917,10 @@ fn route(method: &str, path: &str, snapshot: &Arc<Mutex<Replay>>) -> (u16, Strin
         }
         "/api/v1/metrics" => (200, replay.metrics.to_json().to_string()),
         "/api/v1/metrics/series" => (200, series_json(&replay, unix_millis()).to_string()),
+        "/api/v1/telemetry/phi" => (
+            200,
+            replay.phi.to_json(replay.metrics.first_ns, replay.metrics.last_ns).to_string(),
+        ),
         path if path.starts_with("/api/v1/locks/") => {
             let id: u64 = path
                 .trim_start_matches("/api/v1/locks/")

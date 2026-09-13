@@ -100,10 +100,9 @@ carries no licence file; the licence record is the upstream repository's.
 
 ## Console assets served from CDNs
 
-Not vendored into this repository; loaded by the browser at runtime:
-
-- [Apache ECharts](https://echarts.apache.org/) 5.5.1 — Apache-2.0,
-  served from cdn.jsdelivr.net, SRI-pinned in `console/assets/index.html`
+- [Apache ECharts](https://echarts.apache.org/) 5.6.0 — Apache-2.0,
+  vendored at `console/assets/vendor/echarts.min.js`; `make vendor-lock`
+  mints the sha256-named cache-immutable copy and the nginx redirect.
 - [Inter](https://rsms.me/inter/) and
   [JetBrains Mono](https://www.jetbrains.com/lp/mono/) — SIL Open Font
   License 1.1, served from fonts.googleapis.com / fonts.gstatic.com

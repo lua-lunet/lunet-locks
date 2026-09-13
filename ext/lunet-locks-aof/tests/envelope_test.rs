@@ -46,11 +46,13 @@ fn marker_bytes_are_distinct() {
 }
 
 /// An unknown marker byte classifies to None — the reader's rejection path.
+/// Byte 5 is known: the interval-sample marker.
 #[test]
 fn unknown_marker_byte_rejected() {
     assert_eq!(Marker::from_byte(0), None);
-    assert_eq!(Marker::from_byte(5), None);
+    assert_eq!(Marker::from_byte(5), Some(Marker::TelemetryIntervalSample));
     assert_eq!(Marker::from_byte(0xFF), None);
+    assert_eq!(Marker::from_byte(6), None);
 }
 
 /// A Wire record wraps the raw uVRR wire bytes unchanged: the payload the

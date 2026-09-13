@@ -604,6 +604,14 @@ impl Host {
             leader_addr: phi::addr_text(addr),
             monitor: self.own_id,
         };
+        // The pre-arrival phi: how suspect the leader had become just
+        // before this heartbeat proved it alive — the scatter's y over
+        // time. Reset by the observe below, so read it first.
+        let pre_phi = monitor
+            .live()
+            .filter(|(live_key, _)| **live_key == key)
+            .map(|(_, sketch)| sketch.phi(now))
+            .unwrap_or(0.0);
         let interval = monitor.observe(&key, now);
         self.phi_last_era = Some(trailer.era);
         if let Some(interval) = interval {
@@ -622,7 +630,7 @@ impl Host {
                 Marker::TelemetryIntervalSample,
                 local_ns(),
                 format!(
-                    "{{\"node\":{},\"era\":{},\"leader\":{},\"addr\":\"{}\",\"dt_ms\":{},\"ts_ms\":{}}}",
+                    "{{\"node\":{},\"era\":{},\"leader\":{},\"addr\":\"{}\",\"dt_ms\":{},\"ts_ms\":{},\"phi\":{pre_phi:.3}}}",
                     self.own_id,
                     trailer.era,
                     trailer.leader,

@@ -524,3 +524,45 @@ fn wire_alphabet_is_total() {
         position: 0,
     };
 }
+
+/// The bulk telemetry endpoint: the phi samples (marker 5) and the timeout
+/// decisions (marker 2) as arrays, plus the span — the ECharts tab's data
+/// source.
+#[test]
+fn telemetry_phi_endpoint_serves_samples_and_decisions() {
+    let dir = temp_dir("telemetry-phi");
+    let sample_json = br#"{"node":88,"era":4,"leader":33,"addr":"127.0.0.1:1","dt_ms":22,"ts_ms":1789214915000,"phi":1.106}"#;
+    let decision_json = br#"{"phi":1.7,"now_ms":100,"prev_wait_ms":900,"next_wait_ms":1000,"leader":33,"era":4,"view":1}"#;
+    {
+        let mut aof = AofFile::open(&dir).unwrap();
+        aof.append(
+            &Record::telemetry(
+                Marker::TelemetryIntervalSample,
+                1_000_000_000,
+                sample_json,
+            )
+            .encode(),
+        )
+        .unwrap();
+        aof.append(
+            &Record::telemetry(
+                Marker::TelemetryTimeoutDecision,
+                2_000_000_000,
+                decision_json,
+            )
+            .encode(),
+        )
+        .unwrap();
+    }
+    let server = bridge::Server::spawn(&dir, "127.0.0.1:0", false).unwrap();
+    let (_, reply) = http_get(server.port(), "/api/v1/telemetry/phi");
+    let value: Value = serde_json::from_str(&reply).expect("json");
+    assert_eq!(value["samples"].as_array().unwrap().len(), 1);
+    assert_eq!(value["samples"][0][0], 1789214915000u64, "ts_ms from the payload");
+    assert_eq!(value["samples"][0][1], 22, "dt_ms second column");
+    assert_eq!(value["samples"][0][2], 33, "leader third column");
+    assert_eq!(value["samples"][0][3], 4, "era fourth column");
+    assert_eq!(value["samples"][0][4], 1.106, "phi fifth column");
+    assert_eq!(value["decisions"][0]["phi"], 1.7);
+    assert_eq!(value["span"]["first_ms"], 1000, "the envelope ns floors to ms");
+}

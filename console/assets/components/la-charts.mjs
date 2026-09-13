@@ -66,7 +66,7 @@ class LaCharts extends HTMLElement {
       for (const el of this.querySelectorAll(".plot")) {
         if (!el.dataset.fb) {
           el.dataset.fb = "1";
-          el.innerHTML = '<div class="chart-fallback">echarts CDN unavailable — check network access to cdn.jsdelivr.net</div>';
+          el.innerHTML = '<div class="chart-fallback">echarts failed to load — check that ./vendor/echarts.min.js serves</div>';
         }
       }
       return;
