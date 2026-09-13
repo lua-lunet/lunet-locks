@@ -406,5 +406,153 @@ if not cli_ok then
     check("tl-cli-anchor-echo", false, "main errored: " .. tostring(cli_rc))
 end
 
+-- 9. item03.5: --kind is repeatable AND space-joined, union semantics —
+-- ONE contract in both twins (the dry run proved the divergence: py
+-- overwrote last-wins but split joined values, tl overwrote and
+-- silently exported nothing for joined values).
+local function read_lines(p: string): {string}
+    local fh = io.open(p, "r")
+    local out: {string} = {}
+    if fh ~= nil then
+        for line in fh:lines() do
+            out[#out + 1] = line
+        end
+        fh:close()
+    end
+    return out
+end
+local oku, erru = pcall(function()
+    local u1 = timeline_dir .. "/union1.jsonl"
+    local rcu1 = tool.main({"prog", "--kind", "hb-spacing", "--kind", "aof-noise",
+        timeline_dir, u1})
+    local u2 = timeline_dir .. "/union2.jsonl"
+    local rcu2 = tool.main({"prog", "--kind", "hb-spacing aof-noise", timeline_dir, u2})
+    local l1 = read_lines(u1)
+    local l2 = read_lines(u2)
+    local n_hb, n_noise = 0, 0
+    for _, l in ipairs(l1) do
+        if l:find('"kind": "hb-spacing"', 1, true) ~= nil then
+            n_hb = n_hb + 1
+        end
+        if l:find('"kind": "aof-noise"', 1, true) ~= nil then
+            n_noise = n_noise + 1
+        end
+    end
+    check("kind-union-repeatable", rcu1 == 0 and #l1 == 3
+        and n_hb == 2 and n_noise == 1,
+        tostring(rcu1) .. " lines=" .. tostring(#l1) .. " hb=" .. tostring(n_hb)
+            .. " noise=" .. tostring(n_noise))
+    local same = #l1 == #l2
+    if same then
+        for i = 1, #l1 do
+            if l1[i] ~= l2[i] then
+                same = false
+            end
+        end
+    end
+    check("kind-union-joined-matches-repeatable", rcu2 == 0 and same,
+        "joined and repeatable are one contract")
+end)
+if not oku then
+    check("kind-union-cli", false, "main errored: " .. tostring(erru))
+end
+
+-- 10. item03.5 large-scale twin parity: >=28,000 wire records, ns stamps
+-- ~1.789e18 (> 2^53) — the real-w1b dry run drifted in aof-noise
+-- gaps.mean_ms (the naive accumulation vs the reference's compensated
+-- sum). The tl export of hb-spacing + aof-noise must be byte-identical
+-- to the python twin's CLI export of the same fixture dir.
+local LARGE_N = 28001
+local LBASE_NS = 1789248826514115648 -- 256-aligned: exact as a double literal
+local LBASE_MS = 1789248826514
+local ldir = ".tmp/large-parity-tl"
+os.execute("rm -rf " .. ldir)
+os.execute("mkdir -p " .. ldir)
+local hw = tool.open_writer(ldir .. "/w.aof")
+local lns = ffi.new("uint64_t", LBASE_NS)
+local lsent = LBASE_MS
+for k = 0, LARGE_N - 1 do
+    if k > 0 then
+        local g = 100000 + (k * 2654435761) % 9900000
+        if k % 4096 == 0 then
+            g = g + 5008914641
+        end
+        lns = lns + g
+        lsent = lsent + 5 + (k * 97) % 17
+    end
+    local frame = wire(4, 4, 1, 5) .. string.char(0xc0, 0x0b)
+        .. LE32(4) .. LE32(44) .. LE32(k) .. be64n(lsent):reverse()
+    tool.append(hw, envelope_u64(1, lns, frame))
+end
+tool.close_writer(hw)
+local hg = tool.open_writer(ldir .. "/g.aof")
+for i = 0, 511 do
+    local dt = 20 + (i * 13 % 7) / 3
+    local js = ('{"node":88,"era":4,"leader":44,"addr":"127.0.0.1:1",'
+        .. '"dt_ms":%s,"ts_ms":%d,"phi":0.123,"sent_at_ms":%d}')
+        :format(("%.17g"):format(dt), LBASE_MS + i * 7, LBASE_MS + i * 7)
+    tool.append(hg, envelope_u64(5,
+        ffi.new("uint64_t", LBASE_NS) + 1000000000 + i * 1000000, js))
+end
+tool.close_writer(hg)
+local ltl_out = ldir .. "/tl.jsonl"
+local rcl = tool.main({"prog", "--kind", "hb-spacing", "--kind", "aof-noise",
+    "--hb-ms", "6000", ldir, ltl_out})
+local ph3 = io.popen("command -v python3")
+local has_py3 = (ph3:read("*l") or "") ~= ""
+ph3:close()
+if not has_py3 then
+    print("SKIP: python3 not on PATH — the large-scale twin cross-check needs it")
+end
+if has_py3 then
+    os.execute("python3 tools/aof-trace-tool.py --kind hb-spacing"
+        .. " --kind aof-noise --hb-ms 6000 " .. ldir .. " " .. ldir
+        .. "/py.jsonl > /dev/null 2>&1")
+    local ltl = read_lines(ltl_out)
+    local lpy = read_lines(ldir .. "/py.jsonl")
+    local ident = #ltl == #lpy
+    local firstdiff = "line counts " .. tostring(#ltl) .. "/" .. tostring(#lpy)
+    if ident then
+        for i = 1, #ltl do
+            if ltl[i] ~= lpy[i] then
+                ident = false
+                firstdiff = "line " .. tostring(i) .. ":\ntl: "
+                    .. ltl[i]:sub(1, 160) .. "\npy: " .. lpy[i]:sub(1, 160)
+                break
+            end
+        end
+    end
+    check("large-parity-byte-identical", rcl == 0 and #ltl == 3 and ident, firstdiff)
+    -- the exported aof-noise mean is the compensated (Neumaier) sum over
+    -- the sorted gaps, NOT the naive accumulation the old twin shipped
+    local mean_txt = (ltl[3] ~= nil)
+        and (ltl[3]:match('"mean_ms": ([%d%.]+)') or "?") or "?"
+    local exported_mean = tonumber(mean_txt)
+    local gaps: {number} = {}
+    for i = 1, LARGE_N - 1 do
+        local g = 100000 + (i * 2654435761) % 9900000
+        if i % 4096 == 0 then
+            g = g + 5008914641
+        end
+        gaps[#gaps + 1] = g / 1e6
+    end
+    table.sort(gaps)
+    local naive = 0.0
+    local tot, cor = 0.0, 0.0
+    for _, v in ipairs(gaps) do
+        naive = naive + v
+        local t = tot + v
+        if math.abs(tot) >= math.abs(v) then
+            cor = cor + ((tot - t) + v)
+        else
+            cor = cor + ((v - t) + tot)
+        end
+        tot = t
+    end
+    check("large-parity-compensated-mean", exported_mean == (tot + cor) / #gaps
+        and exported_mean ~= naive / #gaps,
+        "mean=" .. tostring(mean_txt) .. " naive=" .. tostring(naive / #gaps))
+end
+
 print(("aof-trace-tool.tl: %d passed, %d failed"):format(passed, failed))
 os.exit(failed == 0 and 0 or 1)

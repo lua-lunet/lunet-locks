@@ -4,6 +4,19 @@
 # the Teal/LuaJIT tool is the lean twin and their summaries must have
 # PARITY (identical JSON). Reference sketch: the upstream reader gist
 # (handover 337b313e, aof-reader-tool-sketch.md).
+#
+# The twins share two hard contracts (item03.5):
+# - --kind is repeatable AND space-joined, with UNION semantics
+#   ("--kind hb-spacing --kind aof-noise" == "--kind hb-spacing aof-noise");
+#   the special names "all" and "both" expand to their kind sets and
+#   union with any named kinds.
+# - distribution means use one documented summation algorithm: Neumaier
+#   compensated summation over the sorted values (_compensated_sum).
+#
+# The LuaJIT twin's CLI is tools/tl-driver.lua (tl gen of the .tl alone
+# is NOT a CLI — it silently no-ops). Run it from the repo root:
+#   LUA_PATH="./?.tl;./?.lua;.rocks/share/lua/5.1/?.lua;;" \
+#     luajit -l tl tools/tl-driver.lua [--kind KIND ...] DIR OUT.jsonl
 import ctypes
 import json
 import math
@@ -376,6 +389,25 @@ def _row_ts_ms(row: dict):
     return None
 
 
+def _compensated_sum(values) -> float:
+    """The one summation algorithm both twins share (item03.5): Neumaier
+    compensated summation over the sorted values. CPython >= 3.12's
+    sum() already compensates; the explicit loop pins that behaviour
+    version-independently so the LuaJIT twin has an exact recipe to
+    mirror (naive accumulation drifted the aof-noise mean by ~1e-12 ms
+    on the 28k-gap real-w1b trace)."""
+    total = 0.0
+    corr = 0.0
+    for v in values:
+        t = total + v
+        if abs(total) >= abs(v):
+            corr += (total - t) + v
+        else:
+            corr += (v - t) + total
+        total = t
+    return total + corr
+
+
 def _stats(values) -> dict:
     s = sorted(float(v) for v in values)
     n = len(s)
@@ -383,7 +415,7 @@ def _stats(values) -> dict:
         return {"min_ms": ABSENT, "mean_ms": ABSENT, "p50_ms": ABSENT,
                 "p95_ms": ABSENT, "max_ms": ABSENT, "count": 0}
     return {"min_ms": s[0],
-            "mean_ms": sum(s) / n,
+            "mean_ms": _compensated_sum(s) / n,
             "p50_ms": s[math.ceil(0.5 * n) - 1],
             "p95_ms": s[math.ceil(0.95 * n) - 1],
             "max_ms": s[-1],
@@ -543,10 +575,12 @@ def export_series(dir_path, lib=None, kinds="all", anchors=None, hb_ms=5.0):
     """The trace of what happened: one JSON dict per line-worthy event,
     ordered as the trace recorded them (file order = epoch order = ns
     order). Kinds: all | both (reconfig+locks) | phi | phi-samples |
-    reconfig | locks | locks-timeline | hb-spacing | aof-noise. With
-    anchors (unix ms, repeatable), every exported row gains t_rel_ms /
-    t_fmt and the locks-timeline export gains per-anchor takeover
-    summary lines."""
+    reconfig | locks | locks-timeline | hb-spacing | aof-noise; the
+    kinds string is a whitespace-joined UNION (the repeatable --kind
+    CLI flag accumulates into it, one contract with the LuaJIT twin).
+    With anchors (unix ms, repeatable), every exported row gains
+    t_rel_ms / t_fmt and the locks-timeline export gains per-anchor
+    takeover summary lines."""
     dir_path = Path(str(getattr(dir_path, "path", dir_path)))
     wanted = set(kinds.split()) if kinds != "all" else {"locks", "reconfig", "phi", "phi-samples"}
     if kinds == "both":
@@ -645,10 +679,10 @@ def main(argv):
     lib_path = None
     follow_json = False
     export_out = None
-    export_kinds = "all"
     anchors = []
     hb_ms = 5.0
     paths = []
+    kind_parts: list = []  # --kind is repeatable AND space-joined: union
     i = 0
     while i < len(args):
         if args[i] == "--lib":
@@ -658,7 +692,13 @@ def main(argv):
             follow_json = True
             i += 1
         elif args[i] == "--kind":
-            export_kinds = args[i + 1]
+            for token in args[i + 1].split():
+                if token == "all":
+                    kind_parts.extend(("locks", "reconfig", "phi", "phi-samples"))
+                elif token == "both":
+                    kind_parts.extend(("locks", "reconfig"))
+                else:
+                    kind_parts.append(token)
             i += 2
         elif args[i] == "--anchor":
             anchors.append(int(args[i + 1]))
@@ -669,12 +709,13 @@ def main(argv):
         else:
             paths.append(args[i])
             i += 1
+    export_kinds = " ".join(kind_parts) if kind_parts else "all"
     export_out = paths[1] if len(paths) > 1 and not Path(paths[1]).exists() else None
     if export_out is not None:
         paths = paths[:1]
     if not paths:
         print("usage: aof-trace-tool.py [--lib PATH] [--json] "
-              "[--kind KINDS] [--anchor EPOCHMS ...] [--hb-ms N] "
+              "[--kind KIND ...] [--anchor EPOCHMS ...] [--hb-ms N] "
               "FILE_OR_DIR [OUT.jsonl]")
         return 2
     lib = load(lib_path)

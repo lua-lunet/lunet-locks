@@ -8,6 +8,20 @@
 --
 -- Run the parity test: LUA_PATH='./?.tl;./?.lua;<tl-path>;;' luajit -l tl \
 --   -e 'require("tl").loader(); require("tools.test_aof_trace_tool")'
+--
+-- The twins share two hard contracts (item03.5):
+-- - --kind is repeatable AND space-joined, with UNION semantics
+--   ("--kind hb-spacing --kind aof-noise" == "--kind hb-spacing aof-noise");
+--   the special names "all" and "both" expand to their kind sets and
+--   union with any named kinds.
+-- - distribution means use one documented summation algorithm: Neumaier
+--   compensated summation over the sorted values (compensated_sum).
+--
+-- The CLI is tools/tl-driver.lua — tl gen of this module alone is NOT
+-- a CLI (the generated file only runs under the Teal loader and a
+-- plain luajit run silently no-ops). Run it from the repo root:
+--   LUA_PATH="./?.tl;./?.lua;.rocks/share/lua/5.1/?.lua;;" \
+--     luajit -l tl tools/tl-driver.lua [--kind KIND ...] DIR OUT.jsonl
 local ffi = require("ffi")
 
 ffi.cdef([[
@@ -671,7 +685,10 @@ local function ev_json(e: {string: any}): string
 end
 
 -- Parity with the python twin's wanted-set: "all" is the base kinds
--- only (the new kinds ride under their own names).
+-- only (the new kinds ride under their own names). item03.5: the kinds
+-- string is a whitespace-joined UNION (the CLI accumulates repeatable
+-- --kind values into it; "all"/"both" stay whole-string for the
+-- library callers).
 local function kind_wanted(kinds: string, kind: string): boolean
     if kinds == "all" then
         return kind == "locks" or kind == "reconfig" or kind == "phi"
@@ -680,7 +697,12 @@ local function kind_wanted(kinds: string, kind: string): boolean
     if kinds == "both" then
         return kind == "locks" or kind == "reconfig"
     end
-    return kinds == kind
+    for token in kinds:gmatch("%S+") do
+        if token == kind then
+            return true
+        end
+    end
+    return false
 end
 
 -- Forward declarations: the extras (timeline/hb-spacing/aof-noise) and
@@ -912,6 +934,29 @@ end
 -- the sort is stable for the statistics read).
 local STATS_ORDER: {string} = {"min_ms", "mean_ms", "p50_ms", "p95_ms",
                                "max_ms", "count"}
+
+-- The one summation algorithm both twins share (item03.5): Neumaier
+-- compensated summation over the SORTED values — the python twin's
+-- reference behaviour (its _compensated_sum; CPython >= 3.12's sum()
+-- already compensates, the explicit loop pins it version-independently).
+-- Naive left-to-right accumulation drifted the aof-noise mean ~1e-12 ms
+-- on the 28k-gap real-w1b trace; min/p50/p95/max never drifted (they
+-- are picks, not sums).
+local function compensated_sum(s: {number}): number
+    local total = 0.0
+    local corr = 0.0
+    for _, v in ipairs(s) do
+        local t = total + v
+        if math.abs(total) >= math.abs(v) then
+            corr = corr + ((total - t) + v)
+        else
+            corr = corr + ((v - t) + total)
+        end
+        total = t
+    end
+    return total + corr
+end
+
 local function stats(values: {number}): {string: any}
     local s: {number} = {}
     for _, v in ipairs(values) do
@@ -924,11 +969,7 @@ local function stats(values: {number}): {string: any}
                 p95_ms = ABSENT, max_ms = ABSENT, count = ffi.new("uint64_t", 0),
                 _o = STATS_ORDER}
     end
-    local sum = 0.0
-    for _, v in ipairs(s) do
-        sum = sum + v
-    end
-    return {min_ms = s[1], mean_ms = sum / n,
+    return {min_ms = s[1], mean_ms = compensated_sum(s) / n,
             p50_ms = s[math.ceil(0.5 * n)],
             p95_ms = s[math.ceil(0.95 * n)],
             max_ms = s[n], count = ffi.new("uint64_t", n), _o = STATS_ORDER}
@@ -1307,13 +1348,15 @@ end
 
 local function main(argv: {string}): number
     -- Usage parity with the python twin: --lib is accepted (the cdylib
-    -- is loaded at require time), --json, --kind KINDS, repeatable
-    -- --anchor EPOCHMS, --hb-ms N, FILE_OR_DIR [OUT.jsonl].
+    -- is loaded at require time), --json, --kind KIND (repeatable AND
+    -- space-joined, union semantics — one contract with the python
+    -- twin), repeatable --anchor EPOCHMS, --hb-ms N, FILE_OR_DIR
+    -- [OUT.jsonl].
     local follow_json = false
-    local export_kinds = "all"
     local anchors: {number} = {}
     local hb_ms = 5.0
     local paths: {string} = {}
+    local kind_parts: {string} = {}
     local i = 2
     while i <= #argv do
         local a = argv[i]
@@ -1323,7 +1366,19 @@ local function main(argv: {string}): number
             follow_json = true
             i = i + 1
         elseif a == "--kind" then
-            export_kinds = argv[i + 1]
+            for token in argv[i + 1]:gmatch("%S+") do
+                if token == "all" then
+                    kind_parts[#kind_parts + 1] = "locks"
+                    kind_parts[#kind_parts + 1] = "reconfig"
+                    kind_parts[#kind_parts + 1] = "phi"
+                    kind_parts[#kind_parts + 1] = "phi-samples"
+                elseif token == "both" then
+                    kind_parts[#kind_parts + 1] = "locks"
+                    kind_parts[#kind_parts + 1] = "reconfig"
+                else
+                    kind_parts[#kind_parts + 1] = token
+                end
+            end
             i = i + 2
         elseif a == "--anchor" then
             anchors[#anchors + 1] = tonumber(argv[i + 1])
@@ -1336,9 +1391,10 @@ local function main(argv: {string}): number
             i = i + 1
         end
     end
+    local export_kinds = #kind_parts > 0 and table.concat(kind_parts, " ") or "all"
     if #paths < 1 then
         print("usage: aof-trace-tool.tl [--lib PATH] [--json] "
-            .. "[--kind KINDS] [--anchor EPOCHMS ...] [--hb-ms N] "
+            .. "[--kind KIND ...] [--anchor EPOCHMS ...] [--hb-ms N] "
             .. "FILE_OR_DIR [OUT.jsonl]")
         return 2
     end
