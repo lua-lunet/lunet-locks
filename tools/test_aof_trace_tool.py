@@ -114,7 +114,7 @@ class ExportMode(unittest.TestCase):
         tool.append(f, envelope(1, 2000, prepare))
         tool.append(f, envelope(1, 2500, commit + trailer))
         tool.append(f, envelope(2, 3000, b'{"phi":1.7,"now_ms":100,"prev_wait_ms":900,"next_wait_ms":1000,"leader":33,"era":4,"view":1,"mean":22.0}'))
-        tool.append(f, envelope(5, 4000, b'{"node":88,"era":4,"leader":33,"addr":"127.0.0.1:1","dt_ms":22,"ts_ms":1789214915000}'))
+        tool.append(f, envelope(5, 4000, b'{"node":88,"era":4,"leader":33,"addr":"127.0.0.1:1","dt_ms":22,"ts_ms":1789214915000,"phi":0.123,"sent_at_ms":1789214915000}'))
         # a Join reconfig: System payload disc 2, op disc 7, node 77, pos 255
         join = (struct.pack(">IIIQ", 2, 4, 1, 6)
                 + bytes([2])
@@ -144,6 +144,15 @@ class ExportMode(unittest.TestCase):
         reconf = [l for l in out if l["kind"] == "reconfig"][0]
         self.assertEqual(reconf["command"], "Join node=77 position=255")
         self.assertEqual(reconf["leader_ms"], 1789214915000)
+
+    def test_marker5_sent_at_ms_round_trips_into_the_export(self):
+        out = tool.export_series(self.dir, LIB, kinds="phi-samples")
+        self.assertEqual(len(out), 1)
+        sample = out[0]
+        self.assertEqual(sample["node"], 88)
+        self.assertEqual(sample["dt_ms"], 22)
+        self.assertEqual(sample["phi"], 0.123)
+        self.assertEqual(sample["sent_at_ms"], 1789214915000)
 
     def test_export_filters_one_kind(self):
         out = tool.export_series(self.dir, LIB, kinds="locks")

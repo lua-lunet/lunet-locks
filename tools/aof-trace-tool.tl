@@ -541,7 +541,8 @@ local function ev_json(e: {string: any}): string
                              "request_num", "command", "phi", "now_ms",
                              "prev_wait_ms", "next_wait_ms", "mean_interval_ms",
                              "min_ms", "max_ms", "node", "era", "leader",
-                             "view", "addr", "dt_ms", "ts_ms", "phi"}
+                             "view", "addr", "dt_ms", "ts_ms", "phi",
+                             "sent_at_ms"}
     for _, key in ipairs(order) do
         local v = e[key]
         if v ~= nil then
@@ -621,6 +622,7 @@ local function export_series(dir_path: string, kinds: string): {{string: any}}
                     e.dt_ms = json_num(j, "dt_ms")
                     e.ts_ms = json_num(j, "ts_ms")
                     e.phi = json_num(j, "phi")
+                    e.sent_at_ms = json_num(j, "sent_at_ms")
                     events[#events + 1] = e
                 end
             elseif marker == MARKER_WIRE then

@@ -474,6 +474,24 @@ fn parse_options() -> Options {
     options
 }
 
+/// The marker-5 interval-sample JSON: the arrival-interval sample the
+/// exported phi-samples kind plots (one record per learned interval).
+fn interval_sample_json(
+    own_id: u32,
+    trailer: &phi::Trailer,
+    addr_text: &str,
+    dt_ms: u64,
+    now_ms: u64,
+    phi: f64,
+) -> String {
+    format!(
+        "{{\"node\":{own_id},\"era\":{},\"leader\":{},\"addr\":\"{addr_text}\",\
+         \"dt_ms\":{dt_ms},\"ts_ms\":{now_ms},\"phi\":{phi:.3},\
+         \"sent_at_ms\":{}}}",
+        trailer.era, trailer.leader, trailer.sent_at_ms
+    )
+}
+
 impl Host {
     fn note(&self, body: &str) {
         info!("{} ts={}", body, millis());
@@ -598,10 +616,11 @@ impl Host {
         let Some(monitor) = &mut self.phi_monitor else {
             return;
         };
+        let addr_text = phi::addr_text(addr);
         let key = phi::SketchKey {
             era: trailer.era,
             leader: trailer.leader,
-            leader_addr: phi::addr_text(addr),
+            leader_addr: addr_text.clone(),
             monitor: self.own_id,
         };
         // The pre-arrival phi: how suspect the leader had become just
@@ -617,11 +636,7 @@ impl Host {
         if let Some(interval) = interval {
             self.note(&format!(
                 "phi-interval node={} era={} leader={} addr={} dt={}",
-                self.own_id,
-                trailer.era,
-                trailer.leader,
-                phi::addr_text(addr),
-                interval
+                self.own_id, trailer.era, trailer.leader, addr_text, interval
             ));
             // The sampled-estimate evidence (marker 5): the arrival's
             // learned interval AND when it was sampled — the exported
@@ -629,16 +644,8 @@ impl Host {
             self.record_telemetry(Record::telemetry(
                 Marker::TelemetryIntervalSample,
                 local_ns(),
-                format!(
-                    "{{\"node\":{},\"era\":{},\"leader\":{},\"addr\":\"{}\",\"dt_ms\":{},\"ts_ms\":{},\"phi\":{pre_phi:.3}}}",
-                    self.own_id,
-                    trailer.era,
-                    trailer.leader,
-                    phi::addr_text(addr),
-                    interval,
-                    now
-                )
-                .as_bytes(),
+                interval_sample_json(self.own_id, trailer, &addr_text, interval, now, pre_phi)
+                    .as_bytes(),
             ));
         }
     }
@@ -2085,4 +2092,29 @@ fn handle_client_line(host: &mut Host, index: usize, line: &str, now: u64, rng: 
         deadline: now + ADMIN_DEADLINE_MS,
     });
     true
+}
+
+#[cfg(test)]
+mod interval_sample_tests {
+    use super::*;
+
+    #[test]
+    fn sample_json_carries_the_leader_send_clock() {
+        let trailer = phi::Trailer {
+            era: 4,
+            leader: 33,
+            seq: 9,
+            sent_at_ms: 1_789_214_915_000,
+        };
+        let json = interval_sample_json(88, &trailer, "127.0.0.1:1", 22, 1_789_214_915_022, 0.5);
+        for key in [
+            "node", "era", "leader", "addr", "dt_ms", "ts_ms", "phi", "sent_at_ms",
+        ] {
+            assert!(json.contains(&format!("\"{key}\"")), "missing {key}: {json}");
+        }
+        assert!(
+            json.contains("\"sent_at_ms\":1789214915000"),
+            "leader send clock missing: {json}"
+        );
+    }
 }
