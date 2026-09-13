@@ -27,7 +27,9 @@
 //! GET probe, never a blind BUMP.
 
 mod membership;
-pub mod phi;
+// The lib crate owns the phi module (its #[no_mangle] C-ABI surface must
+// exist in exactly one compilation unit — the lib rlib the bin links).
+pub use lease_sequencer::phi;
 pub mod telemetry;
 mod transport;
 
