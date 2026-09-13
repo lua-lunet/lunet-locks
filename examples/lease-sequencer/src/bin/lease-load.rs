@@ -28,11 +28,11 @@
 //! NON-holder — its first action is a GET probe, never a blind BUMP or
 //! SET renewal. Transitions are logged on the client's stdout stream.
 
-use lease_sequencer::client_gate::{self, Gate, Mode, Op};
+use lease_sequencer::client_gate::{self, Mode};
+use lease_sequencer::embedded_client::{Config, Contender, Signals, reply_ok};
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -121,49 +121,10 @@ fn wall_ms() -> u64 {
         .as_millis() as u64
 }
 
-/// The process-level signal flags: SIGUSR1 (silence) and SIGUSR2 (start)
-/// arrive asynchronously and light `Arc<AtomicBool>`s; every worker drains
-/// both at its sleep/every-iteration boundary into its own client gate.
-/// No request or reply encoding changes — the gate sits entirely outside
-/// the wire.
-#[derive(Clone)]
-struct Signals {
-    silence: Arc<AtomicBool>,
-    start: Arc<AtomicBool>,
-}
-
-impl Signals {
-    fn register() -> Signals {
-        let silence = Arc::new(AtomicBool::new(false));
-        let start = Arc::new(AtomicBool::new(false));
-        signal_hook::flag::register(signal_hook::consts::SIGUSR1, Arc::clone(&silence))
-            .expect("SIGUSR1 registration");
-        signal_hook::flag::register(signal_hook::consts::SIGUSR2, Arc::clone(&start))
-            .expect("SIGUSR2 registration");
-        Signals { silence, start }
-    }
-
-    /// Drain both flags into the worker's gate. Transitions are logged on
-    /// the client's normal stdout stream; repeated signals in the same
-    /// mode are no-ops (the gate was already there).
-    fn apply(&self, gate: &mut Gate) {
-        let now = wall_ms();
-        if self.silence.swap(false, Ordering::Relaxed) {
-            let was_on = gate.mode == Mode::On;
-            client_gate::stop(gate, now);
-            if was_on {
-                println!("client stop (SIGUSR1) at wall={now}");
-            }
-        }
-        if self.start.swap(false, Ordering::Relaxed) {
-            let was_off = gate.mode == Mode::Off;
-            client_gate::start(gate, now);
-            if was_off {
-                println!("client start (SIGUSR2) at wall={now}");
-            }
-        }
-    }
-}
+// The process-level SIGUSR1 (silence) / SIGUSR2 (start) flags and their
+// gate plumbing live in the shared embedded-client module: the same
+// signal gate, the same transition log lines, the same chase machinery
+// the sequencer host's embedded clients run (src/embedded_client.rs).
 
 struct Rng(u64);
 
@@ -183,14 +144,11 @@ impl Rng {
 }
 
 /// One timed operation: the round trip in microseconds from the client's
-/// monotonic clock, plus the leader-echoed expiry interpretation.
+/// monotonic clock.
 struct Sample {
     op: &'static str,
     ok: bool,
     rt_us: u64,
-    /// Remaining lease in the leader's timeline at execution
-    /// (`expiry - executed_at`), when the reply carried a lease.
-    remaining_ms: Option<u64>,
 }
 
 #[derive(Default)]
@@ -307,7 +265,6 @@ impl Link {
                     op,
                     ok: false,
                     rt_us: rt,
-                    remaining_ms: None,
                 },
                 None,
             );
@@ -322,7 +279,6 @@ impl Link {
                         op,
                         ok: false,
                         rt_us: rt,
-                        remaining_ms: None,
                     },
                     None,
                 );
@@ -331,9 +287,7 @@ impl Link {
         }
         let rt = start.elapsed().as_micros() as u64;
         let reply: Option<Value> = serde_json::from_str(line.trim_end()).ok();
-        let ok = reply
-            .as_ref()
-            .is_some_and(|reply| reply.get("error").is_none());
+        let ok = reply.as_ref().is_some_and(|reply| reply_ok(reply));
         // The client-side TCP port answers a non-leader `not_leader` and
         // does not forward: the op is a completed (failed) round trip, and
         // the connection rotates to the next node so the stream follows
@@ -344,18 +298,11 @@ impl Link {
         if not_leader {
             self.reconnect();
         }
-        let remaining_ms = reply.as_ref().and_then(|reply| {
-            let lease = reply.get("lease")?;
-            let expiry = lease.get("expiry")?.as_u64()?;
-            let executed_at = reply.get("executed_at")?.as_u64()?;
-            Some(expiry.saturating_sub(executed_at))
-        });
         (
             Sample {
                 op,
                 ok,
                 rt_us: rt,
-                remaining_ms,
             },
             reply,
         )
@@ -374,112 +321,44 @@ impl Link {
 /// The contender loop: hold the lock under a lease (SET), renew it one
 /// window ahead of the leader-echoed deadline (BUMP as the same-holder
 /// regrant), poll as GET while a live incumbent stands, and race to SET
-/// when the lock is free or expired — the design's §1.2 cadence.
+/// when the lock is free or expired — the design's §1.2 cadence, driven
+/// through the shared decision machinery (the same module the sequencer
+/// host's embedded clients run in-process).
 fn contender(options: &Options, shared: &Arc<Mutex<Vec<Sample>>>, index: usize, signals: &Signals) {
-    let mut rng = Rng::new(wall_ms() ^ (index as u64 + 1) ^ (std::process::id() as u64));
-    let client_id = options.id_base + index as u64;
-    let holder = format!("{:032x}", rng.next());
+    let mut contender = Contender::new(
+        Config {
+            lock_id: options.lock_id,
+            client_id: options.id_base + index as u64,
+            lease_ms: options.lease_ms,
+            renew_fraction: options.renew_fraction,
+        },
+        wall_ms() ^ (index as u64 + 1) ^ (std::process::id() as u64),
+    );
     let mut link = Link::connect(&options.servers, index);
-    // The gate boots OFF (silence until the first SIGUSR2) and is the
-    // single owner of the chase state: schedule, holdership identity, and
-    // the lease-id/request-num bookkeeping (silence resets it all).
-    let mut gate = client_gate::boot();
-    // The renewal schedule lives a renewal-margin inside the leader-echoed
-    // deadline.
-    let renew_margin = (options.lease_ms as f64 * (1.0 - options.renew_fraction)) as u64;
     loop {
-        signals.apply(&mut gate);
-        if gate.mode == Mode::Off {
+        signals.apply(contender.gate());
+        if contender.mode() == Mode::Off {
             std::thread::sleep(Duration::from_millis(20));
             continue;
         }
         let now = wall_ms();
-        if let Some(at) = gate.schedule
+        if let Some(at) = contender.scheduled_at()
             && now < at
         {
             std::thread::sleep(Duration::from_millis((at - now).clamp(1, 20)));
             continue;
         }
-        let (op, request) = match client_gate::next_op(&gate, now).expect("gate is On") {
-            Op::Get => {
-                gate.request_num += 1;
-                let message_id = uuid::Uuid::new_v4();
-                (
-                    "get",
-                    format!(
-                        "{{\"op\":\"get\",\"message_id\":\"{message_id}\",\"client_id\":{client_id},\"request_num\":{},\"lock_id\":{}}}",
-                        gate.request_num, options.lock_id
-                    ),
-                )
-            }
-            Op::Bump => {
-                // A renewal (BUMP): the same-holder regrant extends the
-                // lease by one window from now. Reachable only while the
-                // gate still holds the lock.
-                gate.request_num += 1;
-                gate.lease_id += 1;
-                let message_id = uuid::Uuid::new_v4();
-                let expiry = wall_ms() + options.lease_ms;
-                (
-                    "bump",
-                    format!(
-                        "{{\"op\":\"set\",\"message_id\":\"{message_id}\",\"client_id\":{client_id},\"request_num\":{},\"lock_id\":{},\"lease\":{{\"lease_id\":{},\"holder\":\"{holder}\",\"expiry\":{expiry}}}}}",
-                        gate.request_num, options.lock_id, gate.lease_id
-                    ),
-                )
-            }
-            Op::Set => unreachable!("the gate schedules probes and renewals only"),
+        let Some(action) = contender.next_action(now) else {
+            continue;
         };
-        let (sample, reply) = link.round_trip(&request, op);
-        let holds = reply.as_ref().is_some_and(|reply| {
-            reply
-                .get("lease")
-                .and_then(|lease| lease.get("holder"))
-                .and_then(|lease_holder| lease_holder.as_str())
-                .is_some_and(|lease_holder| lease_holder == holder)
-                && reply
-                    .get("granted")
-                    .and_then(|granted| granted.as_bool())
-                    .unwrap_or(true)
-        });
-        if holds {
-            gate.holder = Some(holder.clone());
-        }
-        gate.schedule = match (op, sample.ok, sample.remaining_ms, holds) {
-            ("get", true, Some(remaining), false) => {
-                // A live foreign incumbent: poll past its leader-echoed
-                // expiry with jitter; it may renew out from under us.
-                Some(wall_ms() + remaining + rng.below(100))
-            }
-            ("get", true, remaining, _) => {
-                // Free or expired: race to SET immediately.
-                if remaining.is_some() {
-                    Some(wall_ms() + rng.below(50))
-                } else {
-                    let expiry = wall_ms() + options.lease_ms;
-                    gate.request_num += 1;
-                    gate.lease_id += 1;
-                    let message_id = uuid::Uuid::new_v4();
-                    let request = format!(
-                        "{{\"op\":\"set\",\"message_id\":\"{message_id}\",\"client_id\":{client_id},\"request_num\":{},\"lock_id\":{},\"lease\":{{\"lease_id\":{},\"holder\":\"{holder}\",\"expiry\":{expiry}}}}}",
-                        gate.request_num, options.lock_id, gate.lease_id
-                    );
-                    let (sample, _) = link.round_trip(&request, "set");
-                    shared.lock().unwrap().push(sample);
-                    gate.holder = Some(holder.clone());
-                    Some(wall_ms() + options.lease_ms - renew_margin)
-                }
-            }
-            ("bump", true, Some(remaining), _) => {
-                Some(wall_ms() + remaining.saturating_sub(renew_margin))
-            }
-            _ => {
-                // Error, rejection, or an unparseable reply: back off and
-                // probe again.
-                Some(wall_ms() + 100 + rng.below(200))
-            }
-        };
+        let (sample, reply) = link.round_trip(&action.request, action.op);
         shared.lock().unwrap().push(sample);
+        if let Some(race) = contender.absorb(wall_ms(), &action, reply.as_ref()) {
+            // A free or expired probe races to SET immediately.
+            let (sample, reply) = link.round_trip(&race.request, race.op);
+            shared.lock().unwrap().push(sample);
+            contender.absorb(wall_ms(), &race, reply.as_ref());
+        }
     }
 }
 

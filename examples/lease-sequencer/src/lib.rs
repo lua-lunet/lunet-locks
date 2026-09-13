@@ -4,5 +4,6 @@
 
 pub mod bridge;
 pub mod client_gate;
+pub mod embedded_client;
 pub mod phi;
 pub mod telemetry;

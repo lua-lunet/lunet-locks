@@ -11,12 +11,27 @@
 //! schedule the next poll at the reported expiry plus `rand()*100 ms`.
 //! Every attempt is logged as
 //! `lease-attempt ts=<ms> node=<id> op=set|renew|get|steal expiry=<ms>`.
+//!
+//! The embedded lock client: launched with `--embedded-client N`, the
+//! host runs N contender loops against its own `Node` in-process (the
+//! shared `embedded_client` module — the same chase machine the
+//! `lease-load` binary drives over the wire, no client→cluster TCP).
+//! Every op is submitted through the node's own request path — proposed
+//! locally when this node leads, forwarded to the leader over the peer
+//! application channel otherwise — so the committed lock transitions
+//! are the same Service calls the wire clients' verbs exercise and the
+//! AOF records identical evidence. The loops share the host's client
+//! gate: SIGUSR1 silences every embedded client (holdership forgotten,
+//! in-flight ops abandoned), SIGUSR2 starts them, boot is OFF, and a
+//! restarted client re-enters as a NON-holder — its first action is a
+//! GET probe, never a blind BUMP.
 
 mod membership;
 pub mod phi;
 pub mod telemetry;
 mod transport;
 
+use lease_sequencer::embedded_client::{self, Action, Runner};
 use lunet_advisory_lock::{
     NOT_LEADER, Node, OK, POSITION_APPEND, RECONFIGURE_DECREMENT, RECONFIGURE_INCREMENT,
     RECONFIGURE_JOIN, RECONFIGURE_LEAVE, RecoveryFlush, maybe_invariant,
@@ -32,6 +47,12 @@ use tracing_appender::non_blocking::WorkerGuard;
 
 /// The sequencer lease's sentinel lock id.
 const LOCK_ID: u64 = 0x0DDBA11;
+/// The embedded lock clients' default chase target (the lease-load
+/// binary's default lock).
+const EMBEDDED_LOCK_ID: u64 = 0x0DDBA12;
+/// The embedded lock clients' client-id base (the lease-load default;
+/// client `i` uses `800_000 + i`).
+const EMBEDDED_CLIENT_ID_BASE: u64 = 800_000;
 /// The full lease the sequencer holds, in milliseconds.
 const LEASE_MS: u64 = 500;
 /// The renewal lead: the holder renews this long before its own deadline
@@ -215,6 +236,11 @@ struct Host {
     /// disabled the stream for the process (telemetry contract: never
     /// poison the replication path).
     telemetry: Option<telemetry::TelemetryLog>,
+    /// The embedded lock client runner (item04): N contender loops against
+    /// this node's own service, ticked from the host loop behind the
+    /// host's SIGUSR1/SIGUSR2 client gate. `None` when launched without
+    /// `--embedded-client`.
+    embedded: Option<Runner>,
 }
 
 /// The boot-time era-qualified discovery state: request to every node the
@@ -385,6 +411,17 @@ struct Options {
     /// The hard safety multiple: no detection fires before
     /// `safety * heartbeat_ms` of leader silence, whatever phi says.
     phi_safety: f64,
+    /// The embedded lock client count (item04): N contender loops run
+    /// in-process against the node's own service, behind the host's
+    /// SIGUSR1/SIGUSR2 client gate. 0 = none (no signal registration).
+    embedded_clients: usize,
+    /// The lock the embedded clients chase.
+    embedded_lock_id: u64,
+    /// The embedded clients' lease window (the lease-load default).
+    embedded_client_ttl_ms: u64,
+    /// The embedded clients' renewal point as a fraction of the window
+    /// (the lease-load default).
+    embedded_renew_fraction: f64,
 }
 
 fn parse_options() -> Options {
@@ -408,6 +445,10 @@ fn parse_options() -> Options {
         recovery_ms: 1000,
         phi_threshold: 1.0,
         phi_safety: 2.0,
+        embedded_clients: 0,
+        embedded_lock_id: EMBEDDED_LOCK_ID,
+        embedded_client_ttl_ms: 500,
+        embedded_renew_fraction: 0.5,
     };
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut index = 0;
@@ -447,6 +488,16 @@ fn parse_options() -> Options {
             "--recovery-ms" => options.recovery_ms = value.parse().unwrap_or(1000),
             "--phi-threshold" => options.phi_threshold = value.parse().unwrap_or(1.0),
             "--phi-safety" => options.phi_safety = value.parse().unwrap_or(2.0),
+            "--embedded-client" => {
+                options.embedded_clients = value.parse().unwrap_or(0)
+            }
+            "--lock" => options.embedded_lock_id = value.parse().unwrap_or(EMBEDDED_LOCK_ID),
+            "--client-ttl-ms" => {
+                options.embedded_client_ttl_ms = value.parse().unwrap_or(500)
+            }
+            "--renew-fraction" => {
+                options.embedded_renew_fraction = value.parse().unwrap_or(0.5)
+            }
             other => {
                 eprintln!("lease-sequencer: unknown option {other}");
                 exit(2);
@@ -467,7 +518,8 @@ fn parse_options() -> Options {
              [--telemetry-rollover-mib N] [--phi-timeout-min-ms N] [--phi-timeout-max-ms N] \
              [--recovery-flush diskless|single|double-ring] [--recovery-scratch-dir PATH] \
              [--heartbeat-ms N] [--election-ms N] [--recovery-ms N] \
-             [--phi-threshold F] [--phi-safety F]"
+             [--phi-threshold F] [--phi-safety F] \
+             [--embedded-client N] [--lock N] [--client-ttl-ms N] [--renew-fraction F]"
         );
         exit(2);
     }
@@ -917,6 +969,8 @@ impl Host {
                         None => continue,
                     };
                     self.driver_complete(op, &out.bytes, now, rng);
+                } else if self.embedded_reply(now, rng, &out.message_id, &out.bytes) {
+                    // An embedded contender's op completed in-process.
                 } else {
                     for conn in &mut self.conns {
                         let matches = matches!(
@@ -1233,6 +1287,62 @@ impl Host {
         }
         self.submit_get(now, rng);
     }
+
+    /// Feed one kind-2 reply to the embedded runner: the client whose
+    /// in-flight op carries this message id absorbs it (and submits the
+    /// free-probe SET race its absorption decides on). `true` when the
+    /// runner claimed the reply.
+    fn embedded_reply(
+        &mut self,
+        now: u64,
+        rng: &mut Rng,
+        message_id: &[u8; 16],
+        bytes: &[u8],
+    ) -> bool {
+        let Some(mut runner) = self.embedded.take() else {
+            return false;
+        };
+        let absorbed = runner.absorb(now, message_id, bytes, &mut |action| {
+            self.submit_embedded(now, rng, action)
+        });
+        self.embedded = Some(runner);
+        absorbed
+    }
+
+    /// A forwarded embedded op's not-leader refusal: the pending op is
+    /// dropped and the chase backs off. `true` when the runner owned the
+    /// message id.
+    fn embedded_not_leader(&mut self, now: u64, message_id: &[u8; 16]) -> bool {
+        let Some(mut runner) = self.embedded.take() else {
+            return false;
+        };
+        let dropped = runner.not_leader(now, message_id);
+        self.embedded = Some(runner);
+        dropped
+    }
+
+    /// One embedded action's submission route — the same route the
+    /// lease driver's ops take: propose locally as the leader, forward
+    /// to the leader over the application channel; anything else is a
+    /// refusal the runner absorbs as a backoff-and-reprobe.
+    fn submit_embedded(&mut self, now: u64, rng: &mut Rng, action: &Action) -> bool {
+        let rc = self.node.request(action.request.as_bytes());
+        if rc == OK {
+            return true;
+        }
+        self.flush_outputs(now, rng);
+        if rc == NOT_LEADER {
+            let status = self.node.status();
+            if status.leader != LEADER_UNKNOWN
+                && status.leader != self.own_id
+                && let Some(&addr) = self.peers.get(&status.leader)
+            {
+                self.send_forward_request(addr, &action.message_id, &action.request);
+                return true;
+            }
+        }
+        false
+    }
 }
 
 fn main() {
@@ -1425,6 +1535,25 @@ fn main() {
         next_action_at: millis() + 300,
         pending: None,
     };
+    // The embedded lock client (item04): N contender loops against this
+    // node's own service, behind the host's client gate. The SIGUSR1 /
+    // SIGUSR2 flags are registered only when clients run — a gateless
+    // host ignores them.
+    let embedded = (options.embedded_clients > 0).then(|| {
+        let signals = embedded_client::Signals::register();
+        Runner::new(
+            options.embedded_clients,
+            embedded_client::Config {
+                lock_id: options.embedded_lock_id,
+                client_id: EMBEDDED_CLIENT_ID_BASE,
+                lease_ms: options.embedded_client_ttl_ms,
+                renew_fraction: options.embedded_renew_fraction,
+            },
+            signals,
+            OP_DEADLINE_MS,
+            millis() ^ (std::process::id() as u64),
+        )
+    });
     let mut host = Host {
         node,
         sock,
@@ -1479,6 +1608,7 @@ fn main() {
             fixed_ms: options.election_ms,
         },
         telemetry,
+        embedded,
     };
     host.note(&format!(
         "boot name={} descriptor-id={own_desc_id} own={own_id} incarnation={incarnation}",
@@ -1537,6 +1667,7 @@ fn main() {
         timers(&mut host, now, &mut rng);
         host.discovery_step(now);
         host.driver_step(now, &mut rng);
+        embedded_step(&mut host, now, &mut rng);
         host.flush_outputs(now, &mut rng);
         // The AOF lifecycle gate + the 1000 ms forced flusher + the
         // rollover (item22 M2): the gate follows the node's voting
@@ -1638,6 +1769,18 @@ fn timers(host: &mut Host, now: u64, rng: &mut Rng) {
         let _ = host.node.recover();
         host.flush_outputs(now, rng);
     }
+}
+
+/// One host-loop tick of the embedded lock client runner (item04): drain
+/// the process signal flags into every embedded client's gate and step
+/// each chase — one op in flight at a time, submitted through the node's
+/// own request path.
+fn embedded_step(host: &mut Host, now: u64, rng: &mut Rng) {
+    let Some(mut runner) = host.embedded.take() else {
+        return;
+    };
+    runner.tick(now, &mut |action| host.submit_embedded(now, rng, action));
+    host.embedded = Some(runner);
 }
 
 fn pump_udp(host: &mut Host, now: u64, rng: &mut Rng) {
@@ -1775,10 +1918,11 @@ fn handle_packet(
             }
         }
         0x02 => {
-            // FORWARD_RESPONSE: correlate to the driver's pending op. An
-            // ack that correlates to nothing is a maybe: unexpected, not
-            // provably impossible (the pending op may have timed out and
-            // been retried in the window), and survivable.
+            // FORWARD_RESPONSE: correlate to the driver's pending op or an
+            // embedded contender's. An ack that correlates to nothing is a
+            // maybe: unexpected, not provably impossible (the pending op
+            // may have timed out and been retried in the window), and
+            // survivable.
             if payload.len() > 1 + 16
                 && host
                     .driver
@@ -1793,23 +1937,34 @@ fn handle_packet(
             } else if payload.len() > 1 + 16 {
                 let mut message_id = [0u8; 16];
                 message_id.copy_from_slice(&payload[1..17]);
-                maybe_invariant!(
-                    "ack for an unclaimed verb (message_id={}, len={})",
-                    uuid::Uuid::from_bytes(message_id),
-                    payload.len()
-                );
+                if host.embedded_reply(now, rng, &message_id, &payload[17..]) {
+                    // The embedded contender's forwarded op completed.
+                } else {
+                    maybe_invariant!(
+                        "ack for an unclaimed verb (message_id={}, len={})",
+                        uuid::Uuid::from_bytes(message_id),
+                        payload.len()
+                    );
+                }
             }
         }
-        // FORWARD_NOT_LEADER: drop the pending op; the policy retries.
-        0x03 if payload.len() == 1 + 16 + 8
-            && host
+        // FORWARD_NOT_LEADER: drop the pending op — the driver's or an
+        // embedded contender's; the policy retries.
+        0x03 if payload.len() == 1 + 16 + 8 => {
+            let mut message_id = [0u8; 16];
+            message_id.copy_from_slice(&payload[1..17]);
+            if host
                 .driver
                 .pending
                 .as_ref()
-                .is_some_and(|p| p.message_id == payload[1..17]) =>
-        {
-            host.driver.pending = None;
-            host.driver.next_action_at = now + rng.below(80) + 20;
+                .is_some_and(|p| p.message_id == message_id)
+            {
+                host.driver.pending = None;
+                host.driver.next_action_at = now + rng.below(80) + 20;
+            } else if host.embedded_not_leader(now, &message_id) {
+                // The embedded contender's forwarded op was refused; the
+                // chase backs off and re-probes.
+            }
         }
         _ => {}
     }
