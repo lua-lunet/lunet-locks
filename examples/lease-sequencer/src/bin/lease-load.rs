@@ -20,10 +20,19 @@
 //! --renew-fraction 0.8` runs the design's cadence exactly; the committed
 //! demo's aggressive timing (500 ms lease, renewal at half the window) is
 //! the default.
+//!
+//! The client gate boots every worker OFF: a (re)started client is silent
+//! until the first SIGUSR2 (start) and returns to OFF on SIGUSR1
+//! (silence). Silence also forgets holdership and resets the lease-id /
+//! request-num bookkeeping, so a restarted worker re-enters as a
+//! NON-holder — its first action is a GET probe, never a blind BUMP or
+//! SET renewal. Transitions are logged on the client's stdout stream.
 
+use lease_sequencer::client_gate::{self, Gate, Mode, Op};
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -110,6 +119,50 @@ fn wall_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .expect("clock before epoch")
         .as_millis() as u64
+}
+
+/// The process-level signal flags: SIGUSR1 (silence) and SIGUSR2 (start)
+/// arrive asynchronously and light `Arc<AtomicBool>`s; every worker drains
+/// both at its sleep/every-iteration boundary into its own client gate.
+/// No request or reply encoding changes — the gate sits entirely outside
+/// the wire.
+#[derive(Clone)]
+struct Signals {
+    silence: Arc<AtomicBool>,
+    start: Arc<AtomicBool>,
+}
+
+impl Signals {
+    fn register() -> Signals {
+        let silence = Arc::new(AtomicBool::new(false));
+        let start = Arc::new(AtomicBool::new(false));
+        signal_hook::flag::register(signal_hook::consts::SIGUSR1, Arc::clone(&silence))
+            .expect("SIGUSR1 registration");
+        signal_hook::flag::register(signal_hook::consts::SIGUSR2, Arc::clone(&start))
+            .expect("SIGUSR2 registration");
+        Signals { silence, start }
+    }
+
+    /// Drain both flags into the worker's gate. Transitions are logged on
+    /// the client's normal stdout stream; repeated signals in the same
+    /// mode are no-ops (the gate was already there).
+    fn apply(&self, gate: &mut Gate) {
+        let now = wall_ms();
+        if self.silence.swap(false, Ordering::Relaxed) {
+            let was_on = gate.mode == Mode::On;
+            client_gate::stop(gate, now);
+            if was_on {
+                println!("client stop (SIGUSR1) at wall={now}");
+            }
+        }
+        if self.start.swap(false, Ordering::Relaxed) {
+            let was_off = gate.mode == Mode::Off;
+            client_gate::start(gate, now);
+            if was_off {
+                println!("client start (SIGUSR2) at wall={now}");
+            }
+        }
+    }
 }
 
 struct Rng(u64);
@@ -322,65 +375,77 @@ impl Link {
 /// window ahead of the leader-echoed deadline (BUMP as the same-holder
 /// regrant), poll as GET while a live incumbent stands, and race to SET
 /// when the lock is free or expired — the design's §1.2 cadence.
-fn contender(options: &Options, shared: &Arc<Mutex<Vec<Sample>>>, index: usize) {
+fn contender(options: &Options, shared: &Arc<Mutex<Vec<Sample>>>, index: usize, signals: &Signals) {
     let mut rng = Rng::new(wall_ms() ^ (index as u64 + 1) ^ (std::process::id() as u64));
     let client_id = options.id_base + index as u64;
     let holder = format!("{:032x}", rng.next());
     let mut link = Link::connect(&options.servers, index);
-    let mut request_num: u64 = 0;
-    let mut lease_id: u64 = 0;
-    // None = probe; Some(at) = the wall-ms instant of the next action.
-    let mut next_action: Option<u64> = None;
+    // The gate boots OFF (silence until the first SIGUSR2) and is the
+    // single owner of the chase state: schedule, holdership identity, and
+    // the lease-id/request-num bookkeeping (silence resets it all).
+    let mut gate = client_gate::boot();
+    // The renewal schedule lives a renewal-margin inside the leader-echoed
+    // deadline.
     let renew_margin = (options.lease_ms as f64 * (1.0 - options.renew_fraction)) as u64;
     loop {
+        signals.apply(&mut gate);
+        if gate.mode == Mode::Off {
+            std::thread::sleep(Duration::from_millis(20));
+            continue;
+        }
         let now = wall_ms();
-        if let Some(at) = next_action
+        if let Some(at) = gate.schedule
             && now < at
         {
             std::thread::sleep(Duration::from_millis((at - now).clamp(1, 20)));
             continue;
         }
-        let (op, request) = match next_action {
-            None => {
-                request_num += 1;
+        let (op, request) = match client_gate::next_op(&gate, now).expect("gate is On") {
+            Op::Get => {
+                gate.request_num += 1;
                 let message_id = uuid::Uuid::new_v4();
                 (
                     "get",
                     format!(
-                        "{{\"op\":\"get\",\"message_id\":\"{message_id}\",\"client_id\":{client_id},\"request_num\":{request_num},\"lock_id\":{}}}",
-                        options.lock_id
+                        "{{\"op\":\"get\",\"message_id\":\"{message_id}\",\"client_id\":{client_id},\"request_num\":{},\"lock_id\":{}}}",
+                        gate.request_num, options.lock_id
                     ),
                 )
             }
-            Some(_) => {
+            Op::Bump => {
                 // A renewal (BUMP): the same-holder regrant extends the
-                // lease by one window from now.
-                request_num += 1;
-                lease_id += 1;
+                // lease by one window from now. Reachable only while the
+                // gate still holds the lock.
+                gate.request_num += 1;
+                gate.lease_id += 1;
                 let message_id = uuid::Uuid::new_v4();
                 let expiry = wall_ms() + options.lease_ms;
                 (
                     "bump",
                     format!(
-                        "{{\"op\":\"set\",\"message_id\":\"{message_id}\",\"client_id\":{client_id},\"request_num\":{request_num},\"lock_id\":{},\"lease\":{{\"lease_id\":{lease_id},\"holder\":\"{holder}\",\"expiry\":{expiry}}}}}",
-                        options.lock_id
+                        "{{\"op\":\"set\",\"message_id\":\"{message_id}\",\"client_id\":{client_id},\"request_num\":{},\"lock_id\":{},\"lease\":{{\"lease_id\":{},\"holder\":\"{holder}\",\"expiry\":{expiry}}}}}",
+                        gate.request_num, options.lock_id, gate.lease_id
                     ),
                 )
             }
+            Op::Set => unreachable!("the gate schedules probes and renewals only"),
         };
         let (sample, reply) = link.round_trip(&request, op);
         let holds = reply.as_ref().is_some_and(|reply| {
             reply
                 .get("lease")
                 .and_then(|lease| lease.get("holder"))
-                .and_then(|holder| holder.as_str())
+                .and_then(|lease_holder| lease_holder.as_str())
                 .is_some_and(|lease_holder| lease_holder == holder)
                 && reply
                     .get("granted")
                     .and_then(|granted| granted.as_bool())
                     .unwrap_or(true)
         });
-        next_action = match (op, sample.ok, sample.remaining_ms, holds) {
+        if holds {
+            gate.holder = Some(holder.clone());
+        }
+        gate.schedule = match (op, sample.ok, sample.remaining_ms, holds) {
             ("get", true, Some(remaining), false) => {
                 // A live foreign incumbent: poll past its leader-echoed
                 // expiry with jitter; it may renew out from under us.
@@ -392,15 +457,16 @@ fn contender(options: &Options, shared: &Arc<Mutex<Vec<Sample>>>, index: usize) 
                     Some(wall_ms() + rng.below(50))
                 } else {
                     let expiry = wall_ms() + options.lease_ms;
-                    request_num += 1;
-                    lease_id += 1;
+                    gate.request_num += 1;
+                    gate.lease_id += 1;
                     let message_id = uuid::Uuid::new_v4();
                     let request = format!(
-                        "{{\"op\":\"set\",\"message_id\":\"{message_id}\",\"client_id\":{client_id},\"request_num\":{request_num},\"lock_id\":{},\"lease\":{{\"lease_id\":{lease_id},\"holder\":\"{holder}\",\"expiry\":{expiry}}}}}",
-                        options.lock_id
+                        "{{\"op\":\"set\",\"message_id\":\"{message_id}\",\"client_id\":{client_id},\"request_num\":{},\"lock_id\":{},\"lease\":{{\"lease_id\":{},\"holder\":\"{holder}\",\"expiry\":{expiry}}}}}",
+                        gate.request_num, options.lock_id, gate.lease_id
                     );
                     let (sample, _) = link.round_trip(&request, "set");
                     shared.lock().unwrap().push(sample);
+                    gate.holder = Some(holder.clone());
                     Some(wall_ms() + options.lease_ms - renew_margin)
                 }
             }
@@ -417,14 +483,21 @@ fn contender(options: &Options, shared: &Arc<Mutex<Vec<Sample>>>, index: usize) 
     }
 }
 
-/// The getter loop: fixed-interval GET probes at the configured rate.
-fn getter(options: &Options, shared: &Arc<Mutex<Vec<Sample>>>, index: usize) {
+/// The getter loop: fixed-interval GET probes at the configured rate,
+/// behind the same client gate — booted silent, started on SIGUSR2.
+fn getter(options: &Options, shared: &Arc<Mutex<Vec<Sample>>>, index: usize, signals: &Signals) {
     let interval = if options.high_rate { 50 } else { 250 };
     let mut rng = Rng::new(wall_ms() ^ (index as u64 + 1) ^ (std::process::id() as u64));
     let client_id = options.id_base + 1000 + index as u64;
     let mut link = Link::connect(&options.servers, index);
     let mut request_num: u64 = 0;
+    let mut gate = client_gate::boot();
     loop {
+        signals.apply(&mut gate);
+        if gate.mode == Mode::Off {
+            std::thread::sleep(Duration::from_millis(20));
+            continue;
+        }
         request_num += 1;
         let message_id = uuid::Uuid::new_v4();
         let request = format!(
@@ -441,19 +514,24 @@ fn getter(options: &Options, shared: &Arc<Mutex<Vec<Sample>>>, index: usize) {
 
 fn main() {
     let options = parse_options();
+    let signals = Signals::register();
     let shared = Arc::new(Mutex::new(Vec::<Sample>::new()));
     let mut handles = Vec::new();
     for index in 0..options.clients {
         let options = clone_options(&options);
         let shared = Arc::clone(&shared);
+        let signals = signals.clone();
         handles.push(std::thread::spawn(move || {
-            contender(&options, &shared, index)
+            contender(&options, &shared, index, &signals)
         }));
     }
     for index in 0..options.getters {
         let options = clone_options(&options);
         let shared = Arc::clone(&shared);
-        handles.push(std::thread::spawn(move || getter(&options, &shared, index)));
+        let signals = signals.clone();
+        handles.push(std::thread::spawn(move || {
+            getter(&options, &shared, index, &signals)
+        }));
     }
     let started = Instant::now();
     let mut stats_out = (!options.stats_out.is_empty())

@@ -3,5 +3,6 @@
 //! tests and external embedders need.
 
 pub mod bridge;
+pub mod client_gate;
 pub mod phi;
 pub mod telemetry;

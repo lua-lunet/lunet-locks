@@ -34,8 +34,11 @@ CHECK_SOURCES = tests/teal_learning_test.tl \
                 tests/admin_test.tl \
                 tests/remap_test.tl \
                 tests/snapshot_test.tl
+# POSIX bin helpers carry no logic and still get the discipline: shellcheck
+# plus the client-signal behavioural smoke.
+SIGNAL_BIN := examples/lease-sequencer/bin
 
-.PHONY: init deps build check test smoke simulation simulation-test lunet-runtime docs clean ext ext-check ext-test fmt lint hooks docker-build docker-simulation package package-verify
+.PHONY: init deps build check test smoke simulation simulation-test lunet-runtime docs clean ext ext-check ext-test fmt lint hooks sh-check sh-smoke docker-build docker-simulation package package-verify
 
 init:
 	@command -v mise >/dev/null 2>&1 || { echo "ERROR: mise is not on PATH. Install it from https://mise.jdx.dev and try again."; exit 1; }
@@ -62,7 +65,13 @@ hooks:
 build: ext
 	$(CYAN) build --prune
 
-check: build lint
+sh-check:
+	shellcheck $(SIGNAL_BIN)/*.sh
+
+sh-smoke:
+	$(SIGNAL_BIN)/client-signal-smoke.sh
+
+check: build lint sh-check sh-smoke
 	$(CYAN) check $(CHECK_SOURCES)
 
 test: check
