@@ -427,6 +427,97 @@ fn http_endpoints_serve_console_shapes() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// The same request written as three separate segments — exactly what
+/// `write!` with an interpolation emits (one write per format piece) —
+/// yielding between writes so the server observes each segment arrive
+/// on its own. The response must come back through a clean close.
+fn http_get_segmented(port: u16, path: &str) -> std::io::Result<(u16, String)> {
+    let mut stream = TcpStream::connect(("127.0.0.1", port))?;
+    stream.write_all(b"GET ")?;
+    std::thread::yield_now();
+    stream.write_all(path.as_bytes())?;
+    std::thread::yield_now();
+    stream.write_all(b" HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")?;
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf)?;
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    let status: u16 = text
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let body = text
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body.to_string())
+        .unwrap_or_default();
+    Ok((status, body))
+}
+
+/// Segmented requests under parallel load: several servers, several
+/// client threads, every request written one segment at a time. The
+/// server drains the full request head before answering, so every
+/// request must complete without a connection reset and parse to its
+/// intended route — a reset or a mis-parsed path (the empty path of a
+/// half-read request line) is a failure. Bounded: a few hundred
+/// loopback connections.
+#[test]
+fn segmented_requests_under_parallel_load_never_reset() {
+    const SERVERS: usize = 4;
+    const CLIENTS: usize = 8;
+    const PER_CLIENT: usize = 16;
+
+    let dir = fixture_aof("stress");
+    let mut servers = Vec::new();
+    let mut ports = Vec::new();
+    for _ in 0..SERVERS {
+        let server = bridge::Server::spawn(&dir, "127.0.0.1:0", false).unwrap();
+        ports.push(server.port());
+        servers.push(server);
+    }
+
+    let mut workers = Vec::new();
+    for worker in 0..CLIENTS {
+        let ports = ports.clone();
+        workers.push(std::thread::spawn(move || {
+            let mut failures: Vec<String> = Vec::new();
+            for i in 0..PER_CLIENT {
+                let port = ports[(worker + i) % ports.len()];
+                let path = if i % 2 == 0 {
+                    "/api/v1/health"
+                } else {
+                    "/api/v1/metrics"
+                };
+                match http_get_segmented(port, path) {
+                    Ok((200, _)) => {}
+                    Ok((status, body)) => {
+                        failures.push(format!("{path}: status {status}, body {body}"));
+                    }
+                    Err(error) => {
+                        failures.push(format!("{path}: {error}"));
+                    }
+                }
+            }
+            failures
+        }));
+    }
+    let mut failures = Vec::new();
+    for worker in workers {
+        match worker.join() {
+            Ok(worker_failures) => failures.extend(worker_failures),
+            Err(_) => failures.push("worker panicked".to_string()),
+        }
+    }
+    for server in &servers {
+        server.shutdown();
+    }
+    assert!(
+        failures.is_empty(),
+        "{} of the segmented requests failed: {failures:?}",
+        failures.len()
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 /// The live WebSocket push: with follow on, an appended record arrives as a
 /// text frame on /api/v1/live.
 #[test]

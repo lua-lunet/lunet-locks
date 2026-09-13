@@ -43,7 +43,7 @@ use lunet_locks_aof::retention;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -831,15 +831,33 @@ fn phi_trace(dir: &Path) -> PhiTrace {
     PhiTrace { samples, decisions }
 }
 
-/// One connection's HTTP lifecycle. WebSocket upgrades park the socket in
-/// the live set; everything else answers from the snapshot and closes.
+/// One connection's HTTP lifecycle. The full request head is drained
+/// before anything is answered: TCP delivers a request in as many
+/// segments as the client made writes, and a socket closed with request
+/// bytes still unread is reset by the kernel (BSD and Linux alike), so
+/// the client would lose the response instead of reading it through a
+/// clean FIN. WebSocket upgrades park the socket in the live set;
+/// everything else answers from the snapshot and half-closes.
 fn handle_connection(mut stream: TcpStream, snapshot: Arc<Mutex<Replay>>, live: Arc<Mutex<Vec<TcpStream>>>) {
-    let mut buf = [0u8; 8192];
-    let n = stream.read(&mut buf).unwrap_or(0);
-    if n == 0 {
+    // The request head's bound: the console's GET requests are one line
+    // of headers; anything larger is refused rather than buffered.
+    const MAX_HEAD_BYTES: usize = 64 * 1024;
+    let mut head: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        let n = stream.read(&mut chunk).unwrap_or(0);
+        if n == 0 {
+            break;
+        }
+        head.extend_from_slice(&chunk[..n]);
+        if head.windows(4).any(|window| window == b"\r\n\r\n") || head.len() >= MAX_HEAD_BYTES {
+            break;
+        }
+    }
+    if head.is_empty() {
         return;
     }
-    let request = String::from_utf8_lossy(&buf[..n]).into_owned();
+    let request = String::from_utf8_lossy(&head).into_owned();
     let mut lines = request.lines();
     let request_line = lines.next().unwrap_or_default().to_string();
     let mut parts = request_line.split_whitespace();
@@ -878,6 +896,9 @@ fn handle_connection(mut stream: TcpStream, snapshot: Arc<Mutex<Replay>>, live: 
     );
     let _ = stream.write_all(response.as_bytes());
     let _ = stream.flush();
+    // The graceful close: the response is sent, then the write side
+    // shuts down so the client reads the body through an orderly FIN.
+    let _ = stream.shutdown(Shutdown::Write);
 }
 
 /// The route table: the console's OpenAPI surface, read-only.
