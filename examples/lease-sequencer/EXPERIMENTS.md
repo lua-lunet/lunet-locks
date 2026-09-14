@@ -97,7 +97,11 @@ client runs standalone too:
 
 Node (`lease-sequencer`): `--recovery-flush diskless|single|double-ring`
 with `--recovery-scratch-dir PATH` selects the E2 variant; `--heartbeat-ms`,
-`--election-ms`, `--recovery-ms` are the host's timing knobs.
+`--election-ms`, `--recovery-ms` are the host's timing knobs;
+`--embedded-client N --lock LOCK` runs N embedded lock-client contender
+loops in-process against the node's own service (the same chase machine,
+cadence knobs `--client-ttl-ms 500` / `--renew-fraction 0.5`), booted
+silent behind the SIGUSR1/SIGUSR2 client gate.
 
 ## Timing measurement
 

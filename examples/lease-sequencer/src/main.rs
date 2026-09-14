@@ -11,12 +11,29 @@
 //! schedule the next poll at the reported expiry plus `rand()*100 ms`.
 //! Every attempt is logged as
 //! `lease-attempt ts=<ms> node=<id> op=set|renew|get|steal expiry=<ms>`.
+//!
+//! The embedded lock client: launched with `--embedded-client N`, the
+//! host runs N contender loops against its own `Node` in-process (the
+//! shared `embedded_client` module — the same chase machine the
+//! `lease-load` binary drives over the wire, no client→cluster TCP).
+//! Every op is submitted through the node's own request path — proposed
+//! locally when this node leads, forwarded to the leader over the peer
+//! application channel otherwise — so the committed lock transitions
+//! are the same Service calls the wire clients' verbs exercise and the
+//! AOF records identical evidence. The loops share the host's client
+//! gate: SIGUSR1 silences every embedded client (holdership forgotten,
+//! in-flight ops abandoned), SIGUSR2 starts them, boot is OFF, and a
+//! restarted client re-enters as a NON-holder — its first action is a
+//! GET probe, never a blind BUMP.
 
 mod membership;
-pub mod phi;
+// The lib crate owns the phi module (its #[no_mangle] C-ABI surface must
+// exist in exactly one compilation unit — the lib rlib the bin links).
+pub use lease_sequencer::phi;
 pub mod telemetry;
 mod transport;
 
+use lease_sequencer::embedded_client::{self, Action, Runner};
 use lunet_advisory_lock::{
     NOT_LEADER, Node, OK, POSITION_APPEND, RECONFIGURE_DECREMENT, RECONFIGURE_INCREMENT,
     RECONFIGURE_JOIN, RECONFIGURE_LEAVE, RecoveryFlush, maybe_invariant,
@@ -32,6 +49,12 @@ use tracing_appender::non_blocking::WorkerGuard;
 
 /// The sequencer lease's sentinel lock id.
 const LOCK_ID: u64 = 0x0DDBA11;
+/// The embedded lock clients' default chase target (the lease-load
+/// binary's default lock).
+const EMBEDDED_LOCK_ID: u64 = 0x0DDBA12;
+/// The embedded lock clients' client-id base (the lease-load default;
+/// client `i` uses `800_000 + i`).
+const EMBEDDED_CLIENT_ID_BASE: u64 = 800_000;
 /// The full lease the sequencer holds, in milliseconds.
 const LEASE_MS: u64 = 500;
 /// The renewal lead: the holder renews this long before its own deadline
@@ -215,6 +238,11 @@ struct Host {
     /// disabled the stream for the process (telemetry contract: never
     /// poison the replication path).
     telemetry: Option<telemetry::TelemetryLog>,
+    /// The embedded lock client runner (item04): N contender loops against
+    /// this node's own service, ticked from the host loop behind the
+    /// host's SIGUSR1/SIGUSR2 client gate. `None` when launched without
+    /// `--embedded-client`.
+    embedded: Option<Runner>,
 }
 
 /// The boot-time era-qualified discovery state: request to every node the
@@ -385,6 +413,17 @@ struct Options {
     /// The hard safety multiple: no detection fires before
     /// `safety * heartbeat_ms` of leader silence, whatever phi says.
     phi_safety: f64,
+    /// The embedded lock client count (item04): N contender loops run
+    /// in-process against the node's own service, behind the host's
+    /// SIGUSR1/SIGUSR2 client gate. 0 = none (no signal registration).
+    embedded_clients: usize,
+    /// The lock the embedded clients chase.
+    embedded_lock_id: u64,
+    /// The embedded clients' lease window (the lease-load default).
+    embedded_client_ttl_ms: u64,
+    /// The embedded clients' renewal point as a fraction of the window
+    /// (the lease-load default).
+    embedded_renew_fraction: f64,
 }
 
 fn parse_options() -> Options {
@@ -408,6 +447,10 @@ fn parse_options() -> Options {
         recovery_ms: 1000,
         phi_threshold: 1.0,
         phi_safety: 2.0,
+        embedded_clients: 0,
+        embedded_lock_id: EMBEDDED_LOCK_ID,
+        embedded_client_ttl_ms: 500,
+        embedded_renew_fraction: 0.5,
     };
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut index = 0;
@@ -447,6 +490,16 @@ fn parse_options() -> Options {
             "--recovery-ms" => options.recovery_ms = value.parse().unwrap_or(1000),
             "--phi-threshold" => options.phi_threshold = value.parse().unwrap_or(1.0),
             "--phi-safety" => options.phi_safety = value.parse().unwrap_or(2.0),
+            "--embedded-client" => {
+                options.embedded_clients = value.parse().unwrap_or(0)
+            }
+            "--lock" => options.embedded_lock_id = value.parse().unwrap_or(EMBEDDED_LOCK_ID),
+            "--client-ttl-ms" => {
+                options.embedded_client_ttl_ms = value.parse().unwrap_or(500)
+            }
+            "--renew-fraction" => {
+                options.embedded_renew_fraction = value.parse().unwrap_or(0.5)
+            }
             other => {
                 eprintln!("lease-sequencer: unknown option {other}");
                 exit(2);
@@ -467,11 +520,30 @@ fn parse_options() -> Options {
              [--telemetry-rollover-mib N] [--phi-timeout-min-ms N] [--phi-timeout-max-ms N] \
              [--recovery-flush diskless|single|double-ring] [--recovery-scratch-dir PATH] \
              [--heartbeat-ms N] [--election-ms N] [--recovery-ms N] \
-             [--phi-threshold F] [--phi-safety F]"
+             [--phi-threshold F] [--phi-safety F] \
+             [--embedded-client N] [--lock N] [--client-ttl-ms N] [--renew-fraction F]"
         );
         exit(2);
     }
     options
+}
+
+/// The marker-5 interval-sample JSON: the arrival-interval sample the
+/// exported phi-samples kind plots (one record per learned interval).
+fn interval_sample_json(
+    own_id: u32,
+    trailer: &phi::Trailer,
+    addr_text: &str,
+    dt_ms: u64,
+    now_ms: u64,
+    phi: f64,
+) -> String {
+    format!(
+        "{{\"node\":{own_id},\"era\":{},\"leader\":{},\"addr\":\"{addr_text}\",\
+         \"dt_ms\":{dt_ms},\"ts_ms\":{now_ms},\"phi\":{phi:.3},\
+         \"sent_at_ms\":{}}}",
+        trailer.era, trailer.leader, trailer.sent_at_ms
+    )
 }
 
 impl Host {
@@ -598,22 +670,27 @@ impl Host {
         let Some(monitor) = &mut self.phi_monitor else {
             return;
         };
+        let addr_text = phi::addr_text(addr);
         let key = phi::SketchKey {
             era: trailer.era,
             leader: trailer.leader,
-            leader_addr: phi::addr_text(addr),
+            leader_addr: addr_text.clone(),
             monitor: self.own_id,
         };
+        // The pre-arrival phi: how suspect the leader had become just
+        // before this heartbeat proved it alive — the scatter's y over
+        // time. Reset by the observe below, so read it first.
+        let pre_phi = monitor
+            .live()
+            .filter(|(live_key, _)| **live_key == key)
+            .map(|(_, sketch)| sketch.phi(now))
+            .unwrap_or(0.0);
         let interval = monitor.observe(&key, now);
         self.phi_last_era = Some(trailer.era);
         if let Some(interval) = interval {
             self.note(&format!(
                 "phi-interval node={} era={} leader={} addr={} dt={}",
-                self.own_id,
-                trailer.era,
-                trailer.leader,
-                phi::addr_text(addr),
-                interval
+                self.own_id, trailer.era, trailer.leader, addr_text, interval
             ));
             // The sampled-estimate evidence (marker 5): the arrival's
             // learned interval AND when it was sampled — the exported
@@ -621,16 +698,8 @@ impl Host {
             self.record_telemetry(Record::telemetry(
                 Marker::TelemetryIntervalSample,
                 local_ns(),
-                format!(
-                    "{{\"node\":{},\"era\":{},\"leader\":{},\"addr\":\"{}\",\"dt_ms\":{},\"ts_ms\":{}}}",
-                    self.own_id,
-                    trailer.era,
-                    trailer.leader,
-                    phi::addr_text(addr),
-                    interval,
-                    now
-                )
-                .as_bytes(),
+                interval_sample_json(self.own_id, trailer, &addr_text, interval, now, pre_phi)
+                    .as_bytes(),
             ));
         }
     }
@@ -902,6 +971,8 @@ impl Host {
                         None => continue,
                     };
                     self.driver_complete(op, &out.bytes, now, rng);
+                } else if self.embedded_reply(now, rng, &out.message_id, &out.bytes) {
+                    // An embedded contender's op completed in-process.
                 } else {
                     for conn in &mut self.conns {
                         let matches = matches!(
@@ -1218,6 +1289,62 @@ impl Host {
         }
         self.submit_get(now, rng);
     }
+
+    /// Feed one kind-2 reply to the embedded runner: the client whose
+    /// in-flight op carries this message id absorbs it (and submits the
+    /// free-probe SET race its absorption decides on). `true` when the
+    /// runner claimed the reply.
+    fn embedded_reply(
+        &mut self,
+        now: u64,
+        rng: &mut Rng,
+        message_id: &[u8; 16],
+        bytes: &[u8],
+    ) -> bool {
+        let Some(mut runner) = self.embedded.take() else {
+            return false;
+        };
+        let absorbed = runner.absorb(now, message_id, bytes, &mut |action| {
+            self.submit_embedded(now, rng, action)
+        });
+        self.embedded = Some(runner);
+        absorbed
+    }
+
+    /// A forwarded embedded op's not-leader refusal: the pending op is
+    /// dropped and the chase backs off. `true` when the runner owned the
+    /// message id.
+    fn embedded_not_leader(&mut self, now: u64, message_id: &[u8; 16]) -> bool {
+        let Some(mut runner) = self.embedded.take() else {
+            return false;
+        };
+        let dropped = runner.not_leader(now, message_id);
+        self.embedded = Some(runner);
+        dropped
+    }
+
+    /// One embedded action's submission route — the same route the
+    /// lease driver's ops take: propose locally as the leader, forward
+    /// to the leader over the application channel; anything else is a
+    /// refusal the runner absorbs as a backoff-and-reprobe.
+    fn submit_embedded(&mut self, now: u64, rng: &mut Rng, action: &Action) -> bool {
+        let rc = self.node.request(action.request.as_bytes());
+        if rc == OK {
+            return true;
+        }
+        self.flush_outputs(now, rng);
+        if rc == NOT_LEADER {
+            let status = self.node.status();
+            if status.leader != LEADER_UNKNOWN
+                && status.leader != self.own_id
+                && let Some(&addr) = self.peers.get(&status.leader)
+            {
+                self.send_forward_request(addr, &action.message_id, &action.request);
+                return true;
+            }
+        }
+        false
+    }
 }
 
 fn main() {
@@ -1410,6 +1537,25 @@ fn main() {
         next_action_at: millis() + 300,
         pending: None,
     };
+    // The embedded lock client (item04): N contender loops against this
+    // node's own service, behind the host's client gate. The SIGUSR1 /
+    // SIGUSR2 flags are registered only when clients run — a gateless
+    // host ignores them.
+    let embedded = (options.embedded_clients > 0).then(|| {
+        let signals = embedded_client::Signals::register();
+        Runner::new(
+            options.embedded_clients,
+            embedded_client::Config {
+                lock_id: options.embedded_lock_id,
+                client_id: EMBEDDED_CLIENT_ID_BASE,
+                lease_ms: options.embedded_client_ttl_ms,
+                renew_fraction: options.embedded_renew_fraction,
+            },
+            signals,
+            OP_DEADLINE_MS,
+            millis() ^ (std::process::id() as u64),
+        )
+    });
     let mut host = Host {
         node,
         sock,
@@ -1464,6 +1610,7 @@ fn main() {
             fixed_ms: options.election_ms,
         },
         telemetry,
+        embedded,
     };
     host.note(&format!(
         "boot name={} descriptor-id={own_desc_id} own={own_id} incarnation={incarnation}",
@@ -1522,6 +1669,7 @@ fn main() {
         timers(&mut host, now, &mut rng);
         host.discovery_step(now);
         host.driver_step(now, &mut rng);
+        embedded_step(&mut host, now, &mut rng);
         host.flush_outputs(now, &mut rng);
         // The AOF lifecycle gate + the 1000 ms forced flusher + the
         // rollover (item22 M2): the gate follows the node's voting
@@ -1623,6 +1771,18 @@ fn timers(host: &mut Host, now: u64, rng: &mut Rng) {
         let _ = host.node.recover();
         host.flush_outputs(now, rng);
     }
+}
+
+/// One host-loop tick of the embedded lock client runner (item04): drain
+/// the process signal flags into every embedded client's gate and step
+/// each chase — one op in flight at a time, submitted through the node's
+/// own request path.
+fn embedded_step(host: &mut Host, now: u64, rng: &mut Rng) {
+    let Some(mut runner) = host.embedded.take() else {
+        return;
+    };
+    runner.tick(now, &mut |action| host.submit_embedded(now, rng, action));
+    host.embedded = Some(runner);
 }
 
 fn pump_udp(host: &mut Host, now: u64, rng: &mut Rng) {
@@ -1760,8 +1920,9 @@ fn handle_packet(
             }
         }
         0x02 => {
-            // FORWARD_RESPONSE: correlate to the driver's pending op. An
-            // ack that correlates to nothing is a maybe: unexpected, not
+            // FORWARD_RESPONSE: correlate to the driver's pending op, an
+            // embedded contender's, or a forwarded TCP client's. An ack
+            // that correlates to nothing is a maybe: unexpected, not
             // provably impossible (the pending op may have timed out and
             // been retried in the window), and survivable.
             if payload.len() > 1 + 16
@@ -1778,23 +1939,60 @@ fn handle_packet(
             } else if payload.len() > 1 + 16 {
                 let mut message_id = [0u8; 16];
                 message_id.copy_from_slice(&payload[1..17]);
-                maybe_invariant!(
-                    "ack for an unclaimed verb (message_id={}, len={})",
-                    uuid::Uuid::from_bytes(message_id),
-                    payload.len()
-                );
+                if host.embedded_reply(now, rng, &message_id, &payload[17..]) {
+                    // The embedded contender's forwarded op completed.
+                } else if let Some(conn) = host.conns.iter_mut().find(|conn| {
+                    matches!(
+                        conn.pending,
+                        Some(TcpPending::Lock { message_id: pending_id, .. })
+                            if pending_id == message_id
+                    )
+                }) {
+                    // The forwarded TCP client's op committed on the
+                    // leader: one reply line, then the conn is idle.
+                    conn.pending = None;
+                    let _ = conn.stream.write_all(&payload[17..]);
+                    let _ = conn.stream.write_all(b"\n");
+                    let _ = conn.stream.flush();
+                } else {
+                    maybe_invariant!(
+                        "ack for an unclaimed verb (message_id={}, len={})",
+                        uuid::Uuid::from_bytes(message_id),
+                        payload.len()
+                    );
+                }
             }
         }
-        // FORWARD_NOT_LEADER: drop the pending op; the policy retries.
-        0x03 if payload.len() == 1 + 16 + 8
-            && host
+        // FORWARD_NOT_LEADER: drop the pending op — the driver's or an
+        // embedded contender's; the policy retries.
+        0x03 if payload.len() == 1 + 16 + 8 => {
+            let mut message_id = [0u8; 16];
+            message_id.copy_from_slice(&payload[1..17]);
+            if host
                 .driver
                 .pending
                 .as_ref()
-                .is_some_and(|p| p.message_id == payload[1..17]) =>
-        {
-            host.driver.pending = None;
-            host.driver.next_action_at = now + rng.below(80) + 20;
+                .is_some_and(|p| p.message_id == message_id)
+            {
+                host.driver.pending = None;
+                host.driver.next_action_at = now + rng.below(80) + 20;
+            } else if host.embedded_not_leader(now, &message_id) {
+                // The embedded contender's forwarded op was refused; the
+                // chase backs off and re-probes.
+            } else if let Some(conn) = host.conns.iter_mut().find(|conn| {
+                matches!(
+                    conn.pending,
+                    Some(TcpPending::Lock { message_id: pending_id, .. })
+                        if pending_id == message_id
+                )
+            }) {
+                // The forwarded TCP client's op was refused (the leader
+                // stood down mid-flight); the conn answers not_leader and
+                // its client retries or rotates.
+                conn.pending = None;
+                let _ = conn.stream.write_all(b"{\"error\":\"not_leader\"}\n");
+                let _ = conn.stream.flush();
+            }
         }
         _ => {}
     }
@@ -2005,6 +2203,26 @@ fn handle_client_line(host: &mut Host, index: usize, line: &str, now: u64, rng: 
             });
             return true;
         }
+        // The non-leader route: the op is FORWARDED to the leader over the
+        // peer application channel (the same wire the lease driver and the
+        // embedded clients use). The leader's committed reply rides back
+        // the FORWARD_RESPONSE datagram and this conn answers once. When
+        // no leader is known yet (or the forwarding route is unlearned),
+        // the error reply stands so the client retries or rotates.
+        if rc == NOT_LEADER {
+            let status = host.node.status();
+            if status.leader != LEADER_UNKNOWN
+                && status.leader != host.own_id
+                && let Some(&addr) = host.peers.get(&status.leader)
+            {
+                host.send_forward_request(addr, &message_id, line);
+                host.conns[index].pending = Some(TcpPending::Lock {
+                    message_id,
+                    deadline: now + 30000,
+                });
+                return true;
+            }
+        }
         let reply = if rc == NOT_LEADER {
             "{\"error\":\"not_leader\"}".to_string()
         } else {
@@ -2077,4 +2295,411 @@ fn handle_client_line(host: &mut Host, index: usize, line: &str, now: u64, rng: 
         deadline: now + ADMIN_DEADLINE_MS,
     });
     true
+}
+
+#[cfg(test)]
+mod interval_sample_tests {
+    use super::*;
+
+    #[test]
+    fn sample_json_carries_the_leader_send_clock() {
+        let trailer = phi::Trailer {
+            era: 4,
+            leader: 33,
+            seq: 9,
+            sent_at_ms: 1_789_214_915_000,
+        };
+        let json = interval_sample_json(88, &trailer, "127.0.0.1:1", 22, 1_789_214_915_022, 0.5);
+        for key in [
+            "node", "era", "leader", "addr", "dt_ms", "ts_ms", "phi", "sent_at_ms",
+        ] {
+            assert!(json.contains(&format!("\"{key}\"")), "missing {key}: {json}");
+        }
+        assert!(
+            json.contains("\"sent_at_ms\":1789214915000"),
+            "leader send clock missing: {json}"
+        );
+    }
+}
+
+#[cfg(test)]
+#[cfg(test)]
+mod forward_tests {
+    //! The external TCP client channel's forwarding route: a lock verb
+    //! addressed to a NON-LEADER voter's client port is forwarded to the
+    //! leader over the peer application channel, and the leader's
+    //! committed reply rides FORWARD_RESPONSE back to the same conn. The
+    //! regression is the rig's takeover failure: the non-leader answered
+    //! `{"error":"not_leader"}` and never forwarded, so external
+    //! contenders whose local voter was not the leader never committed a
+    //! get or a set — and, when the holder died, no contender could ever
+    //! see the lease expire and race for the takeover.
+
+    use super::*;
+    use std::path::PathBuf;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    const LOCK_ID: u64 = 0x0DDBA12;
+
+    fn temp_root() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "lease-sequencer-forward-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp root");
+        dir
+    }
+
+    struct NodeHost {
+        host: Host,
+        udp: SocketAddr,
+        client: u16,
+    }
+
+    fn boot_host(name: &str, root: &PathBuf) -> NodeHost {
+        let state = root.join(format!("{name}.state"));
+        // A parallel-test boot race (same-process marker churn) is
+        // tolerated by one fresh-root retry; the boot CONFIG error otherwise.
+        let node = match Node::open("1:a\x002:b", name, state.to_str().expect("path"), None, 0) {
+            Ok(node) => node,
+            Err(_) => {
+                let root = temp_root();
+                let state = root.join(format!("{name}.state"));
+                Node::open("1:a\x002:b", name, state.to_str().expect("path"), None, 0)
+                    .expect("node boots")
+            }
+        };
+        let own_id = node.own_id();
+        let sock = UdpSocket::bind("127.0.0.1:0").expect("udp bind");
+        sock.set_nonblocking(true).expect("nonblocking udp");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("tcp bind");
+        listener.set_nonblocking(true).expect("nonblocking tcp");
+        let client_port = listener.local_addr().expect("local").port();
+        let udp_addr = sock.local_addr().expect("udp local");
+        let rows = vec![
+            (1u32, "127.0.0.1".to_string(), 42901u16, true),
+            (2u32, "127.0.0.1".to_string(), 42902u16, true),
+        ];
+        let model = membership::Model {
+            era: 1,
+            slot: 0,
+            members: membership::descriptor_model(&rows),
+        };
+        let sidecar = membership::SidecarWriter::open(state.to_str().expect("path"))
+            .expect("sidecar opens");
+        // Both hosts compute the same genesis fingerprint — the same three
+        // facts the byte-identical deployment carries.
+        let fingerprint = transport::genesis_fingerprint(&[transport::GenesisMember {
+            id: 1,
+            name: "a",
+            host: "127.0.0.1",
+            port: 42901,
+        }]);
+        let host = Host {
+            node,
+            sock,
+            listener,
+            peers: HashMap::new(),
+            addr_to_id: HashMap::new(),
+            fingerprint,
+            own_id,
+            heartbeat_ms: 100,
+            election_ms: 200,
+            recovery_ms: 200,
+            stagger_ms: 200,
+            last_heartbeat: 0,
+            leader_elapsed: 0,
+            last_recovery: 0,
+            last_status_note: 0,
+            last_seen_leader: LEADER_UNKNOWN,
+            reincarnated: false,
+            driver: Driver {
+                client_id: 800_000,
+                request_num: 0,
+                holder: uuid::Uuid::new_v4(),
+                lease_id: 0,
+                held_expiry: None,
+                last_get_foreign: false,
+                next_action_at: millis() + 300,
+                pending: None,
+            },
+            forwarded_from: HashMap::new(),
+            conns: Vec::new(),
+            model,
+            sidecar,
+            discovery: Discovery {
+                era: 1,
+                slot: 0,
+                tallies: HashMap::new(),
+                deadline_ms: millis() + 15000,
+                next_request_ms: 0,
+                active: true,
+            },
+            phi_monitor: None,
+            phi_cfg: phi::PhiConfig {
+                phi_threshold: 0.0,
+                heartbeat_ms: 100,
+                safety_multiple: 2.0,
+                window: 100,
+            },
+            heartbeat_seq: 0,
+            last_leader_commit_ms: 0,
+            heartbeat_client_id: 0x0BEEF000,
+            heartbeat_request_num: 0,
+            phi_last_era: None,
+            phi_detected_key: None,
+            phi_watch: None,
+            last_state: STATE_RECOVERING,
+            last_weight: None,
+            election_wait_armed: 200,
+            timeout_knobs: telemetry::TimeoutKnobs {
+                min_ms: 100,
+                max_ms: 300,
+                fixed_ms: 200,
+            },
+            telemetry: None,
+            embedded: None,
+        };
+        NodeHost {
+            host,
+            udp: udp_addr,
+            client: client_port,
+        }
+    }
+
+    /// A settled two-node localhost harness: `a` leads genesis's primary,
+    /// `b` follows; both peer rows know each other's real sockets.
+    fn harness() -> (NodeHost, NodeHost, Rng) {
+        let root = temp_root();
+        let mut a = boot_host("a", &root);
+        let mut b = boot_host("b", &root);
+        a.host.peers.insert(2, b.udp);
+        a.host.addr_to_id.insert(b.udp, 2);
+        b.host.peers.insert(1, a.udp);
+        b.host.addr_to_id.insert(a.udp, 1);
+        let seed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_millis() as u64;
+        let mut rng = Rng::new(seed);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while a.host.node.status().state != STATE_NORMAL
+            || b.host.node.status().state != STATE_NORMAL
+        {
+            assert!(
+                Instant::now() < deadline,
+                "the two-node forward harness never settled"
+            );
+            tick(&mut a, &mut b, &mut rng);
+        }
+        (a, b, rng)
+    }
+
+    fn tick(a: &mut NodeHost, b: &mut NodeHost, rng: &mut Rng) {
+        let now = millis();
+        pump_udp(&mut a.host, now, rng);
+        pump_tcp(&mut a.host, now, rng);
+        a.host.discovery_step(now);
+        a.host.driver_step(now, rng);
+        let _ = a.host.node.idle();
+        a.host.flush_outputs(now, rng);
+        let now = millis();
+        pump_udp(&mut b.host, now, rng);
+        pump_tcp(&mut b.host, now, rng);
+        b.host.discovery_step(now);
+        b.host.driver_step(now, rng);
+        let _ = b.host.node.idle();
+        b.host.flush_outputs(now, rng);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    /// One TCP round trip from the test's client to the named host (true =
+    /// to the follower `b`): the request line out, the first reply line
+    /// back, the host loop driven alongside.
+    fn round_trip(
+        a: &mut NodeHost,
+        b: &mut NodeHost,
+        rng: &mut Rng,
+        to_follower: bool,
+        request: &str,
+    ) -> String {
+        let port = if to_follower { b.client } else { a.client };
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("client connects");
+        stream
+            .set_read_timeout(Some(Duration::from_millis(10)))
+            .expect("read timeout");
+        let _ = stream.write_all(request.as_bytes());
+        let _ = stream.write_all(b"\n");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut buf: Vec<u8> = Vec::new();
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "no reply line arrived in time (buf={buf:?})"
+            );
+            tick(a, b, rng);
+            let mut chunk = [0u8; 4096];
+            match stream.read(&mut chunk) {
+                Ok(0) => panic!("the server closed the conn before replying"),
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut
+                        || e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => panic!("{e}"),
+            }
+            if buf.iter().any(|byte| *byte == b'\n') {
+                break;
+            }
+        }
+        let end = buf
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .unwrap_or(buf.len());
+        String::from_utf8_lossy(&buf[..end]).to_string()
+    }
+
+    fn get_request(client_id: u64, request_num: u64) -> String {
+        let mid = uuid::Uuid::new_v4();
+        format!(
+            "{{\"op\":\"get\",\"message_id\":\"{mid}\",\"client_id\":{client_id},\
+             \"request_num\":{request_num},\"lock_id\":{LOCK_ID}}}"
+        )
+    }
+
+    fn set_request(client_id: u64, request_num: u64) -> String {
+        let mid = uuid::Uuid::new_v4();
+        let holder = uuid::Uuid::new_v4();
+        let expiry = millis() + 500;
+        format!(
+            "{{\"op\":\"set\",\"message_id\":\"{mid}\",\"client_id\":{client_id},\
+             \"request_num\":{request_num},\"lock_id\":{LOCK_ID},\
+             \"lease\":{{\"lease_id\":1,\"holder\":\"{holder}\",\"expiry\":{expiry}}}}}"
+        )
+    }
+
+    fn ok_reply(line: &str) -> serde_json::Value {
+        let value: serde_json::Value = serde_json::from_str(line.trim_end())
+            .unwrap_or_else(|e| panic!("the reply line is JSON ({e}): {line}"));
+        assert!(
+            value.get("error").is_none(),
+            "the reply must not be an error: {line}"
+        );
+        value
+    }
+
+    /// One sequential scenario: the four forward-path cases run against
+    /// one fresh harness, in order — the parallel-test interference this
+    /// module's harnesses saw as boot/addressing invariants is the reason
+    /// the cases do not run as separate concurrent #[test]s.
+    #[test]
+    fn the_forward_path_end_to_end() {
+        one_follower_get_scenario();
+        one_follower_set_scenario();
+        one_leader_local_scenario();
+        one_refusal_scenario();
+    }
+
+    fn one_follower_get_scenario() {
+        let (mut a, mut b, mut rng) = harness();
+        let follower_to_b = b.host.node.status().leader != b.host.own_id;
+        assert!(
+            follower_to_b,
+            "harness shape: b follows (the forward regression's shape)"
+        );
+        let line = round_trip(&mut a, &mut b, &mut rng, true, &get_request(800_001, 1));
+        let reply = ok_reply(&line);
+        assert_eq!(reply["op"], "get");
+        assert!(
+            reply.get("executed_at").is_some(),
+            "the committed reply carries the leader's execution tick: {line}"
+        );
+    }
+
+    fn one_follower_set_scenario() {
+        let (mut a, mut b, mut rng) = harness();
+        let line = round_trip(&mut a, &mut b, &mut rng, true, &set_request(800_006, 1));
+        let reply = ok_reply(&line);
+        assert_eq!(reply["granted"], true, "the forwarded set grants: {line}");
+        assert!(
+            reply["lease"]["expiry"].as_u64().is_some(),
+            "the grant carries the lease expiry: {line}"
+        );
+    }
+
+    fn one_leader_local_scenario() {
+        let (mut a, mut b, mut rng) = harness();
+        let line = round_trip(&mut a, &mut b, &mut rng, false, &get_request(800_002, 1));
+        ok_reply(&line);
+    }
+
+    fn one_refusal_scenario() {
+        let (mut a, mut b, mut rng) = harness();
+        // A conn with a pending forward: a real socket pair installed
+        // straight into the host (the accept path is covered above), with
+        // one op in flight whose leader-side refusal is what we feed next.
+        let pair = std::net::TcpListener::bind("127.0.0.1:0").expect("pair listener");
+        let client = TcpStream::connect(
+            ("127.0.0.1", pair.local_addr().expect("local").port()),
+        )
+        .expect("client connects");
+        let (conn_stream, _) = pair.accept().expect("pair accepted");
+        client.set_read_timeout(Some(Duration::from_millis(10))).ok();
+        let mid = *uuid::Uuid::new_v4().as_bytes();
+        b.host.conns.push(Conn {
+            stream: conn_stream,
+            buf: Vec::new(),
+            pending: Some(TcpPending::Lock {
+                message_id: mid,
+                deadline: millis() + 30000,
+            }),
+        });
+        let mut payload = vec![transport::FORWARD_NOT_LEADER];
+        payload.extend_from_slice(&mid);
+        payload.extend_from_slice(&1u32.to_be_bytes());
+        payload.extend_from_slice(&0u32.to_be_bytes());
+        let packet = transport::encode_peer(
+            transport::PEER_APPLICATION,
+            &b.host.fingerprint,
+            &payload,
+        );
+        handle_packet(&mut b.host, 1, a.udp, &packet, millis(), &mut rng);
+        assert!(
+            !b.host.conns.iter().any(|conn| conn.pending.is_some()),
+            "the refusal releases the conn's pending"
+        );
+        // The refusal line lands on the client end of the same conn.
+        let mut buf: Vec<u8> = Vec::new();
+        let read_deadline = Instant::now() + Duration::from_secs(2);
+        let mut chunk = [0u8; 256];
+        let mut client = client;
+        loop {
+            assert!(
+                Instant::now() < read_deadline,
+                "the refusal line never reached the client (buf={buf:?})"
+            );
+            match client.read(&mut chunk) {
+                Ok(0) => panic!("the conn was closed without a refusal line"),
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut
+                        || e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => panic!("{e}"),
+            }
+            if buf.iter().any(|byte| *byte == b'\n') {
+                break;
+            }
+        }
+        let text = String::from_utf8_lossy(&buf).to_string();
+        assert!(
+            text.contains("not_leader"),
+            "the conn reads back the refusal line, got {text:?}"
+        );
+    }
 }

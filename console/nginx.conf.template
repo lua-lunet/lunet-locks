@@ -55,9 +55,13 @@ http {
     index index.html;
 
     add_header X-Lock-Admin-Warning "loopback demo only; TLS+mTLS required off-loopback" always;
-    # Scripts may come only from this origin or the SRI-pinned CDN; styles need
+    # Scripts come only from this origin; Apache ECharts serves locally
+    # (assets/vendor/nginx-vendor.conf, minted by `make vendor-lock`, maps
+    # the plain /vendor/echarts.min.js path onto the sha256-named copy and
+    # marks it cache-immutable). Styles need
     # 'unsafe-inline' because the SPA sets inline style attributes.
-    add_header Content-Security-Policy "default-src 'self'; script-src 'self' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; connect-src 'self'; img-src 'self' data:" always;
+    include @ASSETS@/vendor/nginx-vendor.conf;
+    add_header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; connect-src 'self'; img-src 'self' data:" always;
 
     location / {
       try_files $uri $uri/ /index.html;

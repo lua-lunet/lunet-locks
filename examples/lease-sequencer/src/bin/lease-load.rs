@@ -20,7 +20,16 @@
 //! --renew-fraction 0.8` runs the design's cadence exactly; the committed
 //! demo's aggressive timing (500 ms lease, renewal at half the window) is
 //! the default.
+//!
+//! The client gate boots every worker OFF: a (re)started client is silent
+//! until the first SIGUSR2 (start) and returns to OFF on SIGUSR1
+//! (silence). Silence also forgets holdership and resets the lease-id /
+//! request-num bookkeeping, so a restarted worker re-enters as a
+//! NON-holder — its first action is a GET probe, never a blind BUMP or
+//! SET renewal. Transitions are logged on the client's stdout stream.
 
+use lease_sequencer::client_gate::{self, Mode};
+use lease_sequencer::embedded_client::{Config, Contender, Signals, reply_ok};
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
@@ -112,6 +121,11 @@ fn wall_ms() -> u64 {
         .as_millis() as u64
 }
 
+// The process-level SIGUSR1 (silence) / SIGUSR2 (start) flags and their
+// gate plumbing live in the shared embedded-client module: the same
+// signal gate, the same transition log lines, the same chase machinery
+// the sequencer host's embedded clients run (src/embedded_client.rs).
+
 struct Rng(u64);
 
 impl Rng {
@@ -130,14 +144,11 @@ impl Rng {
 }
 
 /// One timed operation: the round trip in microseconds from the client's
-/// monotonic clock, plus the leader-echoed expiry interpretation.
+/// monotonic clock.
 struct Sample {
     op: &'static str,
     ok: bool,
     rt_us: u64,
-    /// Remaining lease in the leader's timeline at execution
-    /// (`expiry - executed_at`), when the reply carried a lease.
-    remaining_ms: Option<u64>,
 }
 
 #[derive(Default)]
@@ -254,7 +265,6 @@ impl Link {
                     op,
                     ok: false,
                     rt_us: rt,
-                    remaining_ms: None,
                 },
                 None,
             );
@@ -269,7 +279,6 @@ impl Link {
                         op,
                         ok: false,
                         rt_us: rt,
-                        remaining_ms: None,
                     },
                     None,
                 );
@@ -278,31 +287,23 @@ impl Link {
         }
         let rt = start.elapsed().as_micros() as u64;
         let reply: Option<Value> = serde_json::from_str(line.trim_end()).ok();
-        let ok = reply
-            .as_ref()
-            .is_some_and(|reply| reply.get("error").is_none());
-        // The client-side TCP port answers a non-leader `not_leader` and
-        // does not forward: the op is a completed (failed) round trip, and
-        // the connection rotates to the next node so the stream follows
-        // the leader.
+        let ok = reply.as_ref().is_some_and(|reply| reply_ok(reply));
+        // The addressed node forwards a lock verb to the leader on the
+        // peer application channel; the committed reply (or a leader-side
+        // mid-flight refusal, which rotates the connection) is the only
+        // line on the socket. Rotation still follows the leader when the
+        // client names a server list.
         let not_leader = reply.as_ref().is_some_and(|reply| {
             reply.get("error").and_then(|error| error.as_str()) == Some("not_leader")
         });
         if not_leader {
             self.reconnect();
         }
-        let remaining_ms = reply.as_ref().and_then(|reply| {
-            let lease = reply.get("lease")?;
-            let expiry = lease.get("expiry")?.as_u64()?;
-            let executed_at = reply.get("executed_at")?.as_u64()?;
-            Some(expiry.saturating_sub(executed_at))
-        });
         (
             Sample {
                 op,
                 ok,
                 rt_us: rt,
-                remaining_ms,
             },
             reply,
         )
@@ -321,110 +322,67 @@ impl Link {
 /// The contender loop: hold the lock under a lease (SET), renew it one
 /// window ahead of the leader-echoed deadline (BUMP as the same-holder
 /// regrant), poll as GET while a live incumbent stands, and race to SET
-/// when the lock is free or expired — the design's §1.2 cadence.
-fn contender(options: &Options, shared: &Arc<Mutex<Vec<Sample>>>, index: usize) {
-    let mut rng = Rng::new(wall_ms() ^ (index as u64 + 1) ^ (std::process::id() as u64));
-    let client_id = options.id_base + index as u64;
-    let holder = format!("{:032x}", rng.next());
+/// when the lock is free or expired — the design's §1.2 cadence, driven
+/// through the shared decision machinery (the same module the sequencer
+/// host's embedded clients run in-process).
+fn contender(options: &Options, shared: &Arc<Mutex<Vec<Sample>>>, index: usize, signals: &Signals) {
+    let mut contender = Contender::new(
+        Config {
+            lock_id: options.lock_id,
+            client_id: options.id_base + index as u64,
+            lease_ms: options.lease_ms,
+            renew_fraction: options.renew_fraction,
+        },
+        wall_ms() ^ (index as u64 + 1) ^ (std::process::id() as u64),
+    );
     let mut link = Link::connect(&options.servers, index);
-    let mut request_num: u64 = 0;
-    let mut lease_id: u64 = 0;
-    // None = probe; Some(at) = the wall-ms instant of the next action.
-    let mut next_action: Option<u64> = None;
-    let renew_margin = (options.lease_ms as f64 * (1.0 - options.renew_fraction)) as u64;
     loop {
+        signals.apply(contender.gate());
+        if contender.mode() == Mode::Off {
+            std::thread::sleep(Duration::from_millis(20));
+            continue;
+        }
         let now = wall_ms();
-        if let Some(at) = next_action
+        if let Some(at) = contender.scheduled_at()
             && now < at
         {
             std::thread::sleep(Duration::from_millis((at - now).clamp(1, 20)));
             continue;
         }
-        let (op, request) = match next_action {
-            None => {
-                request_num += 1;
-                let message_id = uuid::Uuid::new_v4();
-                (
-                    "get",
-                    format!(
-                        "{{\"op\":\"get\",\"message_id\":\"{message_id}\",\"client_id\":{client_id},\"request_num\":{request_num},\"lock_id\":{}}}",
-                        options.lock_id
-                    ),
-                )
-            }
-            Some(_) => {
-                // A renewal (BUMP): the same-holder regrant extends the
-                // lease by one window from now.
-                request_num += 1;
-                lease_id += 1;
-                let message_id = uuid::Uuid::new_v4();
-                let expiry = wall_ms() + options.lease_ms;
-                (
-                    "bump",
-                    format!(
-                        "{{\"op\":\"set\",\"message_id\":\"{message_id}\",\"client_id\":{client_id},\"request_num\":{request_num},\"lock_id\":{},\"lease\":{{\"lease_id\":{lease_id},\"holder\":\"{holder}\",\"expiry\":{expiry}}}}}",
-                        options.lock_id
-                    ),
-                )
-            }
+        let Some(action) = contender.next_action(now) else {
+            continue;
         };
-        let (sample, reply) = link.round_trip(&request, op);
-        let holds = reply.as_ref().is_some_and(|reply| {
-            reply
-                .get("lease")
-                .and_then(|lease| lease.get("holder"))
-                .and_then(|holder| holder.as_str())
-                .is_some_and(|lease_holder| lease_holder == holder)
-                && reply
-                    .get("granted")
-                    .and_then(|granted| granted.as_bool())
-                    .unwrap_or(true)
-        });
-        next_action = match (op, sample.ok, sample.remaining_ms, holds) {
-            ("get", true, Some(remaining), false) => {
-                // A live foreign incumbent: poll past its leader-echoed
-                // expiry with jitter; it may renew out from under us.
-                Some(wall_ms() + remaining + rng.below(100))
-            }
-            ("get", true, remaining, _) => {
-                // Free or expired: race to SET immediately.
-                if remaining.is_some() {
-                    Some(wall_ms() + rng.below(50))
-                } else {
-                    let expiry = wall_ms() + options.lease_ms;
-                    request_num += 1;
-                    lease_id += 1;
-                    let message_id = uuid::Uuid::new_v4();
-                    let request = format!(
-                        "{{\"op\":\"set\",\"message_id\":\"{message_id}\",\"client_id\":{client_id},\"request_num\":{request_num},\"lock_id\":{},\"lease\":{{\"lease_id\":{lease_id},\"holder\":\"{holder}\",\"expiry\":{expiry}}}}}",
-                        options.lock_id
-                    );
-                    let (sample, _) = link.round_trip(&request, "set");
-                    shared.lock().unwrap().push(sample);
-                    Some(wall_ms() + options.lease_ms - renew_margin)
-                }
-            }
-            ("bump", true, Some(remaining), _) => {
-                Some(wall_ms() + remaining.saturating_sub(renew_margin))
-            }
-            _ => {
-                // Error, rejection, or an unparseable reply: back off and
-                // probe again.
-                Some(wall_ms() + 100 + rng.below(200))
-            }
-        };
+        let (sample, reply) = link.round_trip(&action.request, action.op);
         shared.lock().unwrap().push(sample);
+        if let Some(race) = contender.absorb(wall_ms(), &action, reply.as_ref()) {
+            // The inline SET race only fires while the gate is still ON:
+            // a signal mid-round-trip must never let the follow-up out
+            // (the one-op residual otherwise rides past the silence).
+            signals.apply(contender.gate());
+            if contender.mode() == Mode::On {
+                let (sample, reply) = link.round_trip(&race.request, race.op);
+                shared.lock().unwrap().push(sample);
+                contender.absorb(wall_ms(), &race, reply.as_ref());
+            }
+        }
     }
 }
 
-/// The getter loop: fixed-interval GET probes at the configured rate.
-fn getter(options: &Options, shared: &Arc<Mutex<Vec<Sample>>>, index: usize) {
+/// The getter loop: fixed-interval GET probes at the configured rate,
+/// behind the same client gate — booted silent, started on SIGUSR2.
+fn getter(options: &Options, shared: &Arc<Mutex<Vec<Sample>>>, index: usize, signals: &Signals) {
     let interval = if options.high_rate { 50 } else { 250 };
     let mut rng = Rng::new(wall_ms() ^ (index as u64 + 1) ^ (std::process::id() as u64));
     let client_id = options.id_base + 1000 + index as u64;
     let mut link = Link::connect(&options.servers, index);
     let mut request_num: u64 = 0;
+    let mut gate = client_gate::boot();
     loop {
+        signals.apply(&mut gate);
+        if gate.mode == Mode::Off {
+            std::thread::sleep(Duration::from_millis(20));
+            continue;
+        }
         request_num += 1;
         let message_id = uuid::Uuid::new_v4();
         let request = format!(
@@ -441,19 +399,24 @@ fn getter(options: &Options, shared: &Arc<Mutex<Vec<Sample>>>, index: usize) {
 
 fn main() {
     let options = parse_options();
+    let signals = Signals::register();
     let shared = Arc::new(Mutex::new(Vec::<Sample>::new()));
     let mut handles = Vec::new();
     for index in 0..options.clients {
         let options = clone_options(&options);
         let shared = Arc::clone(&shared);
+        let signals = signals.clone();
         handles.push(std::thread::spawn(move || {
-            contender(&options, &shared, index)
+            contender(&options, &shared, index, &signals)
         }));
     }
     for index in 0..options.getters {
         let options = clone_options(&options);
         let shared = Arc::clone(&shared);
-        handles.push(std::thread::spawn(move || getter(&options, &shared, index)));
+        let signals = signals.clone();
+        handles.push(std::thread::spawn(move || {
+            getter(&options, &shared, index, &signals)
+        }));
     }
     let started = Instant::now();
     let mut stats_out = (!options.stats_out.is_empty())

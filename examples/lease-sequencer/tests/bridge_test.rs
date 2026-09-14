@@ -427,6 +427,97 @@ fn http_endpoints_serve_console_shapes() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// The same request written as three separate segments — exactly what
+/// `write!` with an interpolation emits (one write per format piece) —
+/// yielding between writes so the server observes each segment arrive
+/// on its own. The response must come back through a clean close.
+fn http_get_segmented(port: u16, path: &str) -> std::io::Result<(u16, String)> {
+    let mut stream = TcpStream::connect(("127.0.0.1", port))?;
+    stream.write_all(b"GET ")?;
+    std::thread::yield_now();
+    stream.write_all(path.as_bytes())?;
+    std::thread::yield_now();
+    stream.write_all(b" HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")?;
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf)?;
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    let status: u16 = text
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let body = text
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body.to_string())
+        .unwrap_or_default();
+    Ok((status, body))
+}
+
+/// Segmented requests under parallel load: several servers, several
+/// client threads, every request written one segment at a time. The
+/// server drains the full request head before answering, so every
+/// request must complete without a connection reset and parse to its
+/// intended route — a reset or a mis-parsed path (the empty path of a
+/// half-read request line) is a failure. Bounded: a few hundred
+/// loopback connections.
+#[test]
+fn segmented_requests_under_parallel_load_never_reset() {
+    const SERVERS: usize = 4;
+    const CLIENTS: usize = 8;
+    const PER_CLIENT: usize = 16;
+
+    let dir = fixture_aof("stress");
+    let mut servers = Vec::new();
+    let mut ports = Vec::new();
+    for _ in 0..SERVERS {
+        let server = bridge::Server::spawn(&dir, "127.0.0.1:0", false).unwrap();
+        ports.push(server.port());
+        servers.push(server);
+    }
+
+    let mut workers = Vec::new();
+    for worker in 0..CLIENTS {
+        let ports = ports.clone();
+        workers.push(std::thread::spawn(move || {
+            let mut failures: Vec<String> = Vec::new();
+            for i in 0..PER_CLIENT {
+                let port = ports[(worker + i) % ports.len()];
+                let path = if i % 2 == 0 {
+                    "/api/v1/health"
+                } else {
+                    "/api/v1/metrics"
+                };
+                match http_get_segmented(port, path) {
+                    Ok((200, _)) => {}
+                    Ok((status, body)) => {
+                        failures.push(format!("{path}: status {status}, body {body}"));
+                    }
+                    Err(error) => {
+                        failures.push(format!("{path}: {error}"));
+                    }
+                }
+            }
+            failures
+        }));
+    }
+    let mut failures = Vec::new();
+    for worker in workers {
+        match worker.join() {
+            Ok(worker_failures) => failures.extend(worker_failures),
+            Err(_) => failures.push("worker panicked".to_string()),
+        }
+    }
+    for server in &servers {
+        server.shutdown();
+    }
+    assert!(
+        failures.is_empty(),
+        "{} of the segmented requests failed: {failures:?}",
+        failures.len()
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 /// The live WebSocket push: with follow on, an appended record arrives as a
 /// text frame on /api/v1/live.
 #[test]
@@ -523,4 +614,46 @@ fn wire_alphabet_is_total() {
         node: NodeId(1),
         position: 0,
     };
+}
+
+/// The bulk telemetry endpoint: the phi samples (marker 5) and the timeout
+/// decisions (marker 2) as arrays, plus the span — the ECharts tab's data
+/// source.
+#[test]
+fn telemetry_phi_endpoint_serves_samples_and_decisions() {
+    let dir = temp_dir("telemetry-phi");
+    let sample_json = br#"{"node":88,"era":4,"leader":33,"addr":"127.0.0.1:1","dt_ms":22,"ts_ms":1789214915000,"phi":1.106}"#;
+    let decision_json = br#"{"phi":1.7,"now_ms":100,"prev_wait_ms":900,"next_wait_ms":1000,"leader":33,"era":4,"view":1}"#;
+    {
+        let mut aof = AofFile::open(&dir).unwrap();
+        aof.append(
+            &Record::telemetry(
+                Marker::TelemetryIntervalSample,
+                1_000_000_000,
+                sample_json,
+            )
+            .encode(),
+        )
+        .unwrap();
+        aof.append(
+            &Record::telemetry(
+                Marker::TelemetryTimeoutDecision,
+                2_000_000_000,
+                decision_json,
+            )
+            .encode(),
+        )
+        .unwrap();
+    }
+    let server = bridge::Server::spawn(&dir, "127.0.0.1:0", false).unwrap();
+    let (_, reply) = http_get(server.port(), "/api/v1/telemetry/phi");
+    let value: Value = serde_json::from_str(&reply).expect("json");
+    assert_eq!(value["samples"].as_array().unwrap().len(), 1);
+    assert_eq!(value["samples"][0][0], 1789214915000u64, "ts_ms from the payload");
+    assert_eq!(value["samples"][0][1], 22, "dt_ms second column");
+    assert_eq!(value["samples"][0][2], 33, "leader third column");
+    assert_eq!(value["samples"][0][3], 4, "era fourth column");
+    assert_eq!(value["samples"][0][4], 1.106, "phi fifth column");
+    assert_eq!(value["decisions"][0]["phi"], 1.7);
+    assert_eq!(value["span"]["first_ms"], 1000, "the envelope ns floors to ms");
 }

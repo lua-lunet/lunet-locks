@@ -4,7 +4,10 @@ Local guidance for this repo. Keep it short, factual, and unsurprising.
 
 ## Subagent delegation
 
-- Prefer the subagent delegation skill: work a numbered todo list
+- Agents SHOULD prefer the subagent delegation skill (listed in
+  `opencode`'s available skills) wherever doing so does not overwrite any
+  other instruction here or the user's stated preferences.
+- Within that skill: work a numbered todo list
   (`item00`, `item01`, …), write each item's spec to the gitignored
   `.tmp/delegation/` scratch as `itemNN.md`, launch one agent per spec,
   gate commits on verified-green work, and use a `wip:` prefix until the

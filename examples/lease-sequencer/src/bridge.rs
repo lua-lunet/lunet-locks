@@ -43,7 +43,7 @@ use lunet_locks_aof::retention;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -231,6 +231,47 @@ pub struct Replay {
     pub events: Vec<LockEvent>,
     pub state: LockState,
     pub metrics: BridgeMetrics,
+    /// The phi telemetry: interval samples (marker 5) and timeout
+    /// decisions (marker 2), the ECharts tab's data source.
+    pub phi: PhiTrace,
+}
+
+/// One learned heartbeat-arrival interval (marker 5): when it was
+/// sampled, the learned delta, and the phi estimate at that arrival.
+#[derive(Debug, Clone, Default)]
+pub struct PhiSample {
+    pub ts_ms: u64,
+    pub dt_ms: u64,
+    pub leader: u32,
+    pub era: u32,
+    pub phi: f64,
+}
+
+/// The bulk phi telemetry, endpoint-shaped.
+#[derive(Debug, Clone, Default)]
+pub struct PhiTrace {
+    pub samples: Vec<PhiSample>,
+    pub decisions: Vec<serde_json::Value>,
+}
+
+impl PhiTrace {
+    /// The `/api/v1/telemetry/phi` body: samples as `[[ts_ms, dt_ms,
+    /// leader, era, phi]…]` (the scatter/candle columns), decisions as
+    /// the parsed marker-2 objects, and the span in ms from the
+    /// envelope's ns timestamps.
+    pub fn to_json(&self, first_ns: Option<u64>, last_ns: Option<u64>) -> serde_json::Value {
+        let floor_ms = |ns: u64| ns / 1_000_000;
+        json!({
+            "samples": self.samples.iter()
+                .map(|s| json!([s.ts_ms, s.dt_ms, s.leader, s.era, s.phi]))
+                .collect::<Vec<_>>(),
+            "decisions": self.decisions,
+            "span": {
+                "first_ms": first_ns.map(floor_ms),
+                "last_ms": last_ns.map(floor_ms),
+            },
+        })
+    }
 }
 
 /// One decoded committed op: everything the replay needs.
@@ -742,22 +783,81 @@ impl Server {
 /// A fresh full replay of one series directory.
 fn replay_snapshot(dir: &Path) -> Replay {
     let (events, state, metrics) = replay_series(dir);
+    let phi = phi_trace(dir);
     Replay {
         events,
         state,
         metrics,
+        phi,
     }
 }
 
-/// One connection's HTTP lifecycle. WebSocket upgrades park the socket in
-/// the live set; everything else answers from the snapshot and closes.
+/// The phi telemetry pass: decode every marker-5/marker-2 record's
+/// payload, stating what refused to parse rather than guessing.
+fn phi_trace(dir: &Path) -> PhiTrace {
+    let mut metrics = BridgeMetrics::default();
+    let mut samples = Vec::new();
+    let mut decisions = Vec::new();
+    for file in series_files(dir) {
+        for record in read_file_records(&file, &mut metrics) {
+            match record.marker {
+                Marker::TelemetryIntervalSample => {
+                    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&record.payload)
+                    {
+                        let get = |key: &str| value.get(key).and_then(|v| v.as_u64());
+                        if let (Some(ts_ms), Some(dt_ms), Some(leader), Some(era)) = (
+                            get("ts_ms"), get("dt_ms"), get("leader"), get("era"),
+                        ) {
+                            samples.push(PhiSample {
+                                ts_ms,
+                                dt_ms,
+                                leader: leader as u32,
+                                era: era as u32,
+                                phi: value.get("phi").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                            });
+                        }
+                    }
+                }
+                Marker::TelemetryTimeoutDecision => {
+                    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&record.payload)
+                    {
+                        decisions.push(value);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    PhiTrace { samples, decisions }
+}
+
+/// One connection's HTTP lifecycle. The full request head is drained
+/// before anything is answered: TCP delivers a request in as many
+/// segments as the client made writes, and a socket closed with request
+/// bytes still unread is reset by the kernel (BSD and Linux alike), so
+/// the client would lose the response instead of reading it through a
+/// clean FIN. WebSocket upgrades park the socket in the live set;
+/// everything else answers from the snapshot and half-closes.
 fn handle_connection(mut stream: TcpStream, snapshot: Arc<Mutex<Replay>>, live: Arc<Mutex<Vec<TcpStream>>>) {
-    let mut buf = [0u8; 8192];
-    let n = stream.read(&mut buf).unwrap_or(0);
-    if n == 0 {
+    // The request head's bound: the console's GET requests are one line
+    // of headers; anything larger is refused rather than buffered.
+    const MAX_HEAD_BYTES: usize = 64 * 1024;
+    let mut head: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        let n = stream.read(&mut chunk).unwrap_or(0);
+        if n == 0 {
+            break;
+        }
+        head.extend_from_slice(&chunk[..n]);
+        if head.windows(4).any(|window| window == b"\r\n\r\n") || head.len() >= MAX_HEAD_BYTES {
+            break;
+        }
+    }
+    if head.is_empty() {
         return;
     }
-    let request = String::from_utf8_lossy(&buf[..n]).into_owned();
+    let request = String::from_utf8_lossy(&head).into_owned();
     let mut lines = request.lines();
     let request_line = lines.next().unwrap_or_default().to_string();
     let mut parts = request_line.split_whitespace();
@@ -796,6 +896,9 @@ fn handle_connection(mut stream: TcpStream, snapshot: Arc<Mutex<Replay>>, live: 
     );
     let _ = stream.write_all(response.as_bytes());
     let _ = stream.flush();
+    // The graceful close: the response is sent, then the write side
+    // shuts down so the client reads the body through an orderly FIN.
+    let _ = stream.shutdown(Shutdown::Write);
 }
 
 /// The route table: the console's OpenAPI surface, read-only.
@@ -835,6 +938,10 @@ fn route(method: &str, path: &str, snapshot: &Arc<Mutex<Replay>>) -> (u16, Strin
         }
         "/api/v1/metrics" => (200, replay.metrics.to_json().to_string()),
         "/api/v1/metrics/series" => (200, series_json(&replay, unix_millis()).to_string()),
+        "/api/v1/telemetry/phi" => (
+            200,
+            replay.phi.to_json(replay.metrics.first_ns, replay.metrics.last_ns).to_string(),
+        ),
         path if path.starts_with("/api/v1/locks/") => {
             let id: u64 = path
                 .trim_start_matches("/api/v1/locks/")

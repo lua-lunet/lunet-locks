@@ -35,4 +35,11 @@ export const api = {
   breakLock: (id) => call("POST", "/locks/" + id + "/break", null, { actor: "admin@console" }),
   events: (params) => call("GET", "/events", params),
   series: (params) => call("GET", "/metrics/series", params),
+  // The bulk phi trace as raw text so the sessionStorage cache stays
+  // lossless (la-charts re-parses on read).
+  phiRaw: async () => {
+    const res = await fetch(new URL(base() + "/telemetry/phi", location.origin));
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    return res.text();
+  },
 };

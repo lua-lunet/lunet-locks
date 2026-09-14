@@ -1,0 +1,56 @@
+# AGENTS
+
+Rules for agents operating in `papers/`. Business substance lives in
+`papers/README.md` (written as the documentation target state); this file is
+operative guidance for agents only.
+
+## Priorities (ordered, mandatory)
+
+1. **Repeatability** — A grade. Every run reproducible from recorded
+   commands, knobs, and artifacts.
+2. **Accuracy** — A grade. Numbers anchored on the acting host's clock;
+   never n=1 where a distribution is asked; holder vs leader terminology
+   never mixed.
+3. **Fast feedback** — high pass. Local sanity before rig time.
+
+## Local-before-remote change gate
+
+- Debug all changes locally with TDD; exercise them in colima/Docker
+  (aarch64, no buildkit, no volume mounts, smallest cluster) before
+  deploying to Scaleway. Time-box and keep these sanity rigs minimal:
+  a tooling/logging change may need only a mini three-node short run to
+  pipe-clean; a trivial log-line change may bypass; most non-trivial
+  changes do not bypass.
+- `docker cp` scripts into images to shorten retest cycles.
+- Optimise Dockerfiles: system updates first, code additions last; push
+  new work up the file or into multi-stage builds so the layer cache
+  survives; keep an unchanging set of base images and put our code in
+  last.
+
+## Defensiveness
+
+- Every fix adds a defensive test around it so the regression cannot
+  silently return.
+
+## Andon (hard rules — violating these is insubordination)
+
+- On any non-shallow bug, an ANDON agent is spawned **immediately**, with
+  no todo item, no riveting in the main chat, and no prejudging of the
+  result in this conversation. The main chat is the factory line; the
+  andon must run in a subagent so process-error fixes do not pollute
+  the line's context.
+- The andon agent runs the five-whys on the full production line of
+  code, test, and methodology; it fixes the complete line, not just the
+  proximal symptom. If the mechanism itself is in doubt, replace it
+  (e.g. signals → admin port) rather than patching a faulty part.
+- The andon agent **must not stash** and must not disturb the main flow:
+  no `git stash`, no resets, no restores of shared paths. It works off
+  to the side with self-complete results (its own scratch trees, tests,
+  and proofs).
+- If its fix is complete and every test passes but the shared tree is
+  otherwise dirty, a `git add` of its files is the most it may stage.
+- If the repo is clean and its change is self-contained, it runs the
+  full suite and **commits** with a considered, complete commit message.
+- Andon closes by montaging its five-why chain, evidence, fix, and test
+  status back to the coordinator — nothing else is owed except the
+  work itself.

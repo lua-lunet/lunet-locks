@@ -63,6 +63,46 @@ configuration era or it is not `Normal`; the lease lapses for the
 transition's bounded window and a fresh grant re-acquires it. The measured
 cost is one lease lapse per join, and the joins commit and complete.
 
+## The client channel: every voter serves the lock verbs
+
+A lock verb (get/set) addressed to a voter's TCP client port is always
+executed on the leader: the leader's own port proposes the request
+in-process and answers on the same connection when it commits; a
+non-leader's port forwards the request to the leader over the peer
+application channel (the same `FORWARD_REQUEST`/`FORWARD_RESPONSE` wire
+the lease driver and the embedded clients use), pends the connection on
+the correlation id at the lead of the ordinary client deadline, and
+answers once with the leader's committed reply. A leader-side refusal
+mid-flight (the leader stood down in the window) answers
+`{"error":"not_leader"}` and the client retries or rotates. There is no
+leader requirement on the addressed node: a client speaks to its LOCAL
+voter, whatever the replication state of the rest of the cluster.
+
+## The embedded lock client
+
+Launched with `--embedded-client N --lock LOCK_ID`, the node runs N
+contender loops against its own embedded `Node` in-process — the same
+chase machine the `lease-load` binary drives over the wire (GET probe →
+free/expired ⇒ SET race; live foreign incumbent ⇒ poll past the
+leader-echoed expiry with jitter; holder ⇒ BUMP renewal one
+renewal-margin inside the deadline), with no client→cluster TCP. The
+cadence knobs mirror the load client's defaults: `--client-ttl-ms 500`
+and `--renew-fraction 0.5`. Every op is submitted through the node's
+own request path — proposed locally when this node leads, forwarded to
+the leader over the peer application channel otherwise — so the
+committed lock transitions are the same Service calls the wire clients'
+verbs exercise and the AOF records identical evidence (lock events and
+lookups, byte-for-byte the same request JSON).
+
+The loops share the host's client gate: every embedded client boots OFF
+and is silent until the first SIGUSR2; SIGUSR1 stops all outbound
+operations, forgets holdership, resets the lease-id/request-num
+bookkeeping, and abandons any in-flight op (a reply that arrives late is
+ignored); a restarted client re-enters as a NON-holder — its first
+action is a GET probe, never a blind BUMP. Transitions are logged on the
+process stdout stream (`client stop (SIGUSR1) at wall=<ms>` / `client
+start (SIGUSR2) at wall=<ms>`).
+
 ## The cluster
 
 `config/cluster.jsonl`: one genesis voter per DC (`dc1-node1`, `dc2-node1`,
@@ -201,6 +241,11 @@ as this repo does:
   forward/redirect application channel.
 - `src/bin/lease-client.rs` — the control client the orchestrator drives
   (lock and admin verbs over a node's TCP port).
+- `src/embedded_client.rs` — the contender decision machinery (the
+  `lease-load` chase machine as a shared module) and the host-side
+  embedded runner: the `--embedded-client N` loops, the SIGUSR1/SIGUSR2
+  process gate, and the message-id reply correlation for both
+  in-process and forwarded ops.
 - `config/cluster.jsonl` — the six-node deployment descriptor.
 - `run.sh`, `check.sh` — the stability check.
 - `check-standby.sh` — the standby AOF + console demo check.

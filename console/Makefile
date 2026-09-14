@@ -6,7 +6,7 @@ LUAROCKS ?= luarocks --lua-version=5.1 --tree=../.rocks
 PORT     ?= 8480
 MOCK_PORT ?= 8481
 
-.PHONY: init up down status logs check clean
+.PHONY: init up down status logs vendor vendor-lock check clean
 
 init:
 	@ls ../.rocks/share/lua/5.1/tl.lua >/dev/null 2>&1 || { \
@@ -27,6 +27,17 @@ status:
 
 logs:
 	@tail -n 40 -f tmp/mock.log tmp/nginx-error.log 2>/dev/null
+
+# Vendor Apache ECharts locally (pinned) and, with vendor-lock, mint the
+# sha256-named immutable copy plus the nginx fragment that redirects the
+# plain asset path to it.
+ECHARTS_VERSION ?= 5.6.0
+
+vendor:
+	@ECHARTS_VERSION=$(ECHARTS_VERSION) bin/vendor.sh
+
+vendor-lock:
+	@ECHARTS_VERSION=$(ECHARTS_VERSION) bin/vendor.sh lock
 
 check: init
 	shellcheck bin/*.sh
