@@ -323,17 +323,26 @@ def parse_system(buf: bytes):
 
 
 def lock_fields(payload: bytes):
-    """The lock-op JSON's fields that name the work, or None."""
+    """The lock-op JSON's fields that name the work, or None. A set's
+    lease object rides along: the holder uuid, the lease-id, and the
+    committed expiry — the takeover's evidence of what the successor's
+    acquire actually granted (or absent when the op carries no lease)."""
     try:
         value = json.loads(payload)
     except (ValueError, UnicodeDecodeError):
         return None
     if not isinstance(value, dict) or value.get("op") not in LOCK_OPS:
         return None
-    return {"op": value["op"], "lock_id": value.get("lock_id"),
-            "message_id": value.get("message_id"),
-            "client_id": value.get("client_id"),
-            "request_num": value.get("request_num")}
+    fields = {"op": value["op"], "lock_id": value.get("lock_id"),
+              "message_id": value.get("message_id"),
+              "client_id": value.get("client_id"),
+              "request_num": value.get("request_num")}
+    lease = value.get("lease")
+    if isinstance(lease, dict):
+        fields.update({"lease_id": lease.get("lease_id"),
+                       "lease_holder": lease.get("holder"),
+                       "expiry": lease.get("expiry")})
+    return fields
 
 
 # ------------------------------------------------------------- anchors ----
@@ -443,7 +452,8 @@ def _timeline_rows(dir_path, lib=None) -> list:
         else:
             op = "get"
         rows.append({"kind": "locks-timeline", "op": op, "holder": holder,
-                     "lock_id": lid, "ts_ms": ns_to_ms(r["aof_ns"]),
+                     "lock_id": lid, "slot": r.get("slot"),
+                     "ts_ms": ns_to_ms(r["aof_ns"]),
                      "aof_ns": r["aof_ns"]})
     return rows
 
@@ -470,9 +480,11 @@ def _takeover_row(window_rows, anchor) -> dict:
             last = heres[-1]
     return {"kind": "takeover", "anchor": anchor,
             "last_holder": last["holder"] if last else ABSENT,
+            "last_slot": last["slot"] if last else ABSENT,
             "last_renew_t_rel": exactly(last["ts_ms"] - anchor) if last else ABSENT,
             "break_seen_t_rel": exactly(brk[0]["ts_ms"] - anchor) if brk else ABSENT,
             "next_acquire_t_rel": exactly(nxt["ts_ms"] - anchor) if nxt else ABSENT,
+            "next_slot": nxt["slot"] if nxt else ABSENT,
             "next_holder": nxt["holder"] if nxt else ABSENT,
             "takeover_ms": exactly(nxt["ts_ms"] - anchor) if nxt else ABSENT}
 

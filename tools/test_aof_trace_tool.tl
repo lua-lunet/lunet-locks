@@ -193,8 +193,13 @@ local u64_bytes_be = function(v: any): string
 end
 local function op_lock_json(op: string, holder: number): string
     local mid = ("23456789-1234-5678-9123-67890123456%d"):format(holder)
+    local lease = ""
+    if op == "set" then
+        lease = (',"lease":{"lease_id":%d,"holder":"%032x","expiry":%d}')
+            :format(holder, holder, BASE_MS + 500)
+    end
     return ('{"op":"%s","message_id":"%s","client_id":%d,'
-        .. '"request_num":1,"lock_id":7}'):format(op, mid, holder)
+        .. '"request_num":1,"lock_id":7%s}'):format(op, mid, holder, lease)
 end
 local function operation_prepare(slot: number, era: number, view: number,
                                  lock_json: string, committed: number): string
@@ -277,6 +282,16 @@ check("tl-timeline-holders", #tlout >= 7 and tlout[3].holder == 1
     and tlout[4].holder == 1 and tlout[5].holder == 99
     and tlout[6].holder == 2 and tlout[7].holder == 3,
     tostring(tlout[6]) .. "/" .. tostring(tlout[7]))
+check("tl-timeline-slots", #tlout >= 7 and tlout[3].slot == 5
+    and tlout[4].slot == 6 and tlout[5].slot == 7
+    and tlout[6].slot == 8 and tlout[7].slot == 9,
+    tostring(tlout[6]) .. "/" .. tostring(tlout[7]))
+local lockout = tool.export_series(timeline_dir, "locks", {})
+check("tl-timeline-lease", #lockout >= 5
+    and lockout[1].lease_holder == ("%032x"):format(1)
+    and lockout[1].lease_id == 1 and lockout[1].expiry == BASE_MS + 500
+    and lockout[1].slot == 5 and lockout[3].lease_holder == nil,
+    tostring(lockout[1]))
 check("tl-timeline-ts", #tlout >= 7 and tlout[3].ts_ms == BASE_MS + 1
     and tlout[4].ts_ms == BASE_MS + 3 and tlout[5].ts_ms == BASE_MS + 13
     and tlout[6].ts_ms == BASE_MS + 15 and tlout[7].ts_ms == BASE_MS + 17,
@@ -293,8 +308,10 @@ end
 check("tl-takeover-anchors", #tc == 2 and tc[1].anchor == A1
     and tc[2].anchor == A2, tostring(#tc))
 check("tl-takeover-1-py-mirror", #tc >= 2 and tc[1].last_holder == 1
+    and tc[1].last_slot == 6
     and tc[1].last_renew_t_rel == 0.0 and tc[1].break_seen_t_rel == 10.0
     and tc[1].next_acquire_t_rel == "absent"
+    and tc[1].next_slot == "absent"
     and tc[1].next_holder == "absent" and tc[1].takeover_ms == "absent",
     tostring(tc[1]))
 check("tl-takeover-2-py-mirror", #tc >= 2 and tc[2].last_holder == 2

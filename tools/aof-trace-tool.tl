@@ -549,13 +549,24 @@ local function lock_fields(json: string): ({string: any} | nil)
     if op == nil or LOCK_OPS[op] ~= true then
         return nil
     end
-    return {
+    local fields = {
         op = op,
         lock_id = json_num(json, "lock_id"),
         message_id = json_str(json, "message_id"),
         client_id = json_num(json, "client_id"),
         request_num = json_num(json, "request_num"),
     }
+    -- A set's lease object rides along: the holder uuid, the lease-id,
+    -- and the committed expiry — the takeover's evidence of what the
+    -- successor's acquire actually granted (absent without a lease).
+    local at = json:find('"lease":')
+    if at ~= nil then
+        local tail = json:sub(at)
+        fields.lease_id = json_num(tail, "lease_id")
+        fields.lease_holder = json_str(tail, "holder")
+        fields.expiry = json_num(tail, "expiry")
+    end
+    return fields
 end
 
 local function json_payload(frame: string): string
@@ -631,22 +642,25 @@ end
 -- construction order so a raw line diff is the parity check.
 local DEFAULT_ORDER: {string} = {"kind", "aof_ns", "leader_ms", "slot",
                                  "result", "op", "lock_id", "message_id",
-                                 "client_id", "request_num", "command",
+                                 "client_id", "request_num", "lease_id",
+                                 "lease_holder", "expiry", "command",
                                  "phi", "now_ms", "prev_wait_ms",
                                  "next_wait_ms", "mean_interval_ms", "mean",
                                  "min_ms", "max_ms", "node", "era", "leader",
                                  "view", "addr", "holder", "dt_ms", "ts_ms",
                                  "sent_at_ms", "t_rel_ms", "t_fmt", "anchor",
-                                 "last_holder", "last_renew_t_rel",
+                                 "last_holder", "last_slot",
+                                 "last_renew_t_rel",
                                  "break_seen_t_rel", "next_acquire_t_rel",
-                                 "next_holder", "takeover_ms", "dir",
-                                 "source", "min_ms", "mean_ms", "p50_ms",
-                                 "p95_ms", "max_ms", "count", "gaps",
-                                 "stalls", "samples"}
+                                 "next_slot", "next_holder", "takeover_ms",
+                                 "dir", "source", "min_ms", "mean_ms",
+                                 "p50_ms", "p95_ms", "max_ms", "count",
+                                 "gaps", "stalls", "samples"}
 local ROW_ORDER: {string: {string}} = {
     ["locks"] = {"kind", "aof_ns", "leader_ms", "slot", "result", "op",
                  "lock_id", "message_id", "client_id", "request_num",
-                 "t_rel_ms", "t_fmt"},
+                 "lease_id", "lease_holder", "expiry", "t_rel_ms",
+                 "t_fmt"},
     ["reconfig"] = {"kind", "command", "aof_ns", "leader_ms", "slot",
                     "result", "t_rel_ms", "t_fmt"},
     ["phi"] = {"kind", "aof_ns", "phi", "now_ms", "prev_wait_ms",
@@ -655,10 +669,11 @@ local ROW_ORDER: {string: {string}} = {
     ["phi-samples"] = {"kind", "aof_ns", "node", "era", "leader", "addr",
                        "dt_ms", "ts_ms", "phi", "sent_at_ms",
                        "t_rel_ms", "t_fmt"},
-    ["locks-timeline"] = {"kind", "op", "holder", "lock_id", "ts_ms",
-                          "aof_ns", "t_rel_ms", "t_fmt"},
-    ["takeover"] = {"kind", "anchor", "last_holder", "last_renew_t_rel",
-                    "break_seen_t_rel", "next_acquire_t_rel", "next_holder",
+    ["locks-timeline"] = {"kind", "op", "holder", "lock_id", "slot",
+                          "ts_ms", "aof_ns", "t_rel_ms", "t_fmt"},
+    ["takeover"] = {"kind", "anchor", "last_holder", "last_slot",
+                    "last_renew_t_rel", "break_seen_t_rel",
+                    "next_acquire_t_rel", "next_slot", "next_holder",
                     "takeover_ms"},
     ["anchor"] = {"kind", "anchor", "ts_ms", "t_rel_ms", "t_fmt"},
     ["hb-spacing"] = {"kind", "dir", "source", "era", "leader", "min_ms",
@@ -1018,7 +1033,8 @@ timeline_rows = function(dir_path: string): {{string: any}}
             op = "get"
         end
         rows[#rows + 1] = {kind = "locks-timeline", op = op, holder = holder,
-                           lock_id = r.lock_id, ts_ms = ns_to_ms(r.aof_ns),
+                           lock_id = r.lock_id, slot = r.slot,
+                           ts_ms = ns_to_ms(r.aof_ns),
                            aof_ns = r.aof_ns}
     end
     return rows
@@ -1080,9 +1096,11 @@ takeover_row = function(window_rows: {{string: any}}, anchor: number,
     end
     return {kind = "takeover", anchor = anchor_out,
             last_holder = (last ~= nil) and last.holder or ABSENT,
+            last_slot = (last ~= nil) and last.slot or ABSENT,
             last_renew_t_rel = (last ~= nil) and exactly(last.ts_ms - anchor) or ABSENT,
             break_seen_t_rel = (#brk > 0) and exactly(brk[1].ts_ms - anchor) or ABSENT,
             next_acquire_t_rel = (nxt ~= nil) and exactly(nxt.ts_ms - anchor) or ABSENT,
+            next_slot = (nxt ~= nil) and nxt.slot or ABSENT,
             next_holder = (nxt ~= nil) and nxt.holder or ABSENT,
             takeover_ms = (nxt ~= nil) and exactly(nxt.ts_ms - anchor) or ABSENT}
 end

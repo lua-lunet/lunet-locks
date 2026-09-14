@@ -194,8 +194,12 @@ def write_timeline_fixture(d):
 
     def lock_json(op, holder):
         mid = ("23456789-1234-5678-9123-67890123456{%d}" % holder)[:36]
+        lease = ""
+        if op == "set":
+            lease = (',"lease":{"lease_id":%d,"holder":"%032x","expiry":%d}'
+                     % (holder, holder, AnchoredTimelineExport.BASE_MS + 500))
         return ('{"op":"%s","message_id":"%s","client_id":%d,'
-                '"request_num":1,"lock_id":7}') % (op, mid, holder)
+                '"request_num":1,"lock_id":7%s}') % (op, mid, holder, lease)
 
     path = d / "fixture.aof"
     f = tool.open_writer(path, LIB)
@@ -308,6 +312,16 @@ class AnchoredTimelineExport(unittest.TestCase):
                          [self.BASE_MS + k for k in (1, 3, 13, 15, 17)])
         self.assertEqual([l["aof_ns"] for l in out],
                          [self.BASE_NS + k * 1_000_000 for k in (1, 3, 13, 15, 17)])
+        # The committed slot rides each timeline row; the lease evidence
+        # rides the locks export's set rows.
+        self.assertEqual([l["slot"] for l in out], [5, 6, 7, 8, 9])
+        locks = tool.export_series(self.dir, LIB, kinds="locks")
+        holder1 = "%032x" % 1
+        self.assertEqual(locks[0]["lease_holder"], holder1)
+        self.assertEqual(locks[0]["lease_id"], 1)
+        self.assertEqual(locks[0]["expiry"], self.BASE_MS + 500)
+        self.assertIsNone(locks[2].get("lease_holder"),
+                          "the break op carries no lease object")
         self.assertNotIn("t_rel_ms", out[0], "no anchor, no relative column")
 
     def test_takeover_summaries_per_anchor_as_export_lines(self):
@@ -327,18 +341,22 @@ class AnchoredTimelineExport(unittest.TestCase):
         # next acquire belongs to the NEXT anchor's window -> absent.
         self.assertEqual(tak[0], {"kind": "takeover", "anchor": self.A1,
                                   "last_holder": 1,
+                                  "last_slot": 6,
                                   "last_renew_t_rel": 0.0,
                                   "break_seen_t_rel": 10.0,
                                   "next_acquire_t_rel": "absent",
+                                  "next_slot": "absent",
                                   "next_holder": "absent",
                                   "takeover_ms": "absent"})
         # Anchor 2: holder 2 acquired at the anchor, holder 3 at +1 ms
         # (no break row in the window -> the handover is the signal).
         self.assertEqual(tak[1], {"kind": "takeover", "anchor": self.A2,
                                   "last_holder": 2,
+                                  "last_slot": 8,
                                   "last_renew_t_rel": 0.0,
                                   "break_seen_t_rel": "absent",
                                   "next_acquire_t_rel": 2.0,
+                                  "next_slot": 9,
                                   "next_holder": 3,
                                   "takeover_ms": 2.0})
 
@@ -349,9 +367,11 @@ class AnchoredTimelineExport(unittest.TestCase):
         self.assertEqual(tak[0], {"kind": "takeover",
                                   "anchor": self.BASE_MS + 50,
                                   "last_holder": "absent",
+                                  "last_slot": "absent",
                                   "last_renew_t_rel": "absent",
                                   "break_seen_t_rel": "absent",
                                   "next_acquire_t_rel": "absent",
+                                  "next_slot": "absent",
                                   "next_holder": "absent",
                                   "takeover_ms": "absent"})
 
