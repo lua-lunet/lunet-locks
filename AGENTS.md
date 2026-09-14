@@ -14,6 +14,25 @@ Local guidance for this repo. Keep it short, factual, and unsurprising.
   feature set is complete. Where doing so does not overwrite any other
   instruction here or the user's stated preferences.
 
+## New user work lands as two todos at the end
+
+- A new user message that introduces work is, by default, non-blocking: append
+  two items to the END of the todo list — (1) "plan <work>" and (2) "<work>"
+  — then continue the item in progress. `opencode-chat-history` may be used
+  during the planning item to recover the user's stated details.
+- Exceptions (obey the user's words over this default): they say do it next,
+  immediately, without a todo list, or name a specific order — then do what
+  they said.
+
+## Fast line: pure Rust, then wrappers
+
+- Debugging is ad-hoc Rust first: small throwaway CLI bins named
+  `skaffold_xxxx` that solve exactly one thing. Wrappers (Lua/Python/FFI)
+  are pure overhead while debugging; defer them to reuse, and when they
+  are written, base them on a battle-tested Rust console (AOF + logs +
+  lock client/server interaction) — a small skin, not new machinery.
+- Every fix carries a defensive test so the regression cannot return.
+
 ## Read boundary
 
 - Agents are FORBIDDEN from reading outside this repo. A dependency's code is
