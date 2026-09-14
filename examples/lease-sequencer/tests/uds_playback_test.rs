@@ -31,9 +31,37 @@ struct RigOp {
     lock_id: u64,
     op: String,
     payload: Vec<u8>,
-    /// The offered lease (holder uuid, expiry) when the op is a Set.
+    /// The captured holder (string form) when the op is a Set.
     offered_holder: Option<String>,
-    offered_expiry: Option<u64>,
+    /// The 2026-09-14 rig corpus's CAPTURED absolute expiry, when the op
+    /// is a legacy-shaped Set. The bytes on disk carry the retired
+    /// absolute-expiry candidate; `payload` is the current-shape rewrite
+    /// (`lease_ms = captured_expiry − the replay's execution tick`) and
+    /// this field keeps the capture-side evidence for the census.
+    captured_expiry: Option<u64>,
+}
+
+/// Decode one operation payload for replay. Current-shape bytes decode
+/// directly (no captured expiry). The rig corpus's legacy Sets — the
+/// retired absolute-`expiry` candidate — are rewritten to the duration
+/// wire with `lease_ms = captured_expiry − executed_ms`, the replay's
+/// execution tick: the replayed grant then stamps exactly the expiry the
+/// rig's leader had stamped, so the outcomes match byte-for-byte.
+fn decode_op(payload: &[u8], executed_ms: u64) -> Option<(Request, Vec<u8>, Option<u64>)> {
+    if let Ok(request) = Service::decode(payload) {
+        return Some((request, payload.to_vec(), None));
+    }
+    let value: serde_json::Value = serde_json::from_slice(payload).ok()?;
+    if value.get("op").and_then(|op| op.as_str()) != Some("set") {
+        return None;
+    }
+    let captured_expiry = value.get("lease")?.get("expiry")?.as_u64()?;
+    let mut rewritten = value.clone();
+    rewritten["lease"].as_object_mut()?.remove("expiry");
+    rewritten["lease"]["lease_ms"] = Value::from(captured_expiry.saturating_sub(executed_ms));
+    let bytes = serde_json::to_vec(&rewritten).ok()?;
+    let request = Service::decode(&bytes).ok()?;
+    Some((request, bytes, Some(captured_expiry)))
 }
 
 /// One captured wire datagram: the raw bytes as the network carried them
@@ -92,20 +120,21 @@ fn extract_corpus() -> (Vec<RigDatagram>, Vec<RigOp>) {
             let Payload::Operation { id: _, payload } = &entry.payload else {
                 continue;
             };
-            let Ok(request) = Service::decode(payload) else {
-                continue;
-            };
+            let (request, replay_payload, captured_expiry) =
+                match decode_op(payload, ns / 1_000_000) {
+                    Some((request, bytes, captured)) => (request, bytes, captured),
+                    None => continue,
+                };
             let (message_id, client_id, request_num) = request.ids();
-            let (op, lock_id, offered_holder, offered_expiry) = match &request {
-                Request::Get { lock_id, .. } => ("get".to_string(), *lock_id, None, None),
+            let (op, lock_id, offered_holder) = match &request {
+                Request::Get { lock_id, .. } => ("get".to_string(), *lock_id, None),
                 Request::Set { lock_id, lease, .. } => (
                     "set".to_string(),
                     *lock_id,
                     Some(lease.holder.to_string()),
-                    Some(lease.expiry),
                 ),
-                Request::Release { lock_id, .. } => ("release".to_string(), *lock_id, None, None),
-                Request::Break { lock_id, .. } => ("break".to_string(), *lock_id, None, None),
+                Request::Release { lock_id, .. } => ("release".to_string(), *lock_id, None),
+                Request::Break { lock_id, .. } => ("break".to_string(), *lock_id, None),
             };
             ops.push(RigOp {
                 ns,
@@ -114,9 +143,9 @@ fn extract_corpus() -> (Vec<RigDatagram>, Vec<RigOp>) {
                 request_num,
                 lock_id,
                 op,
-                payload: payload.to_vec(),
+                payload: replay_payload,
                 offered_holder,
-                offered_expiry,
+                captured_expiry,
             });
         }
     }
@@ -336,8 +365,48 @@ fn given_rig_set_through_harness_cluster_stale_lease_denied() {
     let replies = cluster.raw_replies("probe1");
     let (reply, _) = replies.first().expect("the reply is correlated");
     assert_eq!(
-        reply["granted"], false,
-        "a stale rig lease must be denied on the live cluster: {reply}"
+        reply["granted"], true,
+        "a replayed rig SET lands on a fresh cluster: the ledger has never \
+         seen this (client, request_num), the lease carries only a DURATION, \
+         and a fresh owner stamps a fresh expiry — granted: {reply}"
+    );
+    // The second delivery of the SAME captured op (message_id reused):
+    // exactly-once — the dedup replays the prior reply, it never
+    // double-grants. THIS is the fencing across the transport swap
+    // under the duration protocol: staleness does not exist on the
+    // wire, identity does.
+    cluster.raw_issue("probe1", &payload).expect("replay re-issue");
+    let got_second = cluster.wait_until(2000, |lines| {
+        lines
+            .iter()
+            .filter(|l| l.starts_with("node44,probe1,{"))
+            .count()
+            >= 2
+    });
+    assert!(
+        got_second,
+        "no reply for the re-delivered rig op; tail:\n{}",
+        cluster.trace_tail(6)
+    );
+    // The re-delivery is deduped: the second reply line replays the
+    // FIRST execution's exact outcome (same granted, same grant
+    // stamps) — nobody re-executes, nobody double-grants. THIS is the
+    // fencing across the transport swap under the duration protocol:
+    // staleness does not exist on the wire, identity does.
+    let payloads: Vec<String> = cluster
+        .lines
+        .iter()
+        .filter(|l| l.starts_with("node44,probe1,{"))
+        .map(|l| l.split_once(",{").map(|(_, json)| json.to_string()).unwrap_or_default())
+        .collect();
+    assert_eq!(
+        payloads.len(),
+        2,
+        "two trace reply lines for the two deliveries"
+    );
+    assert_eq!(
+        payloads[0], payloads[1],
+        "the dedup replays the first execution's exact reply bytes: nobody re-executes"
     );
 }
 
@@ -354,8 +423,8 @@ fn rig_corpus_census() {
             .or_default() += 1;
         if op.op == "set" {
             println!(
-                "SET in corpus: lock={} client_id={} holder={:?} expiry={:?} ns={}",
-                op.lock_id, op.client_id, op.offered_holder, op.offered_expiry, op.ns
+                "SET in corpus: lock={} client_id={} holder={:?} captured_expiry={:?} ns={}",
+                op.lock_id, op.client_id, op.offered_holder, op.captured_expiry, op.ns
             );
         }
     }

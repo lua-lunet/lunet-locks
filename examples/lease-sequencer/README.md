@@ -10,13 +10,29 @@ The advisory lock holds the lease to be the SEQUENCER.
 
 ## The lease policy
 
+The client never states an expiry. The wire request says "hold/renew
+this lock for me for a duration X" (`lease_ms` in the rented `lease`
+object), and MAY stamp `sent_at_ms` on the request for latency
+measurement only — no protocol decision reads it. The executing host
+(the leader, wherever the core runs the op) checks instantaneously on
+its own clock whether the lock is free (or held by the same holder),
+and only then stamps `expiry = its_execution_time + X` and runs
+consensus. The reply names the input `lease_ms`, the leader-stamped
+`expiry`, and its `executed_at`. The granted window is therefore
+measured in exactly one clock — the leader's — so client clock skew
+cannot lengthen a lease; a desynced client can only fail to hold, and
+fencing across re-delivery is identity (`message_id`, the
+`(client, request_num)` exactly-once contract), not staleness, because
+staleness no longer exists on the wire.
+
 Every node runs the same driver:
 
-- if the lease is free, try to hold it (SET) with a 500 ms lease;
+- if the lease is free, try to hold it (SET) with a 500 ms duration;
 - if it holds it, renew 250 ms before the deadline (a fresh grant renews at
   250 ms after the grant);
 - if another node holds it, poll it as a GET and schedule the next poll at
-  the reported expiry plus `rand()*100 ms`.
+  the leader-echoed remaining time plus `rand()*100 ms` (thinned by the
+  polite probe floor under `--model polite`).
 
 Every attempt is logged at `info` as
 

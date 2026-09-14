@@ -1,11 +1,11 @@
-use lunet_advisory_lock::locks::{Lease, Request, Response, Service};
+use lunet_advisory_lock::locks::{LeaseCandidate, Request, Response, Service};
 use uuid::Uuid;
 
 fn id(byte: u8) -> Uuid {
     Uuid::from_bytes([byte; 16])
 }
 
-fn set(message: u8, client: u64, request_num: u64, holder: u8, expiry: u64) -> Request {
+fn set(message: u8, client: u64, request_num: u64, holder: u8, lease_ms: u64) -> Request {
     Request::Set {
         message_id: id(message),
         client_id: client,
@@ -13,15 +13,12 @@ fn set(message: u8, client: u64, request_num: u64, holder: u8, expiry: u64) -> R
         lock_id: 7,
         name: None,
         labels: None,
-        lease: Lease {
+        lease: LeaseCandidate {
             lease_id: 9,
             holder: id(holder),
-            expiry,
-            name: None,
-            labels: None,
-            taken_at_ms: 0,
-            renew_count: 0,
+            lease_ms,
         },
+        sent_at_ms: None,
     }
 }
 
@@ -46,7 +43,7 @@ fn set_obeys_the_lease_rules() {
                 1,
                 1,
                 100,
-                &serde_json::to_vec(&set(1, 1, 1, 1, 500)).unwrap(),
+                &serde_json::to_vec(&set(1, 1, 1, 1, 400)).unwrap(),
             )
             .unwrap()
             .0,
@@ -65,14 +62,16 @@ fn set_obeys_the_lease_rules() {
             .0,
     )
     .unwrap();
-    let expired: Response = serde_json::from_slice(
+    // After the first leases's stamped window lapses (100 + 400 = 500),
+    // the expired incumbent is free and the new holder takes.
+    let after_expiry: Response = serde_json::from_slice(
         &service
             .execute(
                 id(3),
                 2,
                 2,
                 500,
-                &serde_json::to_vec(&set(3, 2, 2, 2, 900)).unwrap(),
+                &serde_json::to_vec(&set(3, 2, 2, 2, 400)).unwrap(),
             )
             .unwrap()
             .0,
@@ -81,7 +80,7 @@ fn set_obeys_the_lease_rules() {
 
     assert!(matches!(first, Response::Set { granted: true, .. }));
     assert!(matches!(blocked, Response::Set { granted: false, .. }));
-    assert!(matches!(expired, Response::Set { granted: true, .. }));
+    assert!(matches!(after_expiry, Response::Set { granted: true, .. }));
 }
 
 #[test]

@@ -37,12 +37,12 @@ fn millis() -> u64 {
         .as_millis() as u64
 }
 
-fn request_json(byte: u8, client: u64, request_num: u64, expiry: u64) -> String {
+fn request_json(byte: u8, client: u64, request_num: u64, lease_ms: u64) -> String {
     format!(
         "{{\"op\":\"set\",\"message_id\":\"00000000-0000-0000-0000-{byte:012x}\",\
          \"client_id\":{client},\"request_num\":{request_num},\"lock_id\":7,\
          \"lease\":{{\"lease_id\":1,\"holder\":\"00000000-0000-0000-0000-0000000000{byte:02x}\",\
-         \"expiry\":{expiry}}}}}"
+         \"lease_ms\":{lease_ms}}}}}"
     )
 }
 
@@ -77,10 +77,10 @@ fn a_gap_served_chunk_applies_its_whole_committed_range() {
     }
 
     // Three client operations commit on n1 + n3 alone; n2 hears nothing.
-    let expiry = millis() + 60_000;
+    let lease_ms = 60_000;
     let mut held_prepare: Option<Vec<u8>> = None;
     for op in 1..=3u8 {
-        let json = request_json(op, 1, u64::from(op), expiry);
+        let json = request_json(op, 1, u64::from(op), lease_ms);
         assert_eq!(n1.node.request(json.as_bytes()), OK, "op {op} proposed");
         for (to, bytes) in drain_sends(&mut n1) {
             if to == 2 {
@@ -124,7 +124,7 @@ fn a_gap_served_chunk_applies_its_whole_committed_range() {
 
     // The node is whole again: the next operation is accepted and
     // acknowledged like any member's.
-    let json = request_json(4, 1, 4, expiry);
+    let json = request_json(4, 1, 4, lease_ms);
     assert_eq!(n1.node.request(json.as_bytes()), OK);
     let mut next_prepare = None;
     for (to, bytes) in drain_sends(&mut n1) {

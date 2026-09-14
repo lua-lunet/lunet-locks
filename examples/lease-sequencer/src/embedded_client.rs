@@ -259,23 +259,27 @@ impl Contender {
     }
 
     /// The SET request both the acquire race and the same-holder
-    /// renewal (BUMP) send: one lease window from `now`, this
-    /// contender's holder identity, and the gate's lease-id /
-    /// request-num bookkeeping advanced.
+    /// renewal (BUMP) send: the asked DURATION (the lease_ms knob),
+    /// this contender's holder identity, the purely observational
+    /// `sent_at_ms` send stamp, and the gate's lease-id /
+    /// request-num bookkeeping advanced. The request names no expiry —
+    /// the leader stamps `expiry = execution_time + lease_ms` on its
+    /// own clock.
     fn build_set(&mut self, now_ms: u64, op: &'static str) -> Action {
         self.gate.request_num += 1;
         self.gate.lease_id += 1;
         let message_id = *uuid::Uuid::new_v4().as_bytes();
-        let expiry = now_ms + self.config.lease_ms;
         let request = format!(
             "{{\"op\":\"set\",\"message_id\":\"{}\",\"client_id\":{},\"request_num\":{},\
-             \"lock_id\":{},\"lease\":{{\"lease_id\":{},\"holder\":\"{}\",\"expiry\":{expiry}}}}}",
+             \"lock_id\":{},\"lease\":{{\"lease_id\":{},\"holder\":\"{}\",\"lease_ms\":{}}},\
+             \"sent_at_ms\":{now_ms}}}",
             uuid::Uuid::from_bytes(message_id),
             self.config.client_id,
             self.gate.request_num,
             self.config.lock_id,
             self.gate.lease_id,
-            self.holder
+            self.holder,
+            self.config.lease_ms
         );
         Action {
             op,
@@ -740,7 +744,8 @@ mod tests {
         assert_eq!(value["request_num"], 2);
         assert_eq!(value["lock_id"], 0x0DDBA12 as u64);
         assert_eq!(value["lease"]["holder"], holder.as_str());
-        assert_eq!(value["lease"]["expiry"], 10_010 + 500);
+        assert_eq!(value["lease"]["lease_ms"], 500);
+        assert_eq!(value["sent_at_ms"], 10_010);
         assert_eq!(value["lease"]["lease_id"], 1);
         // The race stakes holdership; the gate adopts it only once the
         // race's own reply lands.

@@ -2576,11 +2576,10 @@ mod forward_tests {
     fn set_request(client_id: u64, request_num: u64) -> String {
         let mid = uuid::Uuid::new_v4();
         let holder = uuid::Uuid::new_v4();
-        let expiry = millis() + 500;
         format!(
             "{{\"op\":\"set\",\"message_id\":\"{mid}\",\"client_id\":{client_id},\
              \"request_num\":{request_num},\"lock_id\":{LOCK_ID},\
-             \"lease\":{{\"lease_id\":1,\"holder\":\"{holder}\",\"expiry\":{expiry}}}}}"
+             \"lease\":{{\"lease_id\":1,\"holder\":\"{holder}\",\"lease_ms\":500}}}}"
         )
     }
 

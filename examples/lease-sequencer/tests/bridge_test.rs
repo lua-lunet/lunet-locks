@@ -127,7 +127,7 @@ fn fixture_aof(name: &str) -> std::path::PathBuf {
         1,
         1,
         &format!(
-            ",\"lock_id\":7,\"lease\":{{\"lease_id\":11,\"holder\":\"{holder_a}\",\"expiry\":1700000100000}},\"name\":\"/cluster/leader\",\"labels\":[\"smr\"]"
+            ",\"lock_id\":7,\"lease\":{{\"lease_id\":11,\"holder\":\"{holder_a}\",\"lease_ms\":10000}},\"name\":\"/cluster/leader\",\"labels\":[\"smr\"]"
         ),
     );
     write_wire(&mut aof, t0, &prepare_wire(acquire_id, &acquire, 1));
@@ -143,7 +143,7 @@ fn fixture_aof(name: &str) -> std::path::PathBuf {
         1,
         2,
         &format!(
-            ",\"lock_id\":7,\"lease\":{{\"lease_id\":12,\"holder\":\"{holder_a}\",\"expiry\":1700000200000}},\"name\":\"/cluster/leader\""
+            ",\"lock_id\":7,\"lease\":{{\"lease_id\":12,\"holder\":\"{holder_a}\",\"lease_ms\":10000}},\"name\":\"/cluster/leader\""
         ),
     );
     write_wire(&mut aof, t0 + 2_000_000, &prepare_wire(renew_id, &renew, 2));
@@ -156,7 +156,7 @@ fn fixture_aof(name: &str) -> std::path::PathBuf {
         2,
         1,
         &format!(
-            ",\"lock_id\":7,\"lease\":{{\"lease_id\":13,\"holder\":\"{holder_b}\",\"expiry\":1700000300000}},\"name\":\"/cluster/leader\""
+            ",\"lock_id\":7,\"lease\":{{\"lease_id\":13,\"holder\":\"{holder_b}\",\"lease_ms\":10000}},\"name\":\"/cluster/leader\""
         ),
     );
     write_wire(&mut aof, t0 + 3_000_000, &prepare_wire(deny_id, &deny, 3));
@@ -180,7 +180,7 @@ fn fixture_aof(name: &str) -> std::path::PathBuf {
         1,
         4,
         &format!(
-            ",\"lock_id\":7,\"lease\":{{\"lease_id\":14,\"holder\":\"{holder_a}\",\"expiry\":1700000400000}},\"name\":\"/cluster/leader\""
+            ",\"lock_id\":7,\"lease\":{{\"lease_id\":14,\"holder\":\"{holder_a}\",\"lease_ms\":10000}},\"name\":\"/cluster/leader\""
         ),
     );
     write_wire(&mut aof, t0 + 5_000_000, &prepare_wire(reacquire_id, &reacquire, 5));
@@ -551,7 +551,7 @@ fn follow_pushes_new_events_over_websocket() {
         9,
         1,
         &format!(
-            ",\"lock_id\":8,\"lease\":{{\"lease_id\":1,\"holder\":\"{holder}\",\"expiry\":1700000500000}},\"name\":\"/jobs/compact/shard-00\""
+            ",\"lock_id\":8,\"lease\":{{\"lease_id\":1,\"holder\":\"{holder}\",\"lease_ms\":10000}},\"name\":\"/jobs/compact/shard-00\""
         ),
     );
     let wire = prepare_wire(id, &json, 20);

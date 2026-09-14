@@ -3946,17 +3946,14 @@ mod tests {
             client_id: 1,
             request_num: 1,
             lock_id: 9001,
-            lease: crate::locks::Lease {
+            lease: crate::locks::LeaseCandidate {
                 lease_id: 1,
                 holder: Uuid::from_bytes([0xBB; 16]),
-                expiry: unix_millis().unwrap() + 60_000,
-                name: None,
-                labels: None,
-                taken_at_ms: 0,
-                renew_count: 0,
+                lease_ms: 60_000,
             },
             name: None,
             labels: None,
+            sent_at_ms: None,
         })
         .unwrap();
         assert_eq!(request(&mut nodes[0], &set_payload), OK);
@@ -4324,7 +4321,7 @@ mod tests {
     #[test]
     fn journal_records_committed_transitions_with_roll_and_meta() {
         use crate::journal::{self, Meta, parse_file};
-        use crate::locks::{Lease, Request};
+        use crate::locks::{LeaseCandidate, Request};
 
         let journal_dir = state_path("journal-integration");
         let _ = fs::remove_dir_all(&journal_dir);
@@ -4417,17 +4414,14 @@ mod tests {
                 client_id: 1,
                 request_num: 1,
                 lock_id,
-                lease: Lease {
+                lease: LeaseCandidate {
                     lease_id,
                     holder,
-                    expiry: unix_millis().unwrap() + 60_000,
-                    name: None,
-                    labels: None,
-                    taken_at_ms: 0,
-                    renew_count: 0,
+                    lease_ms: 60_000,
                 },
                 name: None,
                 labels: None,
+                sent_at_ms: None,
             })
             .unwrap();
             assert_eq!(

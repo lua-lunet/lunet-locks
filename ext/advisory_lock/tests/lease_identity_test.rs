@@ -15,14 +15,14 @@ fn uuid_text(byte: u8) -> String {
     Uuid::from_bytes([byte; 16]).to_string()
 }
 
-fn set_json(id: u8, client: u64, num: u64, holder: &str, expiry: u64) -> Value {
+fn set_json(id: u8, client: u64, num: u64, holder: &str, lease_ms: u64) -> Value {
     json!({
         "op": "set",
         "message_id": uuid_text(id),
         "client_id": client,
         "request_num": num,
         "lock_id": LOCK_ID,
-        "lease": {"lease_id": 9, "holder": holder, "expiry": expiry},
+        "lease": {"lease_id": 9, "holder": holder, "lease_ms": lease_ms},
     })
 }
 
@@ -135,7 +135,7 @@ fn get_lease(response: Response) -> (u64, u32, String, Option<String>, Option<Ve
 #[test]
 fn set_with_name_and_labels_stores_canonical_identity() {
     let mut service = Service::default();
-    let mut request = set_json(1, 1, 1, HOLDER_A, 500);
+    let mut request = set_json(1, 1, 1, HOLDER_A, 400);
     request["name"] = json!("/cluster/members/0000001");
     request["labels"] = json!(["prod", "csv", "prod"]);
     let (holder, name, labels, taken_at, renew_count) =
@@ -150,7 +150,7 @@ fn set_with_name_and_labels_stores_canonical_identity() {
 #[test]
 fn get_reply_carries_the_extended_lease() {
     let mut service = Service::default();
-    let mut request = set_json(1, 1, 1, HOLDER_A, 500);
+    let mut request = set_json(1, 1, 1, HOLDER_A, 400);
     request["name"] = json!("/cluster/members/0000001");
     request["labels"] = json!(["csv"]);
     let granted = run(&mut service, 1, 1, 1, 100, request);
@@ -167,7 +167,7 @@ fn get_reply_carries_the_extended_lease() {
 #[test]
 fn same_holder_renew_increments_renew_count_and_keeps_taken_at() {
     let mut service = Service::default();
-    let mut first = set_json(1, 1, 1, HOLDER_A, 500);
+    let mut first = set_json(1, 1, 1, HOLDER_A, 400);
     first["name"] = json!("/cluster/members/0000001");
     let (holder, name, labels, taken_at, renew_count) =
         granted_lease(run(&mut service, 1, 1, 1, 100, first));
@@ -177,7 +177,7 @@ fn same_holder_renew_increments_renew_count_and_keeps_taken_at() {
     assert_eq!(taken_at, 100);
     assert_eq!(renew_count, 0);
 
-    let second = set_json(2, 1, 2, HOLDER_A, 600);
+    let second = set_json(2, 1, 2, HOLDER_A, 490);
     let (holder, name, labels, taken_at, renew_count) =
         granted_lease(run(&mut service, 2, 1, 2, 110, second));
     assert_eq!(holder, HOLDER_A);
@@ -186,7 +186,7 @@ fn same_holder_renew_increments_renew_count_and_keeps_taken_at() {
     assert_eq!(taken_at, 100);
     assert_eq!(renew_count, 1);
 
-    let third = set_json(3, 1, 3, HOLDER_A, 700);
+    let third = set_json(3, 1, 3, HOLDER_A, 580);
     let (_, _, _, taken_at, renew_count) = granted_lease(run(&mut service, 3, 1, 3, 120, third));
     assert_eq!(taken_at, 100);
     assert_eq!(renew_count, 2);
@@ -195,12 +195,12 @@ fn same_holder_renew_increments_renew_count_and_keeps_taken_at() {
 #[test]
 fn renew_supplies_identity_replacements() {
     let mut service = Service::default();
-    let mut first = set_json(1, 1, 1, HOLDER_A, 500);
+    let mut first = set_json(1, 1, 1, HOLDER_A, 400);
     first["name"] = json!("/cluster/members/0000001");
     first["labels"] = json!(["csv"]);
     let _ = granted_lease(run(&mut service, 1, 1, 1, 100, first));
 
-    let mut second = set_json(2, 1, 2, HOLDER_A, 600);
+    let mut second = set_json(2, 1, 2, HOLDER_A, 490);
     second["labels"] = json!(["prod"]);
     let (_, name, labels, _, _) = granted_lease(run(&mut service, 2, 1, 2, 110, second));
     assert_eq!(name.as_deref(), Some("/cluster/members/0000001"));
@@ -210,11 +210,11 @@ fn renew_supplies_identity_replacements() {
 #[test]
 fn holder_change_after_expiry_resets_the_counters() {
     let mut service = Service::default();
-    let first = set_json(1, 1, 1, HOLDER_A, 150);
+    let first = set_json(1, 1, 1, HOLDER_A, 50);
     let (_, _, _, taken_at, _) = granted_lease(run(&mut service, 1, 1, 1, 100, first));
     assert_eq!(taken_at, 100);
 
-    let second = set_json(2, 2, 1, HOLDER_B, 900);
+    let second = set_json(2, 2, 1, HOLDER_B, 700);
     let (holder, _, _, taken_at, renew_count) =
         granted_lease(run(&mut service, 2, 2, 1, 200, second));
     assert_eq!(holder, HOLDER_B);
@@ -225,7 +225,7 @@ fn holder_change_after_expiry_resets_the_counters() {
 #[test]
 fn refused_release_reply_carries_the_incumbent_counters() {
     let mut service = Service::default();
-    let mut request = set_json(1, 1, 1, HOLDER_A, 500);
+    let mut request = set_json(1, 1, 1, HOLDER_A, 400);
     request["name"] = json!("/cluster/members/0000001");
     let granted = run(&mut service, 1, 1, 1, 100, request);
     let (_, _, _, _, _) = granted_lease(granted);
@@ -262,7 +262,7 @@ fn taken_at_ms_bumps_on_a_same_ms_collision() {
 #[test]
 fn break_reply_reports_the_post_break_record() {
     let mut service = Service::default();
-    let mut request = set_json(1, 1, 1, HOLDER_A, 500);
+    let mut request = set_json(1, 1, 1, HOLDER_A, 400);
     request["name"] = json!("/cluster/members/0000001");
     request["labels"] = json!(["csv"]);
     let granted = run(&mut service, 1, 1, 1, 100, request);
@@ -293,7 +293,7 @@ fn break_reply_reports_the_post_break_record() {
     }
 
     // The next grant keeps the identity unless the SET supplies its own.
-    let retake = set_json(4, 3, 1, HOLDER_B, 900);
+    let retake = set_json(4, 3, 1, HOLDER_B, 770);
     let (holder, name, labels, taken_at, renew_count) =
         granted_lease(run(&mut service, 4, 3, 1, 130, retake));
     assert_eq!(holder, HOLDER_B);
@@ -319,7 +319,7 @@ fn break_of_an_unknown_lock_reports_nothing_broken() {
 #[test]
 fn break_journals_a_distinct_event() {
     let mut service = Service::default();
-    let request = set_json(1, 1, 1, HOLDER_A, 500);
+    let request = set_json(1, 1, 1, HOLDER_A, 400);
     let transition = run_transition(&mut service, 1, 1, 1, 100, request);
     assert!(transition.is_some());
 
@@ -349,14 +349,14 @@ fn request_validation_refuses_malformed_identity() {
     let mut service = Service::default();
     let too_long = format!("/{}", "a".repeat(128));
     let cases = vec![
-        json!({"op":"set","message_id":uuid_text(1),"client_id":1,"request_num":1,"lock_id":LOCK_ID,"name":"cluster/x","lease":{"lease_id":1,"holder":HOLDER_A,"expiry":500}}),
-        json!({"op":"set","message_id":uuid_text(1),"client_id":1,"request_num":1,"lock_id":LOCK_ID,"name":"/a//b","lease":{"lease_id":1,"holder":HOLDER_A,"expiry":500}}),
-        json!({"op":"set","message_id":uuid_text(1),"client_id":1,"request_num":1,"lock_id":LOCK_ID,"name":"/a b","lease":{"lease_id":1,"holder":HOLDER_A,"expiry":500}}),
-        json!({"op":"set","message_id":uuid_text(1),"client_id":1,"request_num":1,"lock_id":LOCK_ID,"name":too_long,"lease":{"lease_id":1,"holder":HOLDER_A,"expiry":500}}),
-        json!({"op":"set","message_id":uuid_text(1),"client_id":1,"request_num":1,"lock_id":LOCK_ID,"labels":["ok","-bad"],"lease":{"lease_id":1,"holder":HOLDER_A,"expiry":500}}),
-        json!({"op":"set","message_id":uuid_text(1),"client_id":1,"request_num":1,"lock_id":LOCK_ID,"labels":["UPPER"],"lease":{"lease_id":1,"holder":HOLDER_A,"expiry":500}}),
-        json!({"op":"set","message_id":uuid_text(1),"client_id":1,"request_num":1,"lock_id":LOCK_ID,"labels":["a".repeat(33)],"lease":{"lease_id":1,"holder":HOLDER_A,"expiry":500}}),
-        json!({"op":"set","message_id":uuid_text(1),"client_id":1,"request_num":1,"lock_id":LOCK_ID,"labels":["1","2","3","4","5","6","7","8","9"],"lease":{"lease_id":1,"holder":HOLDER_A,"expiry":500}}),
+        json!({"op":"set","message_id":uuid_text(1),"client_id":1,"request_num":1,"lock_id":LOCK_ID,"name":"cluster/x","lease":{"lease_id":1,"holder":HOLDER_A,"lease_ms":500}}),
+        json!({"op":"set","message_id":uuid_text(1),"client_id":1,"request_num":1,"lock_id":LOCK_ID,"name":"/a//b","lease":{"lease_id":1,"holder":HOLDER_A,"lease_ms":500}}),
+        json!({"op":"set","message_id":uuid_text(1),"client_id":1,"request_num":1,"lock_id":LOCK_ID,"name":"/a b","lease":{"lease_id":1,"holder":HOLDER_A,"lease_ms":500}}),
+        json!({"op":"set","message_id":uuid_text(1),"client_id":1,"request_num":1,"lock_id":LOCK_ID,"name":too_long,"lease":{"lease_id":1,"holder":HOLDER_A,"lease_ms":500}}),
+        json!({"op":"set","message_id":uuid_text(1),"client_id":1,"request_num":1,"lock_id":LOCK_ID,"labels":["ok","-bad"],"lease":{"lease_id":1,"holder":HOLDER_A,"lease_ms":500}}),
+        json!({"op":"set","message_id":uuid_text(1),"client_id":1,"request_num":1,"lock_id":LOCK_ID,"labels":["UPPER"],"lease":{"lease_id":1,"holder":HOLDER_A,"lease_ms":500}}),
+        json!({"op":"set","message_id":uuid_text(1),"client_id":1,"request_num":1,"lock_id":LOCK_ID,"labels":["a".repeat(33)],"lease":{"lease_id":1,"holder":HOLDER_A,"lease_ms":500}}),
+        json!({"op":"set","message_id":uuid_text(1),"client_id":1,"request_num":1,"lock_id":LOCK_ID,"labels":["1","2","3","4","5","6","7","8","9"],"lease":{"lease_id":1,"holder":HOLDER_A,"lease_ms":500}}),
     ];
     for payload in &cases {
         assert!(
@@ -393,26 +393,40 @@ fn nine_labels_are_refused_even_with_duplicates() {
 }
 
 #[test]
-fn counters_are_never_client_writable() {
-    let mut service = Service::default();
+fn forged_lease_fields_are_refused() {
+    // The request candidate decodes strictly: a client cannot forge the
+    // counters or swipe in an absolute expiry under the lease object —
+    // the lease's `expiry`, `taken_at_ms`, and `renew_count` are the
+    // state machine's to set.
     let payload = json!({
         "op": "set",
         "message_id": uuid_text(1),
         "client_id": 1,
         "request_num": 1,
         "lock_id": LOCK_ID,
-        "lease": {"lease_id": 9, "holder": HOLDER_A, "expiry": 500,
-                  "taken_at_ms": 555, "renew_count": 77, "name": "/forged"},
+        "lease": {"lease_id": 9, "holder": HOLDER_A, "lease_ms": 500,
+                  "expiry": 1722600001000u64},
     });
-    let (_, _, _, taken_at, renew_count) = granted_lease(run(&mut service, 1, 1, 1, 100, payload));
+    assert!(Service::decode(payload.to_string().as_bytes()).is_err());
+
+    // The honest candidate still gets state-machine-set counters.
+    let mut service = Service::default();
+    let (_, _, _, taken_at, renew_count) = granted_lease(run(
+        &mut service,
+        1,
+        1,
+        1,
+        100,
+        set_json(1, 1, 1, HOLDER_A, 400),
+    ));
     assert_eq!(taken_at, 100, "the state machine sets taken_at_ms");
     assert_eq!(renew_count, 0, "the state machine sets renew_count");
 }
 
 #[test]
-fn request_round_trip_keeps_old_shapes_decoding() {
+fn request_round_trip_the_bare_candidate_decodes() {
     let mut service = Service::default();
-    let old = set_json(1, 1, 1, HOLDER_A, 500);
+    let old = set_json(1, 1, 1, HOLDER_A, 400);
     let granted = run(&mut service, 1, 1, 1, 100, old);
     let (holder, name, labels, _, _) = granted_lease(granted);
     assert_eq!(holder, HOLDER_A);

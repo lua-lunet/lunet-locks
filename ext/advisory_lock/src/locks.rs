@@ -44,7 +44,14 @@ pub enum Transition {
 pub struct Lease {
     pub lease_id: u64,
     pub holder: Uuid,
+    /// The leader-stamped absolute expiry: `execution_time + lease_ms` on
+    /// the executing host's wallclock. Requests never carry it — the
+    /// client names a duration and the leader stamps the instant.
     pub expiry: u64,
+    /// The granted window in milliseconds: the duration the SET asked
+    /// for, echoed so the reply is self-describing (`expiry - executed_at`
+    /// is the remaining life the leader measured).
+    pub lease_ms: u64,
     pub name: Option<String>,
     pub labels: Option<Vec<String>>,
     /// The leader's execution tick at the holder-changing SET that installed
@@ -57,6 +64,22 @@ pub struct Lease {
     /// client.
     #[serde(default)]
     pub renew_count: u32,
+}
+
+/// The SET request's lease candidate: what the client asks for. The client
+/// names a DURATION and can never name an absolute expiry — the leader
+/// stamps `expiry = execution_time + lease_ms` on its own wallclock, so no
+/// client clock enters the lease's semantics. The shape decodes strictly:
+/// a candidate that still carries the retired absolute-`expiry` field is
+/// refused at decode, before the request can enter the replication log.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LeaseCandidate {
+    pub lease_id: u64,
+    pub holder: Uuid,
+    /// The requested lease window in milliseconds. The grant condition is
+    /// `lease_ms > 0`; a zero (or absent) window is refused.
+    pub lease_ms: u64,
 }
 
 /// Whether `name` is a valid lock display name: at most 128 bytes, a
@@ -156,7 +179,9 @@ pub enum Request {
         client_id: u64,
         request_num: u64,
         lock_id: u64,
-        lease: Lease,
+        /// The candidate: the duration the client asks for. Never an
+        /// absolute expiry — the leader stamps `expiry` at execution.
+        lease: LeaseCandidate,
         /// Optional lock display name; absent leaves the stored name
         /// unchanged. Validated and stored canonically at decode.
         name: Option<String>,
@@ -164,6 +189,11 @@ pub enum Request {
         /// unchanged. Validated and canonically sorted and deduplicated on
         /// receipt.
         labels: Option<Vec<String>>,
+        /// The client's send timestamp, purely observational (latency
+        /// measurement). NO protocol decision may read it: the grant
+        /// condition, the expiry stamp, and the counters never touch it.
+        #[serde(default)]
+        sent_at_ms: Option<u64>,
     },
     Release {
         message_id: Uuid,
@@ -330,11 +360,14 @@ impl Service {
                 labels,
                 ..
             } => {
+                // The liveness check on the leader's own wallclock:
+                // instantaneous "is the lock held by another live holder?"
+                // The candidate's duration is the only client input.
                 let held = self.live(execution_time, lock_id);
                 let granted = held
                     .as_ref()
                     .is_none_or(|current| current.holder == lease.holder)
-                    && lease.expiry > execution_time;
+                    && lease.lease_ms > 0;
                 if granted {
                     // The replaced record, live or not: it donates the
                     // counters' prior values and the sticky identity.
@@ -359,13 +392,18 @@ impl Service {
                         };
                         (taken_at_ms, 0)
                     };
+                    // THE expiry stamp: one host's clock. The lease lives
+                    // exactly `lease_ms` from this execution tick on the
+                    // leader's timeline — the client's clock never enters
+                    // the lease's semantics.
+                    let expiry = execution_time.saturating_add(lease.lease_ms);
                     let transition = if held.is_some() {
                         // Same-holder regrant with a prior live lease → Renew.
                         Some(Transition::Renew {
                             lock_id,
                             lease_id: lease.lease_id,
                             holder: *lease.holder.as_bytes(),
-                            expiry: lease.expiry,
+                            expiry,
                         })
                     } else {
                         // No prior live lease → Hold.
@@ -373,13 +411,14 @@ impl Service {
                             lock_id,
                             lease_id: lease.lease_id,
                             holder: *lease.holder.as_bytes(),
-                            expiry: lease.expiry,
+                            expiry,
                         })
                     };
                     let stored = Lease {
                         lease_id: lease.lease_id,
                         holder: lease.holder,
-                        expiry: lease.expiry,
+                        expiry,
+                        lease_ms: lease.lease_ms,
                         name,
                         labels,
                         taken_at_ms,
@@ -464,6 +503,7 @@ impl Service {
                             lease_id: broken.lease_id.saturating_add(1),
                             holder: Uuid::nil(),
                             expiry: 0,
+                            lease_ms: 0,
                             name: broken.name.clone(),
                             labels: broken.labels.clone(),
                             taken_at_ms: 0,

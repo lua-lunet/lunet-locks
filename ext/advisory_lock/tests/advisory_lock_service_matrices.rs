@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use lunet_advisory_lock::locks::{Lease, Request, Response, Service};
+use lunet_advisory_lock::locks::{Lease, LeaseCandidate, Request, Response, Service};
 use uuid::Uuid;
 
 const EXECUTION_TIME: u64 = 100;
@@ -26,46 +26,69 @@ enum Incumbent {
 impl Incumbent {
     const ALL: [Self; 3] = [Self::Absent, Self::Live, Self::Expired];
 
-    fn lease(self, holder: Uuid) -> Option<Lease> {
+    /// The incumbent's stored lease and the instant it is installed at,
+    /// so the stamp lands relative to the matrix's execution clock:
+    /// `Live` (installed at EXECUTION_TIME) lives past it, `Expired`
+    /// (installed one tick earlier) dies exactly at it. `Absent` leases
+    /// nothing.
+    fn lease(self, holder: Uuid) -> (Lease, u64) {
         match self {
-            Self::Absent => None,
-            Self::Live => Some(Lease {
-                lease_id: 11,
-                holder,
-                expiry: EXECUTION_TIME + 1,
-                name: None,
-                labels: None,
-                taken_at_ms: EXECUTION_TIME,
-                renew_count: 0,
-            }),
-            Self::Expired => Some(Lease {
-                lease_id: 11,
-                holder,
-                expiry: EXECUTION_TIME,
-                name: None,
-                labels: None,
-                taken_at_ms: EXECUTION_TIME,
-                renew_count: 0,
-            }),
+            Self::Absent => (
+                Lease {
+                    lease_id: 11,
+                    holder,
+                    expiry: EXECUTION_TIME + 1,
+                    lease_ms: 0,
+                    name: None,
+                    labels: None,
+                    taken_at_ms: EXECUTION_TIME,
+                    renew_count: 0,
+                },
+                EXECUTION_TIME,
+            ),
+            Self::Live => (
+                Lease {
+                    lease_id: 11,
+                    holder,
+                    expiry: EXECUTION_TIME + 1,
+                    lease_ms: 1,
+                    name: None,
+                    labels: None,
+                    taken_at_ms: EXECUTION_TIME,
+                    renew_count: 0,
+                },
+                EXECUTION_TIME,
+            ),
+            Self::Expired => (
+                Lease {
+                    lease_id: 11,
+                    holder,
+                    expiry: EXECUTION_TIME,
+                    lease_ms: 1,
+                    name: None,
+                    labels: None,
+                    taken_at_ms: EXECUTION_TIME - 1,
+                    renew_count: 0,
+                },
+                EXECUTION_TIME - 1,
+            ),
         }
     }
 }
 
 #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
-enum ExpiryRelation {
-    Less,
-    Equal,
-    Greater,
+enum DurationClass {
+    Zero,
+    Positive,
 }
 
-impl ExpiryRelation {
-    const ALL: [Self; 3] = [Self::Less, Self::Equal, Self::Greater];
+impl DurationClass {
+    const ALL: [Self; 2] = [Self::Zero, Self::Positive];
 
-    fn expiry(self) -> u64 {
+    fn duration(self) -> u64 {
         match self {
-            Self::Less => EXECUTION_TIME - 1,
-            Self::Equal => EXECUTION_TIME,
-            Self::Greater => EXECUTION_TIME + 1,
+            Self::Zero => 0,
+            Self::Positive => 1,
         }
     }
 }
@@ -108,7 +131,7 @@ impl Envelope {
 struct Case {
     operation: Operation,
     incumbent: Incumbent,
-    expiry: ExpiryRelation,
+    duration: DurationClass,
     holder: Holder,
     envelope: Envelope,
 }
@@ -117,7 +140,7 @@ fn id(byte: u8) -> Uuid {
     Uuid::from_bytes([byte; 16])
 }
 
-fn request(operation: Operation, holder: Uuid, expiry: u64) -> Request {
+fn request(operation: Operation, holder: Uuid, duration: u64) -> Request {
     match operation {
         Operation::Get => Request::Get {
             message_id: id(3),
@@ -130,46 +153,58 @@ fn request(operation: Operation, holder: Uuid, expiry: u64) -> Request {
             client_id: 5,
             request_num: 7,
             lock_id: LOCK_ID,
-            lease: Lease {
+            lease: LeaseCandidate {
                 lease_id: 13,
                 holder,
-                expiry,
-                name: None,
-                labels: None,
-                taken_at_ms: 0,
-                renew_count: 0,
+                lease_ms: duration,
             },
             name: None,
             labels: None,
+            sent_at_ms: None,
         },
     }
 }
 
-fn execute(service: &mut Service, request: &Request) -> Result<Vec<u8>, String> {
-    let (message_id, client_id, request_num) = request.ids();
-    service
-        .execute(
-            message_id,
-            client_id,
-            request_num,
-            EXECUTION_TIME,
-            &serde_json::to_vec(request).expect("request serializes"),
-        )
-        .map(|(bytes, _transition)| bytes)
-        .map_err(|error| error.to_string())
-}
-
-fn install(service: &mut Service, lease: Lease) {
+fn install(service: &mut Service, lease: Lease, at: u64) {
     let request = Request::Set {
         message_id: id(9),
         client_id: 9,
         request_num: 9,
         lock_id: LOCK_ID,
-        lease,
+        lease: LeaseCandidate {
+            lease_id: lease.lease_id,
+            holder: lease.holder,
+            lease_ms: lease.lease_ms,
+        },
         name: None,
         labels: None,
+        sent_at_ms: None,
     };
-    assert!(execute(service, &request).is_ok(), "incumbent installs");
+    let (message_id, client_id, request_num) = request.ids();
+    let executed = service
+        .execute(
+            message_id,
+            client_id,
+            request_num,
+            at,
+            &serde_json::to_vec(&request).expect("request serializes"),
+        )
+        .map(|(bytes, _)| bytes)
+        .map_err(|error| error.to_string());
+    assert!(executed.is_ok(), "incumbent installs at {at}");
+    let response: Response = serde_json::from_slice(&executed.unwrap()).expect("stored reply");
+    match response {
+        Response::Set {
+            granted: true,
+            lease: Some(stored),
+            ..
+        } => assert_eq!(
+            stored.expiry,
+            at + stored.lease_ms,
+            "the install must stamp expiry at its own execution tick"
+        ),
+        other => panic!("incumbent install did not grant: {other:?}"),
+    }
 }
 
 fn observed_lease(service: &mut Service, lock_id: u64) -> Option<Lease> {
@@ -212,13 +247,24 @@ fn release_requires_the_exact_live_lease_and_is_idempotent_after_expiry() {
         lease_id: 13,
         holder,
         expiry: 200,
+        lease_ms: 100,
         name: None,
         labels: None,
         taken_at_ms: EXECUTION_TIME,
         renew_count: 0,
     };
     let mut service = Service::default();
-    install(&mut service, incumbent.clone());
+    let install_lease = Lease {
+        lease_id: incumbent.lease_id,
+        holder: incumbent.holder,
+        expiry: incumbent.expiry,
+        lease_ms: incumbent.lease_ms,
+        name: None,
+        labels: None,
+        taken_at_ms: incumbent.taken_at_ms,
+        renew_count: incumbent.renew_count,
+    };
+    install(&mut service, install_lease, EXECUTION_TIME);
 
     let mismatch = Request::Release {
         message_id: id(2),
@@ -297,8 +343,9 @@ fn release_requires_the_exact_live_lease_and_is_idempotent_after_expiry() {
 
 fn service_with(incumbent: Incumbent, holder: Uuid) -> Service {
     let mut service = Service::default();
-    if let Some(lease) = incumbent.lease(holder) {
-        install(&mut service, lease);
+    if incumbent != Incumbent::Absent {
+        let (incumbent, at) = incumbent.lease(holder);
+        install(&mut service, incumbent, at);
     }
     service
 }
@@ -310,30 +357,31 @@ fn service_matrix_is_complete_correlated_and_deterministic() {
 
     for operation in Operation::ALL {
         for incumbent in Incumbent::ALL {
-            for expiry in ExpiryRelation::ALL {
+            for duration in DurationClass::ALL {
                 for holder in Holder::ALL {
                     for envelope in Envelope::ALL {
                         let case = Case {
                             operation,
                             incumbent,
-                            expiry,
+                            duration,
                             holder,
                             envelope,
                         };
                         assert!(cases.insert(case), "duplicate matrix case: {case:?}");
 
                         let candidate_holder = holder.candidate(incumbent_holder);
-                        let request = request(operation, candidate_holder, expiry.expiry());
-                        let candidate_lease = match &request {
+                        let request = request(operation, candidate_holder, duration.duration());
+                        let candidate = match &request {
                             Request::Set { lease, .. } => Some(lease.clone()),
                             Request::Get { .. } => None,
                             Request::Release { .. } | Request::Break { .. } => {
                                 unreachable!("matrix only creates GET and SET")
                             }
                         };
-                        let incumbent_lease = incumbent.lease(incumbent_holder);
-                        let expected_live =
-                            incumbent_lease.filter(|lease| lease.expiry > EXECUTION_TIME);
+                        let (candidate_lease, _) = incumbent.lease(incumbent_holder);
+                        let expected_live = (incumbent != Incumbent::Absent)
+                            .then_some(candidate_lease)
+                            .filter(|lease| lease.expiry > EXECUTION_TIME);
                         let mut first = service_with(incumbent, incumbent_holder);
                         let mut second = service_with(incumbent, incumbent_holder);
                         let payload = serde_json::to_vec(&request).unwrap();
@@ -414,7 +462,7 @@ fn service_matrix_is_complete_correlated_and_deterministic() {
                                 let granted_expected = expected_live
                                     .as_ref()
                                     .is_none_or(|current| current.holder == candidate_holder)
-                                    && expiry.expiry() > EXECUTION_TIME;
+                                    && duration.duration() > 0;
                                 assert_eq!(
                                     (response_id, response_num, lock_id),
                                     (message_id, request_num, LOCK_ID),
@@ -425,21 +473,27 @@ fn service_matrix_is_complete_correlated_and_deterministic() {
                                     "SET grant failed for {case:?}"
                                 );
                                 // A granted SET stores the state machine's
-                                // record: the counters are tracked, never
-                                // echoed from the request.
-                                let granted_reply_lease =
-                                    candidate_lease.clone().map(|mut lease| {
-                                        lease.taken_at_ms = EXECUTION_TIME;
-                                        lease.renew_count = if expected_live
-                                            .as_ref()
-                                            .is_some_and(|live| live.holder == candidate_holder)
-                                        {
-                                            1
-                                        } else {
-                                            0
-                                        };
-                                        lease
-                                    });
+                                // record: the expiry is stamped at the
+                                // leader's execution tick and the counters
+                                // are tracked, never echoed from the
+                                // request.
+                                let granted_reply_lease = candidate.map(|candidate| Lease {
+                                    lease_id: candidate.lease_id,
+                                    holder: candidate.holder,
+                                    expiry: EXECUTION_TIME + candidate.lease_ms,
+                                    lease_ms: candidate.lease_ms,
+                                    name: None,
+                                    labels: None,
+                                    taken_at_ms: EXECUTION_TIME,
+                                    renew_count: if expected_live
+                                        .as_ref()
+                                        .is_some_and(|live| live.holder == candidate_holder)
+                                    {
+                                        1
+                                    } else {
+                                        0
+                                    },
+                                });
                                 assert_eq!(
                                     lease,
                                     if granted {
@@ -470,7 +524,7 @@ fn service_matrix_is_complete_correlated_and_deterministic() {
         }
     }
 
-    assert_eq!(cases.len(), 144, "matrix cardinality changed");
+    assert_eq!(cases.len(), 96, "matrix cardinality changed");
 }
 
 #[test]
@@ -484,23 +538,20 @@ fn lock_isolation_and_u64_extrema_are_preserved() {
 
     for value in cases {
         let mut service = Service::default();
-        let lease = Lease {
-            lease_id: value,
-            holder: id(12),
-            expiry: if value == u64::MIN { 1 } else { u64::MAX },
-            name: None,
-            labels: None,
-            taken_at_ms: 0,
-            renew_count: 0,
-        };
+        let duration: u64 = 1;
         let set = Request::Set {
             message_id: id(13),
             client_id: value,
             request_num: value,
             lock_id: value,
-            lease: lease.clone(),
+            lease: LeaseCandidate {
+                lease_id: value,
+                holder: id(12),
+                lease_ms: duration,
+            },
             name: None,
             labels: None,
+            sent_at_ms: None,
         };
         let (message_id, client_id, request_num) = set.ids();
         let response: Response = serde_json::from_slice(
@@ -516,28 +567,31 @@ fn lock_isolation_and_u64_extrema_are_preserved() {
                 .0,
         )
         .unwrap();
+        let stamped = Lease {
+            lease_id: value,
+            holder: id(12),
+            expiry: value.saturating_add(duration),
+            lease_ms: duration,
+            name: None,
+            labels: None,
+            taken_at_ms: value,
+            renew_count: 0,
+        };
+        let live = stamped.expiry > value;
         assert_eq!(
             response,
             Response::Set {
                 message_id: id(13),
                 request_num: value,
                 lock_id: value,
-                granted: value == u64::MIN,
-                lease: if value == u64::MIN {
-                    Some(lease.clone())
-                } else {
-                    None
-                },
+                granted: true,
+                lease: Some(stamped.clone()),
                 executed_at: value,
             }
         );
         assert_eq!(
             observed_lease_at(&mut service, value, value),
-            if value == u64::MIN {
-                Some(lease.clone())
-            } else {
-                None
-            }
+            live.then_some(stamped.clone())
         );
         assert_eq!(
             observed_lease_at(&mut service, value ^ 1, value),

@@ -285,8 +285,9 @@ struct CommittedOp {
     lock_id: u64,
     /// The Set's offered holder, when the op is a Set.
     offered: Option<Uuid>,
-    /// The Set's offered expiry, when the op is a Set.
-    lease_expiry: Option<u64>,
+    /// The Set's offered lease_ms (the requested duration), when the op
+    /// is a Set.
+    lease_ms: Option<u64>,
 }
 
 /// The request's wire kind name, from its decoded envelope.
@@ -316,10 +317,11 @@ fn set_holder(request: &lunet_advisory_lock::locks::Request) -> Option<Uuid> {
     }
 }
 
-/// The Set request's offered expiry, when present.
-fn set_expiry(request: &lunet_advisory_lock::locks::Request) -> Option<u64> {
+/// The Set request's offered lease_ms (the requested duration), when
+/// present.
+fn set_lease_ms(request: &lunet_advisory_lock::locks::Request) -> Option<u64> {
     match request {
-        lunet_advisory_lock::locks::Request::Set { lease, .. } => Some(lease.expiry),
+        lunet_advisory_lock::locks::Request::Set { lease, .. } => Some(lease.lease_ms),
         _ => None,
     }
 }
@@ -395,7 +397,7 @@ pub fn replay_series(dir: &Path) -> (Vec<LockEvent>, LockState, BridgeMetrics) {
                 kind: request_kind(&request).to_string(),
                 lock_id: request_lock_id(&request),
                 offered: set_holder(&request),
-                lease_expiry: set_expiry(&request),
+                lease_ms: set_lease_ms(&request),
             });
         }
     }
@@ -466,10 +468,9 @@ pub fn replay_series(dir: &Path) -> (Vec<LockEvent>, LockState, BridgeMetrics) {
             if let Some(labels) = &lease.labels {
                 labels_seen.insert(op.lock_id, labels.clone());
             }
-            if let Some(expiry) = op.lease_expiry {
-                let offered = expiry.saturating_sub(now_ms);
-                if offered > 0 {
-                    lease_ms_seen.insert(op.lock_id, offered);
+            if let Some(lease_ms) = op.lease_ms {
+                if lease_ms > 0 {
+                    lease_ms_seen.insert(op.lock_id, lease_ms);
                 }
             }
         }
