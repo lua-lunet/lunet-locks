@@ -1550,6 +1550,7 @@ fn main() {
                 client_id: EMBEDDED_CLIENT_ID_BASE,
                 lease_ms: options.embedded_client_ttl_ms,
                 renew_fraction: options.embedded_renew_fraction,
+                probe_floor_ms: 0,
             },
             signals,
             OP_DEADLINE_MS,

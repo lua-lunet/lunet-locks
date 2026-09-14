@@ -78,6 +78,20 @@ mid-flight (the leader stood down in the window) answers
 leader requirement on the addressed node: a client speaks to its LOCAL
 voter, whatever the replication state of the rest of the cluster.
 
+## The load models
+
+`lease-load` runs one of two load models, selected with
+`--model polite|aggressive`. Polite is the default and the experiment's
+cadence: one contender (`--clients 1`), no getters (`--getters 0`
+unless explicitly overridden), and the foreign-incumbent probe thinned
+by a 1000 ms floor — a live three-client chase across three
+datacentres stays low-volume metadata. Aggressive is the parked stress
+shape, opt-in only (`--model aggressive`): the probe rides just past
+the leader-echoed expiry and the default getters return. The free-lock
+SET race and the holder's renewal cadence are identical in both models:
+the race is the takeover measurement, and the renewal is a correctness
+knob — flooring either would hide the service's own behavior.
+
 ## The embedded lock client
 
 Launched with `--embedded-client N --lock LOCK_ID`, the node runs N

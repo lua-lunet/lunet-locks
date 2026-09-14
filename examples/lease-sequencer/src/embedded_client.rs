@@ -32,6 +32,14 @@ pub struct Config {
     pub client_id: u64,
     pub lease_ms: u64,
     pub renew_fraction: f64,
+    /// The lowest accepted wall interval between a contender's GET probes
+    /// of a live foreign incumbent, in ms. 0 = the untamed aggressive
+    /// chase (schedule right past the leader-echoed expiry); a floor
+    /// spaces the probe out to the experiment's low-volume metadata
+    /// cadence. The free-lock SET race and the holder's renewal are
+    /// NEVER floored: the race is the takeover measurement and the
+    /// renewal is a correctness knob.
+    pub probe_floor_ms: u64,
 }
 
 /// The action a contender decided on: the op label (`get`, or `set` for
@@ -184,7 +192,12 @@ impl Contender {
             ("get", true, Some(remaining), false) => {
                 // A live foreign incumbent: poll past its leader-echoed
                 // expiry with jitter; it may renew out from under us.
-                self.gate.schedule = Some(now_ms + remaining + self.rng.below(100));
+                // The probe floor thins this cadence for the polite
+                // experiment (nothing here races a load test).
+                self.gate.schedule = Some(
+                    now_ms
+                        + self.config.probe_floor_ms.max(remaining + self.rng.below(100)),
+                );
                 None
             }
             ("get", true, Some(_), _) => {
@@ -586,6 +599,7 @@ mod tests {
             client_id: 800_000,
             lease_ms: 500,
             renew_fraction: 0.5,
+            probe_floor_ms: 0,
         }
     }
 
@@ -648,6 +662,66 @@ mod tests {
         let message_id = uuid::Uuid::parse_str(value["message_id"].as_str().expect("uuid"))
             .expect("parseable message id");
         assert_eq!(action.message_id, *message_id.as_bytes());
+    }
+
+    #[test]
+    fn polite_floor_thins_the_foreign_probe_but_never_the_holder_renewal() {
+        let mut polite = Contender::new(
+            Config {
+                probe_floor_ms: 1000,
+                ..config()
+            },
+            0xDEAD_BEEF,
+        );
+        client_gate::start(polite.gate(), 1000);
+        let probe = polite.next_action(1000).expect("started contender probes");
+        let foreign = get_reply(250, "somebody_else");
+        polite.absorb(1000, &probe, Some(&foreign));
+        // The floor fires: the probe waits at least the full floor even
+        // though the leader echoed only 250 ms of lease left.
+        let scheduled = polite
+            .scheduled_at()
+            .expect("a foreign probe stays scheduled");
+        assert!(
+            scheduled >= 1000 + 1000,
+            "the polite probe floor must hold the probe back: got {scheduled}"
+        );
+
+        // Aggressive keeps the old cadence: schedule rides just past the
+        // echoed expiry (remaining + jitter, with no floor).
+        let mut aggressive = contender();
+        client_gate::start(aggressive.gate(), 1000);
+        let probe = aggressive.next_action(1000).expect("started");
+        aggressive.absorb(1000, &probe, Some(&foreign));
+        let scheduled = aggressive
+            .scheduled_at()
+            .expect("aggressive probe schedules");
+        assert!(
+            (1250..1350).contains(&scheduled),
+            "aggressive probes past the echoed expiry: got {scheduled}"
+        );
+
+        // The holder's renewal is never floored: the free/probe race and
+        // the same-holder bump stay on the tight window.
+        let mut holder_client = Contender::new(
+            Config {
+                probe_floor_ms: 5000,
+                ..config()
+            },
+            0xDEAD_BEEF,
+        );
+        client_gate::start(holder_client.gate(), 1000);
+        let own = holder_client.holder().to_string();
+        let probe = holder_client.next_action(1000).expect("started");
+        let held = json!({"op": "get", "lease": {"lease_id": 5, "holder": own, "expiry": 10_500}, "executed_at": 10_000});
+        holder_client.absorb(1000, &probe, Some(&held));
+        let scheduled = holder_client
+            .scheduled_at()
+            .expect("holder schedules the renewal");
+        assert!(
+            scheduled <= 10_000 + 500,
+            "the holder renews ahead of its own deadline regardless of the floor: got {scheduled}"
+        );
     }
 
     #[test]

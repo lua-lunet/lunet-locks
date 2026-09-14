@@ -48,6 +48,18 @@ struct Options {
     stats_out: String,
     lock_id: u64,
     id_base: u64,
+    model: Model,
+}
+
+/// The load model. Polite (the default) is the experiment's cadence: one
+/// contender, no getters, and the not-holder probe thinned by a 1000 ms
+/// floor, so a live three-client chase is low-volume metadata. Aggressive
+/// is the parked stress shape (probe right past the leader-echoed
+/// expiry, chase workers) behind the explicit opt-in.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Model {
+    Polite,
+    Aggressive,
 }
 
 fn parse_options() -> Options {
@@ -63,6 +75,7 @@ fn parse_options() -> Options {
         stats_out: String::new(),
         lock_id: 0x0DDBA12,
         id_base: 800000,
+        model: Model::Polite,
     };
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut index = 0;
@@ -79,6 +92,16 @@ fn parse_options() -> Options {
             "--seconds" => options.seconds = value.parse().expect("--seconds number"),
             "--clients" => options.clients = value.parse().expect("--clients number"),
             "--getters" => options.getters = value.parse().expect("--getters number"),
+            "--model" => {
+                options.model = match value.as_str() {
+                    "polite" => Model::Polite,
+                    "aggressive" => Model::Aggressive,
+                    other => {
+                        eprintln!("lease-load: --model must be polite|aggressive, got {other}");
+                        std::process::exit(2);
+                    }
+                }
+            }
             "--rate" => match value.as_str() {
                 "low" => options.high_rate = false,
                 "high" => options.high_rate = true,
@@ -107,9 +130,16 @@ fn parse_options() -> Options {
             "usage: lease-load --server IPv4:PORT [--server IPv4:PORT ...] \
              [--seconds N] [--clients N] [--getters N] [--rate low|high] \
              [--lease-ms N] [--renew-fraction F] [--window-ms N] \
-             [--stats-out PATH] [--lock-id N] [--id-base N]"
+             [--stats-out PATH] [--lock-id N] [--id-base N] \
+             [--model polite|aggressive]"
         );
         std::process::exit(2);
+    }
+    // Polite is the experiment's cadence: one contender, no getters, and
+    // the foreign-incumbent probe thinned past the leader-echoed expiry.
+    // An explicit --getters overrides; aggressive keeps every worker.
+    if options.model == Model::Polite && options.getters == 1 {
+        options.getters = 0;
     }
     options
 }
@@ -332,6 +362,10 @@ fn contender(options: &Options, shared: &Arc<Mutex<Vec<Sample>>>, index: usize, 
             client_id: options.id_base + index as u64,
             lease_ms: options.lease_ms,
             renew_fraction: options.renew_fraction,
+            probe_floor_ms: match options.model {
+                Model::Polite => 1000,
+                Model::Aggressive => 0,
+            },
         },
         wall_ms() ^ (index as u64 + 1) ^ (std::process::id() as u64),
     );
@@ -473,5 +507,6 @@ fn clone_options(options: &Options) -> Options {
         stats_out: options.stats_out.clone(),
         lock_id: options.lock_id,
         id_base: options.id_base,
+        model: options.model,
     }
 }

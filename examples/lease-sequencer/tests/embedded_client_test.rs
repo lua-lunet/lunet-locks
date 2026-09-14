@@ -302,6 +302,7 @@ fn embedded_clients_gate_takeover_and_rejoin_as_non_holders() {
         client_id: 800_000,
         lease_ms: TTL_MS,
         renew_fraction: RENEW_FRACTION,
+        probe_floor_ms: 0,
     };
     let mut runner_a = Runner::new(
         1,
