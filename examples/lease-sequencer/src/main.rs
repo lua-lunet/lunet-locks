@@ -1920,11 +1920,11 @@ fn handle_packet(
             }
         }
         0x02 => {
-            // FORWARD_RESPONSE: correlate to the driver's pending op or an
-            // embedded contender's. An ack that correlates to nothing is a
-            // maybe: unexpected, not provably impossible (the pending op
-            // may have timed out and been retried in the window), and
-            // survivable.
+            // FORWARD_RESPONSE: correlate to the driver's pending op, an
+            // embedded contender's, or a forwarded TCP client's. An ack
+            // that correlates to nothing is a maybe: unexpected, not
+            // provably impossible (the pending op may have timed out and
+            // been retried in the window), and survivable.
             if payload.len() > 1 + 16
                 && host
                     .driver
@@ -1941,6 +1941,19 @@ fn handle_packet(
                 message_id.copy_from_slice(&payload[1..17]);
                 if host.embedded_reply(now, rng, &message_id, &payload[17..]) {
                     // The embedded contender's forwarded op completed.
+                } else if let Some(conn) = host.conns.iter_mut().find(|conn| {
+                    matches!(
+                        conn.pending,
+                        Some(TcpPending::Lock { message_id: pending_id, .. })
+                            if pending_id == message_id
+                    )
+                }) {
+                    // The forwarded TCP client's op committed on the
+                    // leader: one reply line, then the conn is idle.
+                    conn.pending = None;
+                    let _ = conn.stream.write_all(&payload[17..]);
+                    let _ = conn.stream.write_all(b"\n");
+                    let _ = conn.stream.flush();
                 } else {
                     maybe_invariant!(
                         "ack for an unclaimed verb (message_id={}, len={})",
@@ -1966,6 +1979,19 @@ fn handle_packet(
             } else if host.embedded_not_leader(now, &message_id) {
                 // The embedded contender's forwarded op was refused; the
                 // chase backs off and re-probes.
+            } else if let Some(conn) = host.conns.iter_mut().find(|conn| {
+                matches!(
+                    conn.pending,
+                    Some(TcpPending::Lock { message_id: pending_id, .. })
+                        if pending_id == message_id
+                )
+            }) {
+                // The forwarded TCP client's op was refused (the leader
+                // stood down mid-flight); the conn answers not_leader and
+                // its client retries or rotates.
+                conn.pending = None;
+                let _ = conn.stream.write_all(b"{\"error\":\"not_leader\"}\n");
+                let _ = conn.stream.flush();
             }
         }
         _ => {}
@@ -2177,6 +2203,26 @@ fn handle_client_line(host: &mut Host, index: usize, line: &str, now: u64, rng: 
             });
             return true;
         }
+        // The non-leader route: the op is FORWARDED to the leader over the
+        // peer application channel (the same wire the lease driver and the
+        // embedded clients use). The leader's committed reply rides back
+        // the FORWARD_RESPONSE datagram and this conn answers once. When
+        // no leader is known yet (or the forwarding route is unlearned),
+        // the error reply stands so the client retries or rotates.
+        if rc == NOT_LEADER {
+            let status = host.node.status();
+            if status.leader != LEADER_UNKNOWN
+                && status.leader != host.own_id
+                && let Some(&addr) = host.peers.get(&status.leader)
+            {
+                host.send_forward_request(addr, &message_id, line);
+                host.conns[index].pending = Some(TcpPending::Lock {
+                    message_id,
+                    deadline: now + 30000,
+                });
+                return true;
+            }
+        }
         let reply = if rc == NOT_LEADER {
             "{\"error\":\"not_leader\"}".to_string()
         } else {
@@ -2272,6 +2318,388 @@ mod interval_sample_tests {
         assert!(
             json.contains("\"sent_at_ms\":1789214915000"),
             "leader send clock missing: {json}"
+        );
+    }
+}
+
+#[cfg(test)]
+#[cfg(test)]
+mod forward_tests {
+    //! The external TCP client channel's forwarding route: a lock verb
+    //! addressed to a NON-LEADER voter's client port is forwarded to the
+    //! leader over the peer application channel, and the leader's
+    //! committed reply rides FORWARD_RESPONSE back to the same conn. The
+    //! regression is the rig's takeover failure: the non-leader answered
+    //! `{"error":"not_leader"}` and never forwarded, so external
+    //! contenders whose local voter was not the leader never committed a
+    //! get or a set — and, when the holder died, no contender could ever
+    //! see the lease expire and race for the takeover.
+
+    use super::*;
+    use std::path::PathBuf;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    const LOCK_ID: u64 = 0x0DDBA12;
+
+    fn temp_root() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "lease-sequencer-forward-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp root");
+        dir
+    }
+
+    struct NodeHost {
+        host: Host,
+        udp: SocketAddr,
+        client: u16,
+    }
+
+    fn boot_host(name: &str, root: &PathBuf) -> NodeHost {
+        let state = root.join(format!("{name}.state"));
+        // A parallel-test boot race (same-process marker churn) is
+        // tolerated by one fresh-root retry; the boot CONFIG error otherwise.
+        let node = match Node::open("1:a\x002:b", name, state.to_str().expect("path"), None, 0) {
+            Ok(node) => node,
+            Err(_) => {
+                let root = temp_root();
+                let state = root.join(format!("{name}.state"));
+                Node::open("1:a\x002:b", name, state.to_str().expect("path"), None, 0)
+                    .expect("node boots")
+            }
+        };
+        let own_id = node.own_id();
+        let sock = UdpSocket::bind("127.0.0.1:0").expect("udp bind");
+        sock.set_nonblocking(true).expect("nonblocking udp");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("tcp bind");
+        listener.set_nonblocking(true).expect("nonblocking tcp");
+        let client_port = listener.local_addr().expect("local").port();
+        let udp_addr = sock.local_addr().expect("udp local");
+        let rows = vec![
+            (1u32, "127.0.0.1".to_string(), 42901u16, true),
+            (2u32, "127.0.0.1".to_string(), 42902u16, true),
+        ];
+        let model = membership::Model {
+            era: 1,
+            slot: 0,
+            members: membership::descriptor_model(&rows),
+        };
+        let sidecar = membership::SidecarWriter::open(state.to_str().expect("path"))
+            .expect("sidecar opens");
+        // Both hosts compute the same genesis fingerprint — the same three
+        // facts the byte-identical deployment carries.
+        let fingerprint = transport::genesis_fingerprint(&[transport::GenesisMember {
+            id: 1,
+            name: "a",
+            host: "127.0.0.1",
+            port: 42901,
+        }]);
+        let host = Host {
+            node,
+            sock,
+            listener,
+            peers: HashMap::new(),
+            addr_to_id: HashMap::new(),
+            fingerprint,
+            own_id,
+            heartbeat_ms: 100,
+            election_ms: 200,
+            recovery_ms: 200,
+            stagger_ms: 200,
+            last_heartbeat: 0,
+            leader_elapsed: 0,
+            last_recovery: 0,
+            last_status_note: 0,
+            last_seen_leader: LEADER_UNKNOWN,
+            reincarnated: false,
+            driver: Driver {
+                client_id: 800_000,
+                request_num: 0,
+                holder: uuid::Uuid::new_v4(),
+                lease_id: 0,
+                held_expiry: None,
+                last_get_foreign: false,
+                next_action_at: millis() + 300,
+                pending: None,
+            },
+            forwarded_from: HashMap::new(),
+            conns: Vec::new(),
+            model,
+            sidecar,
+            discovery: Discovery {
+                era: 1,
+                slot: 0,
+                tallies: HashMap::new(),
+                deadline_ms: millis() + 15000,
+                next_request_ms: 0,
+                active: true,
+            },
+            phi_monitor: None,
+            phi_cfg: phi::PhiConfig {
+                phi_threshold: 0.0,
+                heartbeat_ms: 100,
+                safety_multiple: 2.0,
+                window: 100,
+            },
+            heartbeat_seq: 0,
+            last_leader_commit_ms: 0,
+            heartbeat_client_id: 0x0BEEF000,
+            heartbeat_request_num: 0,
+            phi_last_era: None,
+            phi_detected_key: None,
+            phi_watch: None,
+            last_state: STATE_RECOVERING,
+            last_weight: None,
+            election_wait_armed: 200,
+            timeout_knobs: telemetry::TimeoutKnobs {
+                min_ms: 100,
+                max_ms: 300,
+                fixed_ms: 200,
+            },
+            telemetry: None,
+            embedded: None,
+        };
+        NodeHost {
+            host,
+            udp: udp_addr,
+            client: client_port,
+        }
+    }
+
+    /// A settled two-node localhost harness: `a` leads genesis's primary,
+    /// `b` follows; both peer rows know each other's real sockets.
+    fn harness() -> (NodeHost, NodeHost, Rng) {
+        let root = temp_root();
+        let mut a = boot_host("a", &root);
+        let mut b = boot_host("b", &root);
+        a.host.peers.insert(2, b.udp);
+        a.host.addr_to_id.insert(b.udp, 2);
+        b.host.peers.insert(1, a.udp);
+        b.host.addr_to_id.insert(a.udp, 1);
+        let seed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_millis() as u64;
+        let mut rng = Rng::new(seed);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while a.host.node.status().state != STATE_NORMAL
+            || b.host.node.status().state != STATE_NORMAL
+        {
+            assert!(
+                Instant::now() < deadline,
+                "the two-node forward harness never settled"
+            );
+            tick(&mut a, &mut b, &mut rng);
+        }
+        (a, b, rng)
+    }
+
+    fn tick(a: &mut NodeHost, b: &mut NodeHost, rng: &mut Rng) {
+        let now = millis();
+        pump_udp(&mut a.host, now, rng);
+        pump_tcp(&mut a.host, now, rng);
+        a.host.discovery_step(now);
+        a.host.driver_step(now, rng);
+        let _ = a.host.node.idle();
+        a.host.flush_outputs(now, rng);
+        let now = millis();
+        pump_udp(&mut b.host, now, rng);
+        pump_tcp(&mut b.host, now, rng);
+        b.host.discovery_step(now);
+        b.host.driver_step(now, rng);
+        let _ = b.host.node.idle();
+        b.host.flush_outputs(now, rng);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    /// One TCP round trip from the test's client to the named host (true =
+    /// to the follower `b`): the request line out, the first reply line
+    /// back, the host loop driven alongside.
+    fn round_trip(
+        a: &mut NodeHost,
+        b: &mut NodeHost,
+        rng: &mut Rng,
+        to_follower: bool,
+        request: &str,
+    ) -> String {
+        let port = if to_follower { b.client } else { a.client };
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("client connects");
+        stream
+            .set_read_timeout(Some(Duration::from_millis(10)))
+            .expect("read timeout");
+        let _ = stream.write_all(request.as_bytes());
+        let _ = stream.write_all(b"\n");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut buf: Vec<u8> = Vec::new();
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "no reply line arrived in time (buf={buf:?})"
+            );
+            tick(a, b, rng);
+            let mut chunk = [0u8; 4096];
+            match stream.read(&mut chunk) {
+                Ok(0) => panic!("the server closed the conn before replying"),
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut
+                        || e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => panic!("{e}"),
+            }
+            if buf.iter().any(|byte| *byte == b'\n') {
+                break;
+            }
+        }
+        let end = buf
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .unwrap_or(buf.len());
+        String::from_utf8_lossy(&buf[..end]).to_string()
+    }
+
+    fn get_request(client_id: u64, request_num: u64) -> String {
+        let mid = uuid::Uuid::new_v4();
+        format!(
+            "{{\"op\":\"get\",\"message_id\":\"{mid}\",\"client_id\":{client_id},\
+             \"request_num\":{request_num},\"lock_id\":{LOCK_ID}}}"
+        )
+    }
+
+    fn set_request(client_id: u64, request_num: u64) -> String {
+        let mid = uuid::Uuid::new_v4();
+        let holder = uuid::Uuid::new_v4();
+        let expiry = millis() + 500;
+        format!(
+            "{{\"op\":\"set\",\"message_id\":\"{mid}\",\"client_id\":{client_id},\
+             \"request_num\":{request_num},\"lock_id\":{LOCK_ID},\
+             \"lease\":{{\"lease_id\":1,\"holder\":\"{holder}\",\"expiry\":{expiry}}}}}"
+        )
+    }
+
+    fn ok_reply(line: &str) -> serde_json::Value {
+        let value: serde_json::Value = serde_json::from_str(line.trim_end())
+            .unwrap_or_else(|e| panic!("the reply line is JSON ({e}): {line}"));
+        assert!(
+            value.get("error").is_none(),
+            "the reply must not be an error: {line}"
+        );
+        value
+    }
+
+    /// One sequential scenario: the four forward-path cases run against
+    /// one fresh harness, in order — the parallel-test interference this
+    /// module's harnesses saw as boot/addressing invariants is the reason
+    /// the cases do not run as separate concurrent #[test]s.
+    #[test]
+    fn the_forward_path_end_to_end() {
+        one_follower_get_scenario();
+        one_follower_set_scenario();
+        one_leader_local_scenario();
+        one_refusal_scenario();
+    }
+
+    fn one_follower_get_scenario() {
+        let (mut a, mut b, mut rng) = harness();
+        let follower_to_b = b.host.node.status().leader != b.host.own_id;
+        assert!(
+            follower_to_b,
+            "harness shape: b follows (the forward regression's shape)"
+        );
+        let line = round_trip(&mut a, &mut b, &mut rng, true, &get_request(800_001, 1));
+        let reply = ok_reply(&line);
+        assert_eq!(reply["op"], "get");
+        assert!(
+            reply.get("executed_at").is_some(),
+            "the committed reply carries the leader's execution tick: {line}"
+        );
+    }
+
+    fn one_follower_set_scenario() {
+        let (mut a, mut b, mut rng) = harness();
+        let line = round_trip(&mut a, &mut b, &mut rng, true, &set_request(800_006, 1));
+        let reply = ok_reply(&line);
+        assert_eq!(reply["granted"], true, "the forwarded set grants: {line}");
+        assert!(
+            reply["lease"]["expiry"].as_u64().is_some(),
+            "the grant carries the lease expiry: {line}"
+        );
+    }
+
+    fn one_leader_local_scenario() {
+        let (mut a, mut b, mut rng) = harness();
+        let line = round_trip(&mut a, &mut b, &mut rng, false, &get_request(800_002, 1));
+        ok_reply(&line);
+    }
+
+    fn one_refusal_scenario() {
+        let (mut a, mut b, mut rng) = harness();
+        // A conn with a pending forward: a real socket pair installed
+        // straight into the host (the accept path is covered above), with
+        // one op in flight whose leader-side refusal is what we feed next.
+        let pair = std::net::TcpListener::bind("127.0.0.1:0").expect("pair listener");
+        let client = TcpStream::connect(
+            ("127.0.0.1", pair.local_addr().expect("local").port()),
+        )
+        .expect("client connects");
+        let (conn_stream, _) = pair.accept().expect("pair accepted");
+        client.set_read_timeout(Some(Duration::from_millis(10))).ok();
+        let mid = *uuid::Uuid::new_v4().as_bytes();
+        b.host.conns.push(Conn {
+            stream: conn_stream,
+            buf: Vec::new(),
+            pending: Some(TcpPending::Lock {
+                message_id: mid,
+                deadline: millis() + 30000,
+            }),
+        });
+        let mut payload = vec![transport::FORWARD_NOT_LEADER];
+        payload.extend_from_slice(&mid);
+        payload.extend_from_slice(&1u32.to_be_bytes());
+        payload.extend_from_slice(&0u32.to_be_bytes());
+        let packet = transport::encode_peer(
+            transport::PEER_APPLICATION,
+            &b.host.fingerprint,
+            &payload,
+        );
+        handle_packet(&mut b.host, 1, a.udp, &packet, millis(), &mut rng);
+        assert!(
+            !b.host.conns.iter().any(|conn| conn.pending.is_some()),
+            "the refusal releases the conn's pending"
+        );
+        // The refusal line lands on the client end of the same conn.
+        let mut buf: Vec<u8> = Vec::new();
+        let read_deadline = Instant::now() + Duration::from_secs(2);
+        let mut chunk = [0u8; 256];
+        let mut client = client;
+        loop {
+            assert!(
+                Instant::now() < read_deadline,
+                "the refusal line never reached the client (buf={buf:?})"
+            );
+            match client.read(&mut chunk) {
+                Ok(0) => panic!("the conn was closed without a refusal line"),
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut
+                        || e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => panic!("{e}"),
+            }
+            if buf.iter().any(|byte| *byte == b'\n') {
+                break;
+            }
+        }
+        let text = String::from_utf8_lossy(&buf).to_string();
+        assert!(
+            text.contains("not_leader"),
+            "the conn reads back the refusal line, got {text:?}"
         );
     }
 }

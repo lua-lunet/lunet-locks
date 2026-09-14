@@ -63,6 +63,21 @@ configuration era or it is not `Normal`; the lease lapses for the
 transition's bounded window and a fresh grant re-acquires it. The measured
 cost is one lease lapse per join, and the joins commit and complete.
 
+## The client channel: every voter serves the lock verbs
+
+A lock verb (get/set) addressed to a voter's TCP client port is always
+executed on the leader: the leader's own port proposes the request
+in-process and answers on the same connection when it commits; a
+non-leader's port forwards the request to the leader over the peer
+application channel (the same `FORWARD_REQUEST`/`FORWARD_RESPONSE` wire
+the lease driver and the embedded clients use), pends the connection on
+the correlation id at the lead of the ordinary client deadline, and
+answers once with the leader's committed reply. A leader-side refusal
+mid-flight (the leader stood down in the window) answers
+`{"error":"not_leader"}` and the client retries or rotates. There is no
+leader requirement on the addressed node: a client speaks to its LOCAL
+voter, whatever the replication state of the rest of the cluster.
+
 ## The embedded lock client
 
 Launched with `--embedded-client N --lock LOCK_ID`, the node runs N

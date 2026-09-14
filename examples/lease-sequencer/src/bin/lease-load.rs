@@ -288,10 +288,11 @@ impl Link {
         let rt = start.elapsed().as_micros() as u64;
         let reply: Option<Value> = serde_json::from_str(line.trim_end()).ok();
         let ok = reply.as_ref().is_some_and(|reply| reply_ok(reply));
-        // The client-side TCP port answers a non-leader `not_leader` and
-        // does not forward: the op is a completed (failed) round trip, and
-        // the connection rotates to the next node so the stream follows
-        // the leader.
+        // The addressed node forwards a lock verb to the leader on the
+        // peer application channel; the committed reply (or a leader-side
+        // mid-flight refusal, which rotates the connection) is the only
+        // line on the socket. Rotation still follows the leader when the
+        // client names a server list.
         let not_leader = reply.as_ref().is_some_and(|reply| {
             reply.get("error").and_then(|error| error.as_str()) == Some("not_leader")
         });
@@ -354,10 +355,15 @@ fn contender(options: &Options, shared: &Arc<Mutex<Vec<Sample>>>, index: usize, 
         let (sample, reply) = link.round_trip(&action.request, action.op);
         shared.lock().unwrap().push(sample);
         if let Some(race) = contender.absorb(wall_ms(), &action, reply.as_ref()) {
-            // A free or expired probe races to SET immediately.
-            let (sample, reply) = link.round_trip(&race.request, race.op);
-            shared.lock().unwrap().push(sample);
-            contender.absorb(wall_ms(), &race, reply.as_ref());
+            // The inline SET race only fires while the gate is still ON:
+            // a signal mid-round-trip must never let the follow-up out
+            // (the one-op residual otherwise rides past the silence).
+            signals.apply(contender.gate());
+            if contender.mode() == Mode::On {
+                let (sample, reply) = link.round_trip(&race.request, race.op);
+                shared.lock().unwrap().push(sample);
+                contender.absorb(wall_ms(), &race, reply.as_ref());
+            }
         }
     }
 }
