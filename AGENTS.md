@@ -40,6 +40,17 @@ Local guidance for this repo. Keep it short, factual, and unsurprising.
   `https://github.com/lua-lunet/uvrr-core` / raw.githubusercontent.com at the
   pinned ref), never a sibling checkout on disk and never cargo's home cache.
 
+## Write boundary (hard rule)
+
+- Agents are FORBIDDEN from writing outside this repo. No `/tmp/*`, no home
+  dotfiles, no macOS temp dirs. Scratch lives at the REPO-RELATIVE `.tmp/`
+  (`git/tmp/…:15`-style absolute paths outside the workspace are evidence of a
+  violation). This is not a style choice: out-of-repo writes trigger security
+  approval dialogs that stop the operator's world.
+- Any command or prompt an agent issues must carry no absolute path outside
+  the workspace. If a tool defaults to an external temp, redirect it into
+  `.tmp/` or run without it.
+
 ## Scope
 
 - `src/` is the shipped Teal source tree.
