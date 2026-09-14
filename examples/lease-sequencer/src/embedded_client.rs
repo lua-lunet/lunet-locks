@@ -272,59 +272,81 @@ impl Contender {
     }
 }
 
-/// The process-level signal flags: SIGUSR1 (silence) and SIGUSR2 (start)
-/// arrive asynchronously and light `Arc<AtomicBool>`s; every worker
-/// drains both at its sleep/every-iteration boundary into its own client
-/// gate. No request or reply encoding changes — the gate sits entirely
-/// outside the wire.
+/// The process-level signal gate: SIGUSR1 (silence) and SIGUSR2 (start)
+/// arrive to the process, not to a worker. The async handler's only
+/// move is the signal stream's self-pipe write; a dedicated arbiter
+/// reads the stream and latches the process mode (OFF / ON), logging
+/// each real transition exactly once on the client's normal stdout
+/// stream. Every worker — the load binary's contender and getter
+/// loops, the host runner's embedded clients — re-reads the latched
+/// mode at its own sleep/every-iteration boundary and moves its own
+/// gate to match: a signal is a process transition, never an edge one
+/// worker's apply can consume ahead of another's, and a worker that
+/// slept through a signal still follows it on wake. No request or
+/// reply encoding changes — the gate sits entirely outside the wire.
 #[derive(Clone)]
 pub struct Signals {
-    silence: Arc<AtomicBool>,
-    start: Arc<AtomicBool>,
+    on: Arc<AtomicBool>,
 }
 
 impl Signals {
-    /// Register the SIGUSR1/SIGUSR2 flags with the async signal hook.
+    /// Register the SIGUSR1/SIGUSR2 stream and start the arbiter that
+    /// latches the process mode.
     pub fn register() -> Signals {
-        let silence = Arc::new(AtomicBool::new(false));
-        let start = Arc::new(AtomicBool::new(false));
-        signal_hook::flag::register(signal_hook::consts::SIGUSR1, Arc::clone(&silence))
-            .expect("SIGUSR1 registration");
-        signal_hook::flag::register(signal_hook::consts::SIGUSR2, Arc::clone(&start))
-            .expect("SIGUSR2 registration");
-        Signals { silence, start }
+        let on = Arc::new(AtomicBool::new(false));
+        let mut signals = signal_hook::iterator::Signals::new(&[
+            signal_hook::consts::SIGUSR1,
+            signal_hook::consts::SIGUSR2,
+        ])
+        .expect("SIGUSR1/SIGUSR2 registration");
+        let latch = Arc::clone(&on);
+        std::thread::spawn(move || {
+            for signal in signals.forever() {
+                if signal == signal_hook::consts::SIGUSR1 {
+                    if latch.swap(false, Ordering::Relaxed) {
+                        println!("client stop (SIGUSR1) at wall={}", wall_ms());
+                    }
+                } else if signal == signal_hook::consts::SIGUSR2 {
+                    if !latch.swap(true, Ordering::Relaxed) {
+                        println!("client start (SIGUSR2) at wall={}", wall_ms());
+                    }
+                }
+            }
+        });
+        Signals { on }
     }
 
-    /// Light the silence flag exactly as the SIGUSR1 handler would (the
+    /// Latch silence exactly as the arbiter does on SIGUSR1 (the
     /// in-process test seam; the real path is the OS signal).
     pub fn signal_silence(&self) {
-        self.silence.store(true, Ordering::Relaxed);
+        self.on.store(false, Ordering::Relaxed);
     }
 
-    /// Light the start flag exactly as the SIGUSR2 handler would.
+    /// Latch start exactly as the arbiter does on SIGUSR2.
     pub fn signal_start(&self) {
-        self.start.store(true, Ordering::Relaxed);
+        self.on.store(true, Ordering::Relaxed);
     }
 
-    /// The per-worker form the lease-load binary uses: drain both flags
-    /// into this worker's gate, logging transitions on the client's
-    /// normal stdout stream; repeated signals in the same mode are
-    /// no-ops (the gate was already there).
+    /// The latched process mode.
+    pub fn on(&self) -> bool {
+        self.on.load(Ordering::Relaxed)
+    }
+
+    /// The per-worker form the lease-load binary uses: move this
+    /// worker's gate to the latched process mode. Idempotent — a gate
+    /// already in the process mode is untouched, so repeated signals in
+    /// the same mode are no-ops and a worker that slept through a
+    /// signal still follows it on wake.
     pub fn apply(&self, gate: &mut Gate) {
-        let now = wall_ms();
-        if self.silence.swap(false, Ordering::Relaxed) {
-            let was_on = gate.mode == Mode::On;
-            client_gate::stop(gate, now);
-            if was_on {
-                println!("client stop (SIGUSR1) at wall={now}");
-            }
+        let on = self.on.load(Ordering::Relaxed);
+        if on == (gate.mode == Mode::On) {
+            return;
         }
-        if self.start.swap(false, Ordering::Relaxed) {
-            let was_off = gate.mode == Mode::Off;
+        let now = wall_ms();
+        if on {
             client_gate::start(gate, now);
-            if was_off {
-                println!("client start (SIGUSR2) at wall={now}");
-            }
+        } else {
+            client_gate::stop(gate, now);
         }
     }
 }
@@ -479,36 +501,30 @@ impl Runner {
             .and_then(|client| client.pending.as_ref().map(|pending| pending.action.message_id))
     }
 
-    /// One host-loop tick: drain the process signal flags into every
-    /// client's gate (silence also abandons in-flight ops), then step
-    /// every client. The submit closure routes one action to the leader
-    /// and reports whether it was accepted for proposal (or forwarded);
-    /// a refusal is absorbed as an error and the chase backs off.
+    /// One host-loop tick: move every embedded client's gate to the
+    /// latched process signal mode — one process, one transition, one
+    /// log line — then step every client. The submit closure routes one
+    /// action to the leader and reports whether it was accepted for
+    /// proposal (or forwarded); a refusal is absorbed as an error and
+    /// the chase backs off.
     pub fn tick(&mut self, now_ms: u64, submit: &mut dyn FnMut(&Action) -> bool) {
-        // The process gate: drain both flags once and apply them to
-        // every embedded client — one process, one transition, one log
-        // line. Silence also abandons any in-flight op (a reply that
-        // arrives late is ignored, not absorbed).
-        if self.signals.silence.swap(false, Ordering::Relaxed) {
-            let was_on = self.on;
-            for client in &mut self.clients {
-                client_gate::stop(client.contender.gate(), now_ms);
-                client.pending = None;
-            }
-            self.on = false;
-            if was_on {
+        // Silence also abandons any in-flight op (a reply that arrives
+        // late is ignored, not absorbed).
+        let on = self.signals.on();
+        if on != self.on {
+            if on {
+                for client in &mut self.clients {
+                    client_gate::start(client.contender.gate(), now_ms);
+                }
+                println!("client start (SIGUSR2) at wall={now_ms}");
+            } else {
+                for client in &mut self.clients {
+                    client_gate::stop(client.contender.gate(), now_ms);
+                    client.pending = None;
+                }
                 println!("client stop (SIGUSR1) at wall={now_ms}");
             }
-        }
-        if self.signals.start.swap(false, Ordering::Relaxed) {
-            let was_off = !self.on;
-            for client in &mut self.clients {
-                client_gate::start(client.contender.gate(), now_ms);
-            }
-            self.on = true;
-            if was_off {
-                println!("client start (SIGUSR2) at wall={now_ms}");
-            }
+            self.on = on;
         }
         let deadline_ms = self.deadline_ms;
         for client in &mut self.clients {
@@ -951,5 +967,73 @@ mod tests {
             panic!("an abandoned op's reply must not race")
         }));
         assert_eq!(runner.gate(0).expect("client 0").schedule, None);
+    }
+
+    // ------------------------------------------------------------- Signals ----
+
+    /// One SIGUSR1 is a process transition: every worker's gate follows
+    /// it, whichever worker's apply ran first — the drainer awake at
+    /// the signal, the sleeper only on wake. The regression is the
+    /// lost-flag race: an edge consumed by the first apply must never
+    /// starve the second gate.
+    #[test]
+    fn one_silence_signal_reaches_every_gate_not_just_the_first_drainer() {
+        let signals = Signals::register();
+        let mut drainer = client_gate::boot();
+        let mut sleeper = client_gate::boot();
+        for gate in [&mut drainer, &mut sleeper] {
+            client_gate::start(gate, 1000);
+            gate.holder = Some("holder-identity".to_string());
+            gate.schedule = Some(2000);
+        }
+        signals.signal_silence();
+        // The drainer applies first; the sleeper applies only on wake.
+        signals.apply(&mut drainer);
+        signals.apply(&mut sleeper);
+        assert_eq!(drainer.mode, Mode::Off);
+        assert_eq!(
+            sleeper.mode,
+            Mode::Off,
+            "the sleeper follows the process silence on wake"
+        );
+        assert!(
+            sleeper.holder.is_none(),
+            "the late-applied silence still forgets holdership"
+        );
+        assert_eq!(sleeper.schedule, None);
+        // The start direction is a process transition too.
+        signals.signal_start();
+        signals.apply(&mut drainer);
+        signals.apply(&mut sleeper);
+        assert_eq!(drainer.mode, Mode::On);
+        assert_eq!(sleeper.mode, Mode::On);
+        // A gate that followed the silence late restarts as a probe,
+        // never a blind re-BUMP (the item01 discipline holds).
+        assert_eq!(
+            client_gate::next_op(&sleeper, 3000),
+            Some(client_gate::Op::Get)
+        );
+    }
+
+    /// Repeated signals in the same mode are level no-ops: a gate
+    /// already in the process mode is untouched by a later apply.
+    #[test]
+    fn repeated_signals_in_the_same_mode_leave_a_matching_gate_untouched() {
+        let signals = Signals::register();
+        let mut gate = client_gate::boot();
+        signals.signal_start();
+        signals.apply(&mut gate);
+        assert_eq!(gate.mode, Mode::On);
+        gate.request_num = 7;
+        signals.signal_start();
+        signals.apply(&mut gate);
+        assert_eq!(gate.mode, Mode::On);
+        assert_eq!(gate.request_num, 7, "an already-on gate is untouched");
+        signals.signal_silence();
+        signals.apply(&mut gate);
+        assert_eq!(gate.mode, Mode::Off);
+        signals.signal_silence();
+        signals.apply(&mut gate);
+        assert_eq!(gate.mode, Mode::Off);
     }
 }
