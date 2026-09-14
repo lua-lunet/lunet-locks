@@ -12,6 +12,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// One scenario at a time: the stages share the process's scheduler and
 /// the RTT bucket is honest only without contention.
+///
+/// Disposition 2026-09-14: one red run (stage2+stage3) was observed
+/// immediately after a full `--release` rebuild burst, with the RTT
+/// bucket verdicts starving under scheduler contention; the same
+/// binary then passed green three consecutive parallel runs and one
+/// solo run on the unchanged tree. Recorded as resolved
+/// unreproducible-under-normal-load: the bucket is honest, the
+/// contention was external. Re-measure only if a red recurs WITHOUT a
+/// concurrent compile storm.
 static SCENARIO_LOCK: Mutex<()> = Mutex::new(());
 
 fn lock_scenarios() -> MutexGuard<'static, ()> {
