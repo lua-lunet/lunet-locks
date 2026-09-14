@@ -32,6 +32,40 @@ operative guidance for agents only.
 - Every fix adds a defensive test around it so the regression cannot
   silently return.
 
+## Testing methodology (binding for every agent on this work)
+
+- The system is formally specified and the clock rides ON the messages,
+  not in the node: every test is deterministic — "given this message at
+  this clock, we expect this state change". Isolate the message, play
+  it back, assert the transition. Never use wall-clock sleeps as a test
+  oracle; never debug without the trace the message carries.
+- Debug bottom-up: local running processes first; direct ad-hoc Rust
+  (`skaffold_*` bins) over wrappers; colima/plain processes over any
+  cloud. Cloud time is the last mile, not the lab.
+- Environment is not logic: address binding, DNS/resolution, and port
+  reachability are proven by stubs and canaries OUTSIDE the service
+  logic before any serious logic runs on a cloud. The canary — "can we
+  find our arse with both hands on the cloud servers? Y/N" — is a kept
+  dev/test feature, deployed to any new cloud before the service is.
+  Config/address handling woven into service logic is toxic: it is
+  100× harder to test in-place and must live in file-tested layers
+  outside the logic.
+- Polite is the only exercised load model until the paper lands. The
+  aggressive flag ships unexercised; only the agent that later runs
+  aggressive may fix or run it.
+- Every fix carries a defensive regression test that replays the exact
+  failing message and asserts the state change.
+
+## Cluster shape (hard pivot, 2026-09-14)
+
+- All paper work runs on THREE nodes: one voting node per DC (44/55/66), a
+  co-located weight-0 telemetry standby per DC, one polite client per DC.
+  The experiment that reduces time to demonstrable value is REPLACING ONE
+  NODE of the three (crash-stop a voter, boot a fresh-identity replacement,
+  join through the leader, serve throughout).
+- The aggressive fuzz phase also runs on three nodes. Six nodes return only
+  as an item AFTER the fuzz phases.
+
 ## Andon (hard rules — violating these is insubordination)
 
 - On any non-shallow bug, an ANDON agent is spawned **immediately**, with
