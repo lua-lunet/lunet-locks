@@ -323,6 +323,14 @@ impl Journal {
         Ok(())
     }
 
+    /// Force durability: fsync the current open file. The ordinary append
+    /// path only flushes to the OS (page cache); the graceful-stop path's
+    /// durable-state write needs the fsync before the `flushed` marker
+    /// may land.
+    pub fn flush(&self) -> io::Result<()> {
+        self.file.sync_all()
+    }
+
     /// Roll the current open file: close, rename to final name, write meta
     /// atomically, open a fresh `ev-open-*` file.
     fn roll(&mut self) -> io::Result<()> {

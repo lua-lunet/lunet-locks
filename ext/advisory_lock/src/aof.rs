@@ -18,6 +18,15 @@
 //! unflushed bytes may be lost on power loss — documented loss window;
 //! nothing depends on the file for safety.
 //!
+//! # The stop drain
+//!
+//! The graceful-stop path needs a stronger guarantee than the ordinary
+//! fire-and-forget enqueue: [`AofWriter::drain`] blocks until every event
+//! enqueued before the call is appended AND fsynced, so the stop path may
+//! write its `flushed` marker only after the drain returns (the uVRR
+//! termination obligations' write ordering). The queue is FIFO, so the
+//! writer's answer to a drain message proves every earlier event landed.
+//!
 //! # Rolling at one erasure block
 //!
 //! The active file rolls at exactly [`ROLL_BYTES`] (2 MiB). Records are
@@ -48,9 +57,9 @@ use std::os::unix::fs::FileExt;
 #[cfg(windows)]
 use std::os::windows::fs::FileExt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 /// Positional write, portable across the platforms the crate builds on:
@@ -401,6 +410,18 @@ fn unix_millis() -> u64 {
 enum Msg {
     Event(JournalEvent),
     Checkpoint,
+    /// The stop path's drain request: append every earlier event, fsync,
+    /// then answer through the signal. FIFO queue order makes the answer
+    /// prove every event enqueued before the drain is durable.
+    Drain(Arc<DrainSignal>),
+}
+
+/// The drain completion: `None` while the writer has not answered,
+/// `Some(Ok(()))` once the fsync landed, `Some(Err(reason))` when the
+/// writer is disabled after an I/O failure.
+struct DrainSignal {
+    state: Mutex<Option<Result<(), String>>>,
+    cvar: Condvar,
 }
 
 struct Inner {
@@ -452,6 +473,41 @@ impl AofWriter {
         let _ = self.inner.tx.try_send(Msg::Checkpoint);
     }
 
+    /// Block until every event enqueued before this call is durable: the
+    /// queue is FIFO, so when the writer answers the drain request, all
+    /// earlier events have been appended and fsynced. The graceful-stop
+    /// path writes its `flushed` marker only after this returns. A writer
+    /// disabled after an I/O failure reports the failure (the stop path
+    /// then leaves its marker at `stopped`); a writer whose thread is
+    /// gone (post-panic) is an error.
+    pub fn drain(&self) -> io::Result<()> {
+        let signal = Arc::new(DrainSignal {
+            state: Mutex::new(None),
+            cvar: Condvar::new(),
+        });
+        loop {
+            match self.inner.tx.try_send(Msg::Drain(Arc::clone(&signal))) {
+                Ok(()) => break,
+                Err(TrySendError::Full(_)) => {
+                    // The queue is full of events the writer is draining
+                    // right now; retry until the drain is accepted.
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(TrySendError::Disconnected(_)) => {
+                    return Err(io::Error::other("aof writer thread is gone"));
+                }
+            }
+        }
+        let mut state = signal.state.lock().expect("drain state poisoned");
+        while state.is_none() {
+            state = signal.cvar.wait(state).expect("drain state poisoned");
+        }
+        state
+            .take()
+            .expect("completed above")
+            .map_err(|reason| io::Error::other(reason))
+    }
+
     /// Events dropped by this writer so far (overflow, or post-failure).
     pub fn drops(&self) -> u64 {
         self.inner.drops.load(Ordering::Relaxed)
@@ -484,6 +540,30 @@ fn pump(rx: Receiver<Msg>, mut core: AofCore, interval: Option<Duration>, drops:
                     last_sync = Instant::now();
                     last_flush = Instant::now();
                 }
+            }
+            Ok(Msg::Drain(signal)) => {
+                let outcome = if failed {
+                    Err("telemetry disabled after an earlier error".to_string())
+                } else {
+                    match core.checkpoint() {
+                        Ok(()) => {
+                            last_sync = Instant::now();
+                            last_flush = Instant::now();
+                            Ok(())
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "lunet-advisory-lock: aof drain flush failed ({e}); \
+                                 telemetry disabled for this process"
+                            );
+                            failed = true;
+                            Err(e.to_string())
+                        }
+                    }
+                };
+                let mut state = signal.state.lock().expect("drain state poisoned");
+                *state = Some(outcome);
+                signal.cvar.notify_all();
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
@@ -635,6 +715,35 @@ mod tests {
         assert_eq!(open_files.len(), 1);
         let open_data = fs::read(dir.join(&open_files[0])).unwrap();
         assert_eq!(parse_file(&open_data), vec![after]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The stop drain's guarantee (`AofWriter::drain`): after it returns,
+    /// every event enqueued before the call is durable on disk. With the
+    /// periodic-fsync knob OFF and 500 records (30.5 KiB) below the 64 KiB
+    /// write-buffer threshold, the only thing that could have landed the
+    /// buffered bytes is the drain's own flush+fsync — so a full read-back
+    /// here proves the drain blocked until durability.
+    #[test]
+    fn drain_makes_every_queued_event_durable() {
+        let dir = temp_aof_dir("drain");
+        let config = AofConfig {
+            flush_interval: None,
+            ..AofConfig::default()
+        };
+        let writer = AofWriter::open(&dir, config).unwrap();
+        for i in 0..500u64 {
+            writer.enqueue(sample_event(KIND_HOLD, i * 10, i, i * 10 + 500));
+        }
+        writer.drain().expect("drain");
+        let mut total = 0usize;
+        for entry in fs::read_dir(&dir).unwrap().flatten() {
+            let data = fs::read(entry.path()).unwrap();
+            total += parse_file(&data).len();
+        }
+        assert_eq!(total, 500, "every queued event is durable after the drain");
+        // A second drain is idempotent and still reports success.
+        writer.drain().expect("second drain");
         let _ = fs::remove_dir_all(&dir);
     }
 

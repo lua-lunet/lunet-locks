@@ -1735,7 +1735,18 @@ fn main() {
         }
         std::thread::sleep(Duration::from_millis(TICK_MS));
     }
-    // Clean stop: the teardown record LAST and the unconditional flush.
+    // Clean stop (the uVRR termination obligations): the loop break IS
+    // the drain point — no inbound pumping happens after it. The node
+    // stop closes the wire, writes the `stopped` marker, drains the
+    // committed-transition sink to quiescence, and writes `flushed`; the
+    // next boot continues under the SAME incarnation (no resurrection).
+    // SIGKILL skips all of it: the running sentinel stays behind and the
+    // next boot reincarnates — the documented crash shape.
+    let code = host.node.stop();
+    if code != OK {
+        eprintln!("lease-sequencer: node stop failed with code {code}");
+    }
+    // The telemetry teardown record LAST and the unconditional flush.
     if let Some(log) = host.telemetry.as_mut()
         && let Err(error) = log.teardown()
     {

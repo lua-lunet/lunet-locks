@@ -8,7 +8,7 @@
 //! the probe→SET-race path (stage 4). Every stage asserts its invariants
 //! on the cluster-wide trace AOF the driver writes.
 
-use lease_sequencer::uds_harness::{Cluster, ClusterConfig, Verdict};
+use lease_sequencer::uds_harness::{Cluster, ClusterConfig, Verdict, parse_line};
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -151,5 +151,131 @@ fn stage4_three_clients_race_one_free_lock() {
         verdicts.iter().all(|v| v.pass),
         "stage4 verdicts: {}",
         summarize(&verdicts)
+    );
+}
+
+/// The driver-hiccup tolerance: the driver is the cluster's only switch
+/// fabric and runs on the test thread, so a scheduling stall of the test
+/// thread IS wire silence to every follower — even though every node host
+/// stayed up and every heartbeat was emitted on time. The phi detector
+/// must not read that manufactured silence as leader death: the observed
+/// red runs (item09: a 422 ms frame gap, then view churn 1→16 through the
+/// 3 s takeover window, the successors' ops refused not_leader mid-churn)
+/// were exactly this — a driver-side stall storming the cluster. The
+/// harness's phi timeout knobs must exceed the hiccup a loaded host
+/// produces, so the view stays put, the fence stays silent, and the
+/// takeover machinery runs on the lease clock, not the churn.
+#[test]
+fn driver_hiccup_is_not_leader_death() {
+    let _guard = lock_scenarios();
+    let config = ClusterConfig::new(
+        scratch("uds-hiccup"),
+        members(&[44, 55, 66]),
+        vec![44, 55, 66],
+    )
+    .with_clients(vec![("client1".into(), 44)]);
+    let mut cluster = Cluster::launch(config).expect("launch");
+    let ready = cluster.wait_until(8000, |lines| {
+        lines.iter().filter_map(|l| parse_line(l)).any(|l| {
+            l.from.starts_with("node")
+                && l.to.starts_with("node")
+                && l.json.get("tag").and_then(|v| v.as_u64()) == Some(4)
+        })
+    });
+    assert!(
+        ready,
+        "the cluster never stabilized: {}",
+        cluster.trace_tail(8)
+    );
+    cluster.client_start("client1");
+    let held = cluster.wait_until(3000, |lines| {
+        lines.iter().filter_map(|l| parse_line(l)).any(|l| {
+            l.to == "client1" && l.json.get("granted").and_then(|v| v.as_bool()) == Some(true)
+        })
+    });
+    assert!(
+        held,
+        "the contender never acquired: {}",
+        cluster.trace_tail(8)
+    );
+    let settled = cluster.lines.len();
+    let views_before: Vec<u64> = cluster.lines[..settled]
+        .iter()
+        .filter_map(|l| parse_line(l))
+        .filter(|l| l.from.starts_with("node") && l.to.starts_with("node"))
+        .filter_map(|l| l.json.get("view").and_then(|v| v.as_u64()))
+        .collect();
+    let view_before = views_before.last().copied().unwrap_or(0);
+    let leader_before = cluster.lines[..settled]
+        .iter()
+        .rev()
+        .find_map(|l| {
+            parse_line(l).filter(|p| {
+                p.from.starts_with("node") && p.json.get("tag").and_then(|v| v.as_u64()) == Some(4)
+            })
+        })
+        .map(|l| l.from.to_string());
+
+    // THE HICCUP: no polling for 1.8 s — the driver emits and forwards
+    // nothing while every node host keeps stepping on its own thread.
+    // To the followers this is wire silence (their phi monitors are fed
+    // only by the driver's forwarded arrivals); the leases ride their own
+    // clocks and expire on schedule, so the successor machinery — if the
+    // view survives — is exercised purely by the expiry, never by churn.
+    std::thread::sleep(std::time::Duration::from_millis(1800));
+
+    // Recovery: resume the polls; the backlog drains and service resumes.
+    let resume_at = lease_sequencer::uds_harness::millis();
+    while lease_sequencer::uds_harness::millis() < resume_at + 2500 {
+        cluster.poll(lease_sequencer::uds_harness::millis());
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let window = &cluster.lines[settled..];
+    let parsed: Vec<_> = window.iter().filter_map(|l| parse_line(l)).collect();
+    let fences = parsed
+        .iter()
+        .filter(|l| l.from.starts_with("node") && l.to.starts_with("node"))
+        .filter(|l| matches!(l.json.get("tag").and_then(|v| v.as_u64()), Some(5 | 6 | 7)))
+        .count();
+    let views_after: Vec<u64> = parsed
+        .iter()
+        .filter(|l| l.from.starts_with("node") && l.to.starts_with("node"))
+        .filter_map(|l| l.json.get("view").and_then(|v| v.as_u64()))
+        .collect();
+    let max_view = views_after.iter().copied().max().unwrap_or(0);
+    let leader_after = parsed
+        .iter()
+        .rev()
+        .find(|l| {
+            l.from.starts_with("node") && l.json.get("tag").and_then(|v| v.as_u64()) == Some(4)
+        })
+        .map(|l| l.from.to_string());
+    let serving = parsed.iter().any(|l| {
+        l.to == "client1"
+            && l.json.get("op").and_then(|v| v.as_str()) == Some("set")
+            && l.json.get("granted").and_then(|v| v.as_bool()) == Some(true)
+    });
+    let mut failures = Vec::new();
+    if fences != 0 {
+        failures.push(format!("view-change fences through the stall: {fences}"));
+    }
+    if max_view > view_before {
+        failures.push(format!(
+            "the view churned: before={view_before} max_after={max_view}"
+        ));
+    }
+    if leader_before.is_none() || leader_after != leader_before {
+        failures.push(format!(
+            "the leader moved: before={leader_before:?} after={leader_after:?}"
+        ));
+    }
+    if !serving {
+        failures.push("the lock never served a granted set after recovery".to_string());
+    }
+    assert!(
+        failures.is_empty(),
+        "driver-hiccup invariants broken: {}; tail:\n{}",
+        failures.join("; "),
+        cluster.trace_tail(8)
     );
 }

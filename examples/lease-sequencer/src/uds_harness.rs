@@ -469,13 +469,27 @@ impl NodeHost {
         self.flush_outputs(now);
     }
 
-    /// The forever loop the binary runs; `stop` breaks it cleanly.
+    /// The forever loop the binary runs; `stop` breaks it cleanly. The
+    /// break is the drain point: the node stop (wire closed, `stopped`
+    /// marker, sink drained, `flushed` marker) runs after it, so the next
+    /// boot continues under the same incarnation. SIGKILL skips all of
+    /// it: the running sentinel stays behind and the next boot
+    /// reincarnates.
     pub fn run(&mut self, stop: &Arc<AtomicBool>) {
         while !stop.load(Ordering::Relaxed) {
             self.step(millis());
-            std::thread::sleep(Duration::from_millis(1));
+            // The step quantum: sub-millisecond, so a forwarded client op
+            // (home node -> driver relay -> leader -> consensus -> reply)
+            // clears its ~5 sleeping-thread hops inside the 10 ms RTT
+            // bucket even when the host is loaded. The rig binary keeps
+            // its own cadence; this is the harness's in-process fabric.
+            std::thread::sleep(Duration::from_micros(500));
         }
         self.note("stop: clean exit");
+        let code = self.node.stop();
+        if code != OK {
+            self.note(&format!("stop: node stop failed with code {code}"));
+        }
     }
 
     fn accept_request(&mut self) {
@@ -720,9 +734,15 @@ impl NodeHost {
         };
         let (last_arrival, phi_now, fires) = verdict;
         let silence = now.saturating_sub(last_arrival);
+        // The harness's fence floor: the switch fabric is the test thread,
+        // so a scheduling stall of that thread manufactures wire silence
+        // while no node failed. A silence shorter than the configured
+        // minimum never drives the §14.2 forced view — the fence stays
+        // available for genuine, sustained leader loss beyond the floor.
+        let fence_floor_ms = self.timeout_knobs.min_ms.max(self.phi_cfg.heartbeat_ms);
         let detected_key = (status.config_era, status.leader);
         let latched = self.phi_detected_key == Some(detected_key) && status.state == STATE_NORMAL;
-        if latched || !fires {
+        if latched || !fires || silence < fence_floor_ms {
             return;
         }
         self.phi_detected_key = Some(detected_key);
@@ -880,6 +900,15 @@ pub struct ClusterConfig {
     pub election_ms: u64,
     pub phi_threshold: f64,
     pub phi_safety: f64,
+    /// The minimum leader-silence the in-process cluster tolerates before
+    /// any follower acts on it — the fence floor and the election wait's
+    /// lower clamp. The harness's switch fabric is the test thread; a
+    /// scheduler stall of that thread is wire silence to every follower
+    /// while no node actually failed, so the floor must exceed the stall a
+    /// loaded host produces (item09: a 422 ms frame gap alone churned the
+    /// view 1→16 and starved the takeover). Defaults to 3000 ms.
+    pub phi_timeout_min_ms: u64,
+    pub phi_timeout_max_ms: u64,
     pub lock_id: u64,
     pub lease_ms: u64,
     pub probe_floor_ms: u64,
@@ -900,6 +929,8 @@ impl ClusterConfig {
             election_ms: 1000,
             phi_threshold: 1.0,
             phi_safety: 2.0,
+            phi_timeout_min_ms: 3000,
+            phi_timeout_max_ms: 5000,
             lock_id: 0x0DDBA12,
             lease_ms: 500,
             probe_floor_ms: 1000,
@@ -952,6 +983,10 @@ pub struct Cluster {
     /// The in-memory mirror of the trace file: the analyzers read this.
     pub lines: Vec<String>,
     nodes: HashMap<u32, NodeSlot>,
+    /// The in-process node host threads; joined at drop so the stop
+    /// sequence (markers, drain, flushed) completes before the next
+    /// scenario starts instead of racing it on the same disk.
+    threads: Vec<std::thread::JoinHandle<()>>,
     listener: UnixListener,
     /// Accepted out-conns awaiting their IDENT frame.
     incoming: Vec<(UnixStream, FrameBuf)>,
@@ -995,6 +1030,7 @@ impl Cluster {
         listener.set_nonblocking(true)?;
         let mut nodes = HashMap::new();
         let mut stops = Vec::new();
+        let mut threads = Vec::new();
         for id in &config.boot {
             let request_path = config.run_dir.join(format!("node{id}.ud"));
             let options = NodeOptions {
@@ -1009,15 +1045,16 @@ impl Cluster {
                 recovery_ms: 1000,
                 phi_threshold: config.phi_threshold,
                 phi_safety: config.phi_safety,
-                phi_timeout_min_ms: 500,
-                phi_timeout_max_ms: 1000,
+                phi_timeout_min_ms: config.phi_timeout_min_ms,
+                phi_timeout_max_ms: config.phi_timeout_max_ms,
             };
             let slot = match &config.node_bin {
                 None => {
                     let mut host = NodeHost::bind(options)?;
                     let stop = Arc::new(AtomicBool::new(false));
                     let stop_loop = Arc::clone(&stop);
-                    std::thread::spawn(move || host.run(&stop_loop));
+                    let handle = std::thread::spawn(move || host.run(&stop_loop));
+                    threads.push(handle);
                     stops.push(stop);
                     NodeSlot {
                         id: *id,
@@ -1100,6 +1137,7 @@ impl Cluster {
             trace,
             lines: Vec::new(),
             nodes,
+            threads,
             listener,
             incoming: Vec::new(),
             clients,
@@ -1582,6 +1620,15 @@ impl Drop for Cluster {
         self.closed = true;
         for stop in &self.stops {
             stop.store(true, Ordering::Relaxed);
+        }
+        // The break is the drain point: every in-process host thread runs
+        // its node stop (wire closed, `stopped` marker, drain, `flushed`
+        // marker) inside `run`; joining here keeps that sequence inside
+        // THIS cluster's teardown, so the next scenario never races it on
+        // the same disk. The spawned binaries get the crash shape instead:
+        // SIGKILL skips the whole sequence by design.
+        for handle in self.threads.drain(..) {
+            let _ = handle.join();
         }
         for (_, mut slot) in self.nodes.drain() {
             if let Some(child) = slot.child.as_mut() {

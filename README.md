@@ -26,6 +26,16 @@ running sentinel reincarnates: its identity bumps, it announces the
 resurrection that seats the new identity at weight 1 in the old succession
 position and evicts the old one.
 
+Termination follows the uVRR termination obligations. A graceful stop —
+SIGTERM or SIGINT on the embedded-sequencer hosts, `lunet_lock_node_stop`
+through the C ABI — closes the wire before any marker write, writes the
+`stopped` marker, drains the committed-transition sink to quiescence, and
+writes `flushed` only after the drain; the next boot continues under the
+same incarnation with no resurrection. A process killed outright
+(SIGKILL) leaves the running sentinel behind and reincarnates on its next
+boot: the run-sheets' node kills therefore use `kill -9` wherever crash
+semantics are what is being exercised.
+
 Run a three-replica smoke test with the project-local Lunet runtime:
 
 ```console

@@ -199,6 +199,15 @@ unconditionally; SIGKILL loses the last unflushed window. The active file
 rolls at `--telemetry-rollover-mib` (default 4) and the series keeps
 exactly the current file plus one closed old.
 
+Stop semantics (the uVRR termination obligations): SIGTERM/SIGINT is a
+clean stop — the node closes the wire, writes the `stopped` marker, drains
+the AOF sink to quiescence, writes the `flushed` marker, and the next boot
+continues under the same incarnation with no resurrection. SIGKILL is the
+crash shape: the running sentinel stays behind and the next boot
+reincarnates (identity bump, the `(old, new)` announcement, the peers'
+remap) — the run-sheets' node kills use `kill -9` wherever crash semantics
+are being exercised.
+
 The phi-informed election wait: the host tick loop derives the
 election/suspicion wait from the current leader's sketch — `safety *
 max(heartbeat, learned mean interval)`, clamped to

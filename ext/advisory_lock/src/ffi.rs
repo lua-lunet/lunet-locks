@@ -3,8 +3,10 @@
 //!
 //! Concrete core: `Replica<SegmentedLog, WeightedMajority>` running
 //! `Stability::Volatile` — nothing is persisted but the boot state file, so
-//! a same-identity clean restart does not exist in this embedder: every
-//! restart of a process that has been running is DIRTY. The restart story is
+//! a process that died while operating has no same-identity clean restart
+//! in this embedder: its restart is DIRTY. A graceful stop is the one
+//! same-identity restart (the termination lifecycle below). The restart
+//! story is
 //! upstream's Crash-Stop-Self-Evict protocol
 //! (`src/replica/reincarnation.rs`): the durable state file is the
 //! incarnation marker (the four-superblock discipline collapsed to one
@@ -74,6 +76,38 @@
 //!   the core self-gates: a member already voting at weight ≥ 1 has
 //!   nothing to announce). `lunet_lock_node_own_id` reports the live
 //!   identity so the host can compare leaders against it after a bump.
+//! - **Termination (the stop story).** The adapter meets the uVRR
+//!   termination obligations (uvrr-core v0.6.1,
+//!   `docs/uvrr-termination-obligations.md`) host-side, with the core pin
+//!   untouched. The lifecycle is the contract's: startup writes the
+//!   running sentinel BEFORE the loop starts (every boot path ends
+//!   `unflushed`); a graceful stop — [`Node::stop`] and the C ABI's
+//!   `lunet_lock_node_stop` — first CLOSES THE WIRE (the mandatory drain
+//!   point: the `stopped` flag refuses every further inbound entry —
+//!   `request`, `receive`, `idle`, `leader_timeout`, `force_view`,
+//!   `recover`, `reconfigure` — before any marker write and before any
+//!   task processing, making the in-memory state final), then writes
+//!   `stopped` (termination begins), then drains the committed-transition
+//!   sink to quiescence (every queued record appended and fsynced — the
+//!   durable-state write), and only then writes `flushed` at the drain
+//!   point. The write ordering carries the safety argument: a marker at
+//!   `stopped` or later vouches for the state beneath it, so boot reads a
+//!   partial shutdown (died between the marker writes) as a CONTROLLED
+//!   ending, never as a crash. On-disk spelling: the contract spells the
+//!   operating state `running`; this adapter keeps the running sentinel's
+//!   on-disk word as `unflushed` for compatibility with every existing
+//!   rig state file — `flushed` and the new `stopped` spell as the
+//!   contract does. Startup classification: `stopped`/`flushed` → clean
+//!   continue under the SAME incarnation (no reincarnation), rewritten
+//!   `unflushed` before operating; `unflushed` → DIRTY bump (unchanged).
+//!   SIGKILL leaves the running sentinel behind and stays the crash
+//!   shape. Marker-storage honesty: the marker is ONE fsynced flag file
+//!   (fsync+rename+dir-sync) — the vendored Zig store's four-copy
+//!   checksummed quorum superblock machinery exists
+//!   (`ext/lunet-locks-aof/zig/src/vsr/superblock.zig`) but its AOF C ABI
+//!   does not expose it, so the contract's quorum-of-copies construction
+//!   is NOT met; the single-copy discipline is the bounded implementation
+//!   and the gap is recorded as such.
 //! - **Reconfiguration.** `lunet_lock_node_reconfigure` drives
 //!   `Input::Reconfigure { op, pivot }` (Join at weight 0 / Increment /
 //!   Decrement (voter to learner) / Leave at weight 0) on the current primary
@@ -233,6 +267,10 @@ pub const TOO_LARGE: i32 = -6;
 pub const SERVICE: i32 = -7;
 pub const NOT_LEADER: i32 = -8;
 pub const FAULTED: i32 = -9;
+/// The drain point's refusal code: the node has stopped and the wire is
+/// closed — every inbound entry (request, receive, ticks, admin drives)
+/// reports STOPPED and processes nothing.
+pub const STOPPED: i32 = -10;
 pub const PANIC: i32 = -127;
 
 const OUTPUT_SEND: u32 = 1;
@@ -286,14 +324,23 @@ const INCARNATION_BASE: u64 = 1u64 << 24;
 const INCARNATION_MAX: u64 = 255;
 
 /// A superblock copy's marker, upstream-style
-/// (`src/replica/reincarnation.rs:423-430`): `Flushed` = "the durable
-/// state is a self-consistent checkpoint of this identity, written at the
-/// bump and at a clean shutdown"; `Unflushed` = the running sentinel, left
-/// behind by every process that has been operating on volatile state.
+/// (`src/replica/reincarnation.rs:423-430`), extended with the uVRR
+/// termination lifecycle (`docs/uvrr-termination-obligations.md` §2):
+///
+/// - `Unflushed` = the running sentinel, left behind by every process
+///   that has been operating on volatile state. On-disk spelling note:
+///   the contract spells this state `running`; the on-disk word stays
+///   `unflushed` so every existing rig state file boots unchanged.
+/// - `Stopped` = termination has begun at a graceful stop: the wire was
+///   closed before this write, so the state beneath the marker is final.
+///   A `stopped` copy mixed with `unflushed` copies (a death between the
+///   marker writes) is evidence of a controlled ending, never a crash.
+/// - `Flushed` = the durable-state write completed at the drain point.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Marker {
-    Flushed,
     Unflushed,
+    Stopped,
+    Flushed,
 }
 
 struct Queued {
@@ -350,6 +397,16 @@ pub struct Node {
     ///   it), and fsync happens only on the timer, at roll, at checkpoint,
     ///   and at shutdown.
     journal: Option<JournalSink>,
+    /// The durable incarnation-marker path, kept so the stop path can
+    /// write `stopped` and `flushed` against the boot's own marker file.
+    state_path: PathBuf,
+    /// The boot's incarnation (0 for a first boot and for a clean
+    /// continue): the marker line's first field at stop time.
+    incarnation: u64,
+    /// The drain point's wire-closed flag: set BEFORE any marker write at
+    /// stop, and refusing every further inbound entry while set — the
+    /// mandatory obligation that makes the in-memory state final.
+    stopped: bool,
 }
 
 /// The committed-transition sink behind `Node`'s journal hook.
@@ -908,6 +965,11 @@ impl Node {
     /// the request's message_id; the ABI's negative codes otherwise.
     pub fn request(&mut self, json: &[u8]) -> i32 {
         trace!(len = json.len(), "node request entry");
+        if self.stopped {
+            // The drain point closed the wire: no further task processing
+            // (docs/uvrr-termination-obligations.md §1).
+            return STOPPED;
+        }
         if json.len() > MAX_DATAGRAM {
             return TOO_LARGE;
         }
@@ -951,6 +1013,11 @@ impl Node {
     /// (the host has already authenticated the source endpoint).
     pub fn receive(&mut self, from: u32, data: &[u8]) -> i32 {
         trace!(from, len = data.len(), "node receive entry");
+        if self.stopped {
+            // The drain point closed the wire: no further inbound reads
+            // (docs/uvrr-termination-obligations.md §1).
+            return STOPPED;
+        }
         if data.len() > MAX_DATAGRAM {
             return TOO_LARGE;
         }
@@ -1007,6 +1074,10 @@ impl Node {
     /// Heartbeat tick.
     pub fn idle(&mut self) -> i32 {
         trace!("node idle entry");
+        if self.stopped {
+            // The drain point closed the wire: no further task processing.
+            return STOPPED;
+        }
         self.drive(Input::Tick)
     }
 
@@ -1014,6 +1085,10 @@ impl Node {
     /// tag's only view-change trigger (`ViewChangeKnobs::primary_timeout`).
     pub fn leader_timeout(&mut self) -> i32 {
         trace!("node leader timeout entry");
+        if self.stopped {
+            // The drain point closed the wire: no further task processing.
+            return STOPPED;
+        }
         self.drive(Input::Tick)
     }
 
@@ -1023,6 +1098,10 @@ impl Node {
     /// core refuses anything sideways or backwards.
     pub fn force_view(&mut self, era: u32, view: u32) -> i32 {
         trace!(era, view, "node force view entry");
+        if self.stopped {
+            // The drain point closed the wire: no further task processing.
+            return STOPPED;
+        }
         self.drive(Input::AdminForceView {
             target: ViewId {
                 era: Era(era),
@@ -1044,6 +1123,10 @@ impl Node {
         if self.poisoned {
             return SERVICE;
         }
+        if self.stopped {
+            // The drain point closed the wire: no further task processing.
+            return STOPPED;
+        }
         if let Some(old) = self.reincarnate_from {
             debug!(
                 node = self.replica.own().0,
@@ -1064,6 +1147,10 @@ impl Node {
     /// join succession position (`POSITION_APPEND` appends at the current
     /// succession end).
     pub fn reconfigure(&mut self, op: u32, member: u32, position: u32) -> i32 {
+        if self.stopped {
+            // The drain point closed the wire: no further task processing.
+            return STOPPED;
+        }
         let position = if op == RECONFIGURE_JOIN && position == POSITION_APPEND {
             let len = self
                 .replica
@@ -1113,6 +1200,63 @@ impl Node {
             _ => self.derived_pivot(&system),
         };
         self.drive(Input::Reconfigure { op: system, pivot })
+    }
+
+    /// The graceful stop (the uVRR termination lifecycle,
+    /// `docs/uvrr-termination-obligations.md` §1-§2, host-side):
+    ///
+    /// 1. **The wire closes first** — the mandatory drain point. The
+    ///    `stopped` flag is set BEFORE any marker write, so every further
+    ///    inbound entry (`request`, `receive`, ticks, admin drives)
+    ///    refuses and processes nothing: the in-memory state becomes
+    ///    final and nothing arriving later can contradict it. The caller
+    ///    may still drain already-queued outputs (outbound flush is the
+    ///    desirable obligation and must never delay this one).
+    /// 2. **`stopped` is written** as termination begins.
+    /// 3. **The durable-state write completes**: the committed-transition
+    ///    sink drains to quiescence (the AOF writer's queue appended and
+    ///    fsynced; the blocking journal fsynced).
+    /// 4. **`flushed` is written** at the drain point — only after the
+    ///    durable write completed. A `stopped`-or-later marker vouches
+    ///    for the state beneath it, so a death between the writes is a
+    ///    partial shutdown that boot reads CLEAN.
+    ///
+    /// Idempotent: a second stop reports OK without rewriting anything.
+    /// A failed marker write or drain reports SERVICE and leaves the
+    /// marker at `stopped` (still a controlled ending). SIGKILL takes
+    /// none of this path: the running sentinel stays behind and the next
+    /// boot classifies DIRTY.
+    pub fn stop(&mut self) -> i32 {
+        if self.stopped {
+            return OK;
+        }
+        // The drain point: the wire closes BEFORE any marker write.
+        self.stopped = true;
+        info!(
+            node = self.replica.own().0,
+            "stop: the wire is closed, the in-memory state is final"
+        );
+        if write_marker(&self.state_path, self.incarnation, Marker::Stopped).is_err() {
+            eprintln!("lunet-advisory-lock: the stopped marker write failed");
+            return SERVICE;
+        }
+        // The durable-state write, completing BEFORE the flushed marker.
+        if let Err(error) = drain_sink(&mut self.journal) {
+            eprintln!(
+                "lunet-advisory-lock: the stop drain failed ({error}); \
+                       the marker stays at stopped"
+            );
+            return SERVICE;
+        }
+        if write_marker(&self.state_path, self.incarnation, Marker::Flushed).is_err() {
+            eprintln!("lunet-advisory-lock: the flushed marker write failed");
+            return SERVICE;
+        }
+        info!(
+            node = self.replica.own().0,
+            "stop: drained and flushed; the next boot continues under the same incarnation"
+        );
+        OK
     }
 
     /// The live identity: the descriptor id at incarnation 0, the bumped
@@ -1368,10 +1512,12 @@ fn unix_millis() -> Result<u64, i32> {
         .and_then(|duration| u64::try_from(duration.as_millis()).map_err(|_| SERVICE))
 }
 
-/// The marker file's on-disk line: `<incarnation> <flushed|unflushed>`.
+/// The marker file's on-disk line: `<incarnation>
+/// <unflushed|stopped|flushed>`.
 fn marker_line(incarnation: u64, marker: Marker) -> String {
     let marker_text = match marker {
         Marker::Flushed => "flushed",
+        Marker::Stopped => "stopped",
         Marker::Unflushed => "unflushed",
     };
     format!("{incarnation} {marker_text}\n")
@@ -1388,6 +1534,7 @@ fn parse_marker(text: &str) -> Option<(u64, Marker)> {
     }
     let marker = match marker_text {
         "flushed" => Marker::Flushed,
+        "stopped" => Marker::Stopped,
         "unflushed" => Marker::Unflushed,
         _ => return None,
     };
@@ -1429,13 +1576,22 @@ fn write_marker(path: &Path, incarnation: u64, marker: Marker) -> std::io::Resul
 }
 
 /// Boot-time marker discipline (upstream `SuperblockCopies::restart`,
-/// `src/replica/reincarnation.rs:526-541`, collapsed to one durable copy):
-/// a missing file is a first boot at incarnation 0, left `unflushed` (the
-/// running sentinel). A `flushed` marker is a clean continue: same
-/// incarnation, rewritten `unflushed` as operating begins. An `unflushed`
-/// marker is DIRTY: the incarnation bumps (refusing at exhaustion), the
-/// marker is rewritten `(new, flushed)` — the bump's commitment — and then
-/// `(new, unflushed)` as operating begins.
+/// `src/replica/reincarnation.rs:526-541`, collapsed to one durable copy,
+/// extended with the uVRR termination lifecycle
+/// `docs/uvrr-termination-obligations.md` §2-§3): a missing file is a
+/// first boot at incarnation 0, left `unflushed` (the running sentinel —
+/// the contract's startup `running`, written before the loop starts). A
+/// `stopped` or `flushed` marker is a CLEAN STOP: the previous process
+/// reached the drain point (a `flushed` copy mixed with `stopped` copies
+/// is the normal mid-flush shape), so the state is final — the boot
+/// continues under the SAME incarnation, no reincarnation, rewritten
+/// `unflushed` as operating begins. An `unflushed` marker is DIRTY: the
+/// previous process cannot be shown to have reached the drain point, the
+/// incarnation bumps (refusing at exhaustion), the marker is rewritten
+/// `(new, flushed)` — the bump's commitment — and then `(new, unflushed)`
+/// as operating begins. On-disk spelling: the running sentinel stays
+/// `unflushed` for compatibility with every existing rig state file; the
+/// contract's `running` never appears on disk.
 ///
 /// The DIRTY branch is the recovery boundary (the experiment design's §4):
 /// when a variant is configured, its forced flush executes right at the
@@ -1463,7 +1619,13 @@ fn boot_marker(
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             let (incarnation, marker) = read_marker(path).map_err(|_| CONFIG)?;
             match marker {
-                Marker::Flushed => {
+                // A clean stop (`docs/uvrr-termination-obligations.md`
+                // §3): `stopped` and `flushed` copies both show the
+                // previous process reached the drain point — the state is
+                // final, the node continues under the same incarnation
+                // with NO reincarnation, and the running sentinel is
+                // rewritten before operating begins.
+                Marker::Stopped | Marker::Flushed => {
                     write_marker(path, incarnation, Marker::Unflushed).map_err(|_| CONFIG)?;
                     Ok((incarnation, None))
                 }
@@ -1487,6 +1649,18 @@ fn boot_marker(
             }
         }
         Err(_) => Err(CONFIG),
+    }
+}
+
+/// The stop path's durable-state write: drain the committed-transition
+/// sink to quiescence — every record the node enqueued is appended and
+/// fsynced (the AOF writer), or the journal file is fsynced (the blocking
+/// journal). A disabled sink (`None`) has nothing to drain.
+fn drain_sink(sink: &mut Option<JournalSink>) -> std::io::Result<()> {
+    match sink {
+        Some(JournalSink::Aof(writer)) => writer.drain(),
+        Some(JournalSink::Blocking(journal)) => journal.flush(),
+        None => Ok(()),
     }
 }
 
@@ -1789,6 +1963,9 @@ fn node_from_sink(
         last_leader: None,
         last_config_era: None,
         journal,
+        state_path: state_path.clone(),
+        incarnation,
+        stopped: false,
     };
     // The bumped node's entry ticket (§4): the wire phase always
     // follows the bump. The announcement is emitted at boot; every
@@ -2000,6 +2177,17 @@ pub unsafe extern "C" fn lunet_lock_node_force_view(node: *mut c_void, era: u32,
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lunet_lock_node_recover(node: *mut c_void) -> i32 {
     guarded(|| unsafe { node.cast::<Node>().as_mut().map_or(INVALID, Node::recover) })
+}
+
+/// The graceful stop (the uVRR termination obligations, host-side): the
+/// wire closes BEFORE any marker write — every further inbound entry
+/// reports STOPPED and processes nothing — then the `stopped` marker, the
+/// sink drain to quiescence, and the `flushed` marker, in the contract's
+/// §2 write order. Synchronous on the caller's thread: no thread spawn,
+/// no callback, no yield (the item07 invariants). Idempotent.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lunet_lock_node_stop(node: *mut c_void) -> i32 {
+    guarded(|| unsafe { node.cast::<Node>().as_mut().map_or(INVALID, Node::stop) })
 }
 
 #[unsafe(no_mangle)]
@@ -2240,6 +2428,219 @@ mod tests {
         fs::remove_dir_all(&scratch).unwrap();
     }
 
+    /// On-disk compatibility: a marker file in the pre-lifecycle spelling
+    /// (`<incarnation> unflushed`) boots exactly as before — the DIRTY
+    /// bump — with no interpretation change.
+    #[test]
+    fn existing_unflushed_files_boot_unchanged() {
+        let path = state_path("marker-compat");
+        fs::write(&path, "0 unflushed\n").unwrap();
+        assert_eq!(
+            boot_marker(&path, None)
+                .expect("unchanged classification")
+                .0,
+            1,
+            "the running sentinel still classifies DIRTY"
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "1 unflushed\n");
+        fs::remove_file(path).unwrap();
+    }
+
+    /// The contract's partial-marker-write rule
+    /// (`docs/uvrr-termination-obligations.md` §2): a death between the
+    /// marker writes leaves `stopped` without `flushed`, and the next
+    /// boot reads it CLEAN — a controlled ending, never a crash. RED
+    /// before the lifecycle landed: `stopped` did not parse at all.
+    #[test]
+    fn partial_shutdown_stopped_without_flushed_reads_clean() {
+        let path = state_path("marker-partial");
+        // An operating process's running sentinel, then the stop's first
+        // marker write, then death before the durable flush completed.
+        fs::write(&path, "5 unflushed\n").unwrap();
+        write_marker(&path, 5, Marker::Stopped).unwrap();
+        assert_eq!(
+            boot_marker(&path, None)
+                .expect("partial shutdown reads clean")
+                .0,
+            5,
+            "same incarnation, no DIRTY bump"
+        );
+        // The running sentinel is rewritten before operating begins.
+        assert_eq!(fs::read_to_string(&path).unwrap(), "5 unflushed\n");
+        fs::remove_file(path).unwrap();
+    }
+
+    /// The clean-stop lifecycle end to end through `Node::open` and
+    /// `Node::stop` (RED before the lifecycle landed: nothing wrote the
+    /// stop markers, so every restart was DIRTY): the stopped node's
+    /// marker reads clean on the next boot — same incarnation, no bump,
+    /// no reincarnation announcement, the running sentinel rewritten as
+    /// operating begins.
+    #[test]
+    fn clean_stop_boot_continues_the_same_incarnation_no_bump() {
+        let path = state_path("clean-stop");
+        let state = path.to_str().expect("state path");
+        let members = "10:a\x000:b\x0030:c";
+        let mut node = Node::open(members, "a", state, None, 0).expect("first boot");
+        let own_before = node.own_id();
+        // The running sentinel the operating process leaves behind.
+        assert_eq!(fs::read_to_string(&path).unwrap(), "0 unflushed\n");
+        assert_eq!(node.stop(), OK);
+        // The stop's end state: `flushed` (the intermediate `stopped`
+        // write was atomically replaced at the drain point).
+        assert_eq!(fs::read_to_string(&path).unwrap(), "0 flushed\n");
+        drop(node);
+        let node = Node::open(members, "a", state, None, 0).expect("clean continue");
+        assert_eq!(
+            node.own_id(),
+            own_before,
+            "no reincarnation after a clean stop"
+        );
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "0 unflushed\n",
+            "the running sentinel is rewritten before operating begins"
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    /// The mandatory obligation's proof
+    /// (`docs/uvrr-termination-obligations.md` §1): once stopped, NO
+    /// further inbound entry is picked up — request, receive, ticks, and
+    /// the admin drives all refuse, and the node's state stays exactly as
+    /// the drain point left it. RED before the lifecycle landed: there
+    /// was no stop and no refusal.
+    #[test]
+    fn stopped_node_refuses_every_inbound_entry_and_the_state_is_final() {
+        let mut nodes = boot_cluster();
+        // A committed operation so the state is nontrivial, and the send
+        // traffic settles before the drain point.
+        assert_eq!(
+            request(&mut nodes[0], &request_json(Uuid::from_bytes([61; 16]))),
+            OK
+        );
+        route_until_quiet(&mut nodes, &TEST_IDS);
+        let before = nodes[0].status();
+        let outputs_before = nodes[0].outputs.len();
+
+        assert_eq!(nodes[0].stop(), OK);
+        let mut datagram = vec![0u8; 64];
+        assert_eq!(receive(&mut nodes[0], TEST_IDS[1], &datagram), STOPPED);
+        assert_eq!(
+            request(&mut nodes[0], &request_json(Uuid::from_bytes([62; 16]))),
+            STOPPED
+        );
+        assert_eq!(nodes[0].idle(), STOPPED);
+        assert_eq!(nodes[0].leader_timeout(), STOPPED);
+        assert_eq!(nodes[0].recover(), STOPPED);
+        assert_eq!(nodes[0].force_view(1, 2), STOPPED);
+        assert_eq!(
+            nodes[0].reconfigure(RECONFIGURE_INCREMENT, TEST_IDS[1], 0),
+            STOPPED
+        );
+
+        // The in-memory state is final: identical status, no new outputs
+        // queued by any refused entry.
+        let after = nodes[0].status();
+        assert_eq!(
+            (
+                after.state,
+                after.leader,
+                after.era,
+                after.view,
+                after.config_era
+            ),
+            (
+                before.state,
+                before.leader,
+                before.era,
+                before.view,
+                before.config_era
+            ),
+            "no inbound entry changed the state after the drain point"
+        );
+        assert_eq!(
+            nodes[0].outputs.len(),
+            outputs_before,
+            "refused entries queue nothing"
+        );
+        for node in &mut nodes {
+            assert_eq!(node.stop(), OK, "stop is part of the lifecycle");
+        }
+    }
+
+    /// The stop path's write ordering with the async AOF sink (§2): the
+    /// `flushed` marker is written only after the writer drained, so
+    /// every event enqueued before the stop is durable on disk by the
+    /// time the marker lands. RED before the drain existed (no stop, no
+    /// marker writes at all).
+    #[test]
+    fn stop_drains_the_aof_writer_before_the_flushed_marker() {
+        let mut nodes = boot_cluster();
+        let dir = std::env::temp_dir().join(format!(
+            "lunet-advisory-lock-stop-aof-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock is after Unix epoch")
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let config = AofConfig {
+            flush_interval: None,
+            ..AofConfig::default()
+        };
+        let writer = AofWriter::open(&dir, config).expect("aof opens");
+        nodes[0].journal = Some(JournalSink::Aof(writer));
+        // A committed Hold transition enqueues its journal event onto the
+        // writer thread (try_send — possibly still queued when the stop
+        // begins; the drain must make it durable before `flushed` lands).
+        assert_eq!(
+            request(
+                &mut nodes[0],
+                &serde_json::to_vec(&crate::locks::Request::Set {
+                    message_id: Uuid::from_bytes([63; 16]),
+                    client_id: 11,
+                    request_num: 13,
+                    lock_id: 17,
+                    lease: crate::locks::LeaseCandidate {
+                        lease_id: 5,
+                        holder: Uuid::from_bytes([64; 16]),
+                        lease_ms: 500,
+                    },
+                    name: None,
+                    labels: None,
+                    sent_at_ms: None,
+                })
+                .unwrap()
+            ),
+            OK
+        );
+        route_until_quiet(&mut nodes, &TEST_IDS);
+        assert_eq!(nodes[0].stop(), OK);
+        assert_eq!(
+            fs::read_to_string(&nodes[0].state_path).unwrap(),
+            "0 flushed\n",
+            "the marker lands only after the drain"
+        );
+        // Every file in the AOF series parses; the committed Hold is
+        // durable.
+        let mut holds = 0usize;
+        let mut total = 0usize;
+        for entry in fs::read_dir(&dir).expect("aof dir").flatten() {
+            let data = fs::read(entry.path()).expect("aof file");
+            for event in journal::parse_file(&data) {
+                total += 1;
+                if event.kind == journal::KIND_HOLD {
+                    holds += 1;
+                }
+            }
+        }
+        assert!(total > 0, "the drain landed the enqueued events");
+        assert!(holds > 0, "the committed Hold transition is durable");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// The sparse admin-assigned member ids every test cluster uses, in
     /// deployment-descriptor (genesis succession) order.
     const TEST_IDS: [u32; 3] = [10, 20, 30];
@@ -2278,6 +2679,9 @@ mod tests {
             fault_note: None,
             reincarnate_from: None,
             known_ids: TEST_IDS.iter().copied().collect(),
+            state_path: path.to_path_buf(),
+            incarnation: 0,
+            stopped: false,
             last_view: None,
             last_leader: None,
             last_config_era: None,
@@ -2494,6 +2898,9 @@ mod tests {
             fault_note: None,
             reincarnate_from: None,
             known_ids: genesis.iter().copied().chain([own]).collect(),
+            state_path: state_path(name),
+            incarnation: 0,
+            stopped: false,
             last_view: None,
             last_leader: None,
             last_config_era: None,
