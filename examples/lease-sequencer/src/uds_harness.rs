@@ -2238,13 +2238,44 @@ pub fn stage4(mut cluster: Cluster) -> Vec<Verdict> {
         ));
     }
 
+    // THE sustain check: the race's winner KEEPS the lease — its
+    // renewals are granted to it alone (many granted SETs, no other
+    // client acquiring) for as long as nothing external intervenes. A
+    // holder that discards its own granted renewals rotates the lock
+    // every window instead: the other contenders acquire in turn.
+    let sustain_before = cluster.lines.len();
+    let sustain_at = millis();
+    while millis() < sustain_at + 2000 {
+        cluster.poll(millis());
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let sustain_lines = &cluster.lines[sustain_before..];
+    let winner_granted_sets = grants(sustain_lines, &winner).len();
+    let others_granted_sets: usize = losers
+        .iter()
+        .map(|loser| grants(sustain_lines, loser).len())
+        .sum();
+    out.push(verdict(
+        "stage4: the holder sustains (renewals only, no rotation)",
+        winner_granted_sets >= 2 && others_granted_sets == 0,
+        format!(
+            "winner_granted_sets={winner_granted_sets} others_granted_sets={others_granted_sets} \
+             (a holder that discards its own renewals rotates every window)"
+        ),
+    ));
+
     // The holder lapses (gate-silenced): a successor must take the
     // lease through the probe→SET-race path — its SECOND set op. A
-    // takeover through a blind renewal has no second set.
+    // takeover through a blind renewal has no second set. The wait is a
+    // liveness bound, not the verdict's truth: a pause coinciding with
+    // a phi-suspicion view change makes the contenders probe through
+    // `not_leader` backoffs until a leader re-stabilizes, so the bound
+    // tolerates a transient storm; the discriminator is the successor's
+    // op mix, which no amount of waiting can fake.
     let anchor = millis();
     cluster.client_pause(&winner);
     let successors: Vec<String> = losers.clone();
-    let took = cluster.wait_until(8000, |lines| {
+    let took = cluster.wait_until(20000, |lines| {
         successors
             .iter()
             .any(|client| !grants(lines, client).is_empty())

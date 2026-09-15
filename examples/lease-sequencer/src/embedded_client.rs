@@ -20,6 +20,7 @@ use serde_json::Value;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use uuid::Uuid;
 
 fn wall_ms() -> u64 {
     SystemTime::now()
@@ -134,11 +135,15 @@ pub struct Contender {
 impl Contender {
     /// Boot the contender: the gate starts OFF (silent until the first
     /// SIGUSR2) and the holder identity is drawn from the seed exactly
-    /// as the lease-load worker draws it.
+    /// as the lease-load worker draws it. The identity is a UUID drawn
+    /// as one u64 and carried in the wire's canonical (hyphenated)
+    /// string form: the leader parses the request's holder into a
+    /// `Uuid` and echoes it back in exactly this encoding, so the
+    /// reply-absorb comparison is like-for-like.
     pub fn new(config: Config, seed: u64) -> Contender {
         let renew_margin = (config.lease_ms as f64 * (1.0 - config.renew_fraction)) as u64;
         let mut rng = Rng::new(seed);
-        let holder = format!("{:032x}", rng.next());
+        let holder = Uuid::from_u64_pair(0, rng.next()).to_string();
         Contender {
             config,
             gate: client_gate::boot(),
@@ -992,6 +997,100 @@ mod tests {
         let error = json!({"error": "not_leader"});
         assert!(!reply_granted(&error, "bump"));
         assert!(!reply_granted(&error, "get"));
+    }
+
+    /// THE sustain regression (the locks2 rotation line): a holder's
+    /// granted renewals keep the tenure — K consecutive renewals built
+    /// by the contender, executed by the REAL Service, and absorbed as
+    /// the leader's own reply bytes; no withdraw, no further SET, until
+    /// an external silence. The d378114 identity drew the holder as a
+    /// bare `{:032x}` string while the leader echoes a hyphenated UUID:
+    /// every granted renewal was discarded as not-ours, the stake was
+    /// withdrawn, and the lease rotated every window — exactly what
+    /// this test refuses.
+    #[test]
+    fn the_holder_sustains_renewals_against_the_real_service() {
+        use lunet_advisory_lock::locks::Service;
+
+        fn execute(
+            service: &mut Service,
+            request: &Value,
+            at: u64,
+        ) -> Value {
+            let payload = serde_json::to_vec(request).expect("the request serializes");
+            let (bytes, _transition) = service
+                .execute(
+                    request["message_id"].as_str().expect("message id").parse().expect("uuid"),
+                    request["client_id"].as_u64().expect("client id"),
+                    request["request_num"].as_u64().expect("request num"),
+                    at,
+                    &payload,
+                )
+                .expect("the Service executes the contender's request");
+            serde_json::from_slice(&bytes).expect("the reply parses")
+        }
+
+        let mut contender = contender();
+        client_gate::start(contender.gate(), 1000);
+        let probe = contender
+            .next_action(1000)
+            .expect("a started contender probes");
+        // The free probe races; the race is executed by the real
+        // Service, so the reply carries the leader's own encoding.
+        let race = contender
+            .absorb(
+                1000,
+                &probe,
+                Some(&json!({"op": "get", "lease": null, "executed_at": 10_000})),
+            )
+            .expect("the free probe races to SET");
+        let request: Value = serde_json::from_str(&race.request).expect("the race is json");
+        let mut service = Service::default();
+        let granted = execute(&mut service, &request, 10_020);
+        assert_eq!(granted["granted"], true, "the race is granted: {granted}");
+        contender.absorb(10_020, &race, Some(&granted));
+        assert!(contender.holds(), "the granted race stakes holdership");
+
+        // K consecutive renewals: each bump is built, executed by the
+        // real Service, and absorbed — the tenure holds at the renewal
+        // cadence, never withdrawing, never building a SET.
+        let mut execution_tick = 10_270;
+        for renewal_index in 0..4 {
+            let bump = contender
+                .next_action(execution_tick)
+                .expect("the renewal is due");
+            assert_eq!(
+                bump.op, "bump",
+                "a holder renews its own lease; it never re-SETs it"
+            );
+            let request: Value =
+                serde_json::from_str(&bump.request).expect("the renewal is json");
+            let reply = execute(&mut service, &request, execution_tick);
+            assert_eq!(
+                reply["granted"], true,
+                "renewal {renewal_index} is granted: {reply}"
+            );
+            assert_eq!(
+                reply["lease"]["renew_count"],
+                renewal_index + 1,
+                "the Service's own counter says same-holder renewals: {reply}"
+            );
+            contender.absorb(execution_tick, &bump, Some(&reply));
+            assert!(
+                contender.holds(),
+                "a granted renewal in the leader's encoding keeps the tenure: {reply}"
+            );
+            assert_eq!(
+                contender.next_action(execution_tick + 1),
+                None,
+                "the next renewal sits one renewal-margin inside the window"
+            );
+            execution_tick += 300;
+        }
+
+        // The external silence is what ends a tenure — nothing else did.
+        client_gate::stop(contender.gate(), 12_000);
+        assert!(!contender.holds(), "the silence forgets holdership");
     }
 
     #[test]
