@@ -91,13 +91,34 @@ pub fn reply_remaining_ms(reply: &Value) -> Option<u64> {
     Some(expiry.saturating_sub(executed_at))
 }
 
+/// Whether `text` is the wire's canonical UUID form: exactly the
+/// hyphenated lowercase rendering `Uuid::to_string` produces. The
+/// Contender regression drew the bare 32-hex form — a DIFFERENT string
+/// that still parsed — so the like-for-like comparison silently missed
+/// and every granted renewal was absorbed as a denial. Both sides of
+/// that comparison now assert this form: the regression cannot return
+/// silently.
+fn is_wire_uuid(text: &str) -> bool {
+    Uuid::parse_str(text).is_ok_and(|parsed| parsed.to_string() == text)
+}
+
 /// Whether the reply's lease names this contender as its holder.
 fn reply_holds(reply: &Value, holder: &str) -> bool {
+    assert!(
+        is_wire_uuid(holder),
+        "the contender's identity must be the wire's canonical UUID form: {holder}"
+    );
     reply
         .get("lease")
         .and_then(|lease| lease.get("holder"))
         .and_then(|lease_holder| lease_holder.as_str())
-        .is_some_and(|lease_holder| lease_holder == holder)
+        .is_some_and(|lease_holder| {
+            assert!(
+                is_wire_uuid(lease_holder),
+                "the leader's echoed holder must be the wire's canonical UUID form: {lease_holder}"
+            );
+            lease_holder == holder
+        })
         && reply
             .get("granted")
             .and_then(|granted| granted.as_bool())
@@ -144,6 +165,10 @@ impl Contender {
         let renew_margin = (config.lease_ms as f64 * (1.0 - config.renew_fraction)) as u64;
         let mut rng = Rng::new(seed);
         let holder = Uuid::from_u64_pair(0, rng.next()).to_string();
+        assert!(
+            is_wire_uuid(&holder),
+            "the drawn identity must be the wire's canonical UUID form: {holder}"
+        );
         Contender {
             config,
             gate: client_gate::boot(),
@@ -723,7 +748,7 @@ mod tests {
         );
         client_gate::start(polite.gate(), 1000);
         let probe = polite.next_action(1000).expect("started contender probes");
-        let foreign = get_reply(250, "somebody_else");
+        let foreign = get_reply(250, "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee");
         polite.absorb(1000, &probe, Some(&foreign));
         // The floor fires: the probe waits at least the full floor even
         // though the leader echoed only 250 ms of lease left.
@@ -1429,5 +1454,74 @@ mod tests {
         signals.signal_silence();
         signals.apply(&mut gate);
         assert_eq!(gate.mode, Mode::Off);
+    }
+}
+
+#[cfg(test)]
+mod wire_uuid_form_tests {
+    //! The UUID identity discipline's client side (the run-3 rig
+    //! regression): the Contender once drew its holder as bare 32-hex —
+    //! a DIFFERENT string from the leader's hyphenated echo — so the
+    //! like-for-like comparison silently missed and no tenure survived.
+    //! The format guard makes that shape a loud failure at the draw and
+    //! at both sides of the comparison.
+
+    use super::*;
+
+    #[test]
+    fn the_drawn_identity_is_the_wires_canonical_form() {
+        let contender = Contender::new(config_for_tests(), 0xA11CE);
+        assert!(
+            is_wire_uuid(contender.holder()),
+            "the draw produces the hyphenated lowercase form: {}",
+            contender.holder()
+        );
+    }
+
+    #[test]
+    fn the_bare_hex_form_the_contender_once_drew_is_not_the_wires_form() {
+        // The exact identity shape of the rig regression: same 16 bytes,
+        // bare hex. It parses, but it is NOT the string the leader echoes.
+        let bare_hex = format!("{:032x}", 0xfb84_3133_094f_979d_u64);
+        assert!(!is_wire_uuid(&bare_hex), "regression shape: {bare_hex}");
+    }
+
+    #[test]
+    fn reply_holds_flags_a_bare_hex_echo_loudly() {
+        let reply: Value = serde_json::from_str(
+            r#"{"granted": true,
+                "lease": {"lease_id": 1,
+                          "holder": "0000000000000000fb843133094f979d",
+                          "expiry": 100, "lease_ms": 500}}"#,
+        )
+        .expect("the reply parses");
+        let holder = Uuid::from_u64_pair(0, 0xfb84_3133_094f_979d_u64).to_string();
+        let result = std::panic::catch_unwind(|| reply_holds(&reply, &holder));
+        assert!(
+            result.is_err(),
+            "a non-canonical echo must fail the format guard, not compare silently"
+        );
+    }
+
+    #[test]
+    fn reply_holds_compares_like_for_like_on_canonical_forms() {
+        let holder = Uuid::from_u64_pair(0, 0xfb84_3133_094f_979d_u64).to_string();
+        let reply: Value = serde_json::from_str(&format!(
+            r#"{{"granted": true,
+                "lease": {{"lease_id": 1, "holder": "{holder}",
+                          "expiry": 100, "lease_ms": 500}}}}"#
+        ))
+        .expect("the reply parses");
+        assert!(reply_holds(&reply, &holder));
+    }
+
+    fn config_for_tests() -> Config {
+        Config {
+            lock_id: 14531090,
+            client_id: 800002,
+            lease_ms: 500,
+            renew_fraction: 0.5,
+            probe_floor_ms: 1000,
+        }
     }
 }

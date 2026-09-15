@@ -7,7 +7,7 @@
 //! absolute-expiry shape the client's clock decided both, and both
 //! tests failed.
 
-use lunet_advisory_lock::locks::{Response, Service};
+use lunet_advisory_lock::locks::{Request, Response, Service};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -344,4 +344,73 @@ fn the_old_absolute_expiry_candidate_is_refused() {
             )
             .is_err()
     );
+}
+
+/// The wire's UUID identity discipline (the run-3 rig regression): the
+/// Contender drew its holder as bare 32-hex, which parsed silently and
+/// only missed at the client's string comparison against the leader's
+/// hyphenated echo — every granted renewal was absorbed as a denial and
+/// no tenure survived. Decode now refuses every non-canonical id loudly,
+/// before the request can enter the replication log.
+#[test]
+fn the_bare_hex_holder_the_contender_once_drew_is_refused_at_decode() {
+    let payload = json!({
+        "op": "set",
+        "message_id": uuid_text(1),
+        "client_id": 1,
+        "request_num": 1,
+        "lock_id": LOCK_ID,
+        "lease": {"lease_id": 1,
+                  "holder": "0000000000000000fb843133094f979d",
+                  "lease_ms": LEASE_MS},
+    });
+    let error = Service::decode(payload.to_string().as_bytes())
+        .expect_err("the bare-hex draw is the rig regression's exact shape");
+    assert!(
+        error.to_string().contains("canonical"),
+        "the refusal names the canonical-form rule: {error}"
+    );
+}
+
+#[test]
+fn a_bare_hex_message_id_is_refused_at_decode() {
+    let payload = json!({
+        "op": "get",
+        "message_id": "00000000000000000000000000000001",
+        "client_id": 1,
+        "request_num": 1,
+        "lock_id": LOCK_ID,
+    });
+    assert!(
+        Service::decode(payload.to_string().as_bytes()).is_err(),
+        "every request id must be the canonical hyphenated form"
+    );
+}
+
+#[test]
+fn a_bare_hex_release_holder_is_refused_at_decode() {
+    let payload = json!({
+        "op": "release",
+        "message_id": uuid_text(2),
+        "client_id": 1,
+        "request_num": 1,
+        "lock_id": LOCK_ID,
+        "holder": "0000000000000000fb843133094f979d",
+        "lease_id": 1,
+    });
+    assert!(
+        Service::decode(payload.to_string().as_bytes()).is_err(),
+        "the release names its holder; it must be canonical too"
+    );
+}
+
+#[test]
+fn the_canonical_hyphenated_form_round_trips_unchanged() {
+    let payload = set_json(1, 1, 1, "11111111-1111-1111-1111-111111111111", LEASE_MS);
+    let request = Service::decode(payload.to_string().as_bytes())
+        .expect("the canonical form decodes");
+    let Request::Set { lease, .. } = request else {
+        panic!("the payload is a set");
+    };
+    assert_eq!(lease.holder.to_string(), "11111111-1111-1111-1111-111111111111");
 }

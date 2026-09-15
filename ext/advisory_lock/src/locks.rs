@@ -2,6 +2,32 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use uuid::Uuid;
 
+/// The wire's UUID identity discipline: every id a client puts on the wire
+/// must be the canonical hyphenated lowercase rendering (`Uuid::to_string`)
+/// — exactly the form the leader echoes back. The Contender regression
+/// (a bare 32-hex draw) parsed silently and only missed at the client's
+/// string comparison, so decode now refuses every non-canonical id loudly,
+/// before the request can enter the replication log.
+mod canonical_uuid {
+    use super::Uuid;
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Uuid, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let text = <String as serde::Deserialize>::deserialize(deserializer)?;
+        let parsed = Uuid::parse_str(&text)
+            .map_err(|_| <D::Error as serde::de::Error>::custom("uuid: invalid syntax"))?;
+        if parsed.to_string() != text {
+            return Err(<D::Error as serde::de::Error>::custom(
+                "uuid: not the wire's canonical hyphenated lowercase form",
+            ));
+        }
+        Ok(parsed)
+    }
+}
+
+
 /// Classification of a committed lock transition, returned by
 /// `Service::execute` so the adapter can append a journal event.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,6 +102,7 @@ pub struct Lease {
 #[serde(deny_unknown_fields)]
 pub struct LeaseCandidate {
     pub lease_id: u64,
+    #[serde(deserialize_with = "canonical_uuid::deserialize")]
     pub holder: Uuid,
     /// The requested lease window in milliseconds. The grant condition is
     /// `lease_ms > 0`; a zero (or absent) window is refused.
@@ -169,12 +196,14 @@ pub fn taken_at_ms_on_holder_change(prior_taken_at_ms: u64, execution_time: u64)
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Request {
     Get {
+        #[serde(deserialize_with = "canonical_uuid::deserialize")]
         message_id: Uuid,
         client_id: u64,
         request_num: u64,
         lock_id: u64,
     },
     Set {
+        #[serde(deserialize_with = "canonical_uuid::deserialize")]
         message_id: Uuid,
         client_id: u64,
         request_num: u64,
@@ -196,10 +225,12 @@ pub enum Request {
         sent_at_ms: Option<u64>,
     },
     Release {
+        #[serde(deserialize_with = "canonical_uuid::deserialize")]
         message_id: Uuid,
         client_id: u64,
         request_num: u64,
         lock_id: u64,
+        #[serde(deserialize_with = "canonical_uuid::deserialize")]
         holder: Uuid,
         lease_id: u64,
     },
@@ -207,6 +238,7 @@ pub enum Request {
     /// names no holder. Authorization is owned by the admin edge, never by
     /// the state machine.
     Break {
+        #[serde(deserialize_with = "canonical_uuid::deserialize")]
         message_id: Uuid,
         client_id: u64,
         request_num: u64,
