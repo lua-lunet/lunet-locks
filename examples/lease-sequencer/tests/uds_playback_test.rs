@@ -5,9 +5,9 @@
 //! pulls: era 4, leader 66, six members (44/55/66 voters + 77/88/99
 //! weight-0 standbys), where the polite clients' ops never committed.
 
+use lunet_advisory_lock::locks::{Request, Service, Transition};
 use lunet_locks_aof::envelope::{Marker, Record};
 use lunet_locks_aof::retention;
-use lunet_advisory_lock::locks::{Request, Service, Transition};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -17,8 +17,7 @@ use vrr::wire::Unpack;
 
 /// The rig corpus directory (absolute, inside the repo).
 fn corpus_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../.tmp/telemetry/threenode-2026-09-14")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.tmp/telemetry/threenode-2026-09-14")
 }
 
 /// One decoded committed op from the rig's wire stream.
@@ -82,7 +81,11 @@ fn extract_corpus() -> (Vec<RigDatagram>, Vec<RigOp>) {
     let dir = corpus_dir();
     let files = retention::list_aof_files(&dir)
         .unwrap_or_else(|e| panic!("corpus {} unreadable: {e}", dir.display()));
-    assert!(!files.is_empty(), "corpus {} has no .aof files", dir.display());
+    assert!(
+        !files.is_empty(),
+        "corpus {} has no .aof files",
+        dir.display()
+    );
     let mut datagrams = Vec::new();
     let mut ops = Vec::new();
     for (path, _, _) in &files {
@@ -97,11 +100,11 @@ fn extract_corpus() -> (Vec<RigDatagram>, Vec<RigOp>) {
                 continue;
             }
             let ns = record.ns;
-            let (front_bytes, _trailer) = match lease_sequencer::phi::Trailer::strip_from(&record.payload)
-            {
-                Some((front, trailer)) => (front.to_vec(), Some(trailer)),
-                None => (record.payload.clone(), None),
-            };
+            let (front_bytes, _trailer) =
+                match lease_sequencer::phi::Trailer::strip_from(&record.payload) {
+                    Some((front, trailer)) => (front.to_vec(), Some(trailer)),
+                    None => (record.payload.clone(), None),
+                };
             let Ok(message) = Message::unpack_from(&front_bytes) else {
                 continue;
             };
@@ -128,11 +131,9 @@ fn extract_corpus() -> (Vec<RigDatagram>, Vec<RigOp>) {
             let (message_id, client_id, request_num) = request.ids();
             let (op, lock_id, offered_holder) = match &request {
                 Request::Get { lock_id, .. } => ("get".to_string(), *lock_id, None),
-                Request::Set { lock_id, lease, .. } => (
-                    "set".to_string(),
-                    *lock_id,
-                    Some(lease.holder.to_string()),
-                ),
+                Request::Set { lock_id, lease, .. } => {
+                    ("set".to_string(), *lock_id, Some(lease.holder.to_string()))
+                }
                 Request::Release { lock_id, .. } => ("release".to_string(), *lock_id, None),
                 Request::Break { lock_id, .. } => ("break".to_string(), *lock_id, None),
             };
@@ -174,10 +175,7 @@ fn given_rig_corpus_the_polite_sets_are_absent() {
     // from anyone, and only a pair of GETs (the recorded rig paradox:
     // lease-load's get_err climbed forever while the voters' own driver
     // chase on 14531089 committed 1363 SETs on a ~251 ms renewal cadence).
-    let polite_ops: Vec<&RigOp> = ops
-        .iter()
-        .filter(|op| op.lock_id == 0x0DDBA12)
-        .collect();
+    let polite_ops: Vec<&RigOp> = ops.iter().filter(|op| op.lock_id == 0x0DDBA12).collect();
     let polite_sets: Vec<&RigOp> = polite_ops
         .iter()
         .filter(|op| op.op == "set")
@@ -264,7 +262,15 @@ fn given_rig_renewal_sets_service_holds_then_renews() {
     assert_eq!(holds, 1, "exactly one Hold in a renewal run");
     assert_eq!(renews, 9, "the rest are same-holder Renews");
     // The exact reply shape the wire clients see (audit B).
-    for key in ["op", "message_id", "request_num", "lock_id", "granted", "lease", "executed_at"] {
+    for key in [
+        "op",
+        "message_id",
+        "request_num",
+        "lock_id",
+        "granted",
+        "lease",
+        "executed_at",
+    ] {
         // (checked per-reply above through the serde shape)
         let _ = key;
     }
@@ -312,8 +318,8 @@ fn given_rig_commit_trailer_decodes() {
         .filter(|d| d.tag == 4)
         .find(|d| lease_sequencer::phi::Trailer::strip_from(&d.wire).is_some())
         .expect("a trailed Commit must be in the corpus");
-    let (_, trailer) = lease_sequencer::phi::Trailer::strip_from(&commit.wire)
-        .expect("the trailer strips");
+    let (_, trailer) =
+        lease_sequencer::phi::Trailer::strip_from(&commit.wire).expect("the trailer strips");
     assert_eq!(trailer.leader, 66, "the pulled window's leader is 66");
     assert_eq!(trailer.era, 4, "the pulled window's era is 4");
     assert!(
@@ -341,27 +347,36 @@ fn given_rig_set_through_harness_cluster_stale_lease_denied() {
         .duration_since(std::time::UNIX_EPOCH)
         .expect("clock")
         .as_nanos();
-    let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../.tmp/harness");
+    let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.tmp/harness");
     let base = std::fs::canonicalize(&base).expect("scratch base");
     let run = base.join(format!(
         "uds-playback-p{}n{}",
         std::process::id() % 100_000,
         ns % 1_000_000_000
     ));
-    let config = ClusterConfig::new(run, vec![(44, "node44".into()), (55, "node55".into())], vec![44, 55])
-        .with_clients(vec![("probe1".into(), 44)]);
+    let config = ClusterConfig::new(
+        run,
+        vec![(44, "node44".into()), (55, "node55".into())],
+        vec![44, 55],
+    )
+    .with_clients(vec![("probe1".into(), 44)]);
     let mut cluster = Cluster::launch(config).expect("cluster launches");
     let ready = cluster.wait_until(8000, |lines| {
         lines.iter().any(|l| l.starts_with("node44,beef-"))
     });
     assert!(ready, "the harness cluster never settled");
     let payload = String::from_utf8(stale.payload.clone()).expect("the rig op is utf-8 json");
-    cluster.raw_issue("probe1", &payload).expect("the rig op proposes");
+    cluster
+        .raw_issue("probe1", &payload)
+        .expect("the rig op proposes");
     let got = cluster.wait_until(2000, |lines| {
         lines.iter().any(|l| l.starts_with("node44,probe1,{"))
     });
-    assert!(got, "no reply for the rig op; tail:\n{}", cluster.trace_tail(6));
+    assert!(
+        got,
+        "no reply for the rig op; tail:\n{}",
+        cluster.trace_tail(6)
+    );
     let replies = cluster.raw_replies("probe1");
     let (reply, _) = replies.first().expect("the reply is correlated");
     assert_eq!(
@@ -375,7 +390,9 @@ fn given_rig_set_through_harness_cluster_stale_lease_denied() {
     // double-grants. THIS is the fencing across the transport swap
     // under the duration protocol: staleness does not exist on the
     // wire, identity does.
-    cluster.raw_issue("probe1", &payload).expect("replay re-issue");
+    cluster
+        .raw_issue("probe1", &payload)
+        .expect("replay re-issue");
     let got_second = cluster.wait_until(2000, |lines| {
         lines
             .iter()
@@ -397,7 +414,11 @@ fn given_rig_set_through_harness_cluster_stale_lease_denied() {
         .lines
         .iter()
         .filter(|l| l.starts_with("node44,probe1,{"))
-        .map(|l| l.split_once(",{").map(|(_, json)| json.to_string()).unwrap_or_default())
+        .map(|l| {
+            l.split_once(",{")
+                .map(|(_, json)| json.to_string())
+                .unwrap_or_default()
+        })
         .collect();
     assert_eq!(
         payloads.len(),

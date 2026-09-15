@@ -494,11 +494,7 @@ impl Node {
                     let message = payload
                         .downcast_ref::<String>()
                         .cloned()
-                        .or_else(|| {
-                            payload
-                                .downcast_ref::<&str>()
-                                .map(|text| text.to_string())
-                        })
+                        .or_else(|| payload.downcast_ref::<&str>().map(|text| text.to_string()))
                         .unwrap_or_else(|| "an unprintable panic".to_string());
                     self.record_fault(format!("panic: {message}"));
                     eprintln!(
@@ -4906,18 +4902,17 @@ mod tests {
             OK
         );
         assert_eq!(buf[len], 0, "the note is NUL-terminated");
-        assert_eq!(&buf[..len], note.as_bytes(), "the ABI reports the recorded reason");
+        assert_eq!(
+            &buf[..len],
+            note.as_bytes(),
+            "the ABI reports the recorded reason"
+        );
         // A node that has not arrested reports empty.
         let mut fresh = provision("fault-report-clean", TEST_IDS[0], 3);
         let mut len = 0usize;
         assert_eq!(
             unsafe {
-                lunet_lock_node_fault(
-                    (&raw mut fresh).cast(),
-                    std::ptr::null_mut(),
-                    0,
-                    &mut len,
-                )
+                lunet_lock_node_fault((&raw mut fresh).cast(), std::ptr::null_mut(), 0, &mut len)
             },
             OK
         );
@@ -4931,7 +4926,10 @@ mod tests {
         let op = OP.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as u8;
         let before = nodes[leader].replica.progress().committed();
         assert_eq!(
-            request(&mut nodes[leader], &request_json(Uuid::from_bytes([op; 16]))),
+            request(
+                &mut nodes[leader],
+                &request_json(Uuid::from_bytes([op; 16]))
+            ),
             OK,
             "the serving leader accepts the op"
         );
@@ -4953,8 +4951,7 @@ mod tests {
         for (index, node) in nodes.iter().enumerate() {
             let snapshot = node.status();
             assert_eq!(
-                snapshot.state,
-                0,
+                snapshot.state, 0,
                 "member {index} must be Normal after the fence, got status {} era {} view {}",
                 snapshot.state, snapshot.era, snapshot.view
             );

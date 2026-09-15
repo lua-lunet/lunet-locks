@@ -545,16 +545,10 @@ fn parse_options() -> Options {
             "--recovery-ms" => options.recovery_ms = value.parse().unwrap_or(1000),
             "--phi-threshold" => options.phi_threshold = value.parse().unwrap_or(1.0),
             "--phi-safety" => options.phi_safety = value.parse().unwrap_or(2.0),
-            "--embedded-client" => {
-                options.embedded_clients = value.parse().unwrap_or(0)
-            }
+            "--embedded-client" => options.embedded_clients = value.parse().unwrap_or(0),
             "--lock" => options.embedded_lock_id = value.parse().unwrap_or(EMBEDDED_LOCK_ID),
-            "--client-ttl-ms" => {
-                options.embedded_client_ttl_ms = value.parse().unwrap_or(500)
-            }
-            "--renew-fraction" => {
-                options.embedded_renew_fraction = value.parse().unwrap_or(0.5)
-            }
+            "--client-ttl-ms" => options.embedded_client_ttl_ms = value.parse().unwrap_or(500),
+            "--renew-fraction" => options.embedded_renew_fraction = value.parse().unwrap_or(0.5),
             "--join-id" => options.join_id = value.parse().unwrap_or(0),
             "--join-endpoint" => options.join_endpoint = value.clone(),
             other => {
@@ -2372,9 +2366,19 @@ mod interval_sample_tests {
         };
         let json = interval_sample_json(88, &trailer, "127.0.0.1:1", 22, 1_789_214_915_022, 0.5);
         for key in [
-            "node", "era", "leader", "addr", "dt_ms", "ts_ms", "phi", "sent_at_ms",
+            "node",
+            "era",
+            "leader",
+            "addr",
+            "dt_ms",
+            "ts_ms",
+            "phi",
+            "sent_at_ms",
         ] {
-            assert!(json.contains(&format!("\"{key}\"")), "missing {key}: {json}");
+            assert!(
+                json.contains(&format!("\"{key}\"")),
+                "missing {key}: {json}"
+            );
         }
         assert!(
             json.contains("\"sent_at_ms\":1789214915000"),
@@ -2451,8 +2455,8 @@ mod forward_tests {
             slot: 0,
             members: membership::descriptor_model(&rows),
         };
-        let sidecar = membership::SidecarWriter::open(state.to_str().expect("path"))
-            .expect("sidecar opens");
+        let sidecar =
+            membership::SidecarWriter::open(state.to_str().expect("path")).expect("sidecar opens");
         // Both hosts compute the same genesis fingerprint — the same three
         // facts the byte-identical deployment carries.
         let fingerprint = transport::genesis_fingerprint(&[transport::GenesisMember {
@@ -2704,12 +2708,12 @@ mod forward_tests {
         // straight into the host (the accept path is covered above), with
         // one op in flight whose leader-side refusal is what we feed next.
         let pair = std::net::TcpListener::bind("127.0.0.1:0").expect("pair listener");
-        let client = TcpStream::connect(
-            ("127.0.0.1", pair.local_addr().expect("local").port()),
-        )
-        .expect("client connects");
+        let client = TcpStream::connect(("127.0.0.1", pair.local_addr().expect("local").port()))
+            .expect("client connects");
         let (conn_stream, _) = pair.accept().expect("pair accepted");
-        client.set_read_timeout(Some(Duration::from_millis(10))).ok();
+        client
+            .set_read_timeout(Some(Duration::from_millis(10)))
+            .ok();
         let mid = *uuid::Uuid::new_v4().as_bytes();
         b.host.conns.push(Conn {
             stream: conn_stream,
@@ -2723,11 +2727,8 @@ mod forward_tests {
         payload.extend_from_slice(&mid);
         payload.extend_from_slice(&1u32.to_be_bytes());
         payload.extend_from_slice(&0u32.to_be_bytes());
-        let packet = transport::encode_peer(
-            transport::PEER_APPLICATION,
-            &b.host.fingerprint,
-            &payload,
-        );
+        let packet =
+            transport::encode_peer(transport::PEER_APPLICATION, &b.host.fingerprint, &payload);
         handle_packet(&mut b.host, 1, a.udp, &packet, millis(), &mut rng);
         assert!(
             !b.host.conns.iter().any(|conn| conn.pending.is_some()),

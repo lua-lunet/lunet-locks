@@ -210,8 +210,7 @@ fn marker_bytes_table() {
 #[test]
 fn interval_sample_record_passes_the_gate() {
     let dir = temp_dir("interval-sample");
-    let mut log = TelemetryLog::open(&dir, 1000, 4 * 1024 * 1024, 10 * 1024 * 1024)
-        .expect("open");
+    let mut log = TelemetryLog::open(&dir, 1000, 4 * 1024 * 1024, 10 * 1024 * 1024).expect("open");
     let json = br#"{"node":88,"era":4,"leader":33,"addr":"127.0.0.1:41101","dt_ms":22,"ts_ms":1789214915000}"#;
     log.append(lunet_locks_aof::envelope::Record::telemetry(
         lunet_locks_aof::envelope::Marker::TelemetryIntervalSample,

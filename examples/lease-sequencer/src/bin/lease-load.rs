@@ -329,9 +329,7 @@ impl Link {
         // field) is a completed round trip but never an acked
         // operation, so the committed lease state and the client's
         // by_op counters agree.
-        let ok = reply
-            .as_ref()
-            .is_some_and(|reply| reply_granted(reply, op));
+        let ok = reply.as_ref().is_some_and(|reply| reply_granted(reply, op));
         // The addressed node forwards a lock verb to the leader on the
         // peer application channel; the committed reply (or a leader-side
         // mid-flight refusal, which rotates the connection) is the only
@@ -343,14 +341,7 @@ impl Link {
         if not_leader {
             self.reconnect();
         }
-        (
-            Sample {
-                op,
-                ok,
-                rt_us: rt,
-            },
-            reply,
-        )
+        (Sample { op, ok, rt_us: rt }, reply)
     }
 
     fn reconnect(&mut self) {

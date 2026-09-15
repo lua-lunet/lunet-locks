@@ -27,7 +27,6 @@ mod canonical_uuid {
     }
 }
 
-
 /// Classification of a committed lock transition, returned by
 /// `Service::execute` so the adapter can append a journal event.
 #[derive(Debug, Clone, PartialEq, Eq)]

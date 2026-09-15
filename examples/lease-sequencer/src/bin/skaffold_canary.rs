@@ -367,14 +367,18 @@ mod tests {
         let listener_b = std::net::TcpListener::bind("[::1]:0").expect("b tcp");
         let port_a = listener_a.local_addr().expect("a addr").port();
         let port_b = listener_b.local_addr().expect("b addr").port();
-        let server_a = std::thread::spawn(move || tcp_echo_server(listener_a, Duration::from_secs(5)));
-        let server_b = std::thread::spawn(move || tcp_echo_server(listener_b, Duration::from_secs(5)));
+        let server_a =
+            std::thread::spawn(move || tcp_echo_server(listener_a, Duration::from_secs(5)));
+        let server_b =
+            std::thread::spawn(move || tcp_echo_server(listener_b, Duration::from_secs(5)));
         let mut peer_of_a = "[::1]:0".parse::<std::net::SocketAddr>().unwrap();
         peer_of_a.set_port(port_b);
         let mut peer_of_b = "[::1]:0".parse::<std::net::SocketAddr>().unwrap();
         peer_of_b.set_port(port_a);
-        let client_a = std::thread::spawn(move || tcp_echo_client(peer_of_a, Duration::from_secs(5)));
-        let client_b = std::thread::spawn(move || tcp_echo_client(peer_of_b, Duration::from_secs(5)));
+        let client_a =
+            std::thread::spawn(move || tcp_echo_client(peer_of_a, Duration::from_secs(5)));
+        let client_b =
+            std::thread::spawn(move || tcp_echo_client(peer_of_b, Duration::from_secs(5)));
         assert!(client_a.join().unwrap(), "a round trip");
         assert!(client_b.join().unwrap(), "b round trip");
         server_a.join().unwrap();

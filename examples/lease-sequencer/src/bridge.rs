@@ -454,9 +454,7 @@ pub fn replay_series(dir: &Path) -> (Vec<LockEvent>, LockState, BridgeMetrics) {
             }) => {
                 current.insert(op.lock_id, lease.clone());
             }
-            Some(Response::Release {
-                released: true, ..
-            }) => {
+            Some(Response::Release { released: true, .. }) => {
                 current.remove(&op.lock_id);
             }
             _ => {}
@@ -489,10 +487,7 @@ pub fn replay_series(dir: &Path) -> (Vec<LockEvent>, LockState, BridgeMetrics) {
                     .unwrap_or_else(|| format!("/lock/{}", op.lock_id));
                 seq += 1;
                 let event = event_from_transition(&transition, op.ns, seq, &name);
-                *metrics
-                    .lock_events
-                    .entry(event.kind.clone())
-                    .or_insert(0) += 1;
+                *metrics.lock_events.entry(event.kind.clone()).or_insert(0) += 1;
                 events.push(event);
             }
             None => {
@@ -806,9 +801,9 @@ fn phi_trace(dir: &Path) -> PhiTrace {
                     if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&record.payload)
                     {
                         let get = |key: &str| value.get(key).and_then(|v| v.as_u64());
-                        if let (Some(ts_ms), Some(dt_ms), Some(leader), Some(era)) = (
-                            get("ts_ms"), get("dt_ms"), get("leader"), get("era"),
-                        ) {
+                        if let (Some(ts_ms), Some(dt_ms), Some(leader), Some(era)) =
+                            (get("ts_ms"), get("dt_ms"), get("leader"), get("era"))
+                        {
                             samples.push(PhiSample {
                                 ts_ms,
                                 dt_ms,
@@ -839,7 +834,11 @@ fn phi_trace(dir: &Path) -> PhiTrace {
 /// the client would lose the response instead of reading it through a
 /// clean FIN. WebSocket upgrades park the socket in the live set;
 /// everything else answers from the snapshot and half-closes.
-fn handle_connection(mut stream: TcpStream, snapshot: Arc<Mutex<Replay>>, live: Arc<Mutex<Vec<TcpStream>>>) {
+fn handle_connection(
+    mut stream: TcpStream,
+    snapshot: Arc<Mutex<Replay>>,
+    live: Arc<Mutex<Vec<TcpStream>>>,
+) {
     // The request head's bound: the console's GET requests are one line
     // of headers; anything larger is refused rather than buffered.
     const MAX_HEAD_BYTES: usize = 64 * 1024;
@@ -905,7 +904,10 @@ fn handle_connection(mut stream: TcpStream, snapshot: Arc<Mutex<Replay>>, live: 
 /// The route table: the console's OpenAPI surface, read-only.
 fn route(method: &str, path: &str, snapshot: &Arc<Mutex<Replay>>) -> (u16, String) {
     if method != "GET" {
-        return (405, json!({"error": "GET only; the bridge is read-only"}).to_string());
+        return (
+            405,
+            json!({"error": "GET only; the bridge is read-only"}).to_string(),
+        );
     }
     let replay = snapshot.lock().unwrap();
     match path {
@@ -929,19 +931,17 @@ fn route(method: &str, path: &str, snapshot: &Arc<Mutex<Replay>>) -> (u16, Strin
             (200, json!({"nowMs": now_ms, "locks": locks}).to_string())
         }
         "/api/v1/events" => {
-            let events: Vec<Value> = replay
-                .events
-                .iter()
-                .rev()
-                .map(LockEvent::to_json)
-                .collect();
+            let events: Vec<Value> = replay.events.iter().rev().map(LockEvent::to_json).collect();
             (200, json!({"events": events}).to_string())
         }
         "/api/v1/metrics" => (200, replay.metrics.to_json().to_string()),
         "/api/v1/metrics/series" => (200, series_json(&replay, unix_millis()).to_string()),
         "/api/v1/telemetry/phi" => (
             200,
-            replay.phi.to_json(replay.metrics.first_ns, replay.metrics.last_ns).to_string(),
+            replay
+                .phi
+                .to_json(replay.metrics.first_ns, replay.metrics.last_ns)
+                .to_string(),
         ),
         path if path.starts_with("/api/v1/locks/") => {
             let id: u64 = path
@@ -1022,7 +1022,12 @@ fn series_json(replay: &Replay, now_ms: u64) -> Value {
                 if let Some(b) = bucket(event.ts_ms, first_bucket, bucket_ms, &mut buckets) {
                     b["acquire"] = json!(b["acquire"].as_u64().unwrap_or(0) + 1);
                 }
-                if let Some(expiry) = event.detail.split("expiry ").nth(1).and_then(|e| e.parse::<u64>().ok()) {
+                if let Some(expiry) = event
+                    .detail
+                    .split("expiry ")
+                    .nth(1)
+                    .and_then(|e| e.parse::<u64>().ok())
+                {
                     active.push((event.ts_ms, expiry));
                 }
             }
@@ -1030,14 +1035,23 @@ fn series_json(replay: &Replay, now_ms: u64) -> Value {
                 if let Some(b) = bucket(event.ts_ms, first_bucket, bucket_ms, &mut buckets) {
                     b["renew"] = json!(b["renew"].as_u64().unwrap_or(0) + 1);
                 }
-                if let Some(expiry) = event.detail.split("expiry ").nth(1).and_then(|e| e.parse::<u64>().ok()) {
+                if let Some(expiry) = event
+                    .detail
+                    .split("expiry ")
+                    .nth(1)
+                    .and_then(|e| e.parse::<u64>().ok())
+                {
                     if let Some(interval) = active.last_mut() {
                         interval.1 = expiry;
                     }
                 }
             }
             "release" | "break" => {
-                let key = if event.kind == "release" { "release" } else { "break" };
+                let key = if event.kind == "release" {
+                    "release"
+                } else {
+                    "break"
+                };
                 if let Some(b) = bucket(event.ts_ms, first_bucket, bucket_ms, &mut buckets) {
                     b[key] = json!(b[key].as_u64().unwrap_or(0) + 1);
                 }
@@ -1128,10 +1142,7 @@ fn sha1_base64(data: &[u8]) -> String {
         h[4] = h[4].wrapping_add(e);
     }
 
-    let digest: Vec<u8> = h
-        .iter()
-        .flat_map(|word| word.to_be_bytes())
-        .collect();
+    let digest: Vec<u8> = h.iter().flat_map(|word| word.to_be_bytes()).collect();
     base64(&digest)
 }
 

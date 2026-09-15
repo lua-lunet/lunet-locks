@@ -5,7 +5,7 @@
 //! step prints a `[pass]`/`[fail]` line; exit 0 only when all pass.
 
 use lease_sequencer::uds_harness::{
-    print_verdicts, stage1, stage2, stage3, Cluster, ClusterConfig,
+    Cluster, ClusterConfig, print_verdicts, stage1, stage2, stage3,
 };
 use std::path::PathBuf;
 

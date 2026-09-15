@@ -21,7 +21,7 @@
 
 use lease_sequencer::client_gate::Mode;
 use lease_sequencer::embedded_client::{Action, Config, Runner, Signals};
-use lunet_advisory_lock::{Node, NOT_LEADER, OK};
+use lunet_advisory_lock::{NOT_LEADER, Node, OK};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -196,20 +196,14 @@ fn drive_round(
     let mut unclaimed = Vec::new();
     for (message_id, bytes) in harness.pump() {
         let now = millis();
-        if runner_a.absorb(
-            now,
-            &message_id,
-            &bytes,
-            &mut |action| submit_via(harness, 0, action),
-        ) {
+        if runner_a.absorb(now, &message_id, &bytes, &mut |action| {
+            submit_via(harness, 0, action)
+        }) {
             continue;
         }
-        if runner_b.absorb(
-            now,
-            &message_id,
-            &bytes,
-            &mut |action| submit_via(harness, 1, action),
-        ) {
+        if runner_b.absorb(now, &message_id, &bytes, &mut |action| {
+            submit_via(harness, 1, action)
+        }) {
             continue;
         }
         unclaimed.push((message_id, bytes));
@@ -395,7 +389,8 @@ fn embedded_clients_gate_takeover_and_rejoin_as_non_holders() {
         &mut probe_num,
         TAKEOVER_BOUND_MS,
         &|reply| {
-            reply["lease"].is_object() && reply["lease"]["taken_at_ms"].as_u64().unwrap_or(0) > silence_wall
+            reply["lease"].is_object()
+                && reply["lease"]["taken_at_ms"].as_u64().unwrap_or(0) > silence_wall
         },
         "the surviving client to take over",
     );
@@ -424,7 +419,8 @@ fn embedded_clients_gate_takeover_and_rejoin_as_non_holders() {
     // a request_num of zero through the whole takeover window is the
     // proof the silenced client built nothing new.
     assert_eq!(
-        runner_a.gate(0).expect("client 0").request_num, 0,
+        runner_a.gate(0).expect("client 0").request_num,
+        0,
         "the silenced client built no op"
     );
 

@@ -27,16 +27,16 @@ use crate::client_gate::{self, Mode};
 use crate::embedded_client::{Action, Config as ContenderConfig, Contender};
 use crate::phi::{self, PhiConfig, SketchKey, Trailer};
 use crate::telemetry::{self, TimeoutKnobs};
-use lunet_advisory_lock::{Node, NOT_LEADER, OK};
-use serde_json::{json, Value};
+use lunet_advisory_lock::{NOT_LEADER, Node, OK};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::process::Child;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
@@ -132,7 +132,11 @@ fn payload_json(chan: u8, rest: &[u8]) -> String {
                 "{{\"chan\":\"app\",\"kind\":\"{kind}\",\"len\":{},\"hex\":\"{}\",\"op\":{}}}",
                 rest.len(),
                 hex(rest),
-                if op.is_empty() { "null".to_string() } else { op }
+                if op.is_empty() {
+                    "null".to_string()
+                } else {
+                    op
+                }
             )
         }
         _ => String::from_utf8_lossy(rest).into_owned(),
@@ -1049,7 +1053,9 @@ impl Cluster {
                         .arg("--election-ms")
                         .arg(config.election_ms.to_string())
                         .spawn()
-                        .map_err(|e| std::io::Error::other(format!("node{id} spawn failed: {e}")))?;
+                        .map_err(|e| {
+                            std::io::Error::other(format!("node{id} spawn failed: {e}"))
+                        })?;
                     NodeSlot {
                         id: *id,
                         request_path,
@@ -1424,7 +1430,11 @@ impl Cluster {
                 return Err(format!("no client {client}"));
             };
             let mid = message_id_of(json_text).ok_or("verb without message_id")?;
-            (state.node, mid, frame_body(0, CHAN_CLIENT, json_text.as_bytes()))
+            (
+                state.node,
+                mid,
+                frame_body(0, CHAN_CLIENT, json_text.as_bytes()),
+            )
         };
         self.record(client, &format!("node{node}"), json_text);
         if let Some(state) = self.clients.get_mut(client) {
@@ -1466,12 +1476,9 @@ impl Cluster {
                 // One op in flight at a time (the wire loop discipline):
                 // an overdue pending is abandoned into the backoff, and a
                 // new action is decided only while idle.
-                let overdue = state
-                    .pending
-                    .as_ref()
-                    .is_some_and(|(_, _, issued)| {
-                        now.saturating_sub(*issued) >= self.config.op_deadline_ms
-                    });
+                let overdue = state.pending.as_ref().is_some_and(|(_, _, issued)| {
+                    now.saturating_sub(*issued) >= self.config.op_deadline_ms
+                });
                 if overdue {
                     let (_, pending_action, _) = state.pending.take().expect("overdue pending");
                     if let Some(pending_action) = pending_action {
@@ -1609,7 +1616,12 @@ fn verdict(name: &str, pass: bool, detail: String) -> Verdict {
 pub fn print_verdicts(verdicts: &[Verdict]) -> bool {
     let mut all = true;
     for v in verdicts {
-        println!("[{}] {} — {}", if v.pass { "pass" } else { "fail" }, v.name, v.detail);
+        println!(
+            "[{}] {} — {}",
+            if v.pass { "pass" } else { "fail" },
+            v.name,
+            v.detail
+        );
         all &= v.pass;
     }
     all
@@ -1646,7 +1658,9 @@ fn trailer_sent_at(json: &Value) -> Option<u64> {
         if tail[0..2] != [0xC0, 0x0B] {
             return None;
         }
-        Some(u64::from_le_bytes(tail[14..22].try_into().expect("8 bytes")))
+        Some(u64::from_le_bytes(
+            tail[14..22].try_into().expect("8 bytes"),
+        ))
     } else {
         None
     }
@@ -1691,12 +1705,7 @@ fn view_change_count(lines: &[String]) -> usize {
         .iter()
         .filter_map(|line| parse_line(line))
         .filter(|l| l.from.starts_with("node") && l.to.starts_with("node"))
-        .filter(|l| {
-            matches!(
-                l.json.get("tag").and_then(|v| v.as_u64()),
-                Some(5 | 6 | 7)
-            )
-        })
+        .filter(|l| matches!(l.json.get("tag").and_then(|v| v.as_u64()), Some(5 | 6 | 7)))
         .count()
 }
 
@@ -1774,13 +1783,11 @@ pub fn stage1(mut cluster: Cluster) -> Vec<Verdict> {
     let replies = cluster.raw_replies("probe1");
     let get_reply = replies.first().map(|(v, _)| v.clone());
     let shape_ok = got
-        && get_reply
-            .as_ref()
-            .is_some_and(|r| {
-                r.get("op").and_then(|v| v.as_str()) == Some("get")
-                    && r.get("executed_at").and_then(|v| v.as_u64()).is_some()
-                    && r.get("lease").map(|l| l.is_null()).unwrap_or(false)
-            });
+        && get_reply.as_ref().is_some_and(|r| {
+            r.get("op").and_then(|v| v.as_str()) == Some("get")
+                && r.get("executed_at").and_then(|v| v.as_u64()).is_some()
+                && r.get("lease").map(|l| l.is_null()).unwrap_or(false)
+        });
     let rtt = replies.first().map(|(_, rtt)| *rtt).unwrap_or(u64::MAX);
     out.push(verdict(
         "stage1: GET reply shape",
@@ -1804,21 +1811,17 @@ pub fn stage1(mut cluster: Cluster) -> Vec<Verdict> {
          \"lease_ms\":500}}}}"
     );
     let _ = cluster.raw_issue("probe1", &set);
-    let got = cluster.wait_until(1000, |lines| {
-        cluster_lines_granted(lines, "probe1")
-    });
+    let got = cluster.wait_until(1000, |lines| cluster_lines_granted(lines, "probe1"));
     let replies = cluster.raw_replies("probe1");
     let set_reply = replies.first().map(|(v, _)| v.clone());
     let set_ok = got
-        && set_reply
-            .as_ref()
-            .is_some_and(|r| {
-                r.get("granted").and_then(|v| v.as_bool()) == Some(true)
-                    && r.get("lease")
-                        .and_then(|lease| lease.get("holder"))
-                        .and_then(|v| v.as_str())
-                        == Some(holder.to_string().as_str())
-            });
+        && set_reply.as_ref().is_some_and(|r| {
+            r.get("granted").and_then(|v| v.as_bool()) == Some(true)
+                && r.get("lease")
+                    .and_then(|lease| lease.get("holder"))
+                    .and_then(|v| v.as_str())
+                    == Some(holder.to_string().as_str())
+        });
     out.push(verdict(
         "stage1: SET granted and echoed",
         set_ok,
@@ -1851,10 +1854,11 @@ pub fn stage2(mut cluster: Cluster) -> Vec<Verdict> {
     let mut out = Vec::new();
     // Quorum of two settles: a leader Commit stream appears.
     let ready = cluster.wait_until(8000, |lines| {
-        lines
-            .iter()
-            .filter_map(|l| parse_line(l))
-            .any(|l| l.from.starts_with("node") && l.to.starts_with("node") && l.json.get("tag").and_then(|v| v.as_u64()) == Some(4))
+        lines.iter().filter_map(|l| parse_line(l)).any(|l| {
+            l.from.starts_with("node")
+                && l.to.starts_with("node")
+                && l.json.get("tag").and_then(|v| v.as_u64()) == Some(4)
+        })
     });
     out.push(verdict(
         "stage2: two-node quorum stabilizes",
@@ -1952,7 +1956,9 @@ pub fn stage2(mut cluster: Cluster) -> Vec<Verdict> {
         over_pct <= 1,
         format!(
             "hops={} over_1ms={} ({over_pct}%) max_hop_us={} detail={}",
-            cluster.hops_total, cluster.hops_over_budget, cluster.max_driver_hop_us,
+            cluster.hops_total,
+            cluster.hops_over_budget,
+            cluster.max_driver_hop_us,
             cluster.max_hop_detail
         ),
     ));
@@ -1966,10 +1972,11 @@ pub fn stage2(mut cluster: Cluster) -> Vec<Verdict> {
 pub fn stage3(mut cluster: Cluster) -> Vec<Verdict> {
     let mut out = Vec::new();
     let ready = cluster.wait_until(8000, |lines| {
-        lines
-            .iter()
-            .filter_map(|l| parse_line(l))
-            .any(|l| l.from.starts_with("node") && l.to.starts_with("node") && l.json.get("tag").and_then(|v| v.as_u64()) == Some(4))
+        lines.iter().filter_map(|l| parse_line(l)).any(|l| {
+            l.from.starts_with("node")
+                && l.to.starts_with("node")
+                && l.json.get("tag").and_then(|v| v.as_u64()) == Some(4)
+        })
     });
     out.push(verdict(
         "stage3: three-node quorum stabilizes",
@@ -2023,9 +2030,7 @@ pub fn stage3(mut cluster: Cluster) -> Vec<Verdict> {
     cluster.client_pause("client1");
     let successors: Vec<&str> = vec!["client2", "client3"];
     let took = cluster.wait_until(3000, |lines| {
-        successors
-            .iter()
-            .any(|c| !grants(lines, c).is_empty())
+        successors.iter().any(|c| !grants(lines, c).is_empty())
     });
     let mut takeover_ms: Option<u64> = None;
     let mut successor_holder: Option<String> = None;
@@ -2093,7 +2098,9 @@ pub fn stage3(mut cluster: Cluster) -> Vec<Verdict> {
         over_pct <= 1,
         format!(
             "hops={} over_1ms={} ({over_pct}%) max_hop_us={} detail={}",
-            cluster.hops_total, cluster.hops_over_budget, cluster.max_driver_hop_us,
+            cluster.hops_total,
+            cluster.hops_over_budget,
+            cluster.max_driver_hop_us,
             cluster.max_hop_detail
         ),
     ));
@@ -2118,7 +2125,10 @@ pub fn stage3(mut cluster: Cluster) -> Vec<Verdict> {
     out.push(verdict(
         "stage3: heartbeat noise floor continuous",
         gap.is_some_and(|g| g <= 5 * cluster.config.heartbeat_ms),
-        format!("max_commit_gap_ms={gap:?} heartbeat_ms={}", cluster.config.heartbeat_ms),
+        format!(
+            "max_commit_gap_ms={gap:?} heartbeat_ms={}",
+            cluster.config.heartbeat_ms
+        ),
     ));
     out
 }
@@ -2138,10 +2148,11 @@ pub fn stage3(mut cluster: Cluster) -> Vec<Verdict> {
 pub fn stage4(mut cluster: Cluster) -> Vec<Verdict> {
     let mut out = Vec::new();
     let ready = cluster.wait_until(8000, |lines| {
-        lines
-            .iter()
-            .filter_map(|l| parse_line(l))
-            .any(|l| l.from.starts_with("node") && l.to.starts_with("node") && l.json.get("tag").and_then(|v| v.as_u64()) == Some(4))
+        lines.iter().filter_map(|l| parse_line(l)).any(|l| {
+            l.from.starts_with("node")
+                && l.to.starts_with("node")
+                && l.json.get("tag").and_then(|v| v.as_u64()) == Some(4)
+        })
     });
     out.push(verdict(
         "stage4: three-node quorum stabilizes",
@@ -2174,10 +2185,7 @@ pub fn stage4(mut cluster: Cluster) -> Vec<Verdict> {
     out.push(verdict(
         "stage4: the simultaneous race installs a holder",
         raced && winner.is_some(),
-        format!(
-            "winner={winner:?} tail:\n{}",
-            cluster.trace_tail(6)
-        ),
+        format!("winner={winner:?} tail:\n{}", cluster.trace_tail(6)),
     ));
     let Some(winner) = winner else {
         return out;
@@ -2284,12 +2292,17 @@ pub fn stage4(mut cluster: Cluster) -> Vec<Verdict> {
         .iter()
         .find(|client| !grants(&cluster.lines, client).is_empty())
         .map(|client| client.to_string());
-    let sets_of = |client: &str| cluster.client_ops(client).iter().filter(|op| *op == "set").count();
+    let sets_of = |client: &str| {
+        cluster
+            .client_ops(client)
+            .iter()
+            .filter(|op| *op == "set")
+            .count()
+    };
     let takeover_ms = millis() - anchor;
     out.push(verdict(
         "stage4: a paused holder's lease is taken through the probe-race path",
-        took
-            && successor.is_some()
+        took && successor.is_some()
             && successor
                 .as_ref()
                 .is_some_and(|client| sets_of(client) >= 2),

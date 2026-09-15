@@ -95,7 +95,13 @@ fn commit_wire() -> Vec<u8> {
     buf
 }
 
-fn request_json(op: &str, message_id: &Uuid, client_id: u64, request_num: u64, body: &str) -> String {
+fn request_json(
+    op: &str,
+    message_id: &Uuid,
+    client_id: u64,
+    request_num: u64,
+    body: &str,
+) -> String {
     format!(
         "{{\"op\":\"{op}\",\"message_id\":\"{message_id}\",\"client_id\":{client_id},\"request_num\":{request_num}{body}}}"
     )
@@ -170,7 +176,11 @@ fn fixture_aof(name: &str) -> std::path::PathBuf {
         3,
         &format!(",\"lock_id\":7,\"holder\":\"{holder_a}\",\"lease_id\":12"),
     );
-    write_wire(&mut aof, t0 + 4_000_000, &prepare_wire(release_id, &release, 4));
+    write_wire(
+        &mut aof,
+        t0 + 4_000_000,
+        &prepare_wire(release_id, &release, 4),
+    );
 
     // 6. acquire again (lock free after release → Hold) so break has a record.
     let reacquire_id = Uuid::new_v4();
@@ -183,7 +193,11 @@ fn fixture_aof(name: &str) -> std::path::PathBuf {
             ",\"lock_id\":7,\"lease\":{{\"lease_id\":14,\"holder\":\"{holder_a}\",\"lease_ms\":10000}},\"name\":\"/cluster/leader\""
         ),
     );
-    write_wire(&mut aof, t0 + 5_000_000, &prepare_wire(reacquire_id, &reacquire, 5));
+    write_wire(
+        &mut aof,
+        t0 + 5_000_000,
+        &prepare_wire(reacquire_id, &reacquire, 5),
+    );
 
     // 7. break: force-release whatever is stored.
     let break_id = Uuid::new_v4();
@@ -221,8 +235,7 @@ fn decode_produces_events_with_ms_times() {
     let dir = fixture_aof("events");
     let (events, _state, metrics) = replay_series(&dir);
 
-    let kinds: Vec<(&str, u64)> =
-        events.iter().map(|e| (e.kind.as_str(), e.ts_ms)).collect();
+    let kinds: Vec<(&str, u64)> = events.iter().map(|e| (e.kind.as_str(), e.ts_ms)).collect();
     assert_eq!(
         kinds,
         vec![
@@ -246,9 +259,16 @@ fn decode_produces_events_with_ms_times() {
 
     // The acquire event carries the acquiring holder; the deny names the
     // refused one.
-    assert!(first.holder.starts_with("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"));
+    assert!(
+        first
+            .holder
+            .starts_with("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+    );
     let deny = events.iter().find(|e| e.kind == "deny").unwrap();
-    assert!(deny.holder.starts_with("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"));
+    assert!(
+        deny.holder
+            .starts_with("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
+    );
 
     // Metrics: every message kind counted, lock events tallied, markers
     // tallied, first/last ns stamps.
@@ -300,7 +320,10 @@ fn unknown_markers_are_rejected() {
     let (events, _state, metrics) = replay_series(&dir);
     assert!(events.is_empty());
     assert_eq!(metrics.undecodable, 1);
-    assert_eq!(metrics.records, 0, "rejected records are not counted as read");
+    assert_eq!(
+        metrics.records, 0,
+        "rejected records are not counted as read"
+    );
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -586,7 +609,10 @@ fn follow_pushes_new_events_over_websocket() {
     assert_eq!(msg["type"], "event");
     assert_eq!(msg["event"]["kind"], "acquire");
     assert_eq!(msg["event"]["lockId"], 8);
-    assert_eq!(msg["event"]["tsMs"], serde_json::json!(1_700_000_000_140u64));
+    assert_eq!(
+        msg["event"]["tsMs"],
+        serde_json::json!(1_700_000_000_140u64)
+    );
 
     server.shutdown();
     std::fs::remove_dir_all(&dir).unwrap();
@@ -627,12 +653,8 @@ fn telemetry_phi_endpoint_serves_samples_and_decisions() {
     {
         let mut aof = AofFile::open(&dir).unwrap();
         aof.append(
-            &Record::telemetry(
-                Marker::TelemetryIntervalSample,
-                1_000_000_000,
-                sample_json,
-            )
-            .encode(),
+            &Record::telemetry(Marker::TelemetryIntervalSample, 1_000_000_000, sample_json)
+                .encode(),
         )
         .unwrap();
         aof.append(
@@ -649,11 +671,17 @@ fn telemetry_phi_endpoint_serves_samples_and_decisions() {
     let (_, reply) = http_get(server.port(), "/api/v1/telemetry/phi");
     let value: Value = serde_json::from_str(&reply).expect("json");
     assert_eq!(value["samples"].as_array().unwrap().len(), 1);
-    assert_eq!(value["samples"][0][0], 1789214915000u64, "ts_ms from the payload");
+    assert_eq!(
+        value["samples"][0][0], 1789214915000u64,
+        "ts_ms from the payload"
+    );
     assert_eq!(value["samples"][0][1], 22, "dt_ms second column");
     assert_eq!(value["samples"][0][2], 33, "leader third column");
     assert_eq!(value["samples"][0][3], 4, "era fourth column");
     assert_eq!(value["samples"][0][4], 1.106, "phi fifth column");
     assert_eq!(value["decisions"][0]["phi"], 1.7);
-    assert_eq!(value["span"]["first_ms"], 1000, "the envelope ns floors to ms");
+    assert_eq!(
+        value["span"]["first_ms"], 1000,
+        "the envelope ns floors to ms"
+    );
 }

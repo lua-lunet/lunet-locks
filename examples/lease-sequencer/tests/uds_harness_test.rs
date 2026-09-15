@@ -27,7 +27,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 static SCENARIO_LOCK: Mutex<()> = Mutex::new(());
 
 fn lock_scenarios() -> MutexGuard<'static, ()> {
-    SCENARIO_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    SCENARIO_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn scratch(name: &str) -> PathBuf {
@@ -37,8 +39,7 @@ fn scratch(name: &str) -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .expect("clock")
         .as_nanos();
-    let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../.tmp/harness");
+    let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.tmp/harness");
     let base = std::fs::canonicalize(&base).expect("scratch base");
     let dir = base.join(format!(
         "{}p{}n{}",
@@ -57,7 +58,14 @@ fn members(ids: &[u32]) -> Vec<(u32, String)> {
 fn summarize(verdicts: &[Verdict]) -> String {
     verdicts
         .iter()
-        .map(|v| format!("[{}] {} ({})", if v.pass { "pass" } else { "fail" }, v.name, v.detail))
+        .map(|v| {
+            format!(
+                "[{}] {} ({})",
+                if v.pass { "pass" } else { "fail" },
+                v.name,
+                v.detail
+            )
+        })
         .collect::<Vec<_>>()
         .join(";\n")
 }
@@ -91,12 +99,16 @@ fn stage2_two_nodes_of_three_stabilize_and_serve() {
 #[test]
 fn stage3_pause_holder_takeover() {
     let _guard = lock_scenarios();
-    let config = ClusterConfig::new(scratch("uds-stage3"), members(&[44, 55, 66]), vec![44, 55, 66])
-        .with_clients(vec![
-            ("client1".into(), 44),
-            ("client2".into(), 55),
-            ("client3".into(), 66),
-        ]);
+    let config = ClusterConfig::new(
+        scratch("uds-stage3"),
+        members(&[44, 55, 66]),
+        vec![44, 55, 66],
+    )
+    .with_clients(vec![
+        ("client1".into(), 44),
+        ("client2".into(), 55),
+        ("client3".into(), 66),
+    ]);
     let verdicts = lease_sequencer::uds_harness::stage3(Cluster::launch(config).expect("launch"));
     assert!(
         verdicts.iter().all(|v| v.pass),
@@ -124,12 +136,16 @@ fn stage3_pause_holder_takeover() {
 #[test]
 fn stage4_three_clients_race_one_free_lock() {
     let _guard = lock_scenarios();
-    let config = ClusterConfig::new(scratch("uds-stage4"), members(&[44, 55, 66]), vec![44, 55, 66])
-        .with_clients(vec![
-            ("client1".into(), 44),
-            ("client2".into(), 55),
-            ("client3".into(), 66),
-        ]);
+    let config = ClusterConfig::new(
+        scratch("uds-stage4"),
+        members(&[44, 55, 66]),
+        vec![44, 55, 66],
+    )
+    .with_clients(vec![
+        ("client1".into(), 44),
+        ("client2".into(), 55),
+        ("client3".into(), 66),
+    ]);
     let verdicts = lease_sequencer::uds_harness::stage4(Cluster::launch(config).expect("launch"));
     assert!(
         verdicts.iter().all(|v| v.pass),

@@ -17,8 +17,8 @@
 
 use crate::client_gate::{self, Gate, Mode, Op};
 use serde_json::Value;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
@@ -248,7 +248,10 @@ impl Contender {
                 // experiment (nothing here races a load test).
                 self.gate.schedule = Some(
                     now_ms
-                        + self.config.probe_floor_ms.max(remaining + self.rng.below(100)),
+                        + self
+                            .config
+                            .probe_floor_ms
+                            .max(remaining + self.rng.below(100)),
                 );
                 None
             }
@@ -270,8 +273,7 @@ impl Contender {
                 // extends the lease by one window from now; the next
                 // renewal sits one renewal-margin inside the
                 // leader-echoed deadline.
-                self.gate.schedule =
-                    Some(now_ms + remaining.saturating_sub(self.renew_margin));
+                self.gate.schedule = Some(now_ms + remaining.saturating_sub(self.renew_margin));
                 None
             }
             ("bump", true, Some(_), false) => {
@@ -460,7 +462,10 @@ impl Client {
     fn step(&mut self, now_ms: u64, deadline_ms: u64, submit: &mut dyn FnMut(&Action) -> bool) {
         if let Some(pending) = &self.pending {
             if now_ms >= pending.deadline {
-                let pending = self.pending.take().expect("the deadline check just matched");
+                let pending = self
+                    .pending
+                    .take()
+                    .expect("the deadline check just matched");
                 let _ = self.contender.absorb(now_ms, &pending.action, None);
             } else {
                 return;
@@ -582,9 +587,12 @@ impl Runner {
 
     /// Client `index`'s in-flight message id, if any.
     pub fn pending_id(&self, index: usize) -> Option<[u8; 16]> {
-        self.clients
-            .get(index)
-            .and_then(|client| client.pending.as_ref().map(|pending| pending.action.message_id))
+        self.clients.get(index).and_then(|client| {
+            client
+                .pending
+                .as_ref()
+                .map(|pending| pending.action.message_id)
+        })
     }
 
     /// One host-loop tick: move every embedded client's gate to the
@@ -893,9 +901,7 @@ mod tests {
             .expect("the race");
         let granted = set_reply(true, &holder);
         contender.absorb(10_020, &race, Some(&granted));
-        let renewal = contender
-            .next_action(10_270)
-            .expect("the renewal is due");
+        let renewal = contender.next_action(10_270).expect("the renewal is due");
         assert_eq!(renewal.op, "bump");
         // The leader echoed 300 ms remaining: the next renewal is
         // scheduled one renewal-margin inside that (300 - 250 = 50 ms).
@@ -982,9 +988,7 @@ mod tests {
         let granted = set_reply(true, &holder);
         contender.absorb(10_020, &race, Some(&granted));
         assert!(contender.holds());
-        let renewal = contender
-            .next_action(10_270)
-            .expect("the renewal is due");
+        let renewal = contender.next_action(10_270).expect("the renewal is due");
         let usurper = "00000000-0000-0000-b410-6b6eb5b85683";
         let denied = denied_renewal_reply(400, usurper);
         contender.absorb(10_280, &renewal, Some(&denied));
@@ -1007,7 +1011,10 @@ mod tests {
     #[test]
     fn granted_outcome_semantics_separate_completions_from_grants() {
         let get = json!({"op": "get", "lease": null, "executed_at": 10_000});
-        assert!(reply_granted(&get, "get"), "a completed GET is a granted outcome");
+        assert!(
+            reply_granted(&get, "get"),
+            "a completed GET is a granted outcome"
+        );
         let holder = "00000000-0000-0000-fb84-3133094f979d";
         let granted = set_reply(true, holder);
         assert!(reply_granted(&granted, "set"));
@@ -1037,15 +1044,15 @@ mod tests {
     fn the_holder_sustains_renewals_against_the_real_service() {
         use lunet_advisory_lock::locks::Service;
 
-        fn execute(
-            service: &mut Service,
-            request: &Value,
-            at: u64,
-        ) -> Value {
+        fn execute(service: &mut Service, request: &Value, at: u64) -> Value {
             let payload = serde_json::to_vec(request).expect("the request serializes");
             let (bytes, _transition) = service
                 .execute(
-                    request["message_id"].as_str().expect("message id").parse().expect("uuid"),
+                    request["message_id"]
+                        .as_str()
+                        .expect("message id")
+                        .parse()
+                        .expect("uuid"),
                     request["client_id"].as_u64().expect("client id"),
                     request["request_num"].as_u64().expect("request num"),
                     at,
@@ -1088,8 +1095,7 @@ mod tests {
                 bump.op, "bump",
                 "a holder renews its own lease; it never re-SETs it"
             );
-            let request: Value =
-                serde_json::from_str(&bump.request).expect("the renewal is json");
+            let request: Value = serde_json::from_str(&bump.request).expect("the renewal is json");
             let reply = execute(&mut service, &request, execution_tick);
             assert_eq!(
                 reply["granted"], true,
@@ -1273,7 +1279,9 @@ mod tests {
         assert_eq!(submitted[0].op, "bump", "the staked renewal fires first");
         // The rig's exact denial shape on the renewal: the client must
         // withdraw and probe, never renew again.
-        let denied = denied_renewal_reply(300, incumbent).to_string().into_bytes();
+        let denied = denied_renewal_reply(300, incumbent)
+            .to_string()
+            .into_bytes();
         assert!(runner.absorb(1310, &submitted[0].message_id, &denied, &mut |_| true));
         submitted.clear();
         runner.tick(1700, &mut |action| {

@@ -58,9 +58,7 @@ fn main() {
 }
 
 fn print_usage() {
-    eprintln!(
-        "usage: aof-console-bridge --aof-dir PATH [--bind ADDR:PORT] [--follow]"
-    );
+    eprintln!("usage: aof-console-bridge --aof-dir PATH [--bind ADDR:PORT] [--follow]");
 }
 
 fn die(message: &str) -> ! {

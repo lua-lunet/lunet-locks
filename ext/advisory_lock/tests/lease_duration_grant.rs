@@ -407,10 +407,13 @@ fn a_bare_hex_release_holder_is_refused_at_decode() {
 #[test]
 fn the_canonical_hyphenated_form_round_trips_unchanged() {
     let payload = set_json(1, 1, 1, "11111111-1111-1111-1111-111111111111", LEASE_MS);
-    let request = Service::decode(payload.to_string().as_bytes())
-        .expect("the canonical form decodes");
+    let request =
+        Service::decode(payload.to_string().as_bytes()).expect("the canonical form decodes");
     let Request::Set { lease, .. } = request else {
         panic!("the payload is a set");
     };
-    assert_eq!(lease.holder.to_string(), "11111111-1111-1111-1111-111111111111");
+    assert_eq!(
+        lease.holder.to_string(),
+        "11111111-1111-1111-1111-111111111111"
+    );
 }

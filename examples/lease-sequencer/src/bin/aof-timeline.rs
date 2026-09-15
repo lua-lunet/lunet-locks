@@ -83,7 +83,9 @@ fn main() {
     );
     for (name, record) in excerpt {
         let payload = match record.marker {
-            Marker::TelemetryIntervalSample => String::from_utf8_lossy(&record.payload).into_owned(),
+            Marker::TelemetryIntervalSample => {
+                String::from_utf8_lossy(&record.payload).into_owned()
+            }
             Marker::Wire => wire_summary(&record.payload),
             _ => String::from_utf8_lossy(&record.payload).into_owned(),
         };
