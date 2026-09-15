@@ -110,6 +110,17 @@ fn stage3_pause_holder_takeover() {
 /// re-probe, and take a paused holder's lease through the probe→SET
 /// race — the regression for the renewal loop that misread the leader's
 /// `granted:false` refusal as a renewal and never probed again.
+///
+/// Disposition: the sustain, denial, and re-probe verdicts are
+/// ordering facts and hold under load. The paused-holder takeover
+/// needs a leader that stays stable through a ~1-2 s window after the
+/// pause: under a heavily loaded host the in-process cluster's phi
+/// detector can churn views for the whole wait (observed 2026-09-15 at
+/// sustained load averages 4-6 while the rest of the suite stayed
+/// green), and the 20 s liveness bound does not cover a storm that
+/// long. The verdict's truth is the successor's op mix (a second set
+/// op), which no amount of waiting can fake; re-measure on a quiet
+/// host when it goes red alongside a view-change storm.
 #[test]
 fn stage4_three_clients_race_one_free_lock() {
     let _guard = lock_scenarios();
