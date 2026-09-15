@@ -147,6 +147,17 @@ the founding membership plus its own appended line — a boot on the
 genesis descriptor against a live, reconfigured cluster, the shape the
 membership snapshots serve.
 
+The descriptor is a hint list, not membership law. A `--name` the
+descriptor carries boots exactly as documented above; a `--name` it omits
+is NOT a refusal — the node boots as a weight-0 joining member whose
+identity comes from `--join-id N` and `--join-endpoint [HOST]:PORT`,
+appended after the hint rows. The hint rows say where the cluster is;
+the node stays fenced until the leader's committed configuration
+carries its row (the join verb at the leader is the act of entry), then
+folds its admitting era and serves. Nothing about the file gates who may
+exist — the cross-environment boundary is a future PSK, never the
+descriptor.
+
 ## The standby telemetry node
 
 `check-standby.sh` runs the same six-node cluster with `dc1-node2` as the

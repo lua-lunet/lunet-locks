@@ -87,6 +87,7 @@ fn is_commit(payload: &[u8]) -> bool {
         && u32::from_be_bytes(payload[0..4].try_into().expect("4 bytes")) == VRR_COMMIT_TAG
 }
 
+#[derive(Clone, Debug)]
 struct ClusterNode {
     id: u32,
     name: String,
@@ -371,6 +372,52 @@ fn parse_config(path: &str) -> Vec<ClusterNode> {
     nodes
 }
 
+/// The descriptor is a hint list of where the cluster is, not membership
+/// law. A name the descriptor carries boots exactly as before; a name it
+/// omits boots anyway as a weight-0 joining member whose identity comes
+/// from `--join-id` and `--join-endpoint`, appended after the hint rows.
+/// The node stays fenced until the leader's committed configuration
+/// carries its row (the join verb); a future PSK, not this file, is the
+/// cross-environment boundary.
+fn boot_nodes(nodes: Vec<ClusterNode>, options: &Options) -> Result<Vec<ClusterNode>, String> {
+    if nodes.iter().any(|node| node.name == options.name) {
+        if options.join_id != 0 || !options.join_endpoint.is_empty() {
+            return Err(format!(
+                "lease-sequencer: --name {} is in the descriptor; --join-id/--join-endpoint are for a name it omits",
+                options.name
+            ));
+        }
+        return Ok(nodes);
+    }
+    if options.join_id == 0 || options.join_endpoint.is_empty() {
+        return Err(format!(
+            "lease-sequencer: --name {} is not in the descriptor; supply --join-id N and --join-endpoint HOST:PORT to boot as a joining member",
+            options.name
+        ));
+    }
+    let Some((host, port)) = options.join_endpoint.rsplit_once(':') else {
+        return Err(
+            "lease-sequencer: --join-endpoint must be HOST:PORT (bracket IPv6 host)".to_string(),
+        );
+    };
+    let Ok(port) = port.parse::<u16>() else {
+        return Err("lease-sequencer: --join-endpoint port must be u16".to_string());
+    };
+    if host.is_empty() {
+        return Err("lease-sequencer: --join-endpoint host is empty".to_string());
+    }
+    let mut nodes = nodes;
+    nodes.push(ClusterNode {
+        id: options.join_id,
+        endpoint: options.join_endpoint.clone(),
+        genesis: false,
+        host: host.to_string(),
+        name: options.name.clone(),
+        port,
+    });
+    Ok(nodes)
+}
+
 struct Options {
     name: String,
     config: String,
@@ -424,6 +471,12 @@ struct Options {
     /// The embedded clients' renewal point as a fraction of the window
     /// (the lease-load default).
     embedded_renew_fraction: f64,
+    /// The id of a name the descriptor omits: the descriptor is a hint
+    /// list of where the cluster is, not membership law, so an absent
+    /// name boots as a weight-0 joining member with this identity.
+    join_id: u32,
+    /// The joining member's endpoint (`[host]:port`), the UDP bind.
+    join_endpoint: String,
 }
 
 fn parse_options() -> Options {
@@ -451,6 +504,8 @@ fn parse_options() -> Options {
         embedded_lock_id: EMBEDDED_LOCK_ID,
         embedded_client_ttl_ms: 500,
         embedded_renew_fraction: 0.5,
+        join_id: 0,
+        join_endpoint: String::new(),
     };
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut index = 0;
@@ -500,6 +555,8 @@ fn parse_options() -> Options {
             "--renew-fraction" => {
                 options.embedded_renew_fraction = value.parse().unwrap_or(0.5)
             }
+            "--join-id" => options.join_id = value.parse().unwrap_or(0),
+            "--join-endpoint" => options.join_endpoint = value.clone(),
             other => {
                 eprintln!("lease-sequencer: unknown option {other}");
                 exit(2);
@@ -521,7 +578,8 @@ fn parse_options() -> Options {
              [--recovery-flush diskless|single|double-ring] [--recovery-scratch-dir PATH] \
              [--heartbeat-ms N] [--election-ms N] [--recovery-ms N] \
              [--phi-threshold F] [--phi-safety F] \
-             [--embedded-client N] [--lock N] [--client-ttl-ms N] [--renew-fraction F]"
+             [--embedded-client N] [--lock N] [--client-ttl-ms N] [--renew-fraction F] \
+             [--join-id N --join-endpoint HOST:PORT]"
         );
         exit(2);
     }
@@ -1349,10 +1407,12 @@ impl Host {
 
 fn main() {
     let options = parse_options();
-    let nodes = parse_config(&options.config);
-    let Some(own) = nodes.iter().find(|node| node.name == options.name) else {
-        eprintln!("lease-sequencer: --name not in descriptor");
+    let nodes = boot_nodes(parse_config(&options.config), &options).unwrap_or_else(|message| {
+        eprintln!("{message}");
         exit(2);
+    });
+    let Some(own) = nodes.iter().find(|node| node.name == options.name) else {
+        unreachable!("boot_nodes guarantees the own row");
     };
     let own_desc_id = own.id;
     // The member buffer, in descriptor line order: plain entries are the
@@ -2701,5 +2761,121 @@ mod forward_tests {
             text.contains("not_leader"),
             "the conn reads back the refusal line, got {text:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod boot_hint_tests {
+    //! The descriptor-as-hint regression: run 1's replacement refused to
+    //! boot with `--name not in descriptor` and needed a hand-edited
+    //! descriptor listing the joining node. A name the descriptor omits
+    //! must boot as a weight-0 joiner from `--join-id`/`--join-endpoint`
+    //! (the file says where the cluster is, never who may exist), and a
+    //! listed name must not take join flags.
+
+    use super::*;
+
+    fn hint_nodes() -> Vec<ClusterNode> {
+        vec![
+            ClusterNode {
+                id: 44,
+                endpoint: "[2001:db8::1]:9101".to_string(),
+                genesis: true,
+                host: "[2001:db8::1]".to_string(),
+                name: "w1b".to_string(),
+                port: 9101,
+            },
+            ClusterNode {
+                id: 55,
+                endpoint: "[2001:db8::2]:9101".to_string(),
+                genesis: true,
+                host: "[2001:db8::2]".to_string(),
+                name: "w2b".to_string(),
+                port: 9101,
+            },
+        ]
+    }
+
+    fn options(name: &str, join_id: u32, join_endpoint: &str) -> Options {
+        Options {
+            name: name.to_string(),
+            config: "cluster.jsonl".to_string(),
+            client: "[::]:19301".to_string(),
+            state: "state/node.state".to_string(),
+            log: "node.log".to_string(),
+            aof_dir: String::new(),
+            aof_flush_ms: 0,
+            aof_retention_mib: 10,
+            telemetry_aof_dir: String::new(),
+            telemetry_rollover_mib: 4,
+            phi_timeout_min_ms: 10,
+            phi_timeout_max_ms: 200,
+            recovery_flush: RecoveryFlush::Diskless,
+            recovery_scratch: String::new(),
+            heartbeat_ms: 5,
+            election_ms: 1000,
+            recovery_ms: 1000,
+            phi_threshold: 1.0,
+            phi_safety: 2.0,
+            embedded_clients: 0,
+            embedded_lock_id: EMBEDDED_LOCK_ID,
+            embedded_client_ttl_ms: 500,
+            embedded_renew_fraction: 0.5,
+            join_id,
+            join_endpoint: join_endpoint.to_string(),
+        }
+    }
+
+    #[test]
+    fn absent_name_boots_as_a_joiner_with_the_cli_identity() {
+        let nodes = boot_nodes(hint_nodes(), &options("w1b-r1", 45, "[2001:db8::1]:9103"))
+            .expect("the omitted name boots");
+        assert_eq!(nodes.len(), 3, "the joiner row is appended");
+        let own = nodes
+            .iter()
+            .find(|node| node.name == "w1b-r1")
+            .expect("the own row exists");
+        assert_eq!(own.id, 45);
+        assert_eq!(own.genesis, false);
+        assert_eq!(own.endpoint, "[2001:db8::1]:9103");
+        assert_eq!(own.host, "[2001:db8::1]");
+        assert_eq!(own.port, 9103);
+    }
+
+    #[test]
+    fn absent_name_without_join_flags_is_a_usage_error_not_a_refusal() {
+        let error = boot_nodes(hint_nodes(), &options("w1b-r1", 0, ""))
+            .expect_err("the flags are named in the error");
+        assert!(
+            error.contains("--join-id") && error.contains("--join-endpoint"),
+            "the error names both flags: {error}"
+        );
+    }
+
+    #[test]
+    fn listed_name_rejects_join_flags() {
+        let error = boot_nodes(hint_nodes(), &options("w1b", 45, "[2001:db8::1]:9103"))
+            .expect_err("a listed name does not take join flags");
+        assert!(
+            error.contains("is in the descriptor"),
+            "the conflict is named: {error}"
+        );
+    }
+
+    #[test]
+    fn listed_name_boot_is_unchanged() {
+        let hint = hint_nodes();
+        let nodes = boot_nodes(hint.clone(), &options("w2b", 0, "")).expect("boots as before");
+        assert_eq!(nodes.len(), hint.len(), "no row is appended");
+    }
+
+    #[test]
+    fn bad_join_endpoint_is_rejected() {
+        for bad in ["no-port", "[2001:db8::1]:notaport", ":9103"] {
+            assert!(
+                boot_nodes(hint_nodes(), &options("w1b-r1", 45, bad)).is_err(),
+                "{bad} must be rejected"
+            );
+        }
     }
 }
