@@ -2122,3 +2122,175 @@ pub fn stage3(mut cluster: Cluster) -> Vec<Verdict> {
     ));
     out
 }
+
+/// STAGE 4: the simultaneous bring-up race — three polite contenders
+/// started TOGETHER against one free lock. The Service serializes the
+/// three SET races: one contender is granted, the other two are DENIED
+/// with the incumbent's live lease echoed (the exact reply shape the
+/// wire clients see). The denied contenders must withdraw their stakes
+/// and return to the probe cadence — the op mix shows a GET after the
+/// denied renewal — never renewing a lease they do not hold; a paused
+/// holder's lease is then taken through the probe→SET-race path (the
+/// successor's SECOND set op), never through a blind renewal; and the
+/// paused contender re-enters as a probe. The verdicts key on the trace
+/// and op ordering, never on wall-clock bounds, so a loaded host cannot
+/// flake the scenario's truth.
+pub fn stage4(mut cluster: Cluster) -> Vec<Verdict> {
+    let mut out = Vec::new();
+    let ready = cluster.wait_until(8000, |lines| {
+        lines
+            .iter()
+            .filter_map(|l| parse_line(l))
+            .any(|l| l.from.starts_with("node") && l.to.starts_with("node") && l.json.get("tag").and_then(|v| v.as_u64()) == Some(4))
+    });
+    out.push(verdict(
+        "stage4: three-node quorum stabilizes",
+        ready,
+        if ready {
+            "leader Commit stream observed".into()
+        } else {
+            "no Commit within 8s; tail:\n".to_string() + &cluster.trace_tail(8)
+        },
+    ));
+    if !ready {
+        return out;
+    }
+    cluster.max_driver_hop_us = 0;
+    cluster.max_hop_detail.clear();
+
+    // The simultaneous bring-up: all three chase the free lock at once.
+    for client in ["client1", "client2", "client3"] {
+        cluster.client_start(client);
+    }
+    let raced = cluster.wait_until(4000, |lines| {
+        ["client1", "client2", "client3"]
+            .iter()
+            .any(|client| !grants(lines, client).is_empty())
+    });
+    let winner = ["client1", "client2", "client3"]
+        .iter()
+        .find(|client| !grants(&cluster.lines, client).is_empty())
+        .map(|client| client.to_string());
+    out.push(verdict(
+        "stage4: the simultaneous race installs a holder",
+        raced && winner.is_some(),
+        format!(
+            "winner={winner:?} tail:\n{}",
+            cluster.trace_tail(6)
+        ),
+    ));
+    let Some(winner) = winner else {
+        return out;
+    };
+    let losers: Vec<String> = ["client1", "client2", "client3"]
+        .iter()
+        .filter(|client| **client != winner)
+        .map(|client| client.to_string())
+        .collect();
+
+    // Observe the chase: the holder renews on its cadence, the denied
+    // contenders back off and re-probe at the polite floor.
+    let observe_at = millis();
+    while millis() < observe_at + 4000 {
+        cluster.poll(millis());
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    // The denial itself: each loser's first SET reply carries
+    // granted:false with the incumbent's lease echoed — the race's
+    // outcome as the leader stated it.
+    let first_set_denied = |lines: &[String], client: &str| {
+        lines
+            .iter()
+            .filter_map(|l| parse_line(l))
+            .filter(|l| l.to == client)
+            .filter(|l| l.json.get("op").and_then(|v| v.as_str()) == Some("set"))
+            .filter_map(|l| l.json.get("granted").and_then(|v| v.as_bool()))
+            .next()
+            == Some(false)
+    };
+    for loser in &losers {
+        out.push(verdict(
+            "stage4: the lost race is denied (granted:false, the incumbent echoed)",
+            first_set_denied(&cluster.lines, loser),
+            format!("client={loser} ops={:?}", cluster.client_ops(loser)),
+        ));
+    }
+
+    // THE regression: a contender that staked on a denied race must
+    // re-probe — its op mix shows a GET after the denied renewal. A
+    // contender that keeps renewing against a foreign holder's lease
+    // echo never probes again (its ops stay get, set, bump, bump, …).
+    let bumped_then_probed = |client: &str| {
+        let ops = cluster.client_ops(client);
+        ops.iter()
+            .position(|op| op == "bump")
+            .is_some_and(|at| ops[at + 1..].iter().any(|op| op == "get"))
+    };
+    for loser in &losers {
+        out.push(verdict(
+            "stage4: the denied contender returns to the probe cadence",
+            bumped_then_probed(loser),
+            format!(
+                "client={loser} ops={:?} (a get after a bump: the stake withdrawn, the chase re-entered as a probe)",
+                cluster.client_ops(loser)
+            ),
+        ));
+    }
+
+    // The holder lapses (gate-silenced): a successor must take the
+    // lease through the probe→SET-race path — its SECOND set op. A
+    // takeover through a blind renewal has no second set.
+    let anchor = millis();
+    cluster.client_pause(&winner);
+    let successors: Vec<String> = losers.clone();
+    let took = cluster.wait_until(8000, |lines| {
+        successors
+            .iter()
+            .any(|client| !grants(lines, client).is_empty())
+    });
+    let successor = successors
+        .iter()
+        .find(|client| !grants(&cluster.lines, client).is_empty())
+        .map(|client| client.to_string());
+    let sets_of = |client: &str| cluster.client_ops(client).iter().filter(|op| *op == "set").count();
+    let takeover_ms = millis() - anchor;
+    out.push(verdict(
+        "stage4: a paused holder's lease is taken through the probe-race path",
+        took
+            && successor.is_some()
+            && successor
+                .as_ref()
+                .is_some_and(|client| sets_of(client) >= 2),
+        format!(
+            "successor={successor:?} takeover_ms={takeover_ms} sets={:?}",
+            successor.as_deref().map(sets_of)
+        ),
+    ));
+    if successor.is_none() {
+        return out;
+    }
+
+    // The paused contender re-enters as a probe, never a blind renewal,
+    // and does not steal the successor's lease.
+    let lines_before = cluster.lines.len();
+    let ops_before = cluster.client_ops(&winner).len();
+    cluster.client_start(&winner);
+    let reenter_at = millis();
+    while millis() < reenter_at + 1500 {
+        cluster.poll(millis());
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let ops = cluster.client_ops(&winner);
+    let first_after = ops.get(ops_before).map(|op| op.as_str());
+    let re_grants = grants(&cluster.lines[lines_before..], &winner).len();
+    out.push(verdict(
+        "stage4: the re-entered contender probes first and does not steal",
+        first_after == Some("get") && re_grants == 0,
+        format!(
+            "first_op_after_resume={first_after:?} grants_after_resume={re_grants} ops_tail={:?}",
+            &ops[ops_before.min(ops.len())..]
+        ),
+    ));
+    out
+}

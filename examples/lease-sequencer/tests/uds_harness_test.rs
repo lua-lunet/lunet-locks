@@ -2,8 +2,11 @@
 //! (stage 1); a two-node quorum of a three-member cluster stabilizes and
 //! serves polite lock traffic, and the third client joins politely
 //! (stage 2); the full three-node cluster takes over from a PAUSED holder
-//! inside the honest bound and re-enters cleanly (stage 3). Every stage
-//! asserts its invariants on the cluster-wide trace AOF the driver writes.
+//! inside the honest bound and re-enters cleanly (stage 3); three polite
+//! contenders started together race one free lock — the two denied
+//! contenders must return to the probe cadence and take over through
+//! the probe→SET-race path (stage 4). Every stage asserts its invariants
+//! on the cluster-wide trace AOF the driver writes.
 
 use lease_sequencer::uds_harness::{Cluster, ClusterConfig, Verdict};
 use std::path::PathBuf;
@@ -98,6 +101,28 @@ fn stage3_pause_holder_takeover() {
     assert!(
         verdicts.iter().all(|v| v.pass),
         "stage3 verdicts: {}",
+        summarize(&verdicts)
+    );
+}
+
+/// The simultaneous bring-up race: three polite contenders against one
+/// free lock. The two denied contenders must withdraw their stakes,
+/// re-probe, and take a paused holder's lease through the probe→SET
+/// race — the regression for the renewal loop that misread the leader's
+/// `granted:false` refusal as a renewal and never probed again.
+#[test]
+fn stage4_three_clients_race_one_free_lock() {
+    let _guard = lock_scenarios();
+    let config = ClusterConfig::new(scratch("uds-stage4"), members(&[44, 55, 66]), vec![44, 55, 66])
+        .with_clients(vec![
+            ("client1".into(), 44),
+            ("client2".into(), 55),
+            ("client3".into(), 66),
+        ]);
+    let verdicts = lease_sequencer::uds_harness::stage4(Cluster::launch(config).expect("launch"));
+    assert!(
+        verdicts.iter().all(|v| v.pass),
+        "stage4 verdicts: {}",
         summarize(&verdicts)
     );
 }

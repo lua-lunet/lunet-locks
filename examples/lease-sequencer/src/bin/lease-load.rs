@@ -12,9 +12,14 @@
 //!
 //! Stats: one JSON line per window (window percentiles plus cumulative
 //! percentiles, so the last line is always the summary) and, on a clean
-//! exit, a final JSON object. The bounded reporting interval is the
-//! proof-of-life discipline: the clients show what they see without
-//! taxing the cluster.
+//! exit, a final JSON object. `by_op` counts granted outcomes: a GET is
+//! ok when it completes without error, a SET/BUMP (the acquire race or
+//! the same-holder renewal) only when the leader grants it — the
+//! leader's `granted:false` refusal is a completed round trip counted
+//! as an error, never as an ack, so the client's counters never claim
+//! renewals the committed lease state cannot account for. The bounded
+//! reporting interval is the proof-of-life discipline: the clients
+//! show what they see without taxing the cluster.
 //!
 //! The lease cadence knobs mirror the design's numbers: `--lease-ms 100
 //! --renew-fraction 0.8` runs the design's cadence exactly; the committed
@@ -29,7 +34,7 @@
 //! SET renewal. Transitions are logged on the client's stdout stream.
 
 use lease_sequencer::client_gate::{self, Mode};
-use lease_sequencer::embedded_client::{Config, Contender, Signals, reply_ok};
+use lease_sequencer::embedded_client::{Config, Contender, Signals, reply_granted};
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
@@ -317,7 +322,16 @@ impl Link {
         }
         let rt = start.elapsed().as_micros() as u64;
         let reply: Option<Value> = serde_json::from_str(line.trim_end()).ok();
-        let ok = reply.as_ref().is_some_and(|reply| reply_ok(reply));
+        // The sample's ok is the GRANTED outcome, not the completed
+        // round trip: a SET (the acquire race or the same-holder
+        // renewal) is ok only when the leader granted it — the refusal
+        // (`granted:false`, the incumbent's lease echoed, no error
+        // field) is a completed round trip but never an acked
+        // operation, so the committed lease state and the client's
+        // by_op counters agree.
+        let ok = reply
+            .as_ref()
+            .is_some_and(|reply| reply_granted(reply, op));
         // The addressed node forwards a lock verb to the leader on the
         // peer application channel; the committed reply (or a leader-side
         // mid-flight refusal, which rotates the connection) is the only

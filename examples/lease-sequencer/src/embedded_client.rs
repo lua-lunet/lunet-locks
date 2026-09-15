@@ -8,7 +8,12 @@
 //! machine is the design's §1.2: GET probe → free/expired ⇒ SET race;
 //! live foreign incumbent ⇒ poll past the leader-echoed expiry with
 //! jitter; holder ⇒ BUMP renewal one renewal-margin inside the deadline;
-//! error/deny ⇒ backoff.
+//! error/deny ⇒ backoff. A denied renewal — the leader's `granted:false`
+//! reply with the incumbent's live lease echoed — withdraws the stake
+//! and re-probes: a lease ECHO names its holder, and only a reply whose
+//! lease names THIS contender is a grant. The optimistic stake the SET
+//! race takes corrects on the first denied renewal, exactly as the
+//! race arm's design comment promises.
 
 use crate::client_gate::{self, Gate, Mode, Op};
 use serde_json::Value;
@@ -57,6 +62,23 @@ pub struct Action {
 /// or not).
 pub fn reply_ok(reply: &Value) -> bool {
     reply.get("error").is_none()
+}
+
+/// Whether the reply counts as a granted outcome for the op that asked:
+/// a probe completes when it carries no error, but a SET — the acquire
+/// race or the same-holder renewal — completes only when the leader
+/// granted it. The leader's refusal (`granted:false`, the incumbent's
+/// live lease echoed, no `error` field) is a completed round trip,
+/// never a granted one: the load driver's stats count grants, not
+/// completions.
+pub fn reply_granted(reply: &Value, op: &str) -> bool {
+    if !reply_ok(reply) {
+        return false;
+    }
+    match op {
+        "set" | "bump" => reply.get("granted").and_then(|g| g.as_bool()) == Some(true),
+        _ => true,
+    }
 }
 
 /// The lease's remaining window in the leader's timeline
@@ -212,12 +234,29 @@ impl Contender {
                 self.gate.schedule = Some(now_ms);
                 Some(self.build_set(now_ms, "set"))
             }
-            ("bump", true, Some(remaining), _) => {
-                // A renewal (BUMP): the same-holder regrant extends the
-                // lease by one window from now; the next renewal sits one
-                // renewal-margin inside the leader-echoed deadline.
+            ("bump", true, Some(remaining), true) => {
+                // A renewal (BUMP) the leader GRANTED — the reply's
+                // lease names this contender: the same-holder regrant
+                // extends the lease by one window from now; the next
+                // renewal sits one renewal-margin inside the
+                // leader-echoed deadline.
                 self.gate.schedule =
                     Some(now_ms + remaining.saturating_sub(self.renew_margin));
+                None
+            }
+            ("bump", true, Some(_), false) => {
+                // A denied renewal: the leader answered with a live
+                // lease that names a foreign holder (`granted:false`,
+                // the incumbent echoed — no error field). The stake is
+                // withdrawn — a gate without holdership schedules the
+                // probe, never a blind renewal of a lease it no longer
+                // holds — and the backoff spaces it. The chase re-enters
+                // as a non-holder and re-reads the lock; the probe floor
+                // then paces it. This is the correction the SET race's
+                // optimistic stake rides on: a lost race or a lost
+                // lease surfaces here, as a denial.
+                self.gate.holder = None;
+                self.gate.schedule = Some(now_ms + 100 + self.rng.below(200));
                 None
             }
             ("set", _, _, _) => {
@@ -835,6 +874,126 @@ mod tests {
         assert_eq!(contender.scheduled_at(), Some(10_280 + 50));
     }
 
+    /// A renewal the leader DENIED, in the rig's exact reply shape: no
+    /// error field, the foreign incumbent's live lease echoed with the
+    /// leader's execution tick — the reply the run-2 leader sent the
+    /// two race losers' bumps for the whole run (locks2-2026-09-15).
+    fn denied_renewal_reply(remaining: u64, holder: &str) -> Value {
+        json!({
+            "op": "set",
+            "granted": false,
+            "lease": {
+                "lease_id": 1594,
+                "holder": holder,
+                "expiry": 10_000 + remaining,
+                "lease_ms": 500,
+            },
+            "executed_at": 10_000,
+        })
+    }
+
+    /// THE run-2 regression: a staked contender whose renewal is denied
+    /// must withdraw the stake and re-probe. The old bump arm keyed on
+    /// (no-error, lease-present) and absorbed this exact reply as a
+    /// successful renewal — the two race losers then bumped forever,
+    /// never probing again, while the stats layer counted every denial
+    /// as an acked bump.
+    #[test]
+    fn denied_renewal_withdraws_the_stake_and_reprobes() {
+        let mut contender = contender();
+        let probe = probe_action(&mut contender);
+        let free = json!({"op": "get", "lease": null, "executed_at": 10_000});
+        let race = contender
+            .absorb(10_010, &probe, Some(&free))
+            .expect("the free-probe SET race");
+        // The race is denied — a foreign incumbent holds: the machine
+        // stakes the holdership the race claimed, and the correction is
+        // the next renewal's denial.
+        let incumbent = "00000000-0000-0000-fb84-3133094f979d";
+        let denied_race = set_reply(false, incumbent);
+        contender.absorb(10_020, &race, Some(&denied_race));
+        assert!(
+            contender.holds(),
+            "the race's optimistic stake stands until the denial corrects it"
+        );
+        let renewal = contender
+            .next_action(10_270)
+            .expect("the staked renewal is due");
+        assert_eq!(renewal.op, "bump");
+        // The rig's exact denial shape: a live lease echoed with 300 ms
+        // remaining on the leader's timeline.
+        let denied = denied_renewal_reply(300, incumbent);
+        assert_eq!(contender.absorb(10_280, &renewal, Some(&denied)), None);
+        assert!(!contender.holds(), "a denied renewal withdraws the stake");
+        let at = contender.scheduled_at().expect("the backoff is scheduled");
+        assert!(
+            (10_380..10_580).contains(&at),
+            "the re-probe backs off 100-300 ms, got {at}"
+        );
+        assert_eq!(
+            contender.next_action(at).expect("due").op,
+            "get",
+            "the chase re-enters as a probe, never a blind renewal"
+        );
+    }
+
+    /// A contender that genuinely held its lease and then lost it (the
+    /// leader changed, the new log grants someone else) receives the
+    /// same denial shape on its next renewal — it must re-probe too.
+    #[test]
+    fn holder_denied_a_renewal_also_reprobes() {
+        let mut contender = contender();
+        let holder = contender.holder().to_string();
+        let probe = probe_action(&mut contender);
+        let free = json!({"op": "get", "lease": null, "executed_at": 10_000});
+        let race = contender
+            .absorb(10_010, &probe, Some(&free))
+            .expect("the free-probe SET race");
+        let granted = set_reply(true, &holder);
+        contender.absorb(10_020, &race, Some(&granted));
+        assert!(contender.holds());
+        let renewal = contender
+            .next_action(10_270)
+            .expect("the renewal is due");
+        let usurper = "00000000-0000-0000-b410-6b6eb5b85683";
+        let denied = denied_renewal_reply(400, usurper);
+        contender.absorb(10_280, &renewal, Some(&denied));
+        assert!(
+            !contender.holds(),
+            "the lost lease withdraws holdership on the denial"
+        );
+        assert_eq!(
+            contender
+                .next_action(contender.scheduled_at().expect("backoff"))
+                .expect("due")
+                .op,
+            "get"
+        );
+    }
+
+    /// The stats layer's granted-outcome semantics: a completed round
+    /// trip is not a granted one. The rig's refusal shape is `reply_ok`
+    /// (no error field) yet must never count as an acked bump or set.
+    #[test]
+    fn granted_outcome_semantics_separate_completions_from_grants() {
+        let get = json!({"op": "get", "lease": null, "executed_at": 10_000});
+        assert!(reply_granted(&get, "get"), "a completed GET is a granted outcome");
+        let holder = "00000000-0000-0000-fb84-3133094f979d";
+        let granted = set_reply(true, holder);
+        assert!(reply_granted(&granted, "set"));
+        assert!(reply_granted(&granted, "bump"));
+        let denied = denied_renewal_reply(300, holder);
+        assert!(reply_ok(&denied), "the refusal is a completed round trip");
+        assert!(
+            !reply_granted(&denied, "bump"),
+            "the rig's refusal shape is never a granted bump"
+        );
+        assert!(!reply_granted(&denied, "set"));
+        let error = json!({"error": "not_leader"});
+        assert!(!reply_granted(&error, "bump"));
+        assert!(!reply_granted(&error, "get"));
+    }
+
     #[test]
     fn error_or_unparseable_reply_backs_off_and_reprobes() {
         let mut contender = contender();
@@ -949,6 +1108,63 @@ mod tests {
         runner.tick(1000, &mut |_| true);
         let unknown = [0xAA; 16];
         assert!(!runner.absorb(1010, &unknown, b"{}", &mut |_| true));
+    }
+
+    /// The runner path (the sequencer host's embedded clients): a denied
+    /// renewal returns the client to probing — the pending bump is
+    /// absorbed with the rig's exact refusal shape, the stake is
+    /// withdrawn, and the next submitted op is a GET probe. On the old
+    /// bump arm the denial was absorbed as a renewal and the runner
+    /// submitted bumps forever.
+    #[test]
+    fn runner_denied_renewal_returns_to_probing() {
+        let mut runner = runner(1);
+        runner.signals().signal_start();
+        let mut submitted: Vec<Action> = Vec::new();
+        runner.tick(1000, &mut |action| {
+            submitted.push(action.clone());
+            true
+        });
+        let pending = runner.pending_id(0).expect("the probe is pending");
+        let free = json!({"op": "get", "lease": null, "executed_at": 10_000})
+            .to_string()
+            .into_bytes();
+        let mut race: Option<Action> = None;
+        assert!(runner.absorb(1010, &pending, &free, &mut |action| {
+            race = Some(action.clone());
+            true
+        }));
+        let race = race.expect("the free probe races to SET inline");
+        // The race is denied (a foreign incumbent holds); the stake
+        // stands and the renewal goes out on schedule.
+        let incumbent = "00000000-0000-0000-fb84-3133094f979d";
+        let denied_race = set_reply(false, incumbent).to_string().into_bytes();
+        assert!(runner.absorb(1020, &race.message_id, &denied_race, &mut |_| true));
+        submitted.clear();
+        runner.tick(1300, &mut |action| {
+            submitted.push(action.clone());
+            true
+        });
+        assert_eq!(submitted.len(), 1);
+        assert_eq!(submitted[0].op, "bump", "the staked renewal fires first");
+        // The rig's exact denial shape on the renewal: the client must
+        // withdraw and probe, never renew again.
+        let denied = denied_renewal_reply(300, incumbent).to_string().into_bytes();
+        assert!(runner.absorb(1310, &submitted[0].message_id, &denied, &mut |_| true));
+        submitted.clear();
+        runner.tick(1700, &mut |action| {
+            submitted.push(action.clone());
+            true
+        });
+        assert_eq!(
+            submitted.len(),
+            1,
+            "one op in flight at a time: {submitted:?}"
+        );
+        assert_eq!(
+            submitted[0].op, "get",
+            "the denied renewal returns the runner to the probe"
+        );
     }
 
     #[test]
