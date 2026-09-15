@@ -108,6 +108,15 @@
 //!   operation entry (Prepare / DoViewChange / StartView / NewState) with
 //!   `Service` before the message reaches the core — the same gate the old
 //!   adapter called `valid_message_payload`.
+//! - **Self-arrest reporting.** The core's never-repair contract makes a
+//!   fault sticky: a legality-gate breach, a journal refusal, or a boundary
+//!   panic self-arrests the node — poison is permanent and every further
+//!   entry reports SERVICE, by design (the node never continues past a
+//!   violated invariant). What the contract never allowed was SILENCE: the
+//!   first fault observation records its reason, says it once on stderr,
+//!   and exports it ([`NodeStatus`] and `lunet_lock_node_fault`) so the
+//!   runbook can tell a breached node from a wedged one without
+//!   restarting anything. The arrest itself is unchanged.
 //! - **Lock-event journal.** An optional append-only binary journal records
 //!   every committed lock transition (Hold/Renew/Release) to rolling files
 //!   under a per-replica directory. Enabled when `lunet_lock_node_new`
@@ -165,8 +174,8 @@ use vrr::observe::Diagnostic;
 use vrr::progress::Status;
 use vrr::quorum::{WeightedMajority, construct_pivot};
 use vrr::replica::{
-    Input, PersistedProgress, Pivot, PlanRefusal, PublishOutcome, Replica, TimedInput,
-    ViewChangeKnobs,
+    Input, PersistedProgress, Pivot, PlanRefusal, PublishOutcome, PublishRefusal, Replica,
+    TimedInput, ViewChangeKnobs,
 };
 use vrr::wire::{Pack, Unpack, UnpackError};
 
@@ -310,6 +319,12 @@ pub struct Node {
     pending: HashMap<OperationId, [u8; 16]>,
     last_tick: u64,
     poisoned: bool,
+    /// The recorded reason of the FIRST self-arrest observation (the
+    /// core's never-repair fault, or a boundary panic): `None` until the
+    /// node arrests. The sticky fault would otherwise repeat the
+    /// observation on every drive, so only the first is recorded and
+    /// said — loudly, on stderr, where the runbook reads.
+    fault_note: Option<String>,
     /// The superseded identity when this node booted a DIRTY restart: the
     /// bumped node re-announces `Reincarnation(old, new)` on every
     /// fenced-boot drive (§8). `None` for an incarnation-0 boot.
@@ -408,28 +423,88 @@ impl Node {
                 // for a poisoned node (the host may poll it); the execution
                 // point itself must never be reached while poisoned.
                 assert!(!self.poisoned, "post-poison execution");
-                let planned = self
-                    .replica
-                    .plan(&input, &self.replica.journal().view())
-                    .map_err(plan_error)?;
-                match self.replica.publish(planned).map_err(|_| SERVICE)? {
-                    PublishOutcome::Published { effects, .. } => Ok(effects),
-                    PublishOutcome::Parked { .. } => Err(FAULTED),
+                let planned = match self.replica.plan(&input, &self.replica.journal().view()) {
+                    Ok(planned) => planned,
+                    Err(PlanRefusal::Faulted(fault)) => {
+                        // The core's never-repair contract: the fault is
+                        // sticky and the node self-arrests. Record WHY —
+                        // this observation is the operator's only chance
+                        // to see the reason.
+                        self.record_fault(format!("sticky fault: {fault:?}"));
+                        return Err(FAULTED);
+                    }
+                    Err(refusal) => return Err(plan_error(refusal)),
+                };
+                match self.replica.publish(planned) {
+                    Ok(PublishOutcome::Published { effects, .. }) => Ok(effects),
+                    Ok(PublishOutcome::Parked { revision, .. }) => {
+                        // Parked under Volatile: the durability handshake
+                        // the core expects does not exist in this host.
+                        self.record_fault(format!(
+                            "publish parked under Stability::Volatile (revision {revision})"
+                        ));
+                        Err(FAULTED)
+                    }
+                    Err(PublishRefusal::IllegalCandidate(fault)) => {
+                        // The closed legality gate (or the planner-declared
+                        // breach) refused the candidate: the core faulted the
+                        // node and the next drive observes it. The return
+                        // code is unchanged (SERVICE, as every publish
+                        // refusal reports); the reason is the fix.
+                        self.record_fault(format!(
+                            "the legality gate refused the candidate: {fault:?}"
+                        ));
+                        Err(SERVICE)
+                    }
+                    Err(PublishRefusal::JournalRefused(error)) => {
+                        self.record_fault(format!(
+                            "the journal refused the planned mutation: {error:?}"
+                        ));
+                        Err(SERVICE)
+                    }
+                    Err(_) => Err(SERVICE),
                 }
             }));
             let effects = match result {
                 Ok(Ok(effects)) => effects,
                 Ok(Err(error)) => {
                     if error == FAULTED {
-                        // Parked under Volatile: the durability handshake the
-                        // core expects does not exist in this host. Poison.
+                        // The self-arrest: poison is sticky and every
+                        // further entry reports SERVICE — but never
+                        // silently. Say the arrest once, with the
+                        // recorded reason when the core named one.
+                        eprintln!(
+                            "lunet-advisory-lock: node self-arrested ({}); \
+                             every further entry reports SERVICE",
+                            self.fault_note
+                                .as_deref()
+                                .unwrap_or("the core refused a transition")
+                        );
                         self.poisoned = true;
                         self.outputs.clear();
                         return SERVICE;
                     }
                     return error;
                 }
-                Err(_) => {
+                Err(payload) => {
+                    // A panic unwound at the boundary: the default hook has
+                    // already printed it. Name the arrest with the payload
+                    // so the fault report carries it, then poison — an
+                    // unwound panic must never cross into C.
+                    let message = payload
+                        .downcast_ref::<String>()
+                        .cloned()
+                        .or_else(|| {
+                            payload
+                                .downcast_ref::<&str>()
+                                .map(|text| text.to_string())
+                        })
+                        .unwrap_or_else(|| "an unprintable panic".to_string());
+                    self.record_fault(format!("panic: {message}"));
+                    eprintln!(
+                        "lunet-advisory-lock: node self-arrested (panic); \
+                         every further entry reports SERVICE"
+                    );
                     self.poisoned = true;
                     self.outputs.clear();
                     return PANIC;
@@ -451,6 +526,21 @@ impl Node {
         }
         self.report();
         OK
+    }
+
+    /// The self-arrest bookkeeping: record the reason of the FIRST fault
+    /// observation and say it once, loudly. The core's never-repair
+    /// contract makes the fault sticky — every later drive repeats the
+    /// observation — so the first is the operator's only chance to see
+    /// WHY a node (and then, cascading, a cluster) stopped serving. The
+    /// note rides [`NodeStatus`] and the `lunet_lock_node_fault` ABI for
+    /// the runbook; the arrest itself is unchanged: poison is sticky and
+    /// every further entry reports SERVICE.
+    fn record_fault(&mut self, note: String) {
+        if self.fault_note.is_none() {
+            eprintln!("lunet-advisory-lock: the node self-arrests — {note}");
+            self.fault_note = Some(note);
+        }
     }
 
     /// The lifecycle/observability read after a quiet drive: the named
@@ -703,16 +793,23 @@ pub struct NodeOutput {
 /// One status snapshot for an embedded host (`Node::status`): the
 /// replication state (`0` normal, `1` view_change, `2` recovering,
 /// `3` replaying), the current view's primary as a member id (`u32::MAX`
-/// when unknown or void), the current view's era and view, and the folded
+/// when unknown or void), the current view's era and view, the folded
 /// configuration table's current era — the two eras differ exactly while a
 /// committed reconfiguration's establishing era awaits the view that
-/// enters it.
+/// enters it — whether the node has self-arrested, and the recorded
+/// reason when it has.
+#[derive(Debug)]
 pub struct NodeStatus {
     pub state: u32,
     pub leader: u32,
     pub era: u32,
     pub view: u32,
     pub config_era: u32,
+    /// Whether the node has self-arrested (the core's never-repair
+    /// fault, or a boundary panic): every further entry reports SERVICE.
+    pub poisoned: bool,
+    /// The self-arrest's recorded reason, when the arrest named one.
+    pub fault_note: Option<String>,
 }
 
 impl Node {
@@ -1037,6 +1134,8 @@ impl Node {
             era: snapshot.era,
             view: snapshot.view,
             config_era: self.replica.progress().config().current().era.0,
+            poisoned: self.poisoned,
+            fault_note: self.fault_note.clone(),
         }
     }
 
@@ -1687,6 +1786,7 @@ fn node_from_sink(
         pending: HashMap::new(),
         last_tick: 0,
         poisoned: false,
+        fault_note: None,
         reincarnate_from,
         known_ids,
         last_view: None,
@@ -1952,6 +2052,46 @@ pub unsafe extern "C" fn lunet_lock_node_leader_for_view(
     })
 }
 
+/// The self-arrest report: a node that has self-arrested (the core's
+/// never-repair fault, or a boundary panic) no longer serves — every
+/// further entry reports SERVICE — and the runbook needs the reason
+/// without restarting anything. Writes the recorded reason as a
+/// NUL-terminated string into `out_data` and its length (excluding the
+/// NUL) into `out_len`; a node that has not arrested reports OK with
+/// `out_len` 0. When the note does not fit `capacity`, the call reports
+/// TOO_LARGE and writes the needed size — the mirror of
+/// `lunet_lock_node_next`'s contract. The call never drives the node:
+/// observation only, valid on a poisoned node by design.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lunet_lock_node_fault(
+    node: *mut c_void,
+    out_data: *mut u8,
+    capacity: usize,
+    out_len: *mut usize,
+) -> i32 {
+    guarded(|| {
+        if node.is_null() || out_len.is_null() {
+            return INVALID;
+        }
+        let node = unsafe { &mut *node.cast::<Node>() };
+        let Some(note) = node.fault_note.as_deref() else {
+            unsafe { *out_len = 0 };
+            return OK;
+        };
+        unsafe { *out_len = note.len() };
+        if note.len() + 1 > capacity {
+            return TOO_LARGE;
+        }
+        if !out_data.is_null() {
+            unsafe {
+                ptr::copy_nonoverlapping(note.as_ptr(), out_data, note.len());
+                *out_data.add(note.len()) = 0;
+            }
+        }
+        OK
+    })
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lunet_lock_node_next(
     node: *mut c_void,
@@ -2139,6 +2279,7 @@ mod tests {
             pending: HashMap::new(),
             last_tick: 0,
             poisoned: false,
+            fault_note: None,
             reincarnate_from: None,
             known_ids: TEST_IDS.iter().copied().collect(),
             last_view: None,
@@ -2354,6 +2495,7 @@ mod tests {
             pending: HashMap::new(),
             last_tick: 0,
             poisoned: false,
+            fault_note: None,
             reincarnate_from: None,
             known_ids: genesis.iter().copied().chain([own]).collect(),
             last_view: None,
@@ -4690,5 +4832,222 @@ mod tests {
             OK
         );
         route_until_quiet(&mut nodes, &ids);
+    }
+
+    /// A self-arrested node names its fault. The never-repair contract is
+    /// unchanged — poison is sticky and every further entry reports
+    /// SERVICE — but the arrest is OBSERVABLE: the first fault
+    /// observation is recorded once (later observations of the same
+    /// sticky fault do not overwrite it), the status reports the
+    /// arrest, and the fault ABI returns the recorded reason. On the
+    /// run-4 rig (locks2, 2026-09-15) the voters self-arrested one by
+    /// one with code -7 and NO reason anywhere — the silent wedge this
+    /// test refuses. A genuine core fault cannot be manufactured
+    /// through the public API (faults require real breaches — the
+    /// rig's own lesson), so the recording seam is driven directly:
+    /// the observation path it serves is the drive's plan/publish
+    /// fault arms.
+    #[test]
+    fn a_self_arrested_node_names_its_fault() {
+        let mut node = provision("fault-report", TEST_IDS[0], 3);
+        // The first fault observation is recorded and exported.
+        node.record_fault("sticky fault: IllegalTransition".to_string());
+        assert_eq!(
+            node.status().fault_note.as_deref(),
+            Some("sticky fault: IllegalTransition"),
+            "the first observation is the recorded reason"
+        );
+        // The sticky fault repeats on every drive; only the first
+        // observation is kept.
+        node.record_fault("sticky fault: LaterBreach".to_string());
+        assert_eq!(
+            node.status().fault_note.as_deref(),
+            Some("sticky fault: IllegalTransition"),
+            "a later observation of the sticky fault never overwrites the first"
+        );
+        // The arrest itself: poison is sticky, every entry reports
+        // SERVICE, and the status says so.
+        node.poisoned = true;
+        assert_eq!(node.idle(), SERVICE);
+        let status = node.status();
+        assert!(status.poisoned, "the status reports the self-arrest");
+        assert_eq!(
+            status.fault_note.as_deref(),
+            Some("sticky fault: IllegalTransition")
+        );
+        // The ABI report — the runbook's live probe, valid on a
+        // poisoned node: a short buffer reports TOO_LARGE with the
+        // needed size, a fitting one receives the NUL-terminated reason.
+        let note = "sticky fault: IllegalTransition";
+        let mut short = [0u8; 4];
+        let mut len = 0usize;
+        assert_eq!(
+            unsafe {
+                lunet_lock_node_fault(
+                    (&raw mut node).cast(),
+                    short.as_mut_ptr(),
+                    short.len(),
+                    &mut len,
+                )
+            },
+            TOO_LARGE
+        );
+        assert_eq!(len, note.len(), "the needed size is reported");
+        let mut buf = vec![0u8; len + 1];
+        assert_eq!(
+            unsafe {
+                lunet_lock_node_fault(
+                    (&raw mut node).cast(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                    &mut len,
+                )
+            },
+            OK
+        );
+        assert_eq!(buf[len], 0, "the note is NUL-terminated");
+        assert_eq!(&buf[..len], note.as_bytes(), "the ABI reports the recorded reason");
+        // A node that has not arrested reports empty.
+        let mut fresh = provision("fault-report-clean", TEST_IDS[0], 3);
+        let mut len = 0usize;
+        assert_eq!(
+            unsafe {
+                lunet_lock_node_fault(
+                    (&raw mut fresh).cast(),
+                    std::ptr::null_mut(),
+                    0,
+                    &mut len,
+                )
+            },
+            OK
+        );
+        assert_eq!(len, 0, "a serving node reports no fault");
+    }
+
+    /// One client op committed through the named leader: propose, route to
+    /// quiescence, and require the committed frontier to advance.
+    fn commit_client_op(nodes: &mut [Node], ids: &[u32], leader: usize) {
+        static OP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let op = OP.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as u8;
+        let before = nodes[leader].replica.progress().committed();
+        assert_eq!(
+            request(&mut nodes[leader], &request_json(Uuid::from_bytes([op; 16]))),
+            OK,
+            "the serving leader accepts the op"
+        );
+        route_until_quiet(nodes, ids);
+        let after = nodes[leader].replica.progress().committed();
+        assert!(
+            after > before,
+            "the op committed through view {}: {before:?} -> {after:?}",
+            nodes[leader].replica.observer().read().view
+        );
+    }
+
+    /// The health bar every voter must clear after any fence: Normal
+    /// status, an unpoisoned request path (the leader accepts, a backup
+    /// refuses NOT_LEADER — a self-arrested node reports SERVICE), and a
+    /// committed frontier that still advances.
+    fn assert_cluster_serving(nodes: &mut [Node], ids: &[u32]) -> usize {
+        let mut leader = None;
+        for (index, node) in nodes.iter().enumerate() {
+            let snapshot = node.status();
+            assert_eq!(
+                snapshot.state,
+                0,
+                "member {index} must be Normal after the fence, got status {} era {} view {}",
+                snapshot.state, snapshot.era, snapshot.view
+            );
+            if snapshot.leader == node.replica.own().0 {
+                leader = Some(index);
+            }
+        }
+        for index in 0..nodes.len() {
+            let rc = request(&mut nodes[index], &request_json(Uuid::from_bytes([7; 16])));
+            assert!(
+                rc == OK || rc == NOT_LEADER,
+                "member {index} is serving after the fence: rc={rc} \
+                 (SERVICE/FAULTED is the silent self-arrest the run-4 rig died of)"
+            );
+        }
+        let leader = leader.expect("a Normal member leads the installed view");
+        route_until_quiet(nodes, ids);
+        commit_client_op(nodes, ids, leader);
+        leader
+    }
+
+    /// The phi actuation against a LIVE leader: a backup concludes the
+    /// primary is dead and forces the next view — the run-4 rig's first
+    /// fence of a long-settled cluster (the leader was never dead, only
+    /// suspected).
+    fn phi_fence_live_leader(nodes: &mut [Node], ids: &[u32], suspector: usize) {
+        let before = nodes[suspector].status();
+        let target = (before.era, before.view + 1);
+        assert_eq!(nodes[suspector].force_view(target.0, target.1), OK);
+        route_until_quiet(nodes, ids);
+        let after = nodes[suspector].status();
+        assert_eq!(
+            (after.state, after.view),
+            (0, target.1),
+            "the forced view installed"
+        );
+    }
+
+    /// THE run-4 kill#3 shape (locks2, 2026-09-15): a voter triad with a
+    /// weight-0 learner joined, long settled in its final era and serving
+    /// a client stream, meets its FIRST post-join view change — and then
+    /// the ping-pong the phi warm-up produces: a second forced view
+    /// within moments of the new view's install, then a third. On the rig
+    /// the voters then self-arrested one by one (the silent
+    /// FAULTED→SERVICE poison): the commit stream died mid-second, the
+    /// views churned 15→510 with zero commits, and the wire went silent.
+    /// The regression: every forced view installs Normal, no member
+    /// self-arrests, and the client stream commits through each new view.
+    #[test]
+    fn rapid_fences_with_learners_keep_the_voters_serving() {
+        let (mut nodes, ids) = boot_four_and_join();
+        // The era-completion fence: the cluster settles at era 2, view 1,
+        // with the caught-up weight-0 learner in the fan-out.
+        drive_fence(&mut nodes, &ids, 2);
+        assert_eq!(nodes[1].replica.observer().read().status, 0);
+
+        // The long-settled stream: committed client ops through the
+        // incumbent leader.
+        for _ in 0..20 {
+            commit_client_op(&mut nodes, &ids, 1);
+        }
+
+        // The first post-join fence of a healthy cluster: the live
+        // incumbent is suspected (never dead).
+        phi_fence_live_leader(&mut nodes, &ids, 0);
+        let leader = assert_cluster_serving(&mut nodes, &ids);
+        // The settled stream continues under the new view.
+        for _ in 0..5 {
+            commit_client_op(&mut nodes, &ids, leader);
+        }
+
+        // The ping-pong: the freshly installed leader is suspected within
+        // moments — twice.
+        phi_fence_live_leader(&mut nodes, &ids, 1);
+        let leader = assert_cluster_serving(&mut nodes, &ids);
+        for _ in 0..5 {
+            commit_client_op(&mut nodes, &ids, leader);
+        }
+        phi_fence_live_leader(&mut nodes, &ids, 2);
+        let leader = assert_cluster_serving(&mut nodes, &ids);
+        for _ in 0..5 {
+            commit_client_op(&mut nodes, &ids, leader);
+        }
+
+        // Every member agrees on the committed history and stays caught
+        // up — voters and the weight-0 learner alike.
+        let frontiers: Vec<_> = nodes
+            .iter()
+            .map(|node| node.replica.progress().committed())
+            .collect();
+        assert!(
+            frontiers.iter().all(|slot| *slot == frontiers[0]),
+            "the commit cascade reached every member: {frontiers:?}"
+        );
     }
 }
