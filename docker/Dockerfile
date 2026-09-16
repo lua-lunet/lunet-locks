@@ -28,10 +28,10 @@ COPY .cargo/config.toml /usr/local/cargo/config.toml
 COPY vendor /app/vendor
 COPY ext/uvrr-core/Cargo.toml /app/ext/uvrr-core/Cargo.toml
 COPY ext/lunet-locks-aof/Cargo.toml ext/lunet-locks-aof/build.rs /app/ext/lunet-locks-aof/
+COPY ext/lunet-locks-aof/src /app/ext/lunet-locks-aof/src
 COPY ext/advisory_lock/Cargo.toml ext/advisory_lock/Cargo.lock /app/ext/advisory_lock/
-RUN mkdir -p /app/ext/uvrr-core/src /app/ext/lunet-locks-aof/src /app/ext/advisory_lock/src \
+RUN mkdir -p /app/ext/uvrr-core/src /app/ext/advisory_lock/src \
     && printf '' > /app/ext/uvrr-core/src/lib.rs \
-    && printf '' > /app/ext/lunet-locks-aof/src/lib.rs \
     && printf '' > /app/ext/advisory_lock/src/lib.rs \
     && cargo build --release --locked --manifest-path /app/ext/advisory_lock/Cargo.toml
 
@@ -49,8 +49,8 @@ RUN cargo clean --release --manifest-path /app/ext/advisory_lock/Cargo.toml \
 # node, the lease-client control client, the lease-load traffic generator)
 # and the std-only rtt_probe. The demo crate needs let-chains (rustc 1.88+),
 # so this stage pins its own rust above the cdylib stage's 1.85 and vendors
-# from the demo crate's own Cargo.lock. It reuses the native stage's Zig
-# toolchain (same image target, same pin).
+# from the demo crate's own Cargo.lock. It consumes the same tagged AOF
+# artifact as the native adapter stage.
 FROM rust:1.98-slim AS demo
 
 ARG LUNET_LOCKS_HEAD=unknown
