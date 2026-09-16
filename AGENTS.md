@@ -13,6 +13,10 @@ Local guidance for this repo. Keep it short, factual, and unsurprising.
   gate commits on verified-green work, and use a `wip:` prefix until the
   feature set is complete. Where doing so does not overwrite any other
   instruction here or the user's stated preferences.
+- Item numbers are session-local: they live in the todo and the `.tmp/`
+  spec filename only. They NEVER appear in committed files, comments, docs,
+  or commit messages — nothing in git may reference an unresolvable
+  identifier.
 
 ## New user work lands as two todos at the end
 

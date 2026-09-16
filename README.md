@@ -105,6 +105,30 @@ sees — is the separate [Flight
 Recorder](docs/src/flight-recorder.md), a debug-level feature-flagged
 build, not a prod artifact.
 
+## Two capture planes, one replay tape
+
+The run produces two kinds of capture files, and both stream as the same
+`from,to,{json}` replay tape — one CSV line per record, the first two
+fields the endpoints, the JSON starting after the second comma — so the
+trivial shell filter `... | grep "^${from},${to},"` works on either plain
+output and the filtered lines force-feed a unit test's node through the
+same playback engine (`examples/lease-sequencer/tests/scenario/mod.rs`).
+
+| | The lock telemetry capture file | The Flight Recorder |
+| --- | --- | --- |
+| What it holds | the public, wire-visible events (wire datagrams, timeout decisions, state transitions, outbound queue, interval samples) | the node's private story: every drive outcome, fault, maybe, journal flush, and stop marker, plus the wire events byte-exact |
+| Where it runs | the separate non-voting telemetry nodes, off the critical path — no performance impact on the quorum | feature-flagged build (`flight-recorder`), never a prod release |
+| Format stability | stable-ish file formats for the UI | unstable internal format; captures hidden state that never goes on the wire |
+| Reader gate | none | the deep read requires reader commit == recording commit |
+
+The telemetry plane is the prod surface: always available, read by the
+console UI. The Flight Recorder is debug-only and same-commit-readable
+only: cross-commit, `skaffold_flight_tape` offers only the stable
+`from,to,jsonl` slice, while the deep read (`--deep`, or any kind beyond
+`wire`) is loudly refused — see [the Flight
+Recorder](docs/src/flight-recorder.md) for the from/to derivation rules
+each streamer prints in its `--help`.
+
 `ext/lunet-locks-aof` vendors the AOF (append-only write-behind log) from
 [tigerbeetle/tigerbeetle](https://github.com/tigerbeetle/tigerbeetle)
 release tag 0.17.9 as a stripped Zig source tree behind a C ABI and this

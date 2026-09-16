@@ -33,6 +33,18 @@ test -d "$root/ext/uvrr-core/src" || {
 mkdir -p "$context/ext/uvrr-core"
 cp "$root/ext/uvrr-core/Cargo.toml" "$context/ext/uvrr-core/Cargo.toml"
 cp -R "$root/ext/uvrr-core/src" "$context/ext/uvrr-core/src"
+# The vendored AOF subcrate: the adapter's lifecycle marker rides its
+# quorum-of-copies superblock, which is Zig source compiled by the pinned
+# 0.14.1 toolchain inside the image (the Zig toolchain the Dockerfile
+# installs). The context carries the subcrate's Rust wrapper and its zig/
+# source tree; the zig caches stay behind — they are build state, not
+# source.
+mkdir -p "$context/ext/lunet-locks-aof/zig"
+cp "$root/ext/lunet-locks-aof/Cargo.toml" "$root/ext/lunet-locks-aof/build.rs" \
+    "$context/ext/lunet-locks-aof/"
+cp "$root/ext/lunet-locks-aof/zig/build.zig" "$context/ext/lunet-locks-aof/zig/"
+cp -R "$root/ext/lunet-locks-aof/src" "$context/ext/lunet-locks-aof/src"
+cp -R "$root/ext/lunet-locks-aof/zig/src" "$context/ext/lunet-locks-aof/zig/src"
 # The diagnosis-kit stage builds the demo crate (the lease-sequencer node,
 # the lease-client control client, the lease-load traffic generator) and the
 # std-only rtt_probe. Its dependency closure comes from the demo crate's own
@@ -40,7 +52,7 @@ cp -R "$root/ext/uvrr-core/src" "$context/ext/uvrr-core/src"
 # resolve different versions, so they cannot share one vendor directory).
 mkdir -p "$context/examples/lease-sequencer" "$context/tools"
 cp "$root/examples/lease-sequencer/Cargo.toml" "$root/examples/lease-sequencer/Cargo.lock" \
-    "$context/examples/lease-sequencer/"
+    "$root/examples/lease-sequencer/build.rs" "$context/examples/lease-sequencer/"
 cp -R "$root/examples/lease-sequencer/src" "$context/examples/lease-sequencer/src"
 cp -R "$root/examples/lease-sequencer/config" "$context/examples/lease-sequencer/config"
 cp "$root/tools/rtt_probe.rs" "$context/tools/rtt_probe.rs"

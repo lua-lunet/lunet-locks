@@ -406,4 +406,58 @@ tested.test(
     end
 )
 
+tested.test(
+    "a stopped node refuses further entries and its marker records the clean drain",
+    function()
+        local paths: {string} = {}
+        local nodes: {advisory_lock.Node} = {}
+        for index = 1, #MEMBER_IDS do
+            paths[index] = state_path("stop" .. tostring(index))
+            os.remove(paths[index])
+            os.remove(paths[index] .. ".superblock")
+            nodes[index] = advisory_lock.new(
+                members(), "n" .. tostring(index), paths[index], "", 0
+            )
+        end
+        drain(nodes)
+        nodes[1]:idle()
+        route_until_quiet(nodes)
+        local ok_stop = nodes[1]:stop()
+        -- Idempotent: a second stop reports OK without rewriting anything.
+        local ok_again = nodes[1]:stop()
+        -- The drain point closed the wire: every further inbound entry
+        -- raises the mapped STOPPED error and processes nothing.
+        local refused_request = pcall(function() nodes[1]:request(GET_JSON) end)
+        local refused_receive = pcall(function() nodes[1]:receive(202, "\0\0\0\0") end)
+        local refused_idle = pcall(function() nodes[1]:idle() end)
+        close_cluster(nodes)
+        -- The compatibility projection: "<incarnation> flushed" — the
+        -- marker advanced past `stopped` only because the drain completed.
+        -- A clean boot's incarnation is 0.
+        local fh = io.open(paths[1], "r")
+        local marker = (fh ~= nil and fh:read("a")) or ""
+        if fh ~= nil then
+            fh:close()
+        end
+        tested.assert(
+            {
+                given = "a booted cluster whose leader is stopped through the graceful stop",
+                should = "refuse every further entry, stop idempotently, and leave the flushed marker",
+                expected = "true:true:false:false:false:0 flushed",
+                actual = tostring(ok_stop)
+                    .. ":"
+                    .. tostring(ok_again)
+                    .. ":"
+                    .. tostring(refused_request)
+                    .. ":"
+                    .. tostring(refused_receive)
+                    .. ":"
+                    .. tostring(refused_idle)
+                    .. ":"
+                    .. marker:gsub("\n$", ""),
+            }
+        )
+    end
+)
+
 return tested

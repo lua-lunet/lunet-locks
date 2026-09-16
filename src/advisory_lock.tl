@@ -32,6 +32,7 @@ ffi.cdef(
         uint32_t* slot_hi, uint32_t* slot_lo,
         uint8_t* message_id,
         size_t capacity, size_t* len, uint8_t* data);
+    int32_t lunet_lock_node_stop(void* node);
 ]]
 )
 
@@ -57,6 +58,7 @@ local errors: {integer: string} = {
     [-7] = "lock service execution failed",
     [-8] = "not the leader",
     [-9] = "replica faulted",
+    [-10] = "node stopped",
     [-127] = "native panic",
 }
 
@@ -89,6 +91,7 @@ local record Native
         {number},
         any
     ): number
+    lunet_lock_node_stop: function(any): number
 end
 
 local record DebugInfo
@@ -136,6 +139,7 @@ local record advisory_lock
         leader_for_view: function(Node, integer, integer): integer
         outputs: function(Node): {Output}
         close: function(Node): boolean
+        stop: function(Node): boolean
     end
 
     record Output
@@ -345,6 +349,22 @@ function Node:outputs(): {Output}
     end
 end
 
+-- The graceful stop, run ON the reference runtime's teardown machinery:
+-- the on_stop hook is the trigger, this FFI call is the implementation
+-- (the uVRR termination obligations host-side). The wire closes BEFORE
+-- any marker write, then the `stopped` marker, the sink drain to
+-- quiescence, and the `flushed` marker, in the contract's §2 write order.
+-- Synchronous and idempotent: a second call reports OK without
+-- rewriting anything.
+function Node:stop(): boolean
+    if self._handle == nil then
+        return true
+    end
+    return check(
+        (tonumber(native.lunet_lock_node_stop(self._handle)) or -127) as integer
+    )
+end
+
 function Node:close(): boolean
     if self._handle ~= nil then
         ffi.gc(self._handle, nil)
@@ -448,6 +468,7 @@ function M.new(
         leader_for_view = Node.leader_for_view,
         outputs = Node.outputs,
         close = Node.close,
+        stop = Node.stop,
     }
 end
 

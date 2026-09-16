@@ -39,6 +39,12 @@
 -- over the live member list the lock path uses: it never re-submits a
 -- message_id while its redirect/ack is in flight, and a NOT_LEADER
 -- redirect or a silent-leader window just advances the rotation.
+
+-- The deliberate-stop exit code the runtime reports at shutdown: 1 is the
+-- "no clean stop ran" default; only the TERM bridge (below) records 0 at
+-- the moment it hands the process to the v0.10.0 stop contract.
+global __lunet_exit_code: integer = 1
+
 local record DebugInfo
     source: string
 end
@@ -56,6 +62,7 @@ local cluster_config = require("cluster_config")
 local config = require("config")
 local lunet = require("lunet")
 local membership_guard = require("membership_guard")
+local signal = require("lunet.signal")
 local snapshot = require("snapshot")
 local socket = require("lunet.socket")
 local udp = require("lunet.udp")
@@ -293,6 +300,23 @@ local function main(options: Options)
     )
     own_id = node:own_id()
     log_membership(membership_log)
+    -- The v0.10.0 stop contract's drain point, wired to the reference
+    -- runtime's teardown machinery: the on_stop hook runs exactly once,
+    -- synchronous only, and the hosted node's graceful stop (wire close,
+    -- `stopped` marker, sink drain, `flushed` marker) executes there. No
+    -- Teal-side close machinery of our own runs outside this hook.
+    lunet.on_stop(
+        function()
+            log_membership(
+                "advisory-lock " .. options.node .. " stop: drain point reached"
+            )
+            node:stop()
+            node:close()
+            log_membership(
+                "advisory-lock " .. options.node .. " stop: node drained and flushed"
+            )
+        end
+    )
     local peer, peer_error = udp.bind(udp_host, udp_port)
     assert(peer ~= nil, "server: UDP bind failed: " .. (peer_error or "unknown"))
     local listener, listen_error = socket.listen("tcp", client_host, client_port)
@@ -1322,6 +1346,31 @@ local function main(options: Options)
     lunet.spawn(recovery_loop)
     lunet.spawn(discovery_loop)
     lunet.spawn(write_behind_loop)
+    -- The supported v0.10.0 signal bridge (the runtime's own mechanics,
+    -- not a private handler): arming the one-shot watcher overrides the
+    -- default SIGTERM disposition, the first TERM resumes this coroutine,
+    -- and the process hands itself to the stop contract — the deliberate
+    -- stop passes through the drain point above and exits with the
+    -- recorded clean-stop code. Without this bridge lunet-run kills the
+    -- process at the default disposition and no hook ever runs.
+    lunet.spawn(
+        function()
+            local signal_name, signal_error = signal.wait("TERM")
+            assert(
+                signal_error == nil,
+                "server: signal watch failed: " .. (signal_error or "unknown")
+            )
+            log_membership(
+                "advisory-lock "
+                    .. options.node
+                    .. " stop: "
+                    .. signal_name
+                    .. " received"
+            )
+            __lunet_exit_code = 0
+            lunet.stop()
+        end
+    )
     while true do
         if not guard:allows_client_operation() or not listener_open then
             lunet.sleep(1000)

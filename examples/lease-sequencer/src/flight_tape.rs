@@ -5,7 +5,7 @@
 //! SAME playback engine the telemetry tape feeds
 //! (`tests/scenario/mod.rs`).
 //!
-//! # The commit gate (the reader path's first duty)
+//! # The commit gate (the deep read's first duty)
 //!
 //! The FIRST record of every flight recording is the header naming the
 //! git commit the recording build was compiled from. A recording is
@@ -14,6 +14,13 @@
 //! recording (the `FLIGHT_RECORDER_ALLOW_DIRTY=1` build-time override)
 //! must be annotated loudly by the reader before any use. Debug-level
 //! tool: NO long-term readability is promised across commits.
+//!
+//! The gate binds the DEEP read (`--deep`, or any kind beyond `wire`):
+//! the full internal event log means nothing outside its commit. The
+//! stable `from,to,jsonl` slice (the wire kinds) still streams from any
+//! recording whose format this reader knows — cross-commit too,
+//! best-effort: the CSV shape is the stable surface, the bytes under it
+//! are not guaranteed.
 //!
 //! # The tape lines
 //!
@@ -163,19 +170,36 @@ pub fn read_events(path: &Path) -> Result<(Vec<FlightEvent>, u64), FlightError> 
 pub struct FlightTapeOptions {
     /// The node id to require (`--node N`); `None` accepts any header.
     pub node: Option<u32>,
-    /// Keep only lines whose derived `from` equals this.
+    /// Keep only lines whose derived `from` equals this. A `?` line is
+    /// dropped unless `from_any` — the telemetry tape's filter
+    /// semantics (item03's shape).
     pub from: Option<u32>,
-    /// Keep only lines whose derived `to` equals this.
+    pub from_any: bool,
+    /// Keep only lines whose derived `to` equals this. A `?` line is
+    /// dropped unless `to_any`.
     pub to: Option<u32>,
+    pub to_any: bool,
     /// The kinds to keep; empty keeps only the wire kinds (the playback
     /// surface). The literal kind `internal` adds every non-wire kind.
+    /// Naming anything beyond `wire` makes the read a DEEP read (the
+    /// commit gate applies).
     pub kinds: Vec<String>,
+    /// The deep read: the full internal event log — every event, wire
+    /// and internal, rendered with its `seq`, plus the header facts and
+    /// per-kind counts on stderr. Same-commit only: the commit gate
+    /// (`check_commit`) refuses a foreign commit loudly, before any
+    /// extraction. `--deep` is not narrowed by `--kinds`.
+    pub deep: bool,
 }
 
-/// Whether one event passes the extraction filters.
-fn keeps(kind: &str, from: &str, to: &str, options: &FlightTapeOptions, own: &str) -> bool {
+/// Whether one event passes the kind and node filters. The deep read
+/// streams every event; `--kinds` does not narrow it.
+fn keeps(kind: &str, options: &FlightTapeOptions, own: &str) -> bool {
     let wire = WIRE_KINDS.contains(&kind);
     let internal = !wire;
+    if options.deep {
+        return options.node.is_none_or(|node| own == node.to_string());
+    }
     if !options.kinds.is_empty() {
         let wanted = options.kinds.iter().any(|wanted| match wanted.as_str() {
             "wire" => wire,
@@ -193,15 +217,31 @@ fn keeps(kind: &str, from: &str, to: &str, options: &FlightTapeOptions, own: &st
             return false;
         }
     }
-    if let Some(from_want) = options.from
-        && from != from_want.to_string()
-    {
-        return false;
+    true
+}
+
+/// Whether the line passes the numeric endpoint filters — applied to the
+/// RENDERED endpoints, so the trivial shell filter `grep "^66,44,"` keeps
+/// exactly the lines the flags keep. A `?` endpoint is kept only when the
+/// corresponding `--*-any` flag allows it.
+fn keeps_endpoints(from: &str, to: &str, options: &FlightTapeOptions) -> bool {
+    if let Some(from_want) = options.from {
+        if from == "?" {
+            if !options.from_any {
+                return false;
+            }
+        } else if from != from_want.to_string() {
+            return false;
+        }
     }
-    if let Some(to_want) = options.to
-        && to != to_want.to_string()
-    {
-        return false;
+    if let Some(to_want) = options.to {
+        if to == "?" {
+            if !options.to_any {
+                return false;
+            }
+        } else if to != to_want.to_string() {
+            return false;
+        }
     }
     true
 }
@@ -240,7 +280,9 @@ pub fn event_tape_line(event: &FlightEvent, own_node: u32) -> Option<TapeLine> {
     // An inbound event's `from` is the sender the node's host named; the
     // recorder stamps the node's own id as the receiver in the tape's
     // `to` field. An emission's `to` is the recorded target and the
-    // sender is the node itself.
+    // sender is the node itself. The internal kinds render the record's
+    // own endpoints where the record carries them (the deep read's
+    // honest attribution), else the node's own story: to = the recorder.
     match event.kind.as_str() {
         "emit" => Some(TapeLine {
             from: own,
@@ -253,22 +295,35 @@ pub fn event_tape_line(event: &FlightEvent, own_node: u32) -> Option<TapeLine> {
             json: serde_json::Value::Object(json),
         }),
         _ => Some(TapeLine {
-            from: "?".to_string(),
-            to: own,
+            from,
+            to,
             json: serde_json::Value::Object(json),
         }),
     }
 }
 
 /// The recording's tape: one `from,to,{json}` line per kept event, in
-/// recording order. Returns the line count.
+/// recording order. Returns the line count. The commit gate applies to
+/// the DEEP read only (`--deep`, or any kind beyond `wire`): the stable
+/// `from,to,jsonl` slice streams from any recording whose format this
+/// reader knows — cross-commit too, best-effort (mangled lines are
+/// counted, never guessed).
 pub fn stream_recording(
     path: &Path,
     options: &FlightTapeOptions,
     out: &mut dyn std::io::Write,
 ) -> Result<(usize, u64), FlightError> {
     let header = read_header(path)?;
-    check_commit(&header, READER_COMMIT)?;
+    let deep = options.deep
+        || options
+            .kinds
+            .iter()
+            .any(|kind| kind != "wire" && !WIRE_KINDS.contains(&kind.as_str()));
+    if deep {
+        // The deep read exposes the node's private story: readable ONLY
+        // by the code as-at the recording's commit (item12's gate).
+        check_commit(&header, READER_COMMIT)?;
+    }
     if header.dirty {
         eprintln!(
             "skaffold_flight_tape: WARNING the recording carries dirty=true (an \
@@ -288,27 +343,41 @@ pub fn stream_recording(
     let (events, mangled) = read_events(path)?;
     let mut lines = 0usize;
     for event in &events {
-        let own = header.node.to_string();
-        let from = event
-            .detail
-            .get("from")
-            .and_then(|v| v.as_u64())
-            .map(|v| v.to_string())
-            .unwrap_or_else(|| "?".to_string());
-        let to = event
-            .detail
-            .get("to")
-            .and_then(|v| v.as_u64())
-            .map(|v| v.to_string())
-            .unwrap_or_else(|| own.clone());
-        if !keeps(&event.kind, &from, &to, options, &own) {
+        if !keeps(&event.kind, options, &header.node.to_string()) {
             continue;
         }
-        let Some(line) = event_tape_line(event, header.node) else {
+        let Some(mut line) = event_tape_line(event, header.node) else {
             continue;
         };
+        if !keeps_endpoints(&line.from, &line.to, options) {
+            continue;
+        }
+        if deep && let Some(map) = line.json.as_object_mut() {
+            map.insert("seq".into(), serde_json::Value::from(event.seq));
+        }
         lines += 1;
         writeln!(out, "{}", line.render()).map_err(|error| FlightError::Io(error.to_string()))?;
+    }
+    if deep {
+        let mut tally: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+        for event in &events {
+            *tally.entry(event.kind.clone()).or_insert(0) += 1;
+        }
+        let tally: Vec<String> = tally
+            .into_iter()
+            .map(|(kind, count)| format!("{kind}={count}"))
+            .collect();
+        eprintln!(
+            "skaffold_flight_tape: DEEP read commit={} dirty={} node={} format={}: \
+             events={} mangled={} kinds: {}",
+            header.commit,
+            header.dirty,
+            header.node,
+            header.format,
+            events.len(),
+            mangled,
+            tally.join(" ")
+        );
     }
     Ok((lines, mangled))
 }

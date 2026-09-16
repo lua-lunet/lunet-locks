@@ -114,3 +114,19 @@ console's data endpoint (`/feed/files` through the edge) returns them.
 
 Cluster cadence is unaffected: the stability assertions (renew ~250 ms, poll
 ~2× renewal) hold while the telemetry node's writer and the feed run.
+
+## The replay tape
+
+The capture series also feeds the replay story: `skaffold_aof_tape`
+streams a telemetry AOF directory as the `from,to,{json}` CSV tape — one
+line per record, in file order (epoch order = ns order) — and the trivial
+shell filter `... | grep "^66,99,"` reads any peer pair's raw jsonl
+stream. The filtered lines force-feed a node in the unit tests through
+the same playback engine the Flight Recorder's tape feeds
+([the Flight Recorder](flight-recorder.md)); its streamer
+(`skaffold_flight_tape`) renders the identical CSV shape over the
+internal recordings. The telemetry capture file is the stable-ish,
+prod, UI-facing plane; the Flight Recorder is the feature-flagged,
+debug-only plane whose internal format is unstable and whose deep read
+is same-commit-readable only. Each streamer's from/to derivation rules
+are printed in its `--help`.

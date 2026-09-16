@@ -178,7 +178,7 @@ takeover_lease_ms=60000
 request_lines 28102 "{\"op\":\"set\",\"message_id\":\"00000000-0000-0000-0000-000000000008\",\"client_id\":4,\"request_num\":1,\"lock_id\":9001,\"lease\":{\"lease_id\":4,\"holder\":\"$holder3\",\"lease_ms\":$takeover_lease_ms}}" '"granted":true' \
     || fail "the takeover grant failed"
 
-# A restarted replica reincarnates: the killed process left the running
+# A restarted replica reincarnates: the SIGKILLed process left the running
 # sentinel in its durable state file, so the restart classifies dirty, the
 # incarnation bumps (303 -> 303 + 1 * 16777216 = 16777519), the bumped node
 # announces Reincarnation(303, 16777519) on the VRR channel, and the leader
@@ -197,8 +197,13 @@ request_lines 28102 "{\"op\":\"set\",\"message_id\":\"00000000-0000-0000-0000-00
 # pre-restart lock state — committed truth, nothing fabricated by the
 # restart. The wait covers the fence (~5s of primary idle after the first
 # batch) plus the re-announce cadence (2.5s).
+# The crash shape is this stage's subject: SIGKILL (never the deliberate
+# stop, which the final stop-contract stage exercises) leaves the running
+# sentinel behind, no drain, no marker write — the dirty classification
+# the reincarnation way exists for.
 n3pid=$(cat "$work/n3.pid")
-stop_process "$n3pid"
+kill -KILL "$n3pid" 2>/dev/null || true
+wait "$n3pid" 2>/dev/null || true
 pids=$(printf '%s\n' "$pids" | sed "s/ $n3pid//")
 start n3 28103 27103
 sleep 10
@@ -439,6 +444,35 @@ echo "lunet smoke: live-reconfig stream [leave window]: requests=$1 max_latency=
 set -- $(window "$work/stream.out" 0 99999999999999)
 echo "lunet smoke: live-reconfig stream total: requests=$1 max_latency=${2}ms"
 echo "lunet smoke: live-reconfig timeline join=$((t_join_done - t_join_start))ms increment=$((t_inc_done - t_inc_start))ms decrement=$((t_dec_done - t_dec_start))ms leave=$((t_leave_done - t_leave_start))ms"
+
+# ---------------------------------------------------------------------------
+# The stop contract stage: the runtime's one-shot TERM watcher (armed by
+# the server at boot) hands each process to the deliberate stop, the
+# on_stop hook runs exactly once at the drain point, the node's graceful
+# stop writes the flushed marker, and the process exits 0. A TERM'd
+# replica therefore never dies at the default disposition (the old exit
+# 143) and never leaves the running sentinel behind.
+# ---------------------------------------------------------------------------
+for name in n1 n2 n3; do
+    pid=$(cat "$work/$name.pid")
+    kill "$pid" 2>/dev/null || fail "$name was already gone before the TERM stage"
+    status=0
+    wait "$pid" || status=$?
+    pids=$(printf '%s\n' "$pids" | sed "s/ $pid//")
+    [ "$status" -eq 0 ] ||
+        fail "$name exited $status on TERM (the drain point did not run clean)"
+    drains=$(grep -c "stop: drain point reached" "$work/$name.out" || true)
+    [ "$drains" -eq 1 ] ||
+        fail "$name ran the drain point $drains times (expected exactly once)"
+    [ "$(grep -c "node drained and flushed" "$work/$name.out")" -eq 1 ] ||
+        fail "$name did not record the completed node stop"
+    marker=$(cat "$work/$name.nonce")
+    case "$marker" in
+        *" flushed") ;;
+        *) fail "$name's state marker is not flushed: $marker" ;;
+    esac
+    echo "lunet smoke: $name stopped through the drain point (exit $status, marker: $marker)"
+done
 
 completed=true
 echo "lunet smoke: passed"

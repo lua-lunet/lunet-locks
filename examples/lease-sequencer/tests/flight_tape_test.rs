@@ -286,23 +286,359 @@ fn given_a_scenario_the_flight_tape_feeds_the_playback_engine() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The commit gate runs BEFORE any extraction: a foreign-commit recording
-/// streams nothing.
+/// The commit gate runs before any DEEP extraction: a foreign-commit
+/// recording refuses the deep read — `--deep` and every kind beyond
+/// `wire` alike — naming both sides.
 #[test]
-fn the_gate_refuses_before_any_extraction() {
+fn the_deep_read_refuses_a_foreign_commit_before_any_extraction() {
     let dir = temp_dir("gate-first");
     let recording = dir.join("flight-44.jsonl");
     write_recording(
         &recording,
         "cccccccccccccccccccccccccccccccccccccccc",
         44,
-        &[],
+        &[
+            json!({"seq": 1, "kind": "drive-out", "ts_ms": 1789214915001u64,
+                 "detail": {"code": 0}}),
+        ],
     );
+    let mut options = FlightTapeOptions::default();
+    options.kinds = vec!["internal".to_string()];
     let mut capture: Vec<u8> = Vec::new();
-    let error = stream_recording(&recording, &FlightTapeOptions::default(), &mut capture)
-        .expect_err("the gate refuses first");
+    let error = stream_recording(&recording, &options, &mut capture)
+        .expect_err("the deep read refuses first");
+    assert!(matches!(error, FlightError::CommitMismatch { .. }));
+    let mut options = FlightTapeOptions::default();
+    options.deep = true;
+    let error =
+        stream_recording(&recording, &options, &mut Vec::new()).expect_err("--deep is a deep read");
     assert!(matches!(error, FlightError::CommitMismatch { .. }));
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The stable `from,to,jsonl` slice is offered cross-commit: the wire
+/// kinds of a foreign-commit recording still stream (best-effort —
+/// mangled lines are counted, never guessed), while the deep read of the
+/// same recording refuses.
+#[test]
+fn the_stable_slice_streams_cross_commit_and_the_deep_read_does_not() {
+    let dir = temp_dir("cross-commit-slice");
+    let recording = dir.join("flight-44.jsonl");
+    let frame = prepare_frame();
+    write_recording(
+        &recording,
+        "dddddddddddddddddddddddddddddddddddddddd",
+        44,
+        &[
+            json!({"seq": 1, "kind": "receive-in", "ts_ms": 1789214915001u64,
+                   "detail": {"from": 66, "len": frame.len(), "hex": hex(&frame)}}),
+            json!({"seq": 2, "kind": "emit", "ts_ms": 1789214915002u64,
+                   "detail": {"kind": 1, "to": 66, "era": 1, "view": 0, "slot": 1,
+                              "len": 3, "hex": "aabb00"}}),
+        ],
+    );
+    let mut capture: Vec<u8> = Vec::new();
+    let (lines, mangled) =
+        stream_recording(&recording, &FlightTapeOptions::default(), &mut capture)
+            .expect("the slice streams cross-commit");
+    assert_eq!(mangled, 0);
+    assert_eq!(lines, 2, "both wire lines, cross-commit");
+    let text = String::from_utf8(capture).unwrap();
+    assert!(text.starts_with("66,44,"), "the CSV shape: {text:?}");
+    assert!(text.contains("44,66,"), "the emit's rendered endpoints");
+
+    let mut options = FlightTapeOptions::default();
+    options.kinds = vec!["internal".to_string()];
+    let error = stream_recording(&recording, &options, &mut Vec::new())
+        .expect_err("the deep read of a foreign commit refuses");
+    assert!(matches!(error, FlightError::CommitMismatch { .. }));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The deep read on the SAME commit: the full internal event log — every
+/// event rendered with its `seq`, the internal story included, and the
+/// default read of the same recording staying the slice only.
+#[test]
+fn the_deep_read_streams_the_full_internal_log_on_the_same_commit() {
+    let dir = temp_dir("deep");
+    let recording = dir.join("flight-44.jsonl");
+    write_recording(
+        &recording,
+        READER_COMMIT,
+        44,
+        &[
+            json!({"seq": 1, "kind": "receive-in", "ts_ms": 1789214915001u64,
+                   "detail": {"from": 66, "len": 5, "hex": "aabb00ccdd"}}),
+            json!({"seq": 2, "kind": "drive-out", "ts_ms": 1789214915002u64,
+                   "detail": {"code": 0}}),
+            json!({"seq": 3, "kind": "fault", "ts_ms": 1789214915003u64,
+                   "detail": {"what": "panic: tick regression", "arrest": true}}),
+            json!({"seq": 4, "kind": "journal", "ts_ms": 1789214915004u64,
+                   "detail": {"what": "internal lock-state flush", "kind": 1,
+                              "lock_id": 17}}),
+        ],
+    );
+    let mut options = FlightTapeOptions::default();
+    options.deep = true;
+    let mut capture: Vec<u8> = Vec::new();
+    let (lines, mangled) = stream_recording(&recording, &options, &mut capture)
+        .expect("the deep read streams on the same commit");
+    assert_eq!(mangled, 0);
+    assert_eq!(lines, 4, "every event, wire and internal");
+    let tape: Vec<(String, String, Value)> = String::from_utf8(capture)
+        .unwrap()
+        .lines()
+        .map(|line| parse_tape_line(line).expect("the line parses"))
+        .collect();
+    for (index, (from, _to, json)) in tape.iter().enumerate() {
+        assert_eq!(json["seq"], (index + 1) as u64, "the deep read stamps seq");
+        assert_eq!(
+            json["kind"],
+            ["receive-in", "drive-out", "fault", "journal"][index]
+        );
+        assert_eq!(
+            *from,
+            if index == 0 { "66" } else { "?" },
+            "the record's own 'from' renders, else '?'"
+        );
+    }
+    assert_eq!(tape[2].2["what"], "panic: tick regression");
+    assert_eq!(tape[3].2["lock_id"], 17);
+
+    let mut slice: Vec<u8> = Vec::new();
+    let (lines, _) = stream_recording(&recording, &FlightTapeOptions::default(), &mut slice)
+        .expect("the slice streams");
+    assert_eq!(lines, 1, "the default read stays the playback surface");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The `?` endpoints drop under `--from`/`--to` unless `--from-any`/
+/// `--to-any` — the telemetry tape's filter semantics (item03's shape).
+#[test]
+fn the_question_mark_endpoints_drop_unless_any() {
+    let dir = temp_dir("any-filters");
+    let recording = dir.join("flight-44.jsonl");
+    write_recording(
+        &recording,
+        READER_COMMIT,
+        44,
+        &[
+            // A receive-in with no recorded sender renders from='?'.
+            json!({"seq": 1, "kind": "receive-in", "ts_ms": 1789214915001u64,
+                   "detail": {"len": 3, "hex": "aabb00"}}),
+            json!({"seq": 2, "kind": "emit", "ts_ms": 1789214915002u64,
+                   "detail": {"kind": 1, "to": 66, "len": 3, "hex": "aabb00"}}),
+        ],
+    );
+    let mut options = FlightTapeOptions::default();
+    options.from = Some(44);
+    let mut capture: Vec<u8> = Vec::new();
+    let (lines, _) = stream_recording(&recording, &options, &mut capture).expect("streams");
+    assert_eq!(lines, 1, "the '?'-from line drops, the emit stays");
+    options.from_any = true;
+    let mut capture: Vec<u8> = Vec::new();
+    let (lines, _) = stream_recording(&recording, &options, &mut capture).expect("streams");
+    assert_eq!(lines, 2, "--from-any keeps the '?'-from line");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The endpoint filters apply to the RENDERED endpoints — what the
+/// trivial shell filter `grep "^10,66,"` keeps is exactly what
+/// `--from 10 --to 66` keeps, and `--from 10` alone keeps every rendered
+/// `10,...` line (the emission surface included).
+#[test]
+fn the_endpoint_filter_matches_the_rendered_line() {
+    let dir = temp_dir("grep-equivalence");
+    let recording = dir.join("flight-44.jsonl");
+    write_recording(
+        &recording,
+        READER_COMMIT,
+        44,
+        &[
+            json!({"seq": 1, "kind": "receive-in", "ts_ms": 1789214915001u64,
+                   "detail": {"from": 10, "len": 5, "hex": "aabb00ccdd"}}),
+            json!({"seq": 2, "kind": "emit", "ts_ms": 1789214915002u64,
+                   "detail": {"kind": 1, "to": 10, "len": 3, "hex": "aabb00"}}),
+            json!({"seq": 3, "kind": "emit", "ts_ms": 1789214915003u64,
+                   "detail": {"kind": 1, "to": 11, "len": 3, "hex": "aabb00"}}),
+        ],
+    );
+    let mut all: Vec<u8> = Vec::new();
+    stream_recording(&recording, &FlightTapeOptions::default(), &mut all)
+        .expect("the slice streams");
+    let rendered: Vec<String> = String::from_utf8(all)
+        .unwrap()
+        .lines()
+        .map(|line| line.to_string())
+        .collect();
+
+    for (from, to) in [
+        (10u32, Some(11u32)),
+        (10, Some(44)),
+        (44, Some(10)),
+        (10, None),
+    ] {
+        let mut options = FlightTapeOptions::default();
+        options.from = Some(from);
+        options.to = to;
+        let mut capture: Vec<u8> = Vec::new();
+        stream_recording(&recording, &options, &mut capture).expect("streams");
+        let kept: Vec<String> = String::from_utf8(capture)
+            .unwrap()
+            .lines()
+            .map(|line| line.to_string())
+            .collect();
+        let grepped: Vec<String> = rendered
+            .iter()
+            .filter(|line| {
+                let (line_from, line_to, _) = parse_tape_line(line).expect("the line parses");
+                line_from == from.to_string() && to.is_none_or(|want| line_to == want.to_string())
+            })
+            .cloned()
+            .collect();
+        assert_eq!(kept, grepped, "the filter matches the shell grep");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The item18 acceptance over a REAL flight recording: the feature-ON
+/// build records a live node (boot, promote, client request, emit,
+/// stop), the recording streams as the stable `from,to,jsonl` slice, the
+/// trivial shell filter's `grep "^10,11,"` matches the bin's endpoint
+/// filter exactly, and the extracted frames force-feed a second node
+/// through the SAME playback engine the telemetry tape feeds — the
+/// deterministic outcome asserted. Runs under the `flight-recorder`
+/// feature only (the capture needs the recorder compiled in).
+#[cfg(feature = "flight-recorder")]
+mod real_capture {
+    use super::*;
+    use lunet_advisory_lock::flight::FLIGHT_DIR_ENV;
+    use lunet_advisory_lock::{Node, OK};
+    use std::sync::Mutex;
+
+    /// The env var is process-global; serialized like the recorder
+    /// suite's own tests.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn given_a_feature_on_run_the_flight_tape_extracts_and_force_feeds_a_node() {
+        let guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = temp_dir("real-capture");
+        // SAFETY: the ENV_LOCK serializes every env access in this
+        // process; no other test in this suite reads the flight dir var.
+        unsafe {
+            std::env::set_var(FLIGHT_DIR_ENV, &dir);
+        }
+        let mut node = Node::open(
+            &["10:n1", "11:n2", "12:n3"].join("\0"),
+            "n1",
+            dir.join("state").to_str().unwrap(),
+            None,
+            0,
+        )
+        .expect("the recorded node boots");
+        assert_eq!(node.idle(), OK);
+        assert_eq!(
+            node.request(
+                &serde_json::to_vec(&lunet_advisory_lock::locks::Request::Get {
+                    message_id: uuid::Uuid::from_bytes([42; 16]),
+                    client_id: 11,
+                    request_num: 13,
+                    lock_id: 17,
+                })
+                .unwrap()
+            ),
+            OK
+        );
+        while node.next_output().is_some() {}
+        assert_eq!(node.stop(), OK);
+        unsafe {
+            std::env::remove_var(FLIGHT_DIR_ENV);
+        }
+        drop(guard);
+
+        let recording = dir.join("flight-10.jsonl");
+        // The stable slice, streamed from the REAL recording.
+        let mut capture: Vec<u8> = Vec::new();
+        let (lines, mangled) =
+            stream_recording(&recording, &FlightTapeOptions::default(), &mut capture)
+                .expect("the recording streams");
+        assert_eq!(mangled, 0, "the recording parses clean");
+        let text = String::from_utf8(capture).unwrap();
+        let tape: Vec<&str> = text.lines().collect();
+        assert!(lines > 0, "the run recorded events: {tape:?}");
+        for line in &tape {
+            let (from, to, json) = parse_tape_line(line).expect("every line parses");
+            assert!(from.parse::<u32>().is_ok() || from == "?");
+            assert!(to.parse::<u32>().is_ok() || to == "?");
+            assert!(
+                ["receive-in", "request-in", "emit"]
+                    .contains(&json["kind"].as_str().expect("the kind")),
+                "the default read stays the playback surface: {json}"
+            );
+        }
+
+        // The trivial shell filter's equivalence: what
+        // `skaffold_flight_tape --file F | grep "^10,11,"` yields is
+        // exactly what `--from 10 --to 11` keeps.
+        let grepped: Vec<&&str> = tape
+            .iter()
+            .filter(|line| line.starts_with("10,11,"))
+            .collect();
+        assert!(!grepped.is_empty(), "the leader emitted to 11: {tape:?}");
+        let mut options = FlightTapeOptions::default();
+        options.from = Some(10);
+        options.to = Some(11);
+        let mut filtered: Vec<u8> = Vec::new();
+        let (kept, _) = stream_recording(&recording, &options, &mut filtered)
+            .expect("the filtered stream runs");
+        assert_eq!(
+            kept as usize,
+            grepped.len(),
+            "the filter matches the shell grep: {} vs {:?}",
+            kept,
+            grepped
+        );
+
+        // Extraction → force-feed a second node through the SAME
+        // playback engine the telemetry tape feeds.
+        let frames: Vec<TapeFrame> = grepped
+            .iter()
+            .filter_map(|line| {
+                let (from, _to, json) = parse_tape_line(line)?;
+                tape_frame(from, json.clone())
+            })
+            .collect();
+        let scenario = Scenario::parse(
+            r#"{
+              "node_id": 11,
+              "name": "n2",
+              "membership": [
+                {"id": 10, "name": "n1", "weight": 1},
+                {"id": 11, "name": "n2", "weight": 1},
+                {"id": 12, "name": "n3", "weight": 1}
+              ],
+              "era": 1,
+              "view": 0
+            }"#,
+        )
+        .expect("the scenario parses");
+        let mut fed_node = scenario.open_node(&dir).expect("the fed node boots");
+        let result = feed_tape(&mut fed_node, &frames);
+        assert_eq!(
+            result.skipped_no_sender, 0,
+            "the flight tape attributes every frame"
+        );
+        assert!(result.fed >= 1, "the leader's emits force-feed: {result:?}");
+        assert!(
+            result.codes.get(&0).copied().unwrap_or(0) >= 1,
+            "the era-1 genesis prepares digest with OK: {:?}",
+            result.codes
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 /// Silence the unused-import warning when a helper is only used by one

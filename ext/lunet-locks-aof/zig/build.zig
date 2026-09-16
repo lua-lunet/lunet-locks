@@ -38,6 +38,13 @@ pub fn build(b: *std.Build) void {
         .root_module = srcs_module,
         .version = std.SemanticVersion{ .major = 0, .minor = 1, .patch = 0 },
     });
+    // Stack-probing codegen (x86_64-linux safety) calls __zig_probe_stack
+    // from compiler_rt. Library artifacts do not bundle compiler_rt by
+    // default, so every consumer that links these artifacts (the Rust
+    // rlib embedding the archive, the cdylib's own dynamic links) must get
+    // the probe symbol from inside the artifact itself, or the link
+    // succeeds only to fault at load/call time.
+    cdylib.bundle_compiler_rt = true;
     b.installArtifact(cdylib);
 
     // The same ABI as a static archive: the advisory-lock adapter links the
@@ -49,6 +56,7 @@ pub fn build(b: *std.Build) void {
         .name = "lunet_locks_aof",
         .root_module = srcs_module,
     });
+    static_lib.bundle_compiler_rt = true;
     b.installArtifact(static_lib);
 
     const tests = b.addTest(.{

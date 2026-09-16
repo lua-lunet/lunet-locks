@@ -2346,22 +2346,25 @@ pub unsafe extern "C" fn lunet_lock_node_receive(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lunet_lock_node_idle(node: *mut c_void) -> i32 {
     // Heartbeat tick. The tag has a single liveness input, Input::Tick;
-    // there is no separate idle input.
+    // there is no separate idle input. The routed method carries the
+    // drain point's STOPPED gate: a drive here must not bypass it.
     guarded(|| unsafe {
         node.cast::<Node>()
             .as_mut()
-            .map_or(INVALID, |node| node.drive(Input::Tick))
+            .map_or(INVALID, |node| node.idle())
     })
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lunet_lock_node_leader_timeout(node: *mut c_void) -> i32 {
     // Election tick: same Input::Tick — tick-driven suspicion is the tag's
-    // only view-change trigger (ViewChangeKnobs::primary_timeout).
+    // only view-change trigger (ViewChangeKnobs::primary_timeout). The
+    // routed method carries the drain point's STOPPED gate: a drive here
+    // must not bypass it.
     guarded(|| unsafe {
         node.cast::<Node>()
             .as_mut()
-            .map_or(INVALID, |node| node.drive(Input::Tick))
+            .map_or(INVALID, |node| node.leader_timeout())
     })
 }
 

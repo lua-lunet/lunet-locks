@@ -7,10 +7,28 @@
 # tooling packages and the demo crate's binaries from the kit stage.
 FROM rust:1.85-slim AS native
 
+# The adapter's lifecycle marker rides the vendored AOF's quorum-of-copies
+# superblock, whose store compiles through the pinned Zig 0.14.1 toolchain
+# (the repo's mise pin). Both Rust stages carry the x86_64-linux toolchain
+# in-image: the gate target builds the linux/amd64 (x86) image, and the
+# Zig sources are compiled at build time inside each Rust stage.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl xz-utils \
+    && rm -rf /var/lib/apt/lists/* \
+    && curl --fail --location --retry 3 \
+        "https://ziglang.org/download/0.14.1/zig-x86_64-linux-0.14.1.tar.xz" \
+        --output /tmp/zig.tar.xz \
+    && echo "24aeeec8af16c381934a6cd7d95c807a8cb2cf7df9fa40d359aa884195c4716c  /tmp/zig.tar.xz" | sha256sum -c - \
+    && mkdir -p /opt/zig \
+    && tar -xJf /tmp/zig.tar.xz -C /opt/zig --strip-components=1 \
+    && rm -f /tmp/zig.tar.xz
+ENV LUNET_LOCKS_AOF_ZIG=/opt/zig/zig
+
 WORKDIR /app/ext/advisory_lock
 COPY .cargo/config.toml /usr/local/cargo/config.toml
 COPY vendor /app/vendor
 COPY ext/uvrr-core /app/ext/uvrr-core
+COPY ext/lunet-locks-aof /app/ext/lunet-locks-aof
 COPY ext/advisory_lock /app/ext/advisory_lock
 RUN cargo build --release --locked
 
@@ -18,13 +36,18 @@ RUN cargo build --release --locked
 # node, the lease-client control client, the lease-load traffic generator)
 # and the std-only rtt_probe. The demo crate needs let-chains (rustc 1.88+),
 # so this stage pins its own rust above the cdylib stage's 1.85 and vendors
-# from the demo crate's own Cargo.lock.
+# from the demo crate's own Cargo.lock. It reuses the native stage's Zig
+# toolchain (same image target, same pin).
 FROM rust:1.98-slim AS demo
+
+COPY --from=native /opt/zig /opt/zig
+ENV LUNET_LOCKS_AOF_ZIG=/opt/zig/zig
 
 WORKDIR /app
 COPY .cargo/config-demo.toml /usr/local/cargo/config.toml
 COPY vendor-demo /app/vendor-demo
 COPY ext/uvrr-core /app/ext/uvrr-core
+COPY ext/lunet-locks-aof /app/ext/lunet-locks-aof
 COPY ext/advisory_lock /app/ext/advisory_lock
 COPY examples/lease-sequencer /app/examples/lease-sequencer
 COPY tools/rtt_probe.rs /app/tools/rtt_probe.rs
