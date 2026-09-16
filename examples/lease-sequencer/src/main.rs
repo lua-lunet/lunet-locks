@@ -185,6 +185,14 @@ struct Host {
     reincarnated: bool,
     driver: Driver,
     forwarded_from: HashMap<[u8; 16], (SocketAddr, u64)>,
+    /// Forwarded verbs whose committed ack arrived after this node had
+    /// already dropped the claim — by design on the driver's churn gate
+    /// (the transition pause drops the pending), by discipline on the op
+    /// deadline or a FORWARD_NOT_LEADER refusal, or on the TCP conn's
+    /// own deadline. Each late ack is drained and counted here: the
+    /// lease lapses and a fresh grant re-acquires it, so the ack's
+    /// result is dead on arrival and never a fault.
+    late_acks: u64,
     conns: Vec<Conn>,
     /// The membership model: advisory evidence, never a consensus
     /// mechanism. It boots from the membership sidecar next to the
@@ -1744,6 +1752,7 @@ fn main() {
         reincarnated: incarnation > 0,
         driver,
         forwarded_from: HashMap::new(),
+        late_acks: 0,
         conns: Vec::new(),
         model,
         sidecar,
@@ -2169,10 +2178,20 @@ fn handle_packet(
                     let _ = conn.stream.write_all(b"\n");
                     let _ = conn.stream.flush();
                 } else {
-                    maybe_invariant!(
-                        "ack for an unclaimed verb (message_id={}, len={})",
-                        uuid::Uuid::from_bytes(message_id),
-                        payload.len()
+                    // The late ack: the verb's claim was already gone —
+                    // by design on the driver's churn gate (the
+                    // transition pause drops the pending long before the
+                    // leader's committed reply can arrive), by
+                    // discipline on the op deadline or a
+                    // FORWARD_NOT_LEADER refusal, or on the TCP conn's
+                    // own deadline. The lease lapses and a fresh grant
+                    // re-acquires it, so the ack's result is dead on
+                    // arrival: drained and counted, never a fault.
+                    host.late_acks += 1;
+                    tracing::warn!(
+                        message_id = %uuid::Uuid::from_bytes(message_id),
+                        len = payload.len(),
+                        "late ack for an unclaimed verb drained"
                     );
                 }
             }
@@ -2653,6 +2672,7 @@ mod forward_tests {
                 pending: None,
             },
             forwarded_from: HashMap::new(),
+            late_acks: 0,
             conns: Vec::new(),
             model,
             sidecar,
@@ -2829,6 +2849,7 @@ mod forward_tests {
         one_follower_set_scenario();
         one_leader_local_scenario();
         one_refusal_scenario();
+        one_churn_late_ack_scenario();
     }
 
     fn one_follower_get_scenario() {
@@ -2862,6 +2883,97 @@ mod forward_tests {
         let (mut a, mut b, mut rng) = harness();
         let line = round_trip(&mut a, &mut b, &mut rng, false, &get_request(800_002, 1));
         ok_reply(&line);
+    }
+
+    /// The four-panic regression: a follower's forwarded driver op is
+    /// pending when era churn takes the node out of NORMAL and the
+    /// driver's churn gate drops the pending (the host's design pause,
+    /// `driver_step`) — and the leader's committed FORWARD_RESPONSE
+    /// arrives afterwards. The late ack must not abort the node: two
+    /// dead voters kill the cluster.
+    fn one_churn_late_ack_scenario() {
+        let (mut a, mut b, mut rng) = harness();
+        assert!(
+            b.host.node.status().leader != b.host.own_id,
+            "harness shape: b follows"
+        );
+        // One driver op on b: propose (refused NOT_LEADER), forward to
+        // the leader, pending armed (the route_op forward path).
+        let mid_uuid = uuid::Uuid::new_v4();
+        let mid = *mid_uuid.as_bytes();
+        let json = format!(
+            "{{\"op\":\"get\",\"message_id\":\"{mid_uuid}\",\"client_id\":{},\
+             \"request_num\":1,\"lock_id\":{LOCK_ID}}}",
+            b.host.driver.client_id
+        );
+        let rc = b.host.node.request(json.as_bytes());
+        assert_ne!(rc, OK, "b's proposal is refused (it is not the leader)");
+        b.host.route_op(rc, Op::Get, &json, mid, millis(), &mut rng);
+        assert!(
+            b.host.driver.pending.is_some(),
+            "the forward route armed the pending"
+        );
+
+        // Drive the commit forward with the churn wedged into the
+        // op's flight: pump a (it accepts the FORWARD_REQUEST and
+        // proposes), pump b (its PrepareOk routes back), then the
+        // churn takes b out of NORMAL and the churn gate drops the
+        // pending — then pump a again: the commit completes and the
+        // FORWARD_RESPONSE datagram lands in b's socket buffer, and
+        // only then does b pump the ack.
+        let now = millis();
+        pump_udp(&mut a.host, now, &mut rng);
+        pump_tcp(&mut a.host, now, &mut rng);
+        a.host.discovery_step(now);
+        let _ = a.host.node.idle();
+        a.host.flush_outputs(now, &mut rng);
+        let now = millis();
+        pump_udp(&mut b.host, now, &mut rng);
+        pump_tcp(&mut b.host, now, &mut rng);
+        b.host.discovery_step(now);
+        let _ = b.host.node.idle();
+        b.host.flush_outputs(now, &mut rng);
+
+        // The churn: the forced view takes b out of NORMAL, and the
+        // driver's churn gate drops the pending (the host's design).
+        let status = b.host.node.status();
+        assert_eq!(
+            b.host.node.force_view(status.era, status.view + 1),
+            OK,
+            "the forced view takes b into the view-change window"
+        );
+        b.host.driver_step(millis(), &mut rng);
+        assert!(
+            b.host.driver.pending.is_none(),
+            "the churn gate dropped the pending (the host's design)"
+        );
+
+        // The leader completes the forwarded op's commit; the ack lands
+        // in b's socket buffer. Event-driven: pump a until its
+        // forwarded table is drained (the reply emit removes the row).
+        let ack_deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !a.host.forwarded_from.is_empty() {
+            assert!(
+                std::time::Instant::now() < ack_deadline,
+                "the leader never emitted the committed reply"
+            );
+            let now = millis();
+            pump_udp(&mut a.host, now, &mut rng);
+            pump_tcp(&mut a.host, now, &mut rng);
+            a.host.discovery_step(now);
+            let _ = a.host.node.idle();
+            a.host.flush_outputs(now, &mut rng);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        // The late ack arrives. The node must NOT abort: the ack drains
+        // into the counter.
+        pump_udp(&mut b.host, millis(), &mut rng);
+        assert_eq!(
+            b.host.late_acks,
+            1,
+            "the late ack was drained and counted, not aborted on"
+        );
     }
 
     fn one_refusal_scenario() {
