@@ -159,3 +159,15 @@ no volume mounts, no platform emulation at any step):
   live in `testing-on-cloud.md`, linked from the main `README.md` as
   "Testing On Cloud" — the cloud is not named.
 - The mandatory pre-release cluster cycle lives in `softball-run.md`.
+
+## Tag names
+
+- Sanity-check builds (the gate: does it compile) are tagged
+  `lunet-locks:latest`.
+- Release builds (binaries) are tagged `lunet-locks:<git-tag>`.
+- The optimised builder image (layered OS base / toolchain-deps / code
+  layers, shared cross-project build cache on the VM disk with the
+  deps-drift `repo_branch.json` export, vendored Zig built in a GitHub
+  Action and layered in as a cdylib) is maintained OUTSIDE this
+  repository's scope: docker builds are not deployed to the cloud rigs,
+  and the builder-image work is owned elsewhere.
