@@ -33,7 +33,7 @@ A node opts in per node via `LUNET_FLIGHT_RECORDER_DIR`; the reader is
 
 ## The build-confirmation gate
 
-`make build-proof` is MANDATORY before every cloud test run. We test
+`make sanity` is MANDATORY before every cloud test run. We test
 head-of-push — the cluster never runs through CI, so no pipeline ever
 stands between a commit and the rig — and the gate is what stops a run
 from shipping a "only builds on my laptop" commit. It is a build
@@ -47,44 +47,37 @@ The target, in order:
    never the working tree;
 2. asserts a Docker daemon is reachable (on macOS: `colima start`,
    `docker context use colima`);
-3. runs the local build (`make build`);
-4. assembles the disposable vendored context and builds the Dockerfile
-   for **x86 (linux/amd64)**, whatever the host architecture is;
-5. verifies the built image is `linux/amd64` — a non-x86 image is not a
-   build proof for the cloud rig — and prints the verdict with the HEAD
-   commit hash.
-
-The macOS mechanics: colima runs an aarch64 VM, so an x86 build runs the
-`RUN` steps under the registered emulation. One-time (and again after
-every `colima start`, the VM kernel does not keep it):
-
-```console
-docker run --privileged --rm tonistiigi/binfmt --install amd64
-```
-
-The builder is the default (BuildKit) builder. The Dockerfile itself
-stays compatible with the legacy builder — no BuildKit-only syntax — but
-on Docker Engine 29.x the legacy builder cannot target linux/amd64 at
-all: it silently builds the daemon's own architecture, which is exactly
-the failure the gate's image-architecture assertion exists to catch.
-
-The vendored context carries the Rust dependency sources, the
-`ext/uvrr-core` submodule, and the `ext/lunet-locks-aof` subcrate (Rust
-wrapper and Zig source). The image installs the pinned Zig 0.14.1
-x86_64-linux toolchain (SHA-256 verified) because the adapter's
-lifecycle marker compiles the AOF superblock through it in-image, and
-downloads and SHA-256 verifies its own Lunet v0.10.0 runtime.
+3. runs the fastbuild sanity payload in colima:
+   `cargo check` for BOTH linux triples (`aarch64-unknown-linux-gnu`
+   natively, `x86_64-unknown-linux-gnu` cross-built natively by rustc —
+   never an emulated build target, never a qemu `--platform`), the
+   adapter cdylib and the rig crate, the prod and flight-recorder
+   shapes, against the classic manifests-first deps layer cache;
+4. prints the verdict with the HEAD commit hash. There is no binfmt
+   registration anywhere in this flow, and no BuildKit
+   (`DOCKER_BUILDKIT=0` throughout). The mechanics — the
+   manifests-first deps layer, the cross gcc linker kit, the AOF zig
+   target override — are in [build-and-release.md](build-and-release.md).
 
 ## The release gate
 
 The softball run is MANDATORY before any release: a green softball
 recording from the cloud rig — clean node restart, leader restart with
 takeover, crash-stop reincarnation, and a complete teardown record —
-precedes every release. Its step 0 is the build-confirmation gate: the
-tree committed at HEAD and a Docker x86 (linux/amd64) image build of that
-commit succeeding, so no release is cut from a "only builds on my laptop"
-commit. The method and its acceptance gates are in
-[the softball run](softball-run.md).
+precedes every release. Its step 0 is the build-confirmation gate:
+`make sanity` (above) — the tree committed at HEAD and the colima
+cross-check of that commit passing, so no release is cut from a
+"only builds on my laptop" commit. The method and its acceptance gates
+are in [the softball run](softball-run.md).
+
+The RELEASE dual-arch image gate is `make build-proof`: the two linux
+architecture images built from the committed tree, each carrying BOTH
+binaries (prod and flight-recorder), with the native cross mechanics —
+the x86 binaries are built natively by rustc in the aarch64 container,
+and the amd64 image is assembled COPY-only on the amd64 base image
+(no amd64 code runs at build time; no qemu anywhere). The full flow,
+including the ghcr.io push, is `make release-images TAG=vX.Y.Z`; the
+mechanics are in [build-and-release.md](build-and-release.md).
 
 ## Commands
 
@@ -100,7 +93,9 @@ make simulation      # 30s TCP-NDJSON three-datacenter lease failover demo
 make simulation-test # focused std-Rust simulator unit tests
 make docker-build    # plain Docker image, including Linux Lunet v0.10.0
 make docker-simulation # the same 30s simulation against a stable Docker cluster
-make build-proof     # the build-confirmation gate: clean commit + x86 image build
+make sanity          # the build-confirmation gate: clean commit + colima cross-check both triples
+make build-proof     # the RELEASE dual-arch image gate (prod + flight binaries, no qemu)
+make release-images TAG=vX.Y.Z # the full release image flow, through the ghcr.io push
 make docs            # render the Zensical site
 ```
 
@@ -177,4 +172,7 @@ generated HTML under `docs/site/`.
 | `src/server.tl` | TCP NDJSON server, UDP peers, leader forwarding, reconfiguration drives |
 | `tests/lunet_smoke.sh` | three-process runtime smoke test with restart and live-reconfiguration stages |
 | `tools/lease_failover_sim.rs` | std-Rust live TCP lease-failover simulator |
+| `docker/Dockerfile.fastbuild` | the colima build stages: deps-layer cache, the sanity check payload, the release artifacts, the amd64 rootfs staging |
+| `docker/Dockerfile.release` | the release image (both cdylib shapes + both node binaries + the pinned runtime) |
+| `tools/release_images.sh` | the release flow: gate, flight builds, dual-arch image assembly, ghcr.io push |
 | `docs/src/softball-run.md` | the mandatory pre-release softball run: profile, phases, gates, checklist |

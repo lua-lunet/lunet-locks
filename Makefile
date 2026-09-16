@@ -38,7 +38,7 @@ CHECK_SOURCES = tests/teal_learning_test.tl \
 # plus the client-signal behavioural smoke.
 SIGNAL_BIN := examples/lease-sequencer/bin
 
-.PHONY: init deps build check test smoke simulation simulation-test lunet-runtime docs clean ext ext-check ext-test fmt lint hooks sh-check sh-smoke docker-build docker-simulation build-proof package package-verify
+.PHONY: init deps build check test smoke simulation simulation-test lunet-runtime docs clean ext ext-check ext-test fmt lint hooks sh-check sh-smoke docker-build docker-simulation sanity release-images build-proof package package-verify
 
 init:
 	@command -v mise >/dev/null 2>&1 || { echo "ERROR: mise is not on PATH. Install it from https://mise.jdx.dev and try again."; exit 1; }
@@ -133,18 +133,22 @@ docker-build: build lunet-runtime
 docker-simulation: docker-build $(SIM_BIN)
 	SIM_BIN=$(abspath $(SIM_BIN)) DOCKER_IMAGE=$(DOCKER_IMAGE) DOCKER_PLATFORM=$(DOCKER_PLATFORM) SIM_DURATION=$(SIM_DURATION) tests/docker_simulation.sh
 
-# The build-confirmation gate: MANDATORY before every cloud test run.
+# The build-confirmation gate: MANDATORY before every cloud test run
+# (see docs/src/testing-on-cloud.md and docs/src/build-and-tests.md).
 # (1) The tree is clean and the work is a commit at HEAD — no run ever
-# ships from a dirty tree. (2) A Docker x86 (linux/amd64) image build of
-# exactly that commit succeeds. This is a build confirmation, not a
-# deployment and not testing: nothing is deployed and nothing from the
-# image is run — the build IS the proof that the commit does not rely on
-# the laptop. We test head-of-push, so no CI covers this; the gate does.
-# The verdict and the commit hash print last; tee them into the run dir.
-BUILD_PROOF_IMAGE ?= lunet-advisory-lock:build-proof
-BUILD_PROOF_PLATFORM ?= linux/amd64
+# ships from a dirty tree. (2) The fastbuild sanity payload runs inside
+# colima: `cargo check` for BOTH linux triples (aarch64 native + x86
+# cross-built natively by rustc — there is no emulated RUN step and no
+# binfmt registration anywhere), every crate, the prod and
+# flight-recorder shapes, against the classic manifests-first deps
+# layer cache (no BuildKit; there are no volume mounts — artifacts leave
+# via `docker create` + `docker cp` when a stage produces them).
+# This is a build confirmation, not a deployment and not testing:
+# nothing is deployed and nothing from the image is run — the build IS
+# the proof that the commit does not rely on the laptop. The verdict and
+# the commit hash print last; tee them into the run dir.
 
-build-proof:
+sanity:
 	@test -z "$$(git status --porcelain)" || { \
 		echo "ERROR: the tree is dirty. Commit the work first (the gate ships HEAD, never the working tree):" >&2; \
 		git status --short >&2; exit 1; \
@@ -152,18 +156,32 @@ build-proof:
 	docker version >/dev/null 2>&1 || { \
 		echo "ERROR: docker daemon not reachable. On macOS start colima first (colima start; docker context use colima)." >&2; exit 1; \
 	}; \
-	$(MAKE) build; \
-	context=$$(mktemp -d "$(CURDIR)/.tmp/docker-context.XXXXXX"); \
-	tools/docker_prepare_context.sh "$$context" || exit 1; \
-	docker build --platform $(BUILD_PROOF_PLATFORM) -f "$$context/docker/Dockerfile" -t $(BUILD_PROOF_IMAGE) "$$context" || { \
-		rm -rf "$$context"; exit 1; \
-	}; \
-	rm -rf "$$context"; \
-	image=$$(docker image inspect --format '{{.Os}}/{{.Architecture}}' $(BUILD_PROOF_IMAGE)); \
-	[ "$$image" = "$(BUILD_PROOF_PLATFORM)" ] || { \
-		echo "ERROR: built image is $$image, expected $(BUILD_PROOF_PLATFORM). A non-x86 image is not a build proof for the cloud rig." >&2; exit 1; \
-	}; \
-	echo "BUILD CONFIRMATION: $(BUILD_PROOF_IMAGE) $$(docker image inspect --format '{{.Os}}/{{.Architecture}}' $(BUILD_PROOF_IMAGE)) built from commit $$(git rev-parse --short=12 HEAD). Nothing deployed, nothing run from the image — the build is the proof."
+	env DOCKER_BUILDKIT=0 docker build \
+		--build-arg LUNET_LOCKS_HEAD=$$(git rev-parse HEAD) \
+		--target check -t lunet-locks:sanity \
+		-f docker/Dockerfile.fastbuild .; \
+	echo "SANITY: cargo check green on colima for aarch64-unknown-linux-gnu + x86_64-unknown-linux-gnu (cdylib + rig crates, prod and flight-recorder shapes) at commit $$(git rev-parse --short=12 HEAD). Nothing deployed, nothing run from the image — the build is the proof."
+
+# The RELEASE dual-arch image gate (docs/src/build-and-release.md):
+# both linux architecture images built from the committed tree, each
+# carrying BOTH binaries (prod and flight-recorder), with the native
+# cross mechanics inside the fastbuild stages: the x86 binaries are
+# built natively by rustc in the aarch64 container, and the amd64 IMAGE
+# is assembled COPY-only on the amd64 base image — no amd64 code ever
+# runs at build time, no qemu, no emulation, no BuildKit. This replaces
+# the old emulated x86 image build as the release proof; `make sanity`
+# (above) remains the pre-cloud gate.
+build-proof:
+	tools/release_images.sh local
+
+# The full release flow (docs/src/build-and-release.md): a clean tree at
+# the tag, the gate + flight builds, the dual-arch images, and the
+# ghcr.io push via gh (RELEASE_PUSH=--push or no credentials, the flow
+# does everything short of the push).
+TAG ?=
+release-images:
+	@test -n "$(TAG)" || { echo "ERROR: usage: make release-images TAG=vX.Y.Z [RELEASE_PUSH=--push]" >&2; exit 64; }; \
+	tools/release_images.sh $(TAG) $(RELEASE_PUSH)
 
 # Native extensions: one Rust crate per directory under ext/.
 ext: ext-test

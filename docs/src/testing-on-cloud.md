@@ -14,10 +14,24 @@ infrastructure. The cloud is not named.
    sanity build passes, that is the gate to cloud deploy. See
    [build-and-release.md](build-and-release.md) for the mechanics.
 3. **The cloud binaries must have `maybe!` on and the flight recorder
-   tracing enabled.** The rig builds only the flight-recorder binary
+   enabled.** The rig builds only the flight-recorder binary
    (dev profile: optimisations off, recorder on); it does NOT do a
    release build. Cache is maximised on the rig's own disk; the target
-   platform for cloud tests is x86 linux.
+   platform for cloud tests is x86 linux. The rig command shape (the
+   dev-profile recorder builds; recorded nodes opt in per node via
+   `LUNET_FLIGHT_RECORDER_DIR`):
+
+   ```console
+   cargo build --features flight-recorder       # dev profile, x86 linux target
+   cargo build --features flight-recorder -p lease-sequencer
+   ```
+
+   x86 linux rigs run it natively; any other build host passes the
+   triple (`--target x86_64-unknown-linux-gnu`) and links through the
+   cross gcc kit per [build-and-release.md](build-and-release.md) —
+   never an emulated run. The recorder build's clean-commit guard is the
+   adapter's build script: a checkout supplies git directly, the Docker
+   flows stamp `LUNET_LOCKS_HEAD` (the gate-asserted commit).
 
 ## The build-confirmation gate
 

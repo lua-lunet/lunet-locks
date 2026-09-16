@@ -1,0 +1,44 @@
+# The release image: built for the daemon's own architecture by the
+# classic builder, carrying everything a node needs: the pinned Lunet
+# v0.10.0 runtime, the Cyan service tree, the prebuilt adapter cdylib in
+# BOTH shapes (prod and flight-recorder — swappable per node via the
+# LUNET_ADVISORY_LOCK_LIB environment), and the release lease-sequencer
+# binaries for the rig. The context is the staging directory the release
+# script assembles (tools/release_images.sh): the fastbuild artifacts
+# (cross-built for the x86 shape — built natively in the aarch64 image),
+# the build tree, and the entrypoint. No BuildKit features.
+FROM debian:bookworm-slim
+
+ARG LUNET_VERSION=v0.10.0
+WORKDIR /app
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl libgcc-s1 libluajit-5.1-2 libstdc++6 libuv1 chrony tcpdump iperf3 netcat-openbsd procps \
+    && rm -rf /var/lib/apt/lists/* \
+    && case "$(dpkg --print-architecture)" in \
+        amd64) archive=lunet-linux-amd64.tar.gz; sha=979acc8669d644fd2276d328016f7a54916b444b652452abd6cd16fcbbe8ba94 ;; \
+        arm64) archive=lunet-linux-arm64.tar.gz; sha=e651a9d7b75a53be631a74f5f7fffd332f8a2f3e388170385686369fe0c51d3f ;; \
+        *) echo "unsupported Linux architecture: $(dpkg --print-architecture)" >&2; exit 1 ;; \
+    esac \
+    && curl --fail --location --retry 3 "https://github.com/lua-lunet/lunet/releases/download/${LUNET_VERSION}/${archive}" --output /tmp/lunet.tar.gz \
+    && echo "${sha}  /tmp/lunet.tar.gz" | sha256sum -c - \
+    && mkdir -p /opt/lunet \
+    && tar -xzf /tmp/lunet.tar.gz -C /opt/lunet \
+    && test -x /opt/lunet/lunet-run \
+    && rm -f /tmp/lunet.tar.gz
+
+# The prebuilt release payloads (the fastbuild image's extraction):
+#   lib/          the adapter cdylib — prod plus the flight-recorder variant
+#   demo/bin/     the lease-sequencer node binary — prod and flight variants
+COPY lib /app/lib
+COPY demo /app/demo/bin
+COPY build /app/build
+COPY docker/entrypoint.sh /app/docker/entrypoint.sh
+COPY docker/cluster.jsonl /app/docker/cluster.jsonl
+RUN chmod 755 /app/docker/entrypoint.sh
+
+# The prod cdylib is the default load; a single node swaps to the
+# flight-recorder cdylib by overriding LUNET_ADVISORY_LOCK_LIB (plus its
+# LUNET_FLIGHT_RECORDER_DIR) — one recorder node in the cluster without a
+# release rebuild.
+ENV LUNET_ADVISORY_LOCK_LIB=/app/lib/liblunet_advisory_lock.so
+ENTRYPOINT ["/app/docker/entrypoint.sh"]

@@ -23,22 +23,51 @@ fn main() {
         println!("cargo:rustc-link-arg-bins=-Wl,-rpath,{lib_dir}");
     }
 
-    let commit = String::from_utf8(
-        Command::new("git")
-            .args(["rev-parse", "HEAD"])
-            .output()
-            .expect("the reader names its commit; this tree is a git checkout")
-            .stdout,
-    )
-    .expect("utf-8 commit hash")
-    .trim()
-    .to_string();
+    let (commit, dirty) = head_state();
     println!("cargo:rustc-env=FLIGHT_COMMIT={commit}");
+    println!("cargo:rustc-env=FLIGHT_DIRTY={}", u8::from(dirty));
+}
+
+/// The HEAD hash and whether the working tree carries uncommitted
+/// changes.
+///
+/// Unavailable git (no checkout in the build environment) falls back to
+/// the `"unknown"`/dirty shape instead of failing: the clean-commit
+/// gate belongs to the adapter crate's build script (see
+/// `ext/advisory_lock/build.rs`), which owns the feature flag this
+/// reader annotates.
+///
+/// The Docker build context is the committed-tree snapshot with `.git`
+/// excluded, so git is unavailable in-image. The fastbuild/release gate
+/// asserts the clean-commit state before the build and hands the commit
+/// it ships through `LUNET_LOCKS_HEAD`; that value wins over git when
+/// set (and the gate is the authority — a change might be in flight in
+/// the checking-out tree, which is exactly what the gate refuses).
+fn head_state() -> (String, bool) {
+    if let Some(commit) = std::env::var_os("LUNET_LOCKS_HEAD").and_then(|value| {
+        let value = value
+            .into_string()
+            .expect("utf-8 commit hash")
+            .trim()
+            .to_string();
+        if value.is_empty() { None } else { Some(value) }
+    }) {
+        return (commit, false);
+    }
+
+    let commit = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .map(|output| String::from_utf8(output.stdout).expect("utf-8 commit hash").trim().to_string())
+        .expect("the flight reader names its commit; a build with git unavailable is a Docker context, which carries LUNET_LOCKS_HEAD");
     let dirty = !Command::new("git")
         .args(["status", "--porcelain"])
         .output()
-        .expect("git status")
-        .stdout
-        .is_empty();
-    println!("cargo:rustc-env=FLIGHT_DIRTY={}", u8::from(dirty));
+        .map(|output| {
+            !String::from_utf8(output.stdout)
+                .expect("utf-8 git status")
+                .is_empty()
+        })
+        .expect("git status");
+    (commit, dirty)
 }

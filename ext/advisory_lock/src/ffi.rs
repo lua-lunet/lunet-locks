@@ -3246,6 +3246,96 @@ mod tests {
         );
     }
 
+    /// The phi/timeout plane meets the drain point
+    /// (`docs/src/phi-and-timeouts.md`): a node sits inside a
+    /// view-change window — the host's `timedout` toggle is armed, the
+    /// randomized cluster viewchange timeout polls through ticks — and
+    /// the drain point runs there. The wire closes at the drain: every
+    /// later tick refuses STOPPED, so the viewchange timeout's poll
+    /// cannot fire, and the toggle's fresh-commit resume cannot happen —
+    /// proposals refuse too, so no commit can enter after the drain. The
+    /// in-memory state stays exactly inside the window (final), the
+    /// flushed marker makes the next boot a clean continue under the
+    /// same incarnation, and the window does not survive the restart.
+    #[test]
+    fn a_stop_inside_the_view_change_window_ends_the_toggle_resume_after_the_drain() {
+        let mut nodes = boot_cluster();
+        for node in nodes.iter_mut() {
+            assert_eq!(node.recover(), OK);
+        }
+        route_until_quiet(&mut nodes, &TEST_IDS);
+        let before = nodes[1].replica.observer().read();
+        assert_eq!(before.status, 0, "the cluster converged");
+
+        // A committed operation so the window's history is nontrivial,
+        // then the host suspects the primary: the backup enters the
+        // view-change window (the phi fence's first phase, item19's
+        // trigger with zero wait).
+        assert_eq!(
+            request(&mut nodes[0], &request_json(Uuid::from_bytes([64; 16]))),
+            OK
+        );
+        route_until_quiet(&mut nodes, &TEST_IDS);
+        let target = ViewId {
+            era: Era(before.era),
+            view: View(before.view + 1),
+        };
+        assert_eq!(nodes[1].force_view(target.era.0, target.view.0), OK);
+        let window = nodes[1].replica.observer().read();
+        assert_eq!(
+            (window.status, window.era, window.view),
+            (1, before.era, target.view.0),
+            "the node sits inside the view-change window"
+        );
+
+        // The host plane's toggle capture inside the window (the
+        // timeout-toggle event, item19's shape).
+        nodes[1].note_timeout_toggle(true, 5_000, Some(4_000));
+
+        // The drain point inside the window: the wire closes, the state
+        // is final AT the window, and the markers land.
+        assert_eq!(nodes[1].stop(), OK);
+        let after = nodes[1].replica.observer().read();
+        assert_eq!(
+            (after.status, after.era, after.view),
+            (1, before.era, target.view.0),
+            "the state is final inside the window"
+        );
+        // The viewchange timeout's poll is tick-driven: both ticks
+        // refuse, so the randomized timeout cannot resume the window.
+        assert_eq!(nodes[1].idle(), STOPPED);
+        assert_eq!(nodes[1].leader_timeout(), STOPPED);
+        // The toggle's fresh-commit resume is commit-driven: the
+        // proposals refuse too, so no fresh commit can land after the
+        // drain. The wire is closed to inbound reads as well.
+        assert_eq!(
+            request(&mut nodes[1], &request_json(Uuid::from_bytes([65; 16]))),
+            STOPPED
+        );
+        assert_eq!(receive(&mut nodes[1], TEST_IDS[0], &[0u8; 16]), STOPPED);
+        assert_eq!(
+            fs::read_to_string(&nodes[1].state_path).unwrap(),
+            "0 flushed\n",
+            "the drain point's flushed marker"
+        );
+
+        // The next boot is a clean continue under the same incarnation:
+        // no bump, no reincarnation, and no window to resume.
+        let path = nodes[1].state_path.clone();
+        let members = "10:a\x0020:b\x0030:c";
+        drop(nodes);
+        let node =
+            Node::open(members, "b", path.to_str().unwrap(), None, 0).expect("clean continue");
+        assert_eq!(
+            node.own_id(),
+            TEST_IDS[1],
+            "no DIRTY bump after a stop inside the view-change window"
+        );
+        assert_eq!(node.status().state, 2, "the reopened node boots fenced");
+        fs::remove_file(&path).unwrap();
+        fs::remove_file(marker_store::superblock_path(&path)).unwrap();
+    }
+
     /// The joiner member of the four-node tests: id 40, booted the joiner
     /// way — a later life over the deployment's genesis, fenced
     /// `Recovering`, addressed, and outside every configuration until a

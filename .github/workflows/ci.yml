@@ -120,9 +120,11 @@ jobs:
         run: make docs
       # Tagged builds only: package the per-platform release archive from the
       # tree that just passed test + smoke, for publish-release to attach.
-      # Windows is excluded: the Lua loader has no .dll suffix handling, so
-      # there is no loadable Windows artifact to ship (see the reduced-scope
-      # Windows step below).
+      # The archive carries BOTH cdylib shapes (the package script builds the
+      # flight-recorder variant itself — a clean tagged checkout satisfies
+      # its clean-commit guard). Windows is excluded: the Lua loader has no
+      # .dll suffix handling, so there is no loadable Windows artifact to
+      # ship (see the reduced-scope Windows step below).
       - name: Package release archive
         if: github.ref_type == 'tag' && matrix.platform != 'windows'
         shell: bash

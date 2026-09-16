@@ -1,0 +1,247 @@
+# The fastbuild image: the sanity payload (cargo check for BOTH linux
+# triples) and the release artifact stage (the optimised binaries, prod
+# and flight-recorder shapes, both triples). All of it runs natively in
+# an aarch64 container: rustc emits x86 codegen natively, clang+lld link
+# through the cross sysroot, and the vendored AOF's zig compiles its
+# target with -Dtarget (see ext/lunet-locks-aof/build.rs). No RUN step
+# in this image executes x86 code, so no emulation (binfmt) is ever
+# needed, and the classic non-BuildKit layer cache is the cache: the
+# manifests-first deps stage survives until a lockfile or member
+# manifest changes, source changes recompile only our crates.
+#
+# Stages:
+#   toolchain  rust + the x86 cross-linker kit + the AOF zig toolchain
+#   deps       manifests-first stub build: all dependencies, both triples
+#   check      the sanity payload `make sanity` runs (--target check)
+#   release    optimised libs + binaries, prod and flight shapes
+#   artifacts  /out/: the release payload laid out for extraction
+#   rootfs     the amd64 runtime rootfs, pre-assembled for the x86 image
+#
+# Usage (context is the repo root; no host mounts, no BuildKit:
+#   docker build -f docker/Dockerfile.fastbuild --target check \
+#                --build-arg LUNET_LOCKS_HEAD=$(git rev-parse HEAD) \
+#                -t lunet-locks:sanity .
+#   docker build -f docker/Dockerfile.fastbuild --target artifacts \
+#                --build-arg LUNET_LOCKS_HEAD=$(git rev-parse HEAD) \
+#                -t lunet-locks:artifacts .
+#   docker create --name fastbuild lunet-locks:artifacts
+#   docker cp fastbuild:/out ./release-staging
+#   docker rm fastbuild
+FROM rust:1-slim AS toolchain
+
+# The x86 cross-linker kit: the cross gcc driver suite (runs natively on
+# aarch64, emits and links x86 through its own sysroot — the crt objects
+# and target libgcc included). Nothing emulates. The aarch64 triple
+# links natively in-image.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates curl xz-utils file crossbuild-essential-amd64 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN rustup target add aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu
+
+# Cross-link config: rustc invokes the cross gcc driver, which resolves
+# the x86 target's crt objects and libgcc from its own paths (link-time
+# only — cargo check never links).
+RUN printf '[target.x86_64-unknown-linux-gnu]\nlinker = "x86_64-linux-gnu-gcc"\n' \
+    > /usr/local/cargo/config.toml
+
+# The vendored AOF's build script runs the pinned Zig 0.14.1 (the mise
+# pin) at cargo build-script time. The toolchain below is the aarch64
+# zig, which runs natively in this image.
+RUN mkdir -p /opt/zig \
+    && curl --fail --location --retry 3 \
+        "https://ziglang.org/download/0.14.1/zig-aarch64-linux-0.14.1.tar.xz" \
+        --output /tmp/zig.tar.xz \
+    && echo "f7a654acc967864f7a050ddacfaa778c7504a0eca8d2b678839c21eea47c992b  /tmp/zig.tar.xz" | sha256sum -c - \
+    && tar -xJf /tmp/zig.tar.xz -C /opt/zig --strip-components=1 \
+    && rm -f /tmp/zig.tar.xz
+ENV LUNET_LOCKS_AOF_ZIG=/opt/zig/zig
+
+# Sanity profile: no optimisation, no debug info, no incremental — while
+# debug_assertions stays ON (the maybe! tripwires still execute). The
+# workload is IO-bound; compile speed beats codegen speed.
+ENV CARGO_PROFILE_DEV_OPT_LEVEL=0 \
+    CARGO_PROFILE_DEV_DEBUG=0 \
+    CARGO_INCREMENTAL=0
+
+# The commit the build stamps (FLIGHT_COMMIT): the docker context is the
+# committed-tree snapshot (git is excluded), so the gate passes HEAD
+# through this build arg — a flight build's build.rs refuses an unnamed
+# commit, by design (the clean-commit assert runs before any docker
+# build).
+ARG LUNET_LOCKS_HEAD=unknown
+ENV LUNET_LOCKS_HEAD=${LUNET_LOCKS_HEAD}
+
+FROM toolchain AS deps
+
+# The dependencies layer: every member manifest (the layer's cache key)
+# plus the dependency sources — uvrr-core resolves through the [patch]
+# section to the submodule copy; the AOF crate with its zig/ tree is a
+# dependency of the adapter. The internal crates' Cargo.lock files are
+# deliberately untracked (.gitignore, `ext/*/Cargo.lock` — internal FFI
+# components resolve like CI does, unpinned lockless); the example
+# crate's lockfile IS tracked and pinned (--locked); cargo writes the
+# internal crates' resolved locks inside the image (they are a copy in
+# the layer, not repo truth). Both triples compile on top of empty stub
+# sources, so a source change recompiles only the three own crates.
+WORKDIR /srv
+COPY ext/uvrr-core ext/uvrr-core
+COPY ext/lunet-locks-aof/Cargo.toml ext/lunet-locks-aof/build.rs \
+     ext/lunet-locks-aof/
+COPY ext/lunet-locks-aof/src ext/lunet-locks-aof/src
+COPY ext/lunet-locks-aof/zig ext/lunet-locks-aof/zig
+COPY ext/advisory_lock/Cargo.toml ext/advisory_lock/
+COPY examples/lease-sequencer/Cargo.toml examples/lease-sequencer/Cargo.lock \
+     examples/lease-sequencer/build.rs \
+     examples/lease-sequencer/
+RUN mkdir -p ext/advisory_lock/src examples/lease-sequencer/src \
+    && printf '' > ext/advisory_lock/src/lib.rs \
+    && printf '' > examples/lease-sequencer/src/lib.rs \
+    && printf 'fn main() {}\n' > examples/lease-sequencer/src/main.rs \
+    && cargo check --manifest-path ext/advisory_lock/Cargo.toml \
+        --target aarch64-unknown-linux-gnu \
+    && LUNET_LOCKS_AOF_TARGET=x86_64-linux-gnu \
+        cargo check --manifest-path ext/advisory_lock/Cargo.toml \
+        --target x86_64-unknown-linux-gnu \
+    && cargo check --locked --manifest-path examples/lease-sequencer/Cargo.toml \
+        --target aarch64-unknown-linux-gnu \
+    && LUNET_LOCKS_AOF_TARGET=x86_64-linux-gnu \
+        cargo check --locked --manifest-path examples/lease-sequencer/Cargo.toml \
+        --target x86_64-unknown-linux-gnu
+
+# The sanity payload: exactly what `make sanity` runs (the cdylib crate
+# and the rig binary crate; flight-recorder ON — the recorder gate's
+# types; the prod shape differs by nothing the checker sees). The stubs
+# are replaced by the real sources; the dependency layer is reused as-is.
+FROM deps AS check
+WORKDIR /srv
+COPY . .
+RUN cargo check --manifest-path ext/advisory_lock/Cargo.toml \
+        --target aarch64-unknown-linux-gnu \
+    && cargo check --manifest-path ext/advisory_lock/Cargo.toml \
+        --features flight-recorder \
+        --target aarch64-unknown-linux-gnu \
+    && LUNET_LOCKS_AOF_TARGET=x86_64-linux-gnu \
+        cargo check --manifest-path ext/advisory_lock/Cargo.toml \
+        --target x86_64-unknown-linux-gnu \
+    && LUNET_LOCKS_AOF_TARGET=x86_64-linux-gnu \
+        cargo check --manifest-path ext/advisory_lock/Cargo.toml \
+        --features flight-recorder \
+        --target x86_64-unknown-linux-gnu \
+    && cargo check --locked --manifest-path examples/lease-sequencer/Cargo.toml \
+        --target aarch64-unknown-linux-gnu \
+    && cargo check --locked --manifest-path examples/lease-sequencer/Cargo.toml \
+        --features flight-recorder \
+        --target aarch64-unknown-linux-gnu \
+    && LUNET_LOCKS_AOF_TARGET=x86_64-linux-gnu \
+        cargo check --locked --manifest-path examples/lease-sequencer/Cargo.toml \
+        --target x86_64-unknown-linux-gnu \
+    && LUNET_LOCKS_AOF_TARGET=x86_64-linux-gnu \
+        cargo check --locked --manifest-path examples/lease-sequencer/Cargo.toml \
+        --features flight-recorder \
+        --target x86_64-unknown-linux-gnu
+
+# The release payload: the flight-recorder shape first (its artifacts
+# are moved aside), then the prod shape recompiles over it — the shared
+# target dir keeps every dependency compiled once per triple.
+FROM deps AS release
+WORKDIR /srv
+COPY . .
+RUN mkdir -p /srv/staging/arm64-flight /srv/staging/amd64-flight \
+    && cargo build --release --manifest-path ext/advisory_lock/Cargo.toml \
+        --features flight-recorder \
+        --target aarch64-unknown-linux-gnu \
+    && cargo build --release --locked --manifest-path examples/lease-sequencer/Cargo.toml \
+        --features flight-recorder \
+        --target aarch64-unknown-linux-gnu \
+    && cp ext/advisory_lock/target/aarch64-unknown-linux-gnu/release/liblunet_advisory_lock.so \
+        /srv/staging/arm64-flight/liblunet_advisory_lock_flight.so \
+    && cp examples/lease-sequencer/target/aarch64-unknown-linux-gnu/release/lease-sequencer \
+        /srv/staging/arm64-flight/ \
+    && LUNET_LOCKS_AOF_TARGET=x86_64-linux-gnu \
+        cargo build --release --manifest-path ext/advisory_lock/Cargo.toml \
+        --features flight-recorder \
+        --target x86_64-unknown-linux-gnu \
+    && LUNET_LOCKS_AOF_TARGET=x86_64-linux-gnu \
+        cargo build --release --locked --manifest-path examples/lease-sequencer/Cargo.toml \
+        --features flight-recorder \
+        --target x86_64-unknown-linux-gnu \
+    && LUNET_LOCKS_AOF_TARGET=x86_64-linux-gnu \
+        cp ext/advisory_lock/target/x86_64-unknown-linux-gnu/release/liblunet_advisory_lock.so \
+        /srv/staging/amd64-flight/liblunet_advisory_lock_flight.so \
+    && LUNET_LOCKS_AOF_TARGET=x86_64-linux-gnu \
+        cp examples/lease-sequencer/target/x86_64-unknown-linux-gnu/release/lease-sequencer \
+        /srv/staging/amd64-flight/ \
+    && cargo build --release --manifest-path ext/advisory_lock/Cargo.toml \
+        --target aarch64-unknown-linux-gnu \
+    && cargo build --release --locked --manifest-path examples/lease-sequencer/Cargo.toml \
+        --target aarch64-unknown-linux-gnu \
+    && cp ext/advisory_lock/target/aarch64-unknown-linux-gnu/release/liblunet_advisory_lock.so \
+        /srv/staging/arm64-flight/liblunet_advisory_lock_prod.so \
+    && cp examples/lease-sequencer/target/aarch64-unknown-linux-gnu/release/lease-sequencer \
+        /srv/staging/arm64-flight/lease-sequencer-prod \
+    && LUNET_LOCKS_AOF_TARGET=x86_64-linux-gnu \
+        cargo build --release --manifest-path ext/advisory_lock/Cargo.toml \
+        --target x86_64-unknown-linux-gnu \
+    && LUNET_LOCKS_AOF_TARGET=x86_64-linux-gnu \
+        cargo build --release --locked --manifest-path examples/lease-sequencer/Cargo.toml \
+        --target x86_64-unknown-linux-gnu \
+    && LUNET_LOCKS_AOF_TARGET=x86_64-linux-gnu \
+        cp ext/advisory_lock/target/x86_64-unknown-linux-gnu/release/liblunet_advisory_lock.so \
+        /srv/staging/amd64-flight/liblunet_advisory_lock_prod.so \
+    && LUNET_LOCKS_AOF_TARGET=x86_64-linux-gnu \
+        cp examples/lease-sequencer/target/x86_64-unknown-linux-gnu/release/lease-sequencer \
+        /srv/staging/amd64-flight/lease-sequencer-prod
+
+FROM release AS artifacts
+# The extraction layout is the release flow's contract:
+#   /out/aarch64/{prod,flight}/   the native container's payloads
+#   /out/amd64/{prod,flight}/     the cross-built (native-in-aarch64)
+#                                 payloads for the amd64 image
+#   /out/build/                   the Cyan tree the image runs
+# Nothing here runs x86 code: the artifacts stage only copies.
+RUN mkdir -p /out/aarch64 /out/amd64 \
+    && cp /srv/staging/arm64-flight/liblunet_advisory_lock_prod.so \
+        /out/aarch64/liblunet_advisory_lock.so \
+    && cp /srv/staging/arm64-flight/liblunet_advisory_lock_flight.so \
+        /out/aarch64/liblunet_advisory_lock_flight.so \
+    && cp /srv/staging/arm64-flight/lease-sequencer-prod \
+        /out/aarch64/lease-sequencer \
+    && cp /srv/staging/arm64-flight/lease-sequencer \
+        /out/aarch64/lease-sequencer-flight \
+    && cp /srv/staging/amd64-flight/liblunet_advisory_lock_prod.so \
+        /out/amd64/liblunet_advisory_lock.so \
+    && cp /srv/staging/amd64-flight/liblunet_advisory_lock_flight.so \
+        /out/amd64/liblunet_advisory_lock_flight.so \
+    && cp /srv/staging/amd64-flight/lease-sequencer-prod \
+        /out/amd64/lease-sequencer \
+    && cp /srv/staging/amd64-flight/lease-sequencer \
+        /out/amd64/lease-sequencer-flight \
+    && file /out/aarch64/lease-sequencer /out/amd64/lease-sequencer
+
+# The amd64 runtime rootfs, assembled here on aarch64 code only: the
+# runtime packages are downloaded as amd64 .debs (data pulls — never
+# executed) and unpacked with dpkg -x (arch-agnostic unpacking). The
+# release flow COPY-commits this tree onto the amd64 base image — the
+# whole amd64 image assembly is data movement (pull/cp/commit), no
+# RUN step, no emulation.
+FROM toolchain AS rootfs
+RUN dpkg --add-architecture amd64 \
+    && apt-get update \
+    && apt-get install --download-only --assume-yes --no-install-recommends \
+        ca-certificates:amd64 chrony:amd64 iperf3:amd64 libgcc-s1:amd64 \
+        libluajit-5.1-2:amd64 libstdc++6:amd64 libuv1:amd64 \
+        netcat-openbsd:amd64 procps:amd64 tcpdump:amd64 \
+    && mkdir -p /out/amd64-rootfs \
+    && for deb in /var/cache/apt/archives/*.deb; do dpkg -x "$deb" /out/amd64-rootfs; done \
+    && test -f /out/amd64-rootfs/usr/lib/x86_64-linux-gnu/libluajit-5.1.so.2 \
+    && test -x /out/amd64-rootfs/usr/sbin/chronyd \
+    && curl --fail --location --retry 3 \
+        "https://github.com/lua-lunet/lunet/releases/download/v0.10.0/lunet-linux-amd64.tar.gz" \
+        --output /tmp/lunet.tar.gz \
+    && echo "979acc8669d644fd2276d328016f7a54916b444b652452abd6cd16fcbbe8ba94  /tmp/lunet.tar.gz" | sha256sum -c - \
+    && mkdir -p /out/amd64-rootfs/opt/lunet \
+    && tar -xzf /tmp/lunet.tar.gz -C /out/amd64-rootfs/opt/lunet \
+    && test -x /out/amd64-rootfs/opt/lunet/lunet-run \
+    && rm -f /tmp/lunet.tar.gz

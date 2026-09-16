@@ -56,7 +56,25 @@ fn main() {
 
 /// The HEAD hash and whether the working tree carries uncommitted changes.
 /// `None` when git is unavailable or this is not a git checkout.
+///
+/// The Docker build context is the committed-tree snapshot with `.git`
+/// excluded, so git is unavailable in-image. The fastbuild/release gate
+/// asserts the clean-commit state before the build and hands the commit
+/// it ships through `LUNET_LOCKS_HEAD`; that value wins over git when
+/// set (and the context-in-a-checkout git probe never sees dirt while a
+/// change might be in flight — the gate is the authority, not a
+/// potentially-dirty working tree).
 fn head_state() -> Option<(String, bool)> {
+    if let Some(commit) = std::env::var_os("LUNET_LOCKS_HEAD").and_then(|value| {
+        let value = value
+            .into_string()
+            .expect("utf-8 commit hash")
+            .trim()
+            .to_string();
+        if value.is_empty() { None } else { Some(value) }
+    }) {
+        return Some((commit, false));
+    }
     let commit = String::from_utf8(
         Command::new("git")
             .args(["rev-parse", "HEAD"])

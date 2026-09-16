@@ -54,6 +54,10 @@ supplied `lunet-run` is the project-local official `v0.10.0` runtime from
   RELEASE, and the membership-administration verbs.
 - [Build and tests](build-and-tests.md) describes the pinned runtime and
   project commands.
+- [Building and release](build-and-release.md) documents the two-build
+  architecture — the colima sanity gate before every cloud deploy and
+  the dual-arch release images — with the no-emulation cross-compile
+  mechanics.
 
 Replication mechanics, wire behavior, and safety proofs belong to
 [uvrr-core](https://github.com/lua-lunet/uvrr-core). This repository

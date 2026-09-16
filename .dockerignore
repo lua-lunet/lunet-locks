@@ -1,0 +1,17 @@
+# The classic (non-BuildKit) layer cache depends on the context staying
+# lean and stable: build state, git state, toolchains, and scratch never
+# enter the tarball. Only the fastbuild stages receive the repo-root
+# context (docker/Dockerfile.fastbuild); the docker-simulation context
+# remains a script-assembled directory unaffected by this file.
+/target
+**/target
+/.git
+/.claude
+/campaigns
+/console
+/.rocks
+/build
+/.lunet
+/.tmp
+/docs/site
+/papers

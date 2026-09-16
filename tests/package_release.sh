@@ -8,7 +8,12 @@
 #
 # The archive layout is what a downstream deployment consumes:
 #   build/    compiled Lua service tree (cyan output)
-#   lib/      the native advisory-lock cdylib for this platform
+#   lib/      the native advisory-lock cdylib for this platform, in BOTH
+#             shapes: the prod load (liblunet_advisory_lock.<so|dylib>) and
+#             the flight-recorder swap-in
+#             (liblunet_advisory_lock_flight.<so|dylib>, built with
+#             --features flight-recorder here) — one node swaps shapes by
+#             pointing LUNET_ADVISORY_LOCK_LIB at the flight one
 #   src/      Teal sources, for Teal-toolchain consumers
 #   docs/     rendered-site markdown sources
 #   README.md
@@ -57,6 +62,18 @@ trap 'rm -rf "$stage"' EXIT INT TERM HUP
 mkdir -p "$stage/lib"
 cp -R build "$stage/build"
 cp "$lib" "$stage/lib/"
+# The flight-recorder variant: a second build of the same tree with the
+# feature on; the feature build's artifacts land at the same path, so the
+# prod copy above must be taken BEFORE this build runs. CI's checkout is
+# a clean commit (the clean-commit guard inside the build script holds:
+# the release recording stamps the tagged commit).
+cargo build --manifest-path ext/advisory_lock/Cargo.toml \
+    --release --features flight-recorder
+cp "$lib" "$stage/lib/liblunet_advisory_lock_flight.${libname##*.}"
+test -f "$stage/lib/liblunet_advisory_lock_flight.${libname##*.}" || {
+    echo "package release: missing the flight-recorder cdylib variant" >&2
+    exit 66
+}
 cp -R src "$stage/src"
 cp -R docs/src "$stage/docs"
 cp README.md LICENSE "$stage/"

@@ -174,16 +174,18 @@ aggressive scenario joins this sequence as its third block.
 
 ## Step 0: the build confirmation
 
-Step 0 is `make build-proof`, and it is MANDATORY before the run: the
-tree clean and committed at HEAD (the target fails loudly on a dirty
-tree), then a Docker x86 (linux/amd64) image build of exactly that
-commit — a build confirmation, not a deployment, so the cluster never
-runs a "only builds on my laptop" commit. We test head-of-push, so no
-CI covers this; the gate does. The target prints the verdict and the
-commit hash last; tee both into the run dir. Nothing is deployed and
-nothing from the image is run — the build IS the proof. The mechanics
-(colima, the emulation registration, the x86 assertion) are in
-[Build and tests](build-and-tests.md).
+Step 0 is `make sanity`, and it is MANDATORY before the run: the tree
+clean and committed at HEAD (the target fails loudly on a dirty tree),
+then the colima fastbuild cross-check of exactly that commit —
+`cargo check` for both linux triples (aarch64 native + x86 cross-built
+natively by rustc, in the prod and flight-recorder shapes) — a build
+confirmation, not a deployment, so the cluster never runs a "only builds
+on my laptop" commit. We test head-of-push, so no CI covers this; the
+gate does. The target prints the verdict and the commit hash last; tee
+both into the run dir. Nothing is deployed and nothing from the image is
+run — the build IS the proof. The mechanics (the fastbuild stages, the
+cross libc, the RELEASE dual-arch image follow-up) are in
+[Build and release](build-and-release.md).
 
 The re-minted rig binaries (flight-recorder ON for
 `lease-sequencer`, plain release for the clients) are distributed to the
