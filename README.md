@@ -53,6 +53,15 @@ acquiring, renewing, releasing, and reading a lock without interruption.
 See the [documentation](docs/src/index.md) for the deployment descriptor,
 the client and admin protocols, and operational limits.
 
+## Testing On Cloud
+
+Cloud testing is gated: a CLEAN COMMIT and a passing [sanity
+build](docs/src/testing-on-cloud.md) on the colima build host before
+every deploy; the cloud binaries carry `maybe!` tripwires and the
+[Flight Recorder](docs/src/flight-recorder.md) enabled. No test run on
+a dirty commit, ever. The release pipeline is documented in
+[build-and-release.md](docs/src/build-and-release.md).
+
 Run the thirty-second three-datacenter lease-failover demonstration with:
 
 ```console
