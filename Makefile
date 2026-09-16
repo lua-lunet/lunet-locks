@@ -117,6 +117,7 @@ simulation: lunet-runtime build $(SIM_BIN)
 # over the network inside Docker and no BuildKit mounts are needed.
 DOCKER_IMAGE ?= lunet-advisory-lock
 DOCKER_PLATFORM ?= native
+AOF_IMAGE ?= ghcr.io/simbo1905/tbio-core:v0.17.9-lunet.2-arm64
 docker-build: build lunet-runtime
 	@context=$$(mktemp -d "$(CURDIR)/.tmp/docker-context.XXXXXX"); \
 	tools/docker_prepare_context.sh "$$context" || exit 1; \
@@ -124,7 +125,10 @@ docker-build: build lunet-runtime
 	[ "$(DOCKER_PLATFORM)" = native ] || [ "$$server" = "$(DOCKER_PLATFORM)" ] || { \
 		echo "ERROR: docker daemon is $$server; cross-platform builds are not supported" >&2; exit 1; \
 	}; \
-	docker build --platform "$$server" -f "$$context/docker/Dockerfile" -t $(DOCKER_IMAGE) "$$context"; \
+	docker build --platform "$$server" \
+		--build-arg LUNET_LOCKS_HEAD=$$(git rev-parse HEAD) \
+		--build-arg AOF_IMAGE=$(AOF_IMAGE) \
+		-f "$$context/docker/Dockerfile" -t $(DOCKER_IMAGE) "$$context"; \
 	image=$$(docker image inspect --format '{{.Os}}/{{.Architecture}}' $(DOCKER_IMAGE)); \
 	[ "$$image" = "$$server" ] || { \
 		echo "ERROR: built image is $$image, expected native $$server" >&2; exit 1; \

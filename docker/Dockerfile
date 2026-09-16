@@ -5,44 +5,33 @@
 # branch the manifest's [patch] section names), so no git fetch happens inside
 # Docker. The runtime stage carries the diagnosis kit: the NTP/capture/RTT
 # tooling packages and the demo crate's binaries from the kit stage.
+ARG AOF_IMAGE=ghcr.io/simbo1905/tbio-core:v0.17.9-lunet.2-arm64
+ARG LUNET_LOCKS_HEAD=unknown
+FROM ${AOF_IMAGE} AS aof
+
 FROM rust:1.85-slim AS native-base
 
 ARG APT_REFRESH=off
 
-# The adapter's lifecycle marker rides the vendored AOF's quorum-of-copies
-# superblock, whose store compiles through the pinned Zig 0.14.1 toolchain
-# (the repo's mise pin). Both Rust stages carry the x86_64-linux toolchain
-# in-image: the gate target builds the linux/amd64 (x86) image, and the
-# Zig sources are compiled at build time inside each Rust stage.
 RUN apt-get update \
     && if [ "$APT_REFRESH" != off ]; then apt-get upgrade -y; fi \
-    && apt-get install -y --no-install-recommends ca-certificates curl xz-utils \
+    && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-FROM native-base AS native-toolchain
+FROM native-base AS native-deps
 
-RUN curl --fail --location --retry 3 \
-        "https://ziglang.org/download/0.14.1/zig-x86_64-linux-0.14.1.tar.xz" \
-        --output /tmp/zig.tar.xz \
-    && echo "24aeeec8af16c381934a6cd7d95c807a8cb2cf7df9fa40d359aa884195c4716c  /tmp/zig.tar.xz" | sha256sum -c - \
-    && mkdir -p /opt/zig \
-    && tar -xJf /tmp/zig.tar.xz -C /opt/zig --strip-components=1 \
-    && rm -f /tmp/zig.tar.xz
-ENV LUNET_LOCKS_AOF_ZIG=/opt/zig/zig
-ENV LUNET_LOCKS_AOF_TARGET=aarch64-linux-gnu
-
-FROM native-toolchain AS native-deps
+COPY --from=aof /out /opt/aof
+ENV LUNET_LOCKS_AOF_LIB_DIR=/opt/aof/lib
 
 WORKDIR /app
 COPY .cargo/config.toml /usr/local/cargo/config.toml
 COPY vendor /app/vendor
 COPY ext/uvrr-core/Cargo.toml /app/ext/uvrr-core/Cargo.toml
 COPY ext/lunet-locks-aof/Cargo.toml ext/lunet-locks-aof/build.rs /app/ext/lunet-locks-aof/
-COPY ext/lunet-locks-aof/src /app/ext/lunet-locks-aof/src
-COPY ext/lunet-locks-aof/zig /app/ext/lunet-locks-aof/zig
 COPY ext/advisory_lock/Cargo.toml ext/advisory_lock/Cargo.lock /app/ext/advisory_lock/
-RUN mkdir -p /app/ext/uvrr-core/src /app/ext/advisory_lock/src \
+RUN mkdir -p /app/ext/uvrr-core/src /app/ext/lunet-locks-aof/src /app/ext/advisory_lock/src \
     && printf '' > /app/ext/uvrr-core/src/lib.rs \
+    && printf '' > /app/ext/lunet-locks-aof/src/lib.rs \
     && printf '' > /app/ext/advisory_lock/src/lib.rs \
     && cargo build --release --locked --manifest-path /app/ext/advisory_lock/Cargo.toml
 
@@ -52,7 +41,9 @@ WORKDIR /app
 COPY ext/uvrr-core /app/ext/uvrr-core
 COPY ext/lunet-locks-aof /app/ext/lunet-locks-aof
 COPY ext/advisory_lock /app/ext/advisory_lock
-RUN cargo build --release --locked --manifest-path /app/ext/advisory_lock/Cargo.toml
+RUN cargo clean --release --manifest-path /app/ext/advisory_lock/Cargo.toml \
+        --package vrr-core \
+    && cargo build --release --locked --manifest-path /app/ext/advisory_lock/Cargo.toml
 
 # The diagnosis-kit stage: the demo crate's binaries (the lease-sequencer
 # node, the lease-client control client, the lease-load traffic generator)
@@ -62,9 +53,10 @@ RUN cargo build --release --locked --manifest-path /app/ext/advisory_lock/Cargo.
 # toolchain (same image target, same pin).
 FROM rust:1.98-slim AS demo
 
-COPY --from=native /opt/zig /opt/zig
-ENV LUNET_LOCKS_AOF_ZIG=/opt/zig/zig
-ENV LUNET_LOCKS_AOF_TARGET=aarch64-linux-gnu
+ARG LUNET_LOCKS_HEAD=unknown
+COPY --from=aof /out /opt/aof
+ENV LUNET_LOCKS_AOF_LIB_DIR=/opt/aof/lib
+ENV LUNET_LOCKS_HEAD=${LUNET_LOCKS_HEAD}
 
 WORKDIR /app
 COPY .cargo/config-demo.toml /usr/local/cargo/config.toml

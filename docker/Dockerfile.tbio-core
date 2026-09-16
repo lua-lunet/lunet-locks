@@ -1,0 +1,4 @@
+# Immutable architecture-specific artifact image for the adapted
+# TigerBeetle 0.17.9 AOF. The build context is the AOF's zig/ directory.
+FROM scratch
+COPY zig-out/lib /out/lib
