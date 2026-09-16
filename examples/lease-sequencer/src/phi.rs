@@ -5,6 +5,11 @@
 //! is untouched — the trailer lives entirely at the adapter framing
 //! layer: the host strips it before `node.receive()` and appends it after
 //! the send is queued.
+//!
+//! The detector's steady-state contract — the `timedout` toggle, the
+//! cluster viewchange timeout, and the failover-gap sketch protection —
+//! is stated in `docs/src/phi-and-timeouts.md`; the types here implement
+//! it and the doc governs.
 
 #[cfg(feature = "phi")]
 use std::sync::OnceLock;
@@ -287,8 +292,197 @@ impl Table {
         previous.map(|previous| at_ms.saturating_sub(previous))
     }
 
+    /// Clears the live sketch: the next observation seeds a fresh one,
+    /// whatever key it carries. This is the failover-gap protection's
+    /// resume step (`docs/src/phi-and-timeouts.md`): the gap between the
+    /// old leader's last commit and the new leader's first commit is not
+    /// adjacent heartbeats under one leader, so it must never enter the
+    /// phi window — on the fresh-commit resume the host resets the table
+    /// and the first post-resume arrival only seeds.
+    pub fn reset(&mut self) {
+        self.live = None;
+    }
+
     pub fn config(&self) -> &PhiConfig {
         &self.cfg
+    }
+}
+
+// --------------------------------------------------------------- toggle ----
+
+/// One state change of the `timedout` toggle: everything the toggle
+/// logging carries (`docs/src/phi-and-timeouts.md`) — the new state,
+/// the toggle's local-clock ts, and the ts of the LAST toggle (kept in
+/// memory). It lands in the regular log and, as one `timeout-toggle`
+/// event, in the Flight Recorder.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ToggleRecord {
+    /// The state after the toggle: `true` = the node has timed out on
+    /// its leader and issued or joined a view change; `false` = a fresh
+    /// commit arrived and the next tick resumes.
+    pub timedout: bool,
+    /// This toggle's ts (the local clock, ms).
+    pub at_ms: u64,
+    /// The ts of the previous toggle, when one exists.
+    pub previous_ms: Option<u64>,
+}
+
+/// The `timedout` toggle (`docs/src/phi-and-timeouts.md`): the host's
+/// one-bit record of whether it has timed out on its leader and issued
+/// or joined a view change. While it holds, the phi detector is NEITHER
+/// updated NOR checked — phi is a steady-state leader-failure detector
+/// and is never fed leader-election costs — and the cluster viewchange
+/// timeout polls instead. A fresh commit flips it false; the next tick
+/// of the phi timer resumes.
+pub struct TimeoutToggle {
+    timedout: bool,
+    last_toggle_ms: Option<u64>,
+}
+
+impl TimeoutToggle {
+    pub fn new() -> Self {
+        Self {
+            timedout: false,
+            last_toggle_ms: None,
+        }
+    }
+
+    /// Whether the node is timed out on its leader. The phi timer
+    /// checks this before doing anything (`if not timedout`); the
+    /// cluster viewchange timer polls while it holds.
+    pub fn timed_out(&self) -> bool {
+        self.timedout
+    }
+
+    /// The ts of the LAST toggle, when one has happened.
+    pub fn last_toggle_ms(&self) -> Option<u64> {
+        self.last_toggle_ms
+    }
+
+    /// The node timed out on its leader (its suspicion drive issued a
+    /// view change, or it joined one a peer started): toggle
+    /// `timedout=true`. `Some` only on a state CHANGE — a steady `true`
+    /// logs nothing, so a view change in progress never re-logs per
+    /// poll.
+    pub fn on_suspicion(&mut self, now_ms: u64) -> Option<ToggleRecord> {
+        self.set(true, now_ms)
+    }
+
+    /// A fresh commit arrived: toggle `timedout=false`; the next tick
+    /// of the phi timer resumes. `Some` only on the state change.
+    pub fn on_commit(&mut self, now_ms: u64) -> Option<ToggleRecord> {
+        self.set(false, now_ms)
+    }
+
+    fn set(&mut self, value: bool, now_ms: u64) -> Option<ToggleRecord> {
+        if self.timedout == value {
+            return None;
+        }
+        let previous_ms = self.last_toggle_ms;
+        self.timedout = value;
+        self.last_toggle_ms = Some(now_ms);
+        Some(ToggleRecord {
+            timedout: value,
+            at_ms: now_ms,
+            previous_ms,
+        })
+    }
+}
+
+// ---------------------------------------------------- viewchange timer ----
+
+/// The cluster viewchange timeout's range error: the validated config
+/// pair refused `min > max`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ViewChangeRange {
+    pub min_ms: u64,
+    pub max_ms: u64,
+}
+
+impl std::fmt::Display for ViewChangeRange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "viewchange timeout min {} ms exceeds max {} ms",
+            self.min_ms, self.max_ms
+        )
+    }
+}
+
+impl std::error::Error for ViewChangeRange {}
+
+/// One poll delay in the randomized viewchange schedule:
+/// `min + unit * (max - min)` (`docs/src/phi-and-timeouts.md`). The
+/// unit sample is clamped into [0, 1], so a hostile RNG sample can
+/// never escape the validated bounds; a degenerate `max <= min`
+/// schedule is the fixed poll.
+pub fn viewchange_delay_ms(min_ms: u64, max_ms: u64, unit: f64) -> u64 {
+    if max_ms <= min_ms {
+        return min_ms;
+    }
+    let unit = unit.clamp(0.0, 1.0);
+    min_ms + (unit * (max_ms - min_ms) as f64) as u64
+}
+
+/// The cluster viewchange timeout (`docs/src/phi-and-timeouts.md`): a
+/// node that has SENT a view change / view votes is BY DEFINITION not
+/// talking to the leader it suspects dead — it POLLS on that with its
+/// own fixed, RANDOMISED timeout `min + rand() * (max - min)` so it
+/// does not get stuck when the network drops its messages. This is a
+/// DIFFERENT timer from the phi timer (which checks `if not timedout`
+/// and stands down); a fresh commit disarms the poll. Too-low values
+/// cause view-change storms — hence the randomisation — and the
+/// minimum must stay above 4x RTT.
+pub struct ViewChangeTimer {
+    min_ms: u64,
+    max_ms: u64,
+    deadline_ms: u64,
+    armed: bool,
+}
+
+impl ViewChangeTimer {
+    /// A validated poll timer. `min > max` refuses: the randomized
+    /// schedule needs a real range.
+    pub fn new(min_ms: u64, max_ms: u64) -> Result<Self, ViewChangeRange> {
+        if min_ms > max_ms {
+            return Err(ViewChangeRange { min_ms, max_ms });
+        }
+        Ok(Self {
+            min_ms,
+            max_ms,
+            deadline_ms: 0,
+            armed: false,
+        })
+    }
+
+    /// Arms (or re-arms) the next poll: it lands at
+    /// `now + min + unit * (max - min)`, `unit` the injected RNG's unit
+    /// sample. Re-arming after every poll is the randomisation — a
+    /// synchronised fleet must never re-poll in lockstep.
+    pub fn arm(&mut self, now_ms: u64, unit: f64) {
+        self.deadline_ms = now_ms + viewchange_delay_ms(self.min_ms, self.max_ms, unit);
+        self.armed = true;
+    }
+
+    /// Whether the poll is due: armed and the schedule has elapsed.
+    pub fn due(&self, now_ms: u64) -> bool {
+        self.armed && now_ms >= self.deadline_ms
+    }
+
+    /// Disarms the poll: a fresh commit released the node from the
+    /// view change.
+    pub fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    /// Whether the timer is armed.
+    pub fn armed(&self) -> bool {
+        self.armed
+    }
+
+    /// The armed poll's deadline (meaningful while armed).
+    pub fn deadline_ms(&self) -> u64 {
+        self.deadline_ms
     }
 }
 

@@ -4,9 +4,9 @@ The Flight Recorder is a debug-level trace tool: one INTERNAL tape per
 node, recording everything the node does during a test run — including the
 internal private events the lock telemetry capture file never sees. The
 node's crash plus its flight recording is the black box: no guessing is
-required to see what tripped what. It is NOT intended for prod release,
-carries NO long-term readability promise, and may consume a LOT of disk —
-all accepted, by design.
+required to see what tripped what. It is NOT intended for prod release and
+carries NO long-term readability promise. Its disk use is bounded: one
+node's tape series never exceeds the operator's 200 MiB cap (below).
 
 ## The two uses, two files, two planes
 
@@ -31,10 +31,33 @@ telemetry never sees:
   self-arrests: the sticky-fault reason, the boundary panic's payload,
   and the two-tier maybe convention's trip sites.
 
-There is no size-reduction mechanism. A flight recording may be many
-times larger than the telemetry capture file series; the operator trades
-disk for exactness deliberately. Teardown moves the flight-recorder files
-off the host to free space.
+## The 200 MiB bound: rotation + sweep
+
+The operator's cap: one node's flight-tape series never exceeds **200
+MiB** on disk. The mechanism mirrors the telemetry capture's
+`{epoch}.aof` series:
+
+- The ACTIVE tape `flight-<node>.jsonl` rotates to an epoch-named
+  history file `flight-<node>-<epoch>.jsonl` (epoch in unix
+  milliseconds; same-millisecond rotations add a `-1`, `-2`, ...
+  disambiguator) when it passes **100 MiB** — half the cap, so the
+  active tape and the retained history each own half.
+- Rotation happens between flushed lines: every line is flushed before
+  the rename, the fresh tape opens on a fresh header record, and the
+  event sequence continues unbroken across files — the flush-per-line
+  and crash-evidence properties are intact.
+- After every rotation (and at every open) the history is swept: the
+  newest rotated file is NEVER deleted, older files roll away
+  oldest-first while the retained history sum exceeds the 100 MiB
+  history budget. History is preserved as complete files for the admin
+  up to that budget; nothing is truncated mid-line.
+- A rotation or sweep failure poisons THIS recorder only — the tape
+  stops, the node runs on — exactly like a write error. The recorder
+  never touches the replication path.
+
+History older than the newest rotated file is the thing the cap trades
+away; teardown still pulls and moves the whole surviving series off the
+host.
 
 ## The two uses, side by side
 
@@ -48,7 +71,7 @@ else:
 | --- | --- | --- |
 | Build | always present in prod builds | feature-flagged (`flight-recorder`), NOT for production |
 | Node | the non-voting telemetry nodes | every node that opts in via `LUNET_FLIGHT_RECORDER_DIR` |
-| Critical path | not on it (deferred write-behind) | off the replication path, but unbounded disk |
+| Critical path | not on it (deferred write-behind) | off the replication path, capped at 200 MiB per node |
 | Content | public, wire-visible events | hidden state that never goes on the wire |
 | Format | stable-ish, UI-facing | unstable, internal |
 | Reader gate | none | deep read: reader commit == recording commit |
@@ -163,5 +186,5 @@ AOF tapes (the lock telemetry capture file series) and the node internal
 tapes. The node internal tapes also attach to the local skaffold ad-hoc
 tools investigating a bug. Shutdown gains one step: move the
 flight-recorder files off the host before powering off, to free host
-space — the no-size-reduction rule means they are the largest artifact
-the run produces.
+space — the 200 MiB cap keeps a node's series bounded on the host, and
+the teardown pull takes whatever history the cap preserved.

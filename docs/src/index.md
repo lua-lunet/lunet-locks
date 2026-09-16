@@ -46,6 +46,10 @@ supplied `lunet-run` is the project-local official `v0.10.0` runtime from
   internal trace: the debug-level feature-flagged build that records
   everything the telemetry never sees, the commit gate, and the tape
   reader.
+- [Phi and the timeouts](phi-and-timeouts.md) states the phi detector's
+  steady-state contract, the `timedout` toggle, the phi-sketch failover
+  protection, the cluster viewchange timeout, and the nemesis
+  interruption rules.
 - [External client protocol](client-protocol.md) specifies GET, SET, and
   RELEASE, and the membership-administration verbs.
 - [Build and tests](build-and-tests.md) describes the pinned runtime and

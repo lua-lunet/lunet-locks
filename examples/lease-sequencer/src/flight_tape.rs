@@ -33,9 +33,10 @@
 //! module consumes these lines unchanged.
 //!
 //! The internal events (`drive-in`/`drive-out`/`fault`/`maybe`/
-//! `journal`/`marker`/`stop-drain`) are the node's private story — the
-//! predicted-vs-actual debugging material. They pass through the filters
-//! by kind; the tape carries them only on request (`--kinds internal`).
+//! `journal`/`marker`/`timeout-toggle`/`stop-drain`) are the node's
+//! private story — the predicted-vs-actual debugging material. They
+//! pass through the filters by kind; the tape carries them only on
+//! request (`--kinds internal`).
 
 use crate::tape::TapeLine;
 use serde_json::Map;

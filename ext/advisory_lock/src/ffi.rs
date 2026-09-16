@@ -1253,6 +1253,33 @@ impl Node {
         })
     }
 
+    /// One timeout toggle's event capture (`docs/src/phi-and-timeouts.md`):
+    /// the host's phi/timeout plane records EVERY toggle of its
+    /// `timedout` state — the new state, the toggle's local-clock ts, and
+    /// the ts of the LAST toggle (kept in memory in the host's toggle) —
+    /// in BOTH the regular log (the `info!` here) AND the Flight Recorder
+    /// as one `timeout-toggle` event, alongside the other internal
+    /// events. A no-op on the replication path: capture only.
+    pub fn note_timeout_toggle(&mut self, timedout: bool, at_ms: u64, previous_ms: Option<u64>) {
+        info!(
+            node = self.replica.own().0,
+            timedout,
+            ts = at_ms,
+            last_toggle = previous_ms.unwrap_or(at_ms),
+            previous_known = previous_ms.is_some(),
+            "timeout toggle"
+        );
+        #[cfg(feature = "flight-recorder")]
+        self.flight_log(
+            "timeout-toggle",
+            serde_json::json!({
+                "timedout": timedout,
+                "ts_ms": at_ms,
+                "last_toggle_ms": previous_ms,
+            }),
+        );
+    }
+
     /// One fenced-boot drive. The core has no recovery protocol: a fenced
     /// node starts clean, and the only protocol lever is `Input::Tick` —
     /// the genesis primary self-promotes on it, and the primary's messages
@@ -3140,6 +3167,45 @@ mod tests {
         let at = nodes[driver].last_tick + PRIMARY_TIMEOUT_MS + 1;
         assert_eq!(nodes[driver].drive_at(at, Input::Tick), OK);
         route_until_quiet(nodes, ids);
+    }
+
+    /// The timeout toggle's Flight Recorder capture
+    /// (`docs/src/phi-and-timeouts.md`): every toggle of the host's
+    /// `timedout` state lands as one `timeout-toggle` flight event
+    /// carrying the new state, the toggle's ts, and the ts of the
+    /// previous toggle — alongside the other internal events. The
+    /// regular-log half rides the `info!` in the same method; the
+    /// toggle's state machine and its record live in the host's phi
+    /// module.
+    #[cfg(feature = "flight-recorder")]
+    #[test]
+    fn timeout_toggles_land_in_the_flight_recorder() {
+        let dir = state_path("toggle-flight");
+        let mut node = provision("toggle-flight-node", TEST_IDS[1], 3);
+        node.flight = Some(crate::flight::FlightRecorder::open(&dir, TEST_IDS[1]).unwrap());
+        node.note_timeout_toggle(true, 1_000, None);
+        node.note_timeout_toggle(false, 1_400, Some(1_000));
+        let text = fs::read_to_string(dir.join(format!("flight-{}.jsonl", TEST_IDS[1]))).unwrap();
+        let toggles: Vec<serde_json::Value> = text
+            .lines()
+            .skip(1)
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|event| event["kind"] == "timeout-toggle")
+            .collect();
+        assert_eq!(toggles.len(), 2, "one event per toggle: {toggles:?}");
+        assert_eq!(toggles[0]["detail"]["timedout"], true);
+        assert_eq!(toggles[0]["detail"]["ts_ms"], 1_000);
+        assert!(
+            toggles[0]["detail"]["last_toggle_ms"].is_null(),
+            "no earlier toggle exists"
+        );
+        assert_eq!(toggles[1]["detail"]["timedout"], false);
+        assert_eq!(toggles[1]["detail"]["ts_ms"], 1_400);
+        assert_eq!(
+            toggles[1]["detail"]["last_toggle_ms"], 1_000,
+            "the ts of the LAST toggle rides the event"
+        );
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     /// The phi-accrual actuation surface: the host detector that has

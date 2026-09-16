@@ -73,6 +73,9 @@ const MAX_CLIENT_LINE: usize = 65000;
 const OUTPUT_SEND: u32 = 1;
 const OUTPUT_REPLY: u32 = 2;
 const STATE_NORMAL: u32 = 0;
+/// Inside a view change: the node has issued or joined a view change —
+/// the `timedout` toggle holds (`docs/src/phi-and-timeouts.md`).
+const STATE_VIEW_CHANGE: u32 = 1;
 const STATE_RECOVERING: u32 = 2;
 
 /// Upstream `src/wire.rs` Tag::Commit; the adapter mirrors the tag the
@@ -217,6 +220,17 @@ struct Host {
     /// the watched one: the bootstrap deadline for a sketch that never
     /// learns two intervals. Re-stamped on every leader change.
     phi_watch: Option<((u32, u32), u64)>,
+    /// The `timedout` toggle (`docs/src/phi-and-timeouts.md`): true from
+    /// the moment this node times out on its leader and issues or joins
+    /// a view change, until a fresh commit arrives. While it holds, phi
+    /// is neither updated nor checked and the cluster viewchange timeout
+    /// polls instead.
+    timedout: phi::TimeoutToggle,
+    /// The cluster viewchange timeout (`docs/src/phi-and-timeouts.md`):
+    /// a DIFFERENT timer from the phi timer. While `timedout` holds the
+    /// node polls on `min + rand * (max - min)`; a fresh commit disarms
+    /// the poll. Validated `min <= max` at parse.
+    viewchange: phi::ViewChangeTimer,
     /// The last replication state the transition recorder saw; a change
     /// emits a `TelemetryStateTransition` record.
     last_state: u32,
@@ -329,6 +343,14 @@ impl Rng {
     }
     fn below(&mut self, bound: u64) -> u64 {
         self.next() % bound.max(1)
+    }
+    /// One unit sample in [0, 1): the injected randomness the cluster
+    /// viewchange schedule consumes (`viewchange_delay_ms` clamps it
+    /// into the validated bounds).
+    fn unit(&mut self) -> f64 {
+        // 53 random bits into an f64 fraction: the full double mantissa,
+        // no bias toward either bound.
+        (self.next() >> 11) as f64 / (1u64 << 53) as f64
     }
 }
 
@@ -446,6 +468,14 @@ struct Options {
     phi_timeout_min_ms: u64,
     /// The phi-informed election-wait clamp's ceiling, in ms (item22 M3).
     phi_timeout_max_ms: u64,
+    /// The cluster viewchange timeout's floor
+    /// (`docs/src/phi-and-timeouts.md`): while a node is timed out on
+    /// its leader it polls on `min + rand * (max - min)`. The minimum
+    /// must stay above 4x RTT (RTT 20 ms under load -> the 100/200
+    /// default); validated `min <= max`.
+    viewchange_timeout_min_ms: u64,
+    /// The cluster viewchange timeout's ceiling (see the min).
+    viewchange_timeout_max_ms: u64,
     /// The E2 recovery-boundary flush variant (diskless | single |
     /// double-ring). Non-diskless requires `recovery_scratch`.
     recovery_flush: RecoveryFlush,
@@ -493,6 +523,8 @@ fn parse_options() -> Options {
         telemetry_rollover_mib: 4,
         phi_timeout_min_ms: 500,
         phi_timeout_max_ms: 1000,
+        viewchange_timeout_min_ms: 100,
+        viewchange_timeout_max_ms: 200,
         recovery_flush: RecoveryFlush::Diskless,
         recovery_scratch: String::new(),
         heartbeat_ms: 10,
@@ -530,6 +562,12 @@ fn parse_options() -> Options {
             }
             "--phi-timeout-min-ms" => options.phi_timeout_min_ms = value.parse().unwrap_or(500),
             "--phi-timeout-max-ms" => options.phi_timeout_max_ms = value.parse().unwrap_or(1000),
+            "--viewchange-timeout-min-ms" => {
+                options.viewchange_timeout_min_ms = value.parse().unwrap_or(100)
+            }
+            "--viewchange-timeout-max-ms" => {
+                options.viewchange_timeout_max_ms = value.parse().unwrap_or(200)
+            }
             "--recovery-flush" => {
                 options.recovery_flush = RecoveryFlush::parse(value).unwrap_or_else(|| {
                     eprintln!(
@@ -558,6 +596,17 @@ fn parse_options() -> Options {
         }
         index += 2;
     }
+    // The cluster viewchange timeout's validation
+    // (`docs/src/phi-and-timeouts.md`): the randomized schedule needs a
+    // real range, `min <= max`.
+    if options.viewchange_timeout_min_ms > options.viewchange_timeout_max_ms {
+        eprintln!(
+            "lease-sequencer: --viewchange-timeout-min-ms ({}) exceeds \
+             --viewchange-timeout-max-ms ({})",
+            options.viewchange_timeout_min_ms, options.viewchange_timeout_max_ms
+        );
+        exit(2);
+    }
     if options.name.is_empty()
         || options.config.is_empty()
         || options.client.is_empty()
@@ -569,6 +618,7 @@ fn parse_options() -> Options {
              --state PATH --log PATH [--aof-dir PATH] [--aof-flush-ms N] \
              [--aof-retention-mib N] [--telemetry-aof-dir PATH] \
              [--telemetry-rollover-mib N] [--phi-timeout-min-ms N] [--phi-timeout-max-ms N] \
+             [--viewchange-timeout-min-ms N] [--viewchange-timeout-max-ms N] \
              [--recovery-flush diskless|single|double-ring] [--recovery-scratch-dir PATH] \
              [--heartbeat-ms N] [--election-ms N] [--recovery-ms N] \
              [--phi-threshold F] [--phi-safety F] \
@@ -601,6 +651,37 @@ fn interval_sample_json(
 impl Host {
     fn note(&self, body: &str) {
         info!("{} ts={}", body, millis());
+    }
+
+    /// The node timed out on its leader (`docs/src/phi-and-timeouts.md`):
+    /// toggle `timedout=true`. Voters only — a lagging learner's
+    /// suspicion is noise, and its polling would wedge its own catch-up.
+    /// The toggle record rides BOTH the regular log AND the Flight
+    /// Recorder (`timeout-toggle` event, `Node::note_timeout_toggle`).
+    fn suspect(&mut self, now: u64, why: &str) {
+        if self.node.voting_weight().is_none_or(|weight| weight == 0) {
+            return;
+        }
+        if let Some(record) = self.timedout.on_suspicion(now) {
+            self.log_timeout_toggle(&record, why);
+        }
+    }
+
+    /// One toggle record's logging: the new state, the current ts, and
+    /// the ts of the LAST toggle — in the regular log AND the Flight
+    /// Recorder (`docs/src/phi-and-timeouts.md`).
+    fn log_timeout_toggle(&mut self, record: &phi::ToggleRecord, why: &str) {
+        self.note(&format!(
+            "timedout={} ts={} last_toggle={} why={why}",
+            record.timedout,
+            record.at_ms,
+            record
+                .previous_ms
+                .map(|ts| ts.to_string())
+                .unwrap_or_else(|| "none".into())
+        ));
+        self.node
+            .note_timeout_toggle(record.timedout, record.at_ms, record.previous_ms);
     }
 
     /// One telemetry record into the gated AOF (a no-op without a series
@@ -719,6 +800,25 @@ impl Host {
         trailer: &phi::Trailer,
         now: u64,
     ) {
+        // `docs/src/phi-and-timeouts.md`: while timed out, phi is never
+        // updated — and a commit arriving IS the fresh-commit resume.
+        // The toggle flips false, the stale sketch resets (the old
+        // leader's last commit and this one are not adjacent heartbeats
+        // under the same leader — the gap must not enter the window),
+        // the bootstrap watch re-stamps for the fresh sketch, and this
+        // arrival seeds it.
+        if self.timedout.timed_out() {
+            if let Some(record) = self.timedout.on_commit(now) {
+                self.log_timeout_toggle(&record, "fresh-commit");
+                if let Some(monitor) = self.phi_monitor.as_mut() {
+                    monitor.reset();
+                }
+                self.phi_watch = None;
+                self.phi_detected_key = None;
+            } else {
+                return;
+            }
+        }
         let Some(monitor) = &mut self.phi_monitor else {
             return;
         };
@@ -764,6 +864,14 @@ impl Host {
     /// the drive is issued, not forced.
     fn phi_step(&mut self, now: u64, rng: &mut Rng) {
         if self.phi_monitor.is_none() {
+            return;
+        }
+        // `docs/src/phi-and-timeouts.md`: the phi timer checks `if not
+        // timedout` before doing anything — while the toggle holds, phi
+        // is neither updated nor checked (phi is never updated for
+        // leader-election costs); the cluster viewchange timeout polls
+        // instead, and the next tick resumes on the fresh commit.
+        if self.timedout.timed_out() {
             return;
         }
         let status = self.node.status();
@@ -885,6 +993,11 @@ impl Host {
             if forced != 0 {
                 let _ = self.node.leader_timeout();
             }
+            // The phi-actuated view change IS the node timing out on its
+            // leader: the toggle flips true, phi stands down, and the
+            // cluster viewchange timeout takes the polling
+            // (`docs/src/phi-and-timeouts.md`).
+            self.suspect(now, "phi-detect");
         }
         self.flush_outputs(now, rng);
     }
@@ -1656,6 +1769,12 @@ fn main() {
         phi_last_era: None,
         phi_detected_key: None,
         phi_watch: None,
+        timedout: phi::TimeoutToggle::new(),
+        viewchange: phi::ViewChangeTimer::new(
+            options.viewchange_timeout_min_ms,
+            options.viewchange_timeout_max_ms,
+        )
+        .expect("viewchange bounds validated at parse"),
         last_state: STATE_RECOVERING,
         last_weight: None,
         election_wait_armed: options.election_ms,
@@ -1769,7 +1888,31 @@ fn timers(host: &mut Host, now: u64, rng: &mut Rng) {
         host.flush_outputs(now, rng);
         host.heartbeat_op(now, rng);
     }
+    // `docs/src/phi-and-timeouts.md`: a node INSIDE a view change has,
+    // by definition, issued or joined one (its own fence, a peer's
+    // StartViewChange, or its evidence vote) — the toggle holds until a
+    // fresh commit arrives, whatever the entry path was.
+    if status.state == STATE_VIEW_CHANGE {
+        host.suspect(now, "view-change");
+    }
     host.phi_step(now, rng);
+    // The cluster viewchange timeout (`docs/src/phi-and-timeouts.md`):
+    // a DIFFERENT timer from the phi timer. While the node is timed out
+    // on its leader it polls on the randomized schedule
+    // `min + rand * (max - min)` — it may be pleasantly surprised when
+    // the partition heals and the SAME leader returns, in which case a
+    // fresh commit disarms the poll and phi resumes.
+    if host.timedout.timed_out() {
+        if !host.viewchange.armed() {
+            host.viewchange.arm(now, rng.unit());
+        } else if host.viewchange.due(now) {
+            host.viewchange.arm(now, rng.unit());
+            let _ = host.node.leader_timeout();
+            host.flush_outputs(now, rng);
+        }
+    } else {
+        host.viewchange.disarm();
+    }
     if status.state == STATE_NORMAL && status.leader == host.own_id {
         host.leader_elapsed = 0;
     } else {
@@ -1780,12 +1923,17 @@ fn timers(host: &mut Host, now: u64, rng: &mut Rng) {
         // settled phi allows, never later than the old fixed gate), logs
         // one TelemetryTimeoutDecision record per changed wait, and the
         // drive still happens: leader_timeout, the core's ordinary
-        // suspicion input.
-        let wait = host.election_wait(now);
-        if host.leader_elapsed >= wait + host.stagger_ms {
-            host.leader_elapsed = 0;
-            let _ = host.node.leader_timeout();
-            host.flush_outputs(now, rng);
+        // suspicion input. While the node is timed out the wait stands
+        // down: the cluster viewchange timeout polls instead
+        // (`docs/src/phi-and-timeouts.md`).
+        if !host.timedout.timed_out() {
+            let wait = host.election_wait(now);
+            if host.leader_elapsed >= wait + host.stagger_ms {
+                host.leader_elapsed = 0;
+                let _ = host.node.leader_timeout();
+                host.flush_outputs(now, rng);
+                host.suspect(now, "election-wait");
+            }
         }
     }
     // The state-transition trace (item22): Recovering/Restarting/Joining
@@ -2530,6 +2678,9 @@ mod forward_tests {
             phi_last_era: None,
             phi_detected_key: None,
             phi_watch: None,
+            timedout: phi::TimeoutToggle::new(),
+            viewchange: phi::ViewChangeTimer::new(100, 200)
+                .expect("the harness's viewchange bounds are valid"),
             last_state: STATE_RECOVERING,
             last_weight: None,
             election_wait_armed: 200,
@@ -2822,6 +2973,8 @@ mod boot_hint_tests {
             telemetry_rollover_mib: 4,
             phi_timeout_min_ms: 10,
             phi_timeout_max_ms: 200,
+            viewchange_timeout_min_ms: 100,
+            viewchange_timeout_max_ms: 200,
             recovery_flush: RecoveryFlush::Diskless,
             recovery_scratch: String::new(),
             heartbeat_ms: 5,

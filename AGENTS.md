@@ -28,6 +28,17 @@ Local guidance for this repo. Keep it short, factual, and unsurprising.
   immediately, without a todo list, or name a specific order — then do what
   they said.
 
+## Architecture note: phi vs timeouts
+
+- Phi failure detection, leader-election (leader) timeouts, and the
+  cluster viewchange timeout are DISTINCT concepts with DISTINCT
+  mechanisms. Phi is a steady-state leader-failure detector; while a
+  node is timed out (`timedout` toggle) phi is neither updated nor
+  checked, and the randomized cluster viewchange timeout polls instead.
+  See `docs/src/phi-and-timeouts.md`. Every unit test, feature, and
+  config must reflect this distinction — a test, feature, or config key
+  that conflates them is wrong.
+
 ## Fast line: pure Rust, then wrappers
 
 - Debugging is ad-hoc Rust first: small throwaway CLI bins named
