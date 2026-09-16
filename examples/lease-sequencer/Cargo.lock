@@ -465,6 +465,7 @@ dependencies = [
  "lunet-advisory-lock",
  "lunet-locks-aof",
  "phi-accrual-detector",
+ "serde",
  "serde_json",
  "signal-hook",
  "tokio",
@@ -507,6 +508,7 @@ name = "lunet-advisory-lock"
 version = "0.1.0"
 dependencies = [
  "io-uring",
+ "lunet-locks-aof",
  "serde",
  "serde_json",
  "tracing",

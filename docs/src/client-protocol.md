@@ -67,25 +67,34 @@ The response has `op: "get"`, echoes `message_id`, `request_num`, and
 ## SET
 
 ```json
-{"op":"set","message_id":"01010101-0101-0101-0101-010101010101","client_id":42,"request_num":8,"lock_id":9001,"name":"/cluster/members/0000001","labels":["csv","prod"],"lease":{"lease_id":3,"holder":"02020202-0202-0202-0202-020202020202","expiry":1722600001000}}
+{"op":"set","message_id":"01010101-0101-0101-0101-010101010101","client_id":42,"request_num":8,"lock_id":9001,"name":"/cluster/members/0000001","labels":["csv","prod"],"lease":{"lease_id":3,"holder":"02020202-0202-0202-0202-020202020202","lease_ms":30000}}
 ```
 
 `name` and `labels` are optional; the lease object is required and carries
-only `lease_id`, `holder`, and `expiry` — the counters are never
-client-writable.
+only `lease_id`, `holder`, and `lease_ms` — the candidate never names an
+absolute expiry, and the counters are never client-writable. The wire request
+cannot express an expiry: the executing host checks instantaneously on its
+own clock whether the lock is free or same-held, then stamps
+`expiry = execution_time + lease_ms` and runs consensus. The granted window
+is measured in exactly one clock: a fast client cannot lengthen a lease, a
+slow client can only fail to hold, and a re-delivered op is fenced by
+identity — the dedup replays the first execution's reply, so staleness does
+not exist on the wire. The request may also carry `sent_at_ms` for latency
+measurement only; no protocol decision reads it.
 
-SET returns `granted` and a `lease`. A lease is live only when
-`expiry > execution_time`. An expired candidate is rejected. An absent or
-expired incumbent is free; a live incumbent may be renewed or replaced only
-by the same `holder`. A rejected SET does not change the lock table.
+SET returns `granted` and a `lease`. A candidate's `lease_ms` must be
+greater than zero; a zero duration is refused. An absent or expired incumbent
+is free; a live incumbent may be renewed or replaced only by the same
+`holder`. A rejected SET does not change the lock table.
 
 A granted SET replies with the stored lease — the candidate's `lease_id`,
-`holder`, and `expiry` plus the lock's `name` (null when the lock has none),
-canonical `labels` (null when it has none), and the counters as the state
-machine set them: a first grant and every post-expiry take report
-`renew_count: 0` and a fresh `taken_at_ms`; a same-holder renewal reports the
-prior `taken_at_ms` and `renew_count` incremented by one. A refused SET
-replies with the incumbent lease unchanged, counters included.
+`holder`, and `lease_ms`, the leader-stamped `expiry`, the lock's `name`
+(null when the lock has none), canonical `labels` (null when it has none),
+and the counters as the state machine set them: a first grant and every
+post-expiry take report `renew_count: 0` and a fresh `taken_at_ms`; a
+same-holder renewal reports the prior `taken_at_ms` and `renew_count`
+incremented by one. A refused SET replies with the incumbent lease unchanged,
+counters included.
 
 ## RELEASE
 

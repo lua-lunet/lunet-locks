@@ -31,7 +31,7 @@ byte-identical: files written by this build parse with upstream's
 | Upstream (0.17.9) | Vendored | Strip |
 |---|---|---|
 | `src/aof.zig` | `zig/src/aof.zig` | Keep `AOFEntry`, `AOFType(IO)` (init/close/write/sync/checkpoint/on_fsync/validate/Iterator), the `aof write / read` test. Drop the offline CLI (`main`, `CLIArgs`, `aof recover/debug/merge`) and `ReplayClient` — the recovery tooling rides the whole client/message-bus stack and is not the AOF write path. |
-| `src/vsr.zig` | `zig/src/vsr.zig` | Stripped root module: keep `Version`, `Command`, `Operation`, `Peer`, `BlockReference`, `Checkpoint`, `RegisterRequest/Result`, `BlockRequest`, `UpgradeRequest`, `ReconfigurationRequest/Result` + member helpers, and re-exports (Header, checksum, Release, MessagePool, tigerbeetle, CheckpointState). Drop every replica/client/message-bus/grid/storage/sync/testing re-export — none is referenced by the AOF path. |
+| `src/vsr.zig` | `zig/src/vsr.zig` | Stripped root module: keep `Version`, `Command`, `Operation`, `Peer`, `BlockReference`, `Checkpoint`, `RegisterRequest/Result`, `BlockRequest`, `UpgradeRequest`, `ReconfigurationRequest/Result` + member helpers, and re-exports (Header, checksum, Release, MessagePool, tigerbeetle, CheckpointState). Drop every replica/client/message-bus/grid/storage/sync/testing re-export — none is referenced by the AOF path. Re-added verbatim from upstream for the marker surface's closure: `member_index`, `Zone` (the vendored superblock's `data_file_size_min` computes the grid padding through it), and `ClientSessions.encode_size` (the superblock's consistency asserts compare against it). |
 | `src/vsr/message_header.zig` | `zig/src/vsr/message_header.zig` | Verbatim. |
 | `src/vsr/checksum.zig` | `zig/src/vsr/checksum.zig` | Verbatim (Aegis-based checksums — the on-disk contract). |
 | `src/vsr/superblock.zig` | `zig/src/vsr/superblock.zig` | Verbatim except: the two `Storage == testing/storage` conditional blocks inside the (lazy) SuperBlock state machine are removed — the vendored build carries no testing corpus. Only `SuperBlockHeader`/`CheckpointState` (the on-wire layout constants and `view_headers_max` sizing assert) are in the compiled closure. |
@@ -66,12 +66,26 @@ Deliberately NOT vendored (the dependency web the strip cuts):
   read-back iterator) over the vendored `AOFType`, with the
   header-builder (chain, op, timestamp, Aegis checksums) and the
   optional-force knob wiring.
-- `zig/build.zig` — the cdylib + test steps and the `vsr_options` module.
+- `zig/src/marker.zig` — the lifecycle marker store (the uVRR termination
+  obligations' §4 marker): four fixed sector-aligned copies of a
+  `SuperBlockHeader` in one marker file, hash-chained sequence/parent,
+  quorum write with forced I/O verified at the `.verify` threshold, and
+  the boot classification resolved through the vendored
+  `superblock_quorums.zig` flexible quorums (highest sequence within the
+  `.open` threshold). The marker rides two `VSRState` fields the AOF-only
+  build never drives: `commit_max` = the incarnation (monotonic), 
+  `sync_view` = the lifecycle state. Both are inside the header checksum.
+- `zig/build.zig` — the cdylib + static library + test steps and the
+  `vsr_options` module.
 
 ## Provenance evidence
 
-- `mise exec -- zig build test` runs 14/14 Zig tests, including
-  upstream's own `aof write / read` test (kept verbatim) executing
+- `mise exec -- zig build test` runs the vendored suite plus the marker
+  store's own fault-model tests (quorum write/read, a rotted or torn copy
+  cannot decide the read, a stale copy cannot drag the classification
+  back, a single advanced copy without a quorum cannot fake a clean
+  stop, a forged fork fails closed), including upstream's own
+  `aof write / read` test (kept verbatim) executing
   against the vendored code and this build's blocking IO backend.
 - The Rust `tests/aof_test.rs::ffi_append_read_round_trips_through_the_cdylib`
   proves an append + read round-trip through the built cdylib, with the

@@ -143,8 +143,11 @@ fsync: the last write may be lost on power loss — the same documented
 loss window the AOF writer carries, and nothing depends on the file for
 safety. A sidecar that does not parse is ignored entirely at boot: the
 model falls back to the descriptor and discovery re-learns. The
-incarnation marker's bump semantics are untouched — the marker keeps its
-fsync+rename+dir-sync discipline and its four-line boot classification.
+incarnation marker's bump semantics are untouched — the marker's
+authoritative storage is the quorum-of-copies superblock beside the state
+file (four Aegis-checksummed copies, quorum write with forced I/O,
+highest-sequence read quorum), and the fsync+rename+dir-sync single file
+stays beside it as the compatibility projection.
 
 ## Boundaries
 

@@ -5,7 +5,7 @@ LUAROCKS   ?= luarocks --lua-version=5.1 --lua-dir=$(LUAJIT_DIR) --tree=.rocks
 CYAN       ?= .rocks/bin/cyan
 TESTED     ?= .rocks/bin/tested
 CERU       ?= .rocks/bin/ceru
-LUNET_VERSION := v0.8.0
+LUNET_VERSION := v0.10.0
 LUNET_ROOT := .lunet/$(LUNET_VERSION)
 LUNET_RUN := $(LUNET_ROOT)/lunet-run
 LUNET_OS := $(shell uname -s)
@@ -13,15 +13,15 @@ LUNET_ARCH := $(shell uname -m)
 
 ifeq ($(LUNET_OS),Darwin)
 LUNET_ARCHIVE := lunet-macos.tar.gz
-LUNET_SHA256 := 72833d08d80b7f3ea7817ea53dd937b964ba7866c11034b72d547885a63caee9
+LUNET_SHA256 := 8880dd6d0caf600760379e1476d1dc6343a5214938f37118c5588d533fef50a9
 else ifeq ($(LUNET_OS)-$(LUNET_ARCH),Linux-x86_64)
 LUNET_ARCHIVE := lunet-linux-amd64.tar.gz
-LUNET_SHA256 := 3f884dbe03d0435af08253970e09eb134a8f1ebefa2c5f8a51ec6a8d31ee3d69
+LUNET_SHA256 := 979acc8669d644fd2276d328016f7a54916b444b652452abd6cd16fcbbe8ba94
 else ifeq ($(LUNET_OS)-$(LUNET_ARCH),Linux-aarch64)
 LUNET_ARCHIVE := lunet-linux-arm64.tar.gz
-LUNET_SHA256 := a7b009d31c6677b3aa4243b4811a988fb0d5fe80a8e82bd4a87ec9a83b0249a4
+LUNET_SHA256 := e651a9d7b75a53be631a74f5f7fffd332f8a2f3e388170385686369fe0c51d3f
 else
-$(error Unsupported Lunet runtime platform $(LUNET_OS)/$(LUNET_ARCH); v0.8.0 ships macOS, Linux amd64, and Linux arm64 archives)
+$(error Unsupported Lunet runtime platform $(LUNET_OS)/$(LUNET_ARCH); v0.10.0 ships macOS, Linux amd64, and Linux arm64 archives)
 endif
 
 LUNET_URL := https://github.com/lua-lunet/lunet/releases/download/$(LUNET_VERSION)/$(LUNET_ARCHIVE)

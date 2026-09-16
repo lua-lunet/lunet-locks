@@ -505,7 +505,7 @@ impl AofWriter {
         state
             .take()
             .expect("completed above")
-            .map_err(|reason| io::Error::other(reason))
+            .map_err(io::Error::other)
     }
 
     /// Events dropped by this writer so far (overflow, or post-failure).

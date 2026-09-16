@@ -1,14 +1,16 @@
-# Standby telemetry: the AOF write-behind series
+# The lock telemetry capture file: the write-behind series
 
-A standby node runs the cluster's telemetry: the admin console follows the
-standby's own async write-behind log (the **AOF**, append-only file) instead
-of any replica's replication-path journal. The standby is a
-zero-voting-weight member: it follows the replication stream, applies every
-committed lock transition, and defers its own disk writes so the cluster's
-latency cadence is untouched. The mechanism follows the TigerBeetle AOF
-write-behind pattern: bytes leave the hot path immediately, are never
-force-flushed there, and are fsync'd only on a periodic timer, a checkpoint,
-or shutdown.
+The lock telemetry capture file is the cluster's public telemetry: the
+console follows a non-voting telemetry node's own async write-behind log
+(the **AOF**, append-only file) instead of any replica's replication-path
+journal. The telemetry node is a zero-voting-weight member: it follows
+the replication stream, applies every committed lock transition, and
+defers its own disk writes so the cluster's latency cadence is untouched.
+The mechanism follows the TigerBeetle AOF write-behind pattern: bytes
+leave the hot path immediately, are never force-flushed there, and are
+fsync'd only on a periodic timer, a checkpoint, or shutdown. (This is the
+public, wire-visible plane; the per-node internal trace is the separate
+[Flight Recorder](flight-recorder.md).)
 
 ## The writer
 
@@ -70,22 +72,34 @@ On restart the writer finds the existing `ev-open-*.bin` file, scans its
 valid records to recompute the write position and metadata window, truncates
 any torn tail, and resumes appending.
 
-## The standby node
+## Rotation at (re)start
 
-The standby is a regular cluster member that joined at weight 0 (the
+The capture series the non-voting telemetry nodes write through the
+vendored TigerBeetle store (`ext/lunet-locks-aof`, the
+`{unix_epoch_seconds}.aof` naming) ROTATES at every (re)start: a NEW
+active file opens under a fresh unix-epoch name and the pre-existing
+series is left in place for the ADMIN to prune — no startup sweep deletes rotated files on
+this path. The prior `{epoch}.aof` files are the between-restart history;
+during a run the in-run rollover keeps exactly the current file plus one
+closed old. The telemetry nodes stop and start cleanly, so an admin
+prunes old capture files between runs.
+
+## The telemetry node
+
+The telemetry node is a regular cluster member that joined at weight 0 (the
 `--aof-dir` option turns the embedded node into the AOF host). It participates
 in replication as any member does — it receives prepares, applies committed
 operations — but it holds no vote and writes its lock-event records to the
 AOF writer instead of the blocking journal. Its lease driver converses with
 the leader like every node's driver does: the round-trip traffic is what
-carries the era evidence that keeps the standby tracking the cluster while
+carries the era evidence that keeps the telemetry node tracking the cluster while
 it applies the stream. Its AOF directory is therefore a complete copy of the
 cluster's committed lock-transition stream, produced without taxing the
 quorum path.
 
 ## Serving the console
 
-The `lock-feed` process serves the standby's AOF directory over REST and
+The `lock-feed` process serves the telemetry node's capture directory over REST and
 WebSocket exactly as it serves a journal directory (`/files`, `/files/:name`,
 `/health`, `/ws`). Its follower tails the series — inotify-driven on Linux,
 poll-driven elsewhere, with the poll loop retained as a safety net on both —
@@ -93,10 +107,10 @@ so the console stays live while the writer rolls.
 
 The console edge (nginx) maps `/feed/` to lock-feed and serves the console
 SPA as static assets. The console UI never reads a cluster replica's journal
-files; it reads the standby's deferred telemetry series through the feed.
-The three headless assertions the standby demo makes are that committed
+files; it reads the telemetry node's deferred capture series through the feed.
+The three headless assertions the capture demo makes are that committed
 events land in the AOF files, that the feed serves them, and that the
 console's data endpoint (`/feed/files` through the edge) returns them.
 
 Cluster cadence is unaffected: the stability assertions (renew ~250 ms, poll
-~2× renewal) hold while the standby's AOF writer and the feed run.
+~2× renewal) hold while the telemetry node's writer and the feed run.

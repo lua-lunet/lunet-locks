@@ -317,6 +317,124 @@ fn member_count(members: *const Members) u8 {
     return constants.members_max;
 }
 
+/// Upstream 0.17.9 verbatim (`src/vsr.zig`): locates a replica_id's index.
+/// Re-added (from the upstream strip) for the superblock quorum machinery:
+/// the superblock's own consistency asserts name it.
+pub fn member_index(members: *const Members, replica_id: u128) ?u8 {
+    assert(replica_id != 0);
+    assert(valid_members(members));
+    for (members, 0..) |member, replica_index| {
+        if (member == replica_id) return @intCast(replica_index);
+    } else return null;
+}
+
+/// Upstream 0.17.9 verbatim (`src/vsr.zig`), re-added for the vendored
+/// superblock's zone constants: `data_file_size_min` computes the grid
+/// padding offset through `Zone.size`.
+pub const Zone = enum {
+    superblock,
+    wal_headers,
+    wal_prepares,
+    client_replies,
+    // Add padding between `client_replies` and `grid`, to make sure grid blocks are aligned to
+    // block size and not just to sector size. Aligning blocks this way makes it more likely that
+    // they are aligned to the underlying physical sector size. This padding is zeroed during
+    // format, but isn't used otherwise.
+    grid_padding,
+    grid,
+
+    const size_superblock = superblock.superblock_zone_size;
+    const size_wal_headers = constants.journal_size_headers;
+    const size_wal_prepares = constants.journal_size_prepares;
+    const size_client_replies = constants.client_replies_size;
+    const size_grid_padding = size_grid_padding: {
+        const grid_start_unaligned = size_superblock +
+            size_wal_headers +
+            size_wal_prepares +
+            size_client_replies;
+        const grid_start_aligned = std.mem.alignForward(
+            usize,
+            grid_start_unaligned,
+            constants.block_size,
+        );
+        break :size_grid_padding grid_start_aligned - grid_start_unaligned;
+    };
+
+    comptime {
+        for (.{
+            size_superblock,
+            size_wal_headers,
+            size_wal_prepares,
+            size_client_replies,
+            size_grid_padding,
+        }) |zone_size| {
+            assert(zone_size % constants.sector_size == 0);
+        }
+
+        for (std.enums.values(Zone)) |zone| {
+            assert(Zone.start(zone) % constants.sector_size == 0);
+        }
+        assert(Zone.start(.grid) % constants.block_size == 0);
+    }
+
+    pub fn offset(zone: Zone, offset_logical: u64) u64 {
+        if (zone.size()) |zone_size| {
+            assert(offset_logical < zone_size);
+        }
+
+        return zone.start() + offset_logical;
+    }
+
+    pub fn start(zone: Zone) u64 {
+        comptime var start_offset = 0;
+        inline for (comptime std.enums.values(Zone)) |z| {
+            if (z == zone) return start_offset;
+            start_offset += comptime size(z) orelse 0;
+        }
+        unreachable;
+    }
+
+    pub fn size(zone: Zone) ?u64 {
+        return switch (zone) {
+            .superblock => size_superblock,
+            .wal_headers => size_wal_headers,
+            .wal_prepares => size_wal_prepares,
+            .client_replies => size_client_replies,
+            .grid_padding => size_grid_padding,
+            .grid => null,
+        };
+    }
+};
+
+/// Upstream 0.17.9 verbatim (`src/vsr/client_sessions.zig`): the on-disk
+/// encode size of the client sessions. Re-added (the exact computation;
+/// the client-session machinery itself is not the AOF path) for the
+/// vendored superblock's consistency asserts, which compare a checkpoint's
+/// `client_sessions_size` against it.
+pub const ClientSessions = struct {
+    /// Size of the buffer needed to encode the client sessions on disk.
+    /// (Not rounded up to a sector boundary).
+    pub const encode_size = blk: {
+        var size_max: usize = 0;
+
+        // First goes the vsr headers for the entries.
+        // This takes advantage of the buffer alignment to avoid adding padding for the headers.
+        assert(@alignOf(Header) == 16);
+        size_max = std.mem.alignForward(usize, size_max, 16);
+        size_max += @sizeOf(Header) * constants.clients_max;
+
+        // Then follows the session values for the entries.
+        assert(@alignOf(u64) == 8);
+        size_max = std.mem.alignForward(usize, size_max, 8);
+        size_max += @sizeOf(u64) * constants.clients_max;
+
+        // For encoding/decoding simplicity, the ClientSessions always fits in a single block.
+        assert(size_max <= constants.block_size - @sizeOf(Header));
+
+        break :blk size_max;
+    };
+};
+
 pub const ReconfigurationResult = enum(u32) {
     reserved = 0,
     /// Reconfiguration request is valid.

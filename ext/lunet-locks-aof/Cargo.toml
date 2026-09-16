@@ -15,5 +15,11 @@ crate-type = ["rlib"]
 
 [dependencies]
 
+[features]
+# Link the Zig store statically instead of through the cdylib (the
+# advisory-lock adapter opts in: its own cdylib is loaded by the Lua
+# runtime and must stay self-contained).
+static = []
+
 [dev-dependencies]
 serde_json = "1"

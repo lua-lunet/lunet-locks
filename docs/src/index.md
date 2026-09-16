@@ -28,8 +28,8 @@ must be unique, endpoints must be literal IPv4 `host:port` values, and
 live cluster is appended after the genesis lines with `"genesis":false`;
 running processes never reload the file — live membership changes travel
 through the admin verbs and the peer broadcast, not through the file. The
-supplied `lunet-run` is the project-local official `v0.8.0` runtime from
-`.lunet/v0.8.0/`, not a binary from `PATH`.
+supplied `lunet-run` is the project-local official `v0.10.0` runtime from
+`.lunet/v0.10.0/`, not a binary from `PATH`.
 
 - [Architecture](architecture.md) describes client forwarding, live
   reconfiguration, reincarnation on restart, and operational boundaries.
@@ -38,9 +38,14 @@ supplied `lunet-run` is the project-local official `v0.8.0` runtime from
   dissemination, and the lazy membership sidecar.
 - [Event journal](event-journal.md) documents the append-only lock-event
   journal, the lock-feed server, and the console catch-up model.
-- [Standby telemetry](telemetry-aof.md) documents the standby node's AOF
-  write-behind series: the async writer, 2 MiB erasure-block rolling, the
-  deferred fsync policy, and the console follow path.
+- [The lock telemetry capture file](telemetry-aof.md) documents the
+  telemetry node's AOF write-behind series: the async writer, the
+  rotation at (re)start, 2 MiB erasure-block rolling, the deferred fsync
+  policy, and the console follow path.
+- [The Flight Recorder](flight-recorder.md) documents the per-node
+  internal trace: the debug-level feature-flagged build that records
+  everything the telemetry never sees, the commit gate, and the tape
+  reader.
 - [External client protocol](client-protocol.md) specifies GET, SET, and
   RELEASE, and the membership-administration verbs.
 - [Build and tests](build-and-tests.md) describes the pinned runtime and

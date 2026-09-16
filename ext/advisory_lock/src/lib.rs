@@ -2,8 +2,11 @@
 
 pub mod aof;
 mod ffi;
+#[cfg(feature = "flight-recorder")]
+pub mod flight;
 pub mod journal;
 pub mod locks;
+mod marker_store;
 pub mod recovery_flush;
 
 pub use ffi::{

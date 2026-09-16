@@ -101,13 +101,15 @@
 //!   continue under the SAME incarnation (no reincarnation), rewritten
 //!   `unflushed` before operating; `unflushed` → DIRTY bump (unchanged).
 //!   SIGKILL leaves the running sentinel behind and stays the crash
-//!   shape. Marker-storage honesty: the marker is ONE fsynced flag file
-//!   (fsync+rename+dir-sync) — the vendored Zig store's four-copy
-//!   checksummed quorum superblock machinery exists
-//!   (`ext/lunet-locks-aof/zig/src/vsr/superblock.zig`) but its AOF C ABI
-//!   does not expose it, so the contract's quorum-of-copies construction
-//!   is NOT met; the single-copy discipline is the bounded implementation
-//!   and the gap is recorded as such.
+//!   shape. Marker storage: the lifecycle rides the vendored Zig store's
+//!   quorum-of-copies superblock construction (four fixed sector-aligned
+//!   Aegis-checksummed copies, hash-chained sequence/parent, quorum write
+//!   with forced I/O verified at the 3/4 threshold, quorum read resolving
+//!   by highest sequence at the 2/4 threshold — the contract §4
+//!   construction, reached through the AOF C ABI's marker exports and
+//!   linked statically so this cdylib stays self-contained); the item08
+//!   single fsynced flag file remains as the compatibility projection and
+//!   the conservative fallback (see `marker_store`).
 //! - **Reconfiguration.** `lunet_lock_node_reconfigure` drives
 //!   `Input::Reconfigure { op, pivot }` (Join at weight 0 / Increment /
 //!   Decrement (voter to learner) / Leave at weight 0) on the current primary
@@ -188,6 +190,7 @@
 use crate::aof::{AofConfig, AofWriter};
 use crate::journal::{self, Journal as LockJournal, JournalEvent};
 use crate::locks::{Service, Transition};
+use crate::marker_store;
 use crate::recovery_flush::{self, FlushOutcome, RecoveryFlush};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{OsString, c_void};
@@ -337,7 +340,7 @@ const INCARNATION_MAX: u64 = 255;
 ///   marker writes) is evidence of a controlled ending, never a crash.
 /// - `Flushed` = the durable-state write completed at the drain point.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Marker {
+pub(crate) enum Marker {
     Unflushed,
     Stopped,
     Flushed,
@@ -407,6 +410,12 @@ pub struct Node {
     /// stop, and refusing every further inbound entry while set — the
     /// mandatory obligation that makes the in-memory state final.
     stopped: bool,
+    /// The Flight Recorder's tape (the `flight-recorder` feature): the
+    /// per-node internal trace. `None` without the feature (the field
+    /// itself is compiled out) and whenever the env did not name a
+    /// flight directory — the prod path carries nothing.
+    #[cfg(feature = "flight-recorder")]
+    flight: Option<crate::flight::FlightRecorder>,
 }
 
 /// The committed-transition sink behind `Node`'s journal hook.
@@ -450,7 +459,22 @@ impl Node {
 
     /// A drive whose outer input's tick the caller already chose (fenced
     /// boot nonce ticks); feedback inputs inside the loop still sample the
-    /// clock.
+    /// clock. The Flight Recorder wraps every drive's outcome (the
+    /// `flight-recorder` feature).
+    fn drive_at(&mut self, at: u64, event: Input) -> i32 {
+        #[cfg(feature = "flight-recorder")]
+        self.flight_log("drive-in", Self::flight_input_summary(&event));
+        let code = self.drive_at_inner(at, event);
+        #[cfg(feature = "flight-recorder")]
+        self.flight_log("drive-out", serde_json::json!({ "code": code }));
+        code
+    }
+
+    /// One plan/publish/effects cycle, looping on the host acknowledgements
+    /// (`Input::Applied`) the effects require, until the core goes quiet.
+    /// Under `Stability::Volatile` every publish is `Published`; a `Parked`
+    /// outcome is an invariant/API mismatch, so the node is poisoned rather
+    /// than allowed to fabricate a `StabilityResult::Stable`.
     ///
     /// The feedback queue drains FIRST-IN-FIRST-OUT: the core's §11.1
     /// acknowledgement refuses any `Input::Applied` report but the next
@@ -461,7 +485,7 @@ impl Node {
     /// reports the newest slot first, refuses against its own publish, and
     /// abandons the drive after it — with the install already published
     /// and the applied frontier stranded behind it.
-    fn drive_at(&mut self, at: u64, event: Input) -> i32 {
+    fn drive_at_inner(&mut self, at: u64, event: Input) -> i32 {
         if self.poisoned {
             return SERVICE;
         }
@@ -590,9 +614,91 @@ impl Node {
     /// the runbook; the arrest itself is unchanged: poison is sticky and
     /// every further entry reports SERVICE.
     fn record_fault(&mut self, note: String) {
+        #[cfg(feature = "flight-recorder")]
+        self.flight_log(
+            "fault",
+            serde_json::json!({
+                "what": note,
+                "arrest": self.fault_note.is_none(),
+            }),
+        );
         if self.fault_note.is_none() {
             eprintln!("lunet-advisory-lock: the node self-arrests — {note}");
             self.fault_note = Some(note);
+        }
+    }
+
+    /// One Flight Recorder event (the `flight-recorder` feature): a no-op
+    /// with the recorder absent. Every call site is `#[cfg]`-gated, so
+    /// the flag-OFF build compiles nothing here — the prod path carries
+    /// zero recorder code.
+    #[cfg(feature = "flight-recorder")]
+    fn flight_log(&mut self, kind: &str, detail: serde_json::Value) {
+        if let Some(recorder) = self.flight.as_mut() {
+            recorder.event(kind, detail);
+        }
+    }
+
+    /// One inbound Flight Recorder event carrying the raw bytes (the
+    /// flight recording's `frame_hex`, byte-exact for the playback
+    /// engine). The call sites are `#[cfg]`-gated.
+    #[cfg(feature = "flight-recorder")]
+    fn flight_bytes_in(&mut self, kind: &str, from: u32, bytes: &[u8]) {
+        self.flight_log(
+            kind,
+            serde_json::json!({
+                "from": from,
+                "len": bytes.len(),
+                "hex": crate::flight::hex(bytes),
+            }),
+        );
+    }
+
+    /// The Flight Recorder's summary of one core input (the
+    /// `flight-recorder` feature). Raw bytes ride the entry-level events
+    /// (`receive-in`, `request-in`); this names the internal inputs the
+    /// entries never see (the Applied feedback the drive loop feeds
+    /// itself, the boot's Reincarnate announcement).
+    #[cfg(feature = "flight-recorder")]
+    fn flight_input_summary(input: &Input) -> serde_json::Value {
+        match input {
+            Input::Peer { from, message } => serde_json::json!({
+                "input": "peer",
+                "from": from.0,
+                "era": message.header.view.era.0,
+                "view": message.header.view.view.0,
+                "slot": message.header.slot.0,
+                "tag": format!("{:?}", message.header.tag),
+            }),
+            Input::Propose { operation } => serde_json::json!({
+                "input": "propose",
+                "len": operation.payload.len(),
+            }),
+            Input::Tick => serde_json::json!({"input": "tick"}),
+            Input::Applied { slot } => {
+                serde_json::json!({"input": "applied", "slot": slot.0})
+            }
+            Input::Checkpointed { through } => {
+                serde_json::json!({"input": "checkpointed", "through": through.0})
+            }
+            Input::StabilityConfirmation { revision, result } => serde_json::json!({
+                "input": "stability-confirmation",
+                "revision": revision,
+                "result": format!("{result:?}"),
+            }),
+            Input::Reconfigure { op, pivot } => serde_json::json!({
+                "input": "reconfigure",
+                "op": format!("{op:?}"),
+                "pivot": pivot.is_some(),
+            }),
+            Input::AdminForceView { target } => serde_json::json!({
+                "input": "force-view",
+                "era": target.era.0,
+                "view": target.view.0,
+            }),
+            Input::Reincarnate { old } => {
+                serde_json::json!({"input": "reincarnate", "old": old.0})
+            }
         }
     }
 
@@ -629,6 +735,16 @@ impl Node {
         }
         let config_era = self.replica.progress().config().current().era.0;
         if folded_era_regressed(self.last_config_era, config_era) {
+            #[cfg(feature = "flight-recorder")]
+            self.flight_log(
+                "maybe",
+                serde_json::json!({
+                    "where": "report",
+                    "what": "folded configuration era regressed",
+                    "previous": self.last_config_era,
+                    "current": config_era,
+                }),
+            );
             maybe_invariant!(
                 "folded configuration era regressed (previous={}, current={})",
                 self.last_config_era.unwrap_or_default(),
@@ -765,6 +881,19 @@ impl Node {
                         },
                     };
                     let mut disable_blocking = false;
+                    #[cfg(feature = "flight-recorder")]
+                    self.flight_log(
+                        "journal",
+                        serde_json::json!({
+                            "what": "internal lock-state flush",
+                            "kind": event.kind,
+                            "ts": event.ts,
+                            "lock_id": event.lock_id,
+                            "lease_id": event.lease_id,
+                            "holder_hex": crate::flight::hex(&event.holder),
+                            "expiry": event.expiry,
+                        }),
+                    );
                     match self.journal.as_mut() {
                         Some(JournalSink::Blocking(journal)) => {
                             if let Err(e) = journal.append(&event) {
@@ -965,6 +1094,8 @@ impl Node {
     /// the request's message_id; the ABI's negative codes otherwise.
     pub fn request(&mut self, json: &[u8]) -> i32 {
         trace!(len = json.len(), "node request entry");
+        #[cfg(feature = "flight-recorder")]
+        self.flight_bytes_in("request-in", 0, json);
         if self.stopped {
             // The drain point closed the wire: no further task processing
             // (docs/uvrr-termination-obligations.md §1).
@@ -1013,6 +1144,8 @@ impl Node {
     /// (the host has already authenticated the source endpoint).
     pub fn receive(&mut self, from: u32, data: &[u8]) -> i32 {
         trace!(from, len = data.len(), "node receive entry");
+        #[cfg(feature = "flight-recorder")]
+        self.flight_bytes_in("receive-in", from, data);
         if self.stopped {
             // The drain point closed the wire: no further inbound reads
             // (docs/uvrr-termination-obligations.md §1).
@@ -1027,6 +1160,16 @@ impl Node {
         // it by name (Diagnostic::UnknownSender). Bumped (high-band) ids are
         // the reincarnation story's legitimate callers and exempt.
         if !self.known_ids.contains(&from) && from < (1u32 << 24) {
+            #[cfg(feature = "flight-recorder")]
+            self.flight_log(
+                "maybe",
+                serde_json::json!({
+                    "where": "receive",
+                    "what": "message from an unknown peer id",
+                    "from": from,
+                    "len": data.len(),
+                }),
+            );
             maybe_invariant!(
                 "message from an unknown peer id (from={from}, len={})",
                 data.len()
@@ -1221,6 +1364,11 @@ impl Node {
     ///    for the state beneath it, so a death between the writes is a
     ///    partial shutdown that boot reads CLEAN.
     ///
+    /// Both marker writes go through the routed storage
+    /// (`marker_store::write`): the quorum-of-copies superblock write
+    /// (forced I/O, verified at the write quorum) first, then the
+    /// compatibility projection.
+    ///
     /// Idempotent: a second stop reports OK without rewriting anything.
     /// A failed marker write or drain reports SERVICE and leaves the
     /// marker at `stopped` (still a controlled ending). SIGKILL takes
@@ -1236,7 +1384,15 @@ impl Node {
             node = self.replica.own().0,
             "stop: the wire is closed, the in-memory state is final"
         );
-        if write_marker(&self.state_path, self.incarnation, Marker::Stopped).is_err() {
+        #[cfg(feature = "flight-recorder")]
+        self.flight_log(
+            "marker",
+            serde_json::json!({
+                "what": "stopped written as termination begins",
+                "incarnation": self.incarnation,
+            }),
+        );
+        if marker_store::write(&self.state_path, self.incarnation, Marker::Stopped).is_err() {
             eprintln!("lunet-advisory-lock: the stopped marker write failed");
             return SERVICE;
         }
@@ -1246,9 +1402,22 @@ impl Node {
                 "lunet-advisory-lock: the stop drain failed ({error}); \
                        the marker stays at stopped"
             );
+            #[cfg(feature = "flight-recorder")]
+            self.flight_log(
+                "stop-drain",
+                serde_json::json!({ "what": "the stop drain failed", "error": error.to_string() }),
+            );
             return SERVICE;
         }
-        if write_marker(&self.state_path, self.incarnation, Marker::Flushed).is_err() {
+        #[cfg(feature = "flight-recorder")]
+        self.flight_log(
+            "marker",
+            serde_json::json!({
+                "what": "flushed written at the drain point",
+                "incarnation": self.incarnation,
+            }),
+        );
+        if marker_store::write(&self.state_path, self.incarnation, Marker::Flushed).is_err() {
             eprintln!("lunet-advisory-lock: the flushed marker write failed");
             return SERVICE;
         }
@@ -1311,6 +1480,19 @@ impl Node {
             slot = queued.slot,
             len = queued.bytes.len(),
             "datagram out"
+        );
+        #[cfg(feature = "flight-recorder")]
+        self.flight_log(
+            "emit",
+            serde_json::json!({
+                "kind": queued.kind,
+                "to": queued.to,
+                "era": queued.era,
+                "view": queued.view,
+                "slot": queued.slot,
+                "len": queued.bytes.len(),
+                "hex": crate::flight::hex(&queued.bytes),
+            }),
         );
         Some(NodeOutput {
             kind: queued.kind,
@@ -1525,7 +1707,7 @@ fn marker_line(incarnation: u64, marker: Marker) -> String {
 
 /// Parses the marker line. Anything else is an unreadable marker: the boot
 /// refuses rather than guessing an identity.
-fn parse_marker(text: &str) -> Option<(u64, Marker)> {
+pub(crate) fn parse_marker(text: &str) -> Option<(u64, Marker)> {
     let line = text.trim();
     let (incarnation_text, marker_text) = line.split_once(' ')?;
     let incarnation = incarnation_text.parse::<u64>().ok()?;
@@ -1541,7 +1723,7 @@ fn parse_marker(text: &str) -> Option<(u64, Marker)> {
     Some((incarnation, marker))
 }
 
-fn read_marker(path: &Path) -> std::io::Result<(u64, Marker)> {
+pub(crate) fn read_marker(path: &Path) -> std::io::Result<(u64, Marker)> {
     parse_marker(&fs::read_to_string(path)?)
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid marker"))
 }
@@ -1549,7 +1731,14 @@ fn read_marker(path: &Path) -> std::io::Result<(u64, Marker)> {
 /// One durable marker write: fsync+rename+dir-sync (POSIX crash
 /// consistency — persist the new directory entry, not just the file's
 /// data; Windows no-ops the directory sync, see `sync_dir`).
-fn write_marker(path: &Path, incarnation: u64, marker: Marker) -> std::io::Result<()> {
+///
+/// The item08 single-file write, retained verbatim: since the lifecycle
+/// marker routed through the quorum-of-copies superblock copies, this is
+/// the COMPATIBILITY PROJECTION — written only after the authoritative
+/// quorum write succeeded (see `marker_store`), and the conservative
+/// fallback at boot when the copies predate the routing or lose their
+/// quorum.
+pub(crate) fn write_marker(path: &Path, incarnation: u64, marker: Marker) -> std::io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let base = path.file_name().unwrap_or_default();
     let unique = SystemTime::now()
@@ -1576,22 +1765,28 @@ fn write_marker(path: &Path, incarnation: u64, marker: Marker) -> std::io::Resul
 }
 
 /// Boot-time marker discipline (upstream `SuperblockCopies::restart`,
-/// `src/replica/reincarnation.rs:526-541`, collapsed to one durable copy,
-/// extended with the uVRR termination lifecycle
-/// `docs/uvrr-termination-obligations.md` §2-§3): a missing file is a
-/// first boot at incarnation 0, left `unflushed` (the running sentinel —
-/// the contract's startup `running`, written before the loop starts). A
-/// `stopped` or `flushed` marker is a CLEAN STOP: the previous process
-/// reached the drain point (a `flushed` copy mixed with `stopped` copies
-/// is the normal mid-flush shape), so the state is final — the boot
-/// continues under the SAME incarnation, no reincarnation, rewritten
-/// `unflushed` as operating begins. An `unflushed` marker is DIRTY: the
-/// previous process cannot be shown to have reached the drain point, the
-/// incarnation bumps (refusing at exhaustion), the marker is rewritten
-/// `(new, flushed)` — the bump's commitment — and then `(new, unflushed)`
-/// as operating begins. On-disk spelling: the running sentinel stays
-/// `unflushed` for compatibility with every existing rig state file; the
-/// contract's `running` never appears on disk.
+/// `src/replica/reincarnation.rs:526-541`, extended with the uVRR
+/// termination lifecycle `docs/uvrr-termination-obligations.md` §2-§3):
+/// the classification reads the routed storage (`marker_store::current`)
+/// — the quorum-of-copies superblock copies when they exist (the
+/// authoritative read: the highest-sequence valid quorum, so a torn,
+/// rotted, or stale single copy cannot decide the classification), or the
+/// item08 single file when the copies predate the routing (legacy
+/// migration: the file's state is the truth; the first routed write below
+/// seeds the copies). A missing marker is a first boot at incarnation 0,
+/// left `unflushed` (the running sentinel — the contract's startup
+/// `running`, written before the loop starts). A `stopped` or `flushed`
+/// marker is a CLEAN STOP: the previous process reached the drain point
+/// (a `flushed` copy mixed with `stopped` copies is the normal mid-flush
+/// shape), so the state is final — the boot continues under the SAME
+/// incarnation, no reincarnation, rewritten `unflushed` as operating
+/// begins. An `unflushed` marker is DIRTY: the previous process cannot be
+/// shown to have reached the drain point, the incarnation bumps (refusing
+/// at exhaustion), the marker is rewritten `(new, flushed)` — the bump's
+/// commitment — and then `(new, unflushed)` as operating begins. On-disk
+/// spelling: the running sentinel stays `unflushed` for compatibility
+/// with every existing rig state file; the contract's `running` never
+/// appears on disk.
 ///
 /// The DIRTY branch is the recovery boundary (the experiment design's §4):
 /// when a variant is configured, its forced flush executes right at the
@@ -1606,49 +1801,56 @@ fn boot_marker(
     path: &Path,
     recovery: Option<(&RecoveryFlush, &Path)>,
 ) -> Result<(u64, Option<FlushOutcome>), i32> {
-    match OpenOptions::new().write(true).create_new(true).open(path) {
-        Ok(mut file) => {
-            let result = (|| {
+    let (incarnation, marker) = match marker_store::current(path).map_err(|_| CONFIG)? {
+        Some(current) => current,
+        None => {
+            // First boot: create the single-file projection (fsync +
+            // dir-sync, the item08 first-boot write, still the file the
+            // operators read), then seed the quorum copies with the
+            // running sentinel.
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+                .map_err(|_| CONFIG)?;
+            (|| {
                 file.write_all(marker_line(0, Marker::Unflushed).as_bytes())?;
                 file.sync_all()?;
                 sync_parent(path)
-            })();
-            result.map_err(|_| CONFIG)?;
-            Ok((0, None))
+            })()
+            .map_err(|_| CONFIG)?;
+            marker_store::write(path, 0, Marker::Unflushed).map_err(|_| CONFIG)?;
+            return Ok((0, None));
         }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let (incarnation, marker) = read_marker(path).map_err(|_| CONFIG)?;
-            match marker {
-                // A clean stop (`docs/uvrr-termination-obligations.md`
-                // §3): `stopped` and `flushed` copies both show the
-                // previous process reached the drain point — the state is
-                // final, the node continues under the same incarnation
-                // with NO reincarnation, and the running sentinel is
-                // rewritten before operating begins.
-                Marker::Stopped | Marker::Flushed => {
-                    write_marker(path, incarnation, Marker::Unflushed).map_err(|_| CONFIG)?;
-                    Ok((incarnation, None))
-                }
-                Marker::Unflushed => {
-                    let bumped = incarnation
-                        .checked_add(1)
-                        .filter(|next| *next <= INCARNATION_MAX)
-                        .ok_or(CONFIG)?;
-                    write_marker(path, bumped, Marker::Flushed).map_err(|_| CONFIG)?;
-                    let outcome = match recovery {
-                        None | Some((RecoveryFlush::Diskless, _)) => None,
-                        Some((variant, scratch)) => {
-                            let outcome = recovery_flush::execute(scratch, *variant, bumped)
-                                .map_err(|_| CONFIG)?;
-                            Some(outcome)
-                        }
-                    };
-                    write_marker(path, bumped, Marker::Unflushed).map_err(|_| CONFIG)?;
-                    Ok((bumped, outcome))
-                }
-            }
+    };
+    match marker {
+        // A clean stop (`docs/uvrr-termination-obligations.md`
+        // §3): `stopped` and `flushed` copies both show the
+        // previous process reached the drain point — the state is
+        // final, the node continues under the same incarnation
+        // with NO reincarnation, and the running sentinel is
+        // rewritten before operating begins.
+        Marker::Stopped | Marker::Flushed => {
+            marker_store::write(path, incarnation, Marker::Unflushed).map_err(|_| CONFIG)?;
+            Ok((incarnation, None))
         }
-        Err(_) => Err(CONFIG),
+        Marker::Unflushed => {
+            let bumped = incarnation
+                .checked_add(1)
+                .filter(|next| *next <= INCARNATION_MAX)
+                .ok_or(CONFIG)?;
+            marker_store::write(path, bumped, Marker::Flushed).map_err(|_| CONFIG)?;
+            let outcome = match recovery {
+                None | Some((RecoveryFlush::Diskless, _)) => None,
+                Some((variant, scratch)) => {
+                    let outcome =
+                        recovery_flush::execute(scratch, *variant, bumped).map_err(|_| CONFIG)?;
+                    Some(outcome)
+                }
+            };
+            marker_store::write(path, bumped, Marker::Unflushed).map_err(|_| CONFIG)?;
+            Ok((bumped, outcome))
+        }
     }
 }
 
@@ -1966,6 +2168,8 @@ fn node_from_sink(
         state_path: state_path.clone(),
         incarnation,
         stopped: false,
+        #[cfg(feature = "flight-recorder")]
+        flight: crate::flight::FlightRecorder::open_from_env(own_id.0),
     };
     // The bumped node's entry ticket (§4): the wire phase always
     // follows the bump. The announcement is emitted at boot; every
@@ -2353,6 +2557,14 @@ mod tests {
         let path = state_path("marker");
         assert_eq!(boot_marker(&path, None).expect("first boot").0, 0);
         assert_eq!(fs::read_to_string(&path).unwrap(), "0 unflushed\n");
+        // The first boot seeds the quorum copies with the running
+        // sentinel.
+        assert_eq!(
+            marker_store::current(&path)
+                .expect("current")
+                .expect("the copies carry the sentinel"),
+            (0, Marker::Unflushed)
+        );
         // A restart over the running sentinel is dirty: the incarnation
         // bumps and the marker is rewritten (new, flushed), then
         // (new, unflushed) as operating begins.
@@ -2362,10 +2574,23 @@ mod tests {
         assert_eq!(fs::read_to_string(&path).unwrap(), "2 unflushed\n");
         // A clean checkpoint (flushed) continues under the same incarnation:
         // the running sentinel replaces it, the identity never regresses.
+        // Hand-writing the single file here simulates the pre-routing
+        // projection, so the copies are dropped: this is the legacy
+        // migration path the copy-free rig states boot through.
+        fs::remove_file(marker_store::superblock_path(&path)).unwrap();
         write_marker(&path, 7, Marker::Flushed).unwrap();
         assert_eq!(boot_marker(&path, None).expect("clean continue").0, 7);
         assert_eq!(fs::read_to_string(&path).unwrap(), "7 unflushed\n");
-        fs::remove_file(path).unwrap();
+        // The migration seeded the copies from the single file: the next
+        // classification reads them, not the projection.
+        assert_eq!(
+            marker_store::current(&path)
+                .expect("current")
+                .expect("seeded"),
+            (7, Marker::Unflushed)
+        );
+        fs::remove_file(&path).unwrap();
+        fs::remove_file(marker_store::superblock_path(&path)).unwrap();
     }
 
     #[test]
@@ -2443,7 +2668,87 @@ mod tests {
             "the running sentinel still classifies DIRTY"
         );
         assert_eq!(fs::read_to_string(&path).unwrap(), "1 unflushed\n");
-        fs::remove_file(path).unwrap();
+        fs::remove_file(&path).unwrap();
+        fs::remove_file(marker_store::superblock_path(&path)).unwrap();
+    }
+
+    /// On-disk compatibility, the clean-stop spelling: a copy-free rig
+    /// state whose single file reads `flushed` (the pre-routing boot's
+    /// end state) migrates at boot — the classification reads the file,
+    /// the first routed write seeds the copies, and the boot continues
+    /// under the SAME incarnation.
+    #[test]
+    fn legacy_flushed_file_migrates_and_continues_clean() {
+        let path = state_path("marker-compat-clean");
+        fs::write(&path, "4 flushed\n").unwrap();
+        assert_eq!(
+            boot_marker(&path, None).expect("migrated classification").0,
+            4,
+            "the flush from the pre-routing era continues clean"
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "4 unflushed\n");
+        // The migration seeded the copies: they now carry the running
+        // sentinel, and the projection was rewritten alongside them.
+        assert_eq!(
+            marker_store::current(&path)
+                .expect("current")
+                .expect("seeded"),
+            (4, Marker::Unflushed)
+        );
+        fs::remove_file(&path).unwrap();
+        fs::remove_file(marker_store::superblock_path(&path)).unwrap();
+    }
+
+    /// The contract §4 point of the quorum-of-copies storage: a rotted
+    /// copy (an Aegis checksum that no longer verifies) cannot flip a
+    /// boot classification — the surviving quorum decides. The lifecycle
+    /// reaches its clean-stop end state, one copy's zone is rotted
+    /// (garbage over its leading sector), and the next boot still
+    /// continues under the same incarnation.
+    #[test]
+    fn a_rotted_marker_copy_cannot_flip_a_boot_classification() {
+        use lunet_locks_aof::marker as marker_ffi;
+        let path = state_path("marker-rot");
+        let state = path.to_str().expect("state path");
+        let superblock = marker_store::superblock_path(&path);
+        let members = "10:a\x000:b\x0030:c";
+        let mut node = Node::open(members, "a", state, None, 0).expect("first boot");
+        assert_eq!(node.stop(), OK, "the stop leaves the copies at flushed");
+        drop(node);
+        assert_eq!(
+            marker_store::current(&path)
+                .expect("current")
+                .expect("routed"),
+            (0, Marker::Flushed)
+        );
+
+        let geometry = marker_ffi::geometry().expect("geometry");
+        let rot_slot = 2;
+        let rot_offset = (geometry.copy_size * rot_slot) as u64;
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .open(&superblock)
+                .expect("the copies file");
+            file.seek(SeekFrom::Start(rot_offset)).expect("seek slot");
+            file.write_all(&[0xA5u8; 4096]).expect("rot the copy");
+        }
+        let node = Node::open(members, "a", state, None, 0).expect("clean continue");
+        assert_eq!(
+            node.own_id(),
+            10,
+            "the rotted copy did not flip the classification: no DIRTY bump"
+        );
+        assert_eq!(
+            marker_store::current(&path)
+                .expect("current")
+                .expect("routed"),
+            (0, Marker::Unflushed),
+            "the running sentinel was rewritten as operating begins"
+        );
+        fs::remove_file(&path).unwrap();
+        fs::remove_file(&superblock).unwrap();
     }
 
     /// The contract's partial-marker-write rule
@@ -2524,7 +2829,7 @@ mod tests {
         let outputs_before = nodes[0].outputs.len();
 
         assert_eq!(nodes[0].stop(), OK);
-        let mut datagram = vec![0u8; 64];
+        let datagram = vec![0u8; 64];
         assert_eq!(receive(&mut nodes[0], TEST_IDS[1], &datagram), STOPPED);
         assert_eq!(
             request(&mut nodes[0], &request_json(Uuid::from_bytes([62; 16]))),
@@ -2686,6 +2991,8 @@ mod tests {
             last_leader: None,
             last_config_era: None,
             journal: None,
+            #[cfg(feature = "flight-recorder")]
+            flight: None,
         }
     }
 
@@ -2905,6 +3212,8 @@ mod tests {
             last_leader: None,
             last_config_era: None,
             journal: None,
+            #[cfg(feature = "flight-recorder")]
+            flight: None,
         }
     }
 
@@ -5366,8 +5675,8 @@ mod tests {
                 leader = Some(index);
             }
         }
-        for index in 0..nodes.len() {
-            let rc = request(&mut nodes[index], &request_json(Uuid::from_bytes([7; 16])));
+        for (index, node) in nodes.iter_mut().enumerate() {
+            let rc = request(node, &request_json(Uuid::from_bytes([7; 16])));
             assert!(
                 rc == OK || rc == NOT_LEADER,
                 "member {index} is serving after the fence: rc={rc} \

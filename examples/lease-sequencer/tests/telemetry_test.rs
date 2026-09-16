@@ -147,8 +147,50 @@ fn rollover_produces_exactly_two_files_at_the_threshold() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-// -------------------------------------------------------------- teardown ---
+// ------------------------------------------------------- rotation (item C) -
 
+/// Every (re)start ROTATES: a fresh epoch-named active file opens and the
+/// pre-existing series SURVIVES for the admin to prune — the startup
+/// retention sweep no longer deletes on the telemetry open path.
+#[test]
+fn open_rotates_and_leaves_the_prior_series_for_the_admin() {
+    let dir = temp_dir("rotation");
+    // A prior run's series: two epoch files, well over any small
+    // retention threshold.
+    let old_a = dir.join("1000.aof");
+    let old_b = dir.join("1001.aof");
+    std::fs::write(&old_a, [0u8; 4096]).unwrap();
+    std::fs::write(&old_b, [0u8; 4096]).unwrap();
+    let mut log = TelemetryLog::open(&dir, 1000, 4 * 1024 * 1024, 1).expect("open");
+    log.teardown().unwrap();
+    drop(log);
+    let names: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|entry| {
+            let name = entry.unwrap().file_name().to_string_lossy().to_string();
+            name.ends_with(".aof").then_some(name)
+        })
+        .collect();
+    assert!(
+        names.contains(&"1000.aof".to_string()) && names.contains(&"1001.aof".to_string()),
+        "the rotated prior files survive the open: {names:?}"
+    );
+    assert_eq!(
+        names.len(),
+        3,
+        "the open added exactly one fresh epoch-named active file: {names:?}"
+    );
+    // And the fresh active file is epoch-named, not a fixed name.
+    assert!(
+        names
+            .iter()
+            .any(|name| name != "1000.aof" && name != "1001.aof"),
+        "the new active file carries a fresh unix-epoch name: {names:?}"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+// -------------------------------------------------------------- teardown ---
 /// The clean-stop teardown record: marker TelemetryStateTransition with
 /// the teardown event JSON, and it is the LAST record in the file after a
 /// clean close.

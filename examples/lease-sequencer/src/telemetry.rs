@@ -20,6 +20,14 @@
 //! closed, a new `{epoch}.aof` opens, and the prune deletes older files
 //! oldest-first — the min-2 floor from item21's retention encodes the
 //! same rule; here it is enforced as keep-exactly-two.
+//!
+//! # Rotation at (re)start (the lock telemetry capture file)
+//!
+//! Every (re)start opens a NEW active file under a fresh unix-epoch name
+//! and leaves the pre-existing series in place for the ADMIN to prune —
+//! the startup retention sweep does not run on this path. The prior
+//! `{epoch}.aof` files are the between-restart history; the in-run
+//! rollover still keeps exactly current + one closed old.
 
 use lunet_locks_aof::envelope::{Marker, Record, local_ns};
 use lunet_locks_aof::{AofFile, Error, Options, retention};
@@ -123,20 +131,33 @@ pub struct TelemetryLog {
 }
 
 impl TelemetryLog {
-    /// Open (or start) the telemetry series at `dir`: the retention sweep
-    /// runs, a NEW active file opens with force OFF, and the gate starts
-    /// ON (the boot Recovering/Joining phase).
+    /// Open (or start) the telemetry series at `dir` — the **lock
+    /// telemetry capture file** series. Every (re)start ROTATES: a NEW
+    /// active file opens under a fresh unix-epoch name
+    /// (`{unix_epoch_seconds}.aof`), and the pre-existing series is left
+    /// in place for the ADMIN to prune (the startup retention sweep no
+    /// longer deletes on this path — the rotated files ARE the
+    /// between-restart history an admin prunes; the in-run rollover
+    /// keeps exactly current + one closed old). The gate starts ON (the
+    /// boot Recovering/Joining phase). The `retention_bytes` knob is
+    /// accepted for signature compatibility and no longer drives the
+    /// open-time sweep.
     pub fn open(
         dir: &Path,
         flush_interval_ms: u64,
         rollover_bytes: u64,
         retention_bytes: u64,
     ) -> Result<Self, Error> {
+        let _ = retention_bytes;
         let file = AofFile::open_with(
             dir,
             Options {
                 force_flush: false,
-                retention_bytes,
+                // Keep-everything at open: the epoch-named rotation at
+                // every (re)start leaves the prior files for admin
+                // pruning (u64::MAX/2 cannot be crossed by any real
+                // series, and cannot overflow the retention sum).
+                retention_bytes: u64::MAX / 2,
             },
         )?;
         Ok(TelemetryLog {

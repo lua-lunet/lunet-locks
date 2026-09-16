@@ -9,11 +9,11 @@
 # Usage: tests/package_verify.sh <archive.tar.gz>
 #
 # Requires the project-local Lunet runtime (LUNET_RUN, defaulting to the
-# pinned v0.8.0 tree) and perl for the NDJSON client. POSIX only.
+# pinned v0.10.0 tree) and perl for the NDJSON client. POSIX only.
 set -eu
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-run=${LUNET_RUN:-"$root/.lunet/v0.8.0/lunet-run"}
+run=${LUNET_RUN:-"$root/.lunet/v0.10.0/lunet-run"}
 
 archive=${1:-""}
 test -n "$archive" || {

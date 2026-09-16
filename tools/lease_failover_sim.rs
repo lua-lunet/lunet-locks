@@ -189,9 +189,10 @@ fn request_get(worker: &mut Worker) -> String {
 
 fn request_set(worker: &mut Worker) -> String {
     let (number, message_id) = worker.next_envelope();
-    let expiry = now_ms() + LEASE_MS;
+    // The client rents the lock for a duration; the leader stamps the
+    // absolute expiry off its own execution clock.
     format!(
-        r#"{{"op":"set","message_id":"{message_id}","client_id":{},"request_num":{number},"lock_id":{SENTINEL_LOCK},"lease":{{"lease_id":{},"holder":"{}","expiry":{expiry}}}}}"#,
+        r#"{{"op":"set","message_id":"{message_id}","client_id":{},"request_num":{number},"lock_id":{SENTINEL_LOCK},"lease":{{"lease_id":{},"holder":"{}","lease_ms":{LEASE_MS}}}}}"#,
         worker.client_id, worker.lease_id, worker.holder
     )
 }

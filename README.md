@@ -42,8 +42,8 @@ Run a three-replica smoke test with the project-local Lunet runtime:
 make smoke
 ```
 
-The command fetches the official Lunet `v0.8.0` release into
-`.lunet/v0.8.0/`. The smoke covers acquire, GET, contention, RELEASE,
+The command fetches the official Lunet `v0.10.0` release into
+`.lunet/v0.10.0/`. The smoke covers acquire, GET, contention, RELEASE,
 reacquisition, and lease-expiry takeover; it restarts one replica against
 the live quorum — a dirty restart and a reincarnation — and then runs a
 live-reconfiguration stage in which a fourth replica joins at weight 0, is
@@ -92,7 +92,18 @@ stream. The adapter manifest pins upstream `0fc6380` and its `[patch]`
 section builds the dependency from the submodule, so this tree always
 builds against the patched branch.
 
-## The vendored TigerBeetle AOF
+## The lock telemetry capture file
+
+The public telemetry plane is the **lock telemetry capture file**: the
+`{epoch}.aof` series the separate non-voting telemetry nodes write through
+the vendored TigerBeetle store. The capture series rotates at every
+(re)start to a fresh unix-epoch-named file and leaves the prior files for
+admin pruning; during a run the rollover keeps exactly the current file
+plus one closed old. (The old "telemetry AOF" naming refers to this same
+file.) The per-node INTERNAL trace — everything the capture file never
+sees — is the separate [Flight
+Recorder](docs/src/flight-recorder.md), a debug-level feature-flagged
+build, not a prod artifact.
 
 `ext/lunet-locks-aof` vendors the AOF (append-only write-behind log) from
 [tigerbeetle/tigerbeetle](https://github.com/tigerbeetle/tigerbeetle)

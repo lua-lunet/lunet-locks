@@ -39,14 +39,25 @@ fn main() {
     let lib_dir = out_dir.join("lib");
 
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
-    println!("cargo:rustc-link-lib=dylib=lunet_locks_aof");
 
-    // The cdylib's install name is `@rpath/liblunet_locks_aof.dylib` (zig's
-    // default), so every runtime consumer — the wrapper's own tests, the
-    // lease-sequencer binary — needs the rpath pointing at the artifact.
-    // `rustc-link-arg-tests` requires a test target; the package's tests are
-    // integration tests, declared alongside this crate's manifests.
-    println!("cargo:rustc-link-arg=-Wl,-rpath,{}", lib_dir.display());
+    // Link mode: the crate's default is the shared library (the runtime
+    // lookup rides the `@rpath` install name); the `static` feature links
+    // the same ABI statically — the advisory-lock adapter's cdylib is
+    // loaded by the Lua runtime and must not grow a runtime dependency on
+    // this shared library, so it opts in.
+    let static_link = std::env::var("CARGO_FEATURE_STATIC").as_deref() == Ok("1");
+    if static_link {
+        println!("cargo:rustc-link-lib=static=lunet_locks_aof");
+    } else {
+        println!("cargo:rustc-link-lib=dylib=lunet_locks_aof");
+
+        // The cdylib's install name is `@rpath/liblunet_locks_aof.dylib` (zig's
+        // default), so every runtime consumer — the wrapper's own tests, the
+        // lease-sequencer binary — needs the rpath pointing at the artifact.
+        // `rustc-link-arg-tests` requires a test target; the package's tests are
+        // integration tests, declared alongside this crate's manifests.
+        println!("cargo:rustc-link-arg=-Wl,-rpath,{}", lib_dir.display());
+    }
 
     // Downstream binaries (e.g. the lease-sequencer example) read this
     // metadata through the `links = "lunet_locks_aof"` contract as

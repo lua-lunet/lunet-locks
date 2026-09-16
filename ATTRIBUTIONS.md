@@ -88,13 +88,13 @@ were verified against the crates.io licence field for each pinned version.
 
 ## Fetched at build/run time, not part of this repository
 
-The official Lunet `v0.8.0` runtime is downloaded by `make lunet-runtime`
+The official Lunet `v0.10.0` runtime is downloaded by `make lunet-runtime`
 and by the Docker build, verified by SHA-256 (per-platform pins in the
-`Makefile` and `docker/Dockerfile`), and extracted into `.lunet/v0.8.0/`.
+`Makefile` and `docker/Dockerfile`), and extracted into `.lunet/v0.10.0/`.
 It is a fetched tool: it is not stored in this repository, not rebuilt by
 it, and not included in the release archive. Its upstream is
 [lua-lunet/lunet](https://github.com/lua-lunet/lunet), whose `LICENSE` at
-tag `v0.8.0` is the MIT License (Copyright (c) 2025 xialeistudio,
+tag `v0.10.0` is the MIT License (Copyright (c) 2025 xialeistudio,
 Copyright (c) 2025–2026 Simon Massey). The released archive tarball itself
 carries no licence file; the licence record is the upstream repository's.
 

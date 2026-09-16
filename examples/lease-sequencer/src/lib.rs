@@ -5,6 +5,8 @@
 pub mod bridge;
 pub mod client_gate;
 pub mod embedded_client;
+pub mod flight_tape;
 pub mod phi;
+pub mod tape;
 pub mod telemetry;
 pub mod uds_harness;

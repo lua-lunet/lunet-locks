@@ -1,10 +1,10 @@
 #!/bin/sh
 # End-to-end advisory-lock service smoke. `make smoke` supplies the exact,
-# project-local Lunet v0.8.0 release; it is deliberately never resolved from PATH.
+# project-local Lunet v0.10.0 release; it is deliberately never resolved from PATH.
 set -eu
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-run=${LUNET_RUN:-"$root/.lunet/v0.8.0/lunet-run"}
+run=${LUNET_RUN:-"$root/.lunet/v0.10.0/lunet-run"}
 cyan=${CYAN:-"$root/.rocks/bin/cyan"}
 work=$(mktemp -d "$root/.tmp/lunet-smoke.XXXXXX")
 pids=""
@@ -48,7 +48,7 @@ cleanup() {
 trap cleanup EXIT INT TERM HUP
 
 test -x "$run" || {
-    echo "lunet smoke: missing project-local Lunet v0.8.0 runtime at $run; run make lunet-runtime" >&2
+    echo "lunet smoke: missing project-local Lunet v0.10.0 runtime at $run; run make lunet-runtime" >&2
     exit 127
 }
 test -x "$cyan" || {
@@ -150,29 +150,32 @@ start n3 28103 27103
 # n1's zero election stagger makes it leader under the documented defaults;
 # sending through n2 verifies application forwarding rather than direct leader I/O.
 sleep 3.5
-future=$(perl -MTime::HiRes=time -e 'printf "%.0f", time() * 1000 + 5000')
+# The client rents each lock for a duration; the leader stamps the absolute
+# expiry off its own execution clock (lease_ms is never an absolute time).
+initial_lease_ms=5000
 holder1=11111111-1111-1111-1111-111111111111
 holder2=22222222-2222-2222-2222-222222222222
 holder3=33333333-3333-3333-3333-333333333333
 
-request_lines 28102 "{\"op\":\"set\",\"message_id\":\"00000000-0000-0000-0000-000000000001\",\"client_id\":1,\"request_num\":1,\"lock_id\":9001,\"lease\":{\"lease_id\":1,\"holder\":\"$holder1\",\"expiry\":$future}}
+request_lines 28102 "{\"op\":\"set\",\"message_id\":\"00000000-0000-0000-0000-000000000001\",\"client_id\":1,\"request_num\":1,\"lock_id\":9001,\"lease\":{\"lease_id\":1,\"holder\":\"$holder1\",\"lease_ms\":$initial_lease_ms}}
 {\"op\":\"get\",\"message_id\":\"00000000-0000-0000-0000-000000000002\",\"client_id\":1,\"request_num\":2,\"lock_id\":9001}
-{\"op\":\"set\",\"message_id\":\"00000000-0000-0000-0000-000000000003\",\"client_id\":2,\"request_num\":1,\"lock_id\":9001,\"lease\":{\"lease_id\":2,\"holder\":\"$holder2\",\"expiry\":$future}}
+{\"op\":\"set\",\"message_id\":\"00000000-0000-0000-0000-000000000003\",\"client_id\":2,\"request_num\":1,\"lock_id\":9001,\"lease\":{\"lease_id\":2,\"holder\":\"$holder2\",\"lease_ms\":$initial_lease_ms}}
 {\"op\":\"release\",\"message_id\":\"00000000-0000-0000-0000-000000000004\",\"client_id\":1,\"request_num\":3,\"lock_id\":9001,\"holder\":\"$holder1\",\"lease_id\":1}
-{\"op\":\"set\",\"message_id\":\"00000000-0000-0000-0000-000000000005\",\"client_id\":2,\"request_num\":2,\"lock_id\":9001,\"lease\":{\"lease_id\":2,\"holder\":\"$holder2\",\"expiry\":$future}}
+{\"op\":\"set\",\"message_id\":\"00000000-0000-0000-0000-000000000005\",\"client_id\":2,\"request_num\":2,\"lock_id\":9001,\"lease\":{\"lease_id\":2,\"holder\":\"$holder2\",\"lease_ms\":$initial_lease_ms}}
 {\"op\":\"release\",\"message_id\":\"00000000-0000-0000-0000-000000000006\",\"client_id\":2,\"request_num\":3,\"lock_id\":9001,\"holder\":\"$holder2\",\"lease_id\":2}
 " '"granted":true|"op":"get"|"granted":false|"released":true|"granted":true|"released":true' \
     || fail "the lock exchange failed"
 
-soon=$(perl -MTime::HiRes=time -e 'printf "%.0f", time() * 1000 + 3000')
-request_lines 28102 "{\"op\":\"set\",\"message_id\":\"00000000-0000-0000-0000-000000000007\",\"client_id\":3,\"request_num\":1,\"lock_id\":9001,\"lease\":{\"lease_id\":3,\"holder\":\"$holder1\",\"expiry\":$soon}}" '"granted":true' \
+short_lease_ms=3000
+request_lines 28102 "{\"op\":\"set\",\"message_id\":\"00000000-0000-0000-0000-000000000007\",\"client_id\":3,\"request_num\":1,\"lock_id\":9001,\"lease\":{\"lease_id\":3,\"holder\":\"$holder1\",\"lease_ms\":$short_lease_ms}}" '"granted":true' \
     || fail "the short-lease grant failed"
 sleep 3.1
 # The takeover set's own lease must outlive the post-restart resurrection
-# window (the get below runs ~10s later), so it is granted a minute; the
-# takeover itself is driven by the prior short lease's expiry above.
-takeover_expiry=$(perl -MTime::HiRes=time -e 'printf "%.0f", time() * 1000 + 60000')
-request_lines 28102 "{\"op\":\"set\",\"message_id\":\"00000000-0000-0000-0000-000000000008\",\"client_id\":4,\"request_num\":1,\"lock_id\":9001,\"lease\":{\"lease_id\":4,\"holder\":\"$holder3\",\"expiry\":$takeover_expiry}}" '"granted":true' \
+# window (the get below runs ~10s later), so it is granted a minute off the
+# leader's execution clock; the takeover itself is driven by the prior short
+# lease's duration above.
+takeover_lease_ms=60000
+request_lines 28102 "{\"op\":\"set\",\"message_id\":\"00000000-0000-0000-0000-000000000008\",\"client_id\":4,\"request_num\":1,\"lock_id\":9001,\"lease\":{\"lease_id\":4,\"holder\":\"$holder3\",\"lease_ms\":$takeover_lease_ms}}" '"granted":true' \
     || fail "the takeover grant failed"
 
 # A restarted replica reincarnates: the killed process left the running
@@ -328,18 +331,17 @@ connect_socket();
 while (1) {
     # The 30 s lease survives any legitimate transition stall; the stream
     # holds the lock continuously across the reconfiguration, so a grant
-    # wrested by anyone else would surface as a refused renew here.
+    # wrested by anyone else would surface as a refused renew here. The
+    # leader stamps the absolute expiry off its own execution clock.
     my $lease_id = ++$lease_seq;
-    my $expiry   = now_ms() + 30000;
     request('{"op":"set","message_id":"' . uuid() . '","client_id":' . $client_id
         . ',"request_num":' . $seq . ',"lock_id":9101,"lease":{"lease_id":'
-        . $lease_id . ',"holder":"' . $holder . '","expiry":' . $expiry . '}}',
+        . $lease_id . ',"holder":"' . $holder . '","lease_ms":30000}}',
         '"granted":true', "acquire");
     sleep(0.1);
-    $expiry = now_ms() + 30000;
     request('{"op":"set","message_id":"' . uuid() . '","client_id":' . $client_id
         . ',"request_num":' . $seq . ',"lock_id":9101,"lease":{"lease_id":'
-        . $lease_id . ',"holder":"' . $holder . '","expiry":' . $expiry . '}}',
+        . $lease_id . ',"holder":"' . $holder . '","lease_ms":30000}}',
         '"granted":true', "renew");
     sleep(0.1);
     request('{"op":"release","message_id":"' . uuid() . '","client_id":' . $client_id
@@ -399,8 +401,8 @@ n4pid=$(cat "$work/n4.pid")
 stop_process "$n4pid"
 pids=$(printf '%s\n' "$pids" | sed "s/ $n4pid//")
 sleep 1
-post_expiry=$(perl -MTime::HiRes=time -e 'printf "%.0f", time() * 1000 + 60000')
-request_lines 28102 "{\"op\":\"set\",\"message_id\":\"00000000-0000-0000-0000-00000000000e\",\"client_id\":5,\"request_num\":1,\"lock_id\":9201,\"lease\":{\"lease_id\":5,\"holder\":\"$holder3\",\"expiry\":$post_expiry}}" '"granted":true'
+post_takeover_lease_ms=60000
+request_lines 28102 "{\"op\":\"set\",\"message_id\":\"00000000-0000-0000-0000-00000000000e\",\"client_id\":5,\"request_num\":1,\"lock_id\":9201,\"lease\":{\"lease_id\":5,\"holder\":\"$holder3\",\"lease_ms\":$post_takeover_lease_ms}}" '"granted":true'
 request_lines 28102 "{\"op\":\"release\",\"message_id\":\"00000000-0000-0000-0000-00000000000f\",\"client_id\":5,\"request_num\":2,\"lock_id\":9201,\"holder\":\"$holder3\",\"lease_id\":5}" '"released":true'
 
 stop_process "$stream_pid"

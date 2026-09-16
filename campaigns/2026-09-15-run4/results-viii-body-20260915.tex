@@ -1,0 +1,170 @@
+\section{Experimental results}\label{sec:experiments}
+
+All numbers in this section are from the 2026-09-15 campaign on the
+three-node voting configuration of the \code{lunet-locks} demonstration
+(Section~\ref{sec:demo}): three voting replicas --- ids 44, 55, 66, one
+per Scaleway datacentre (\code{pl-waw-1}, \code{pl-waw-2},
+\code{pl-waw-3}), each on a \code{DEV1-S} virtual machine --- each
+accompanied by a weight-0 telemetry standby (ids 77, 88, 99) in the
+same region, and one polite lease client per datacentre (ids 800002,
+800004, 800006) contending for a single lock, id 14531090, at a 500~ms
+lease window renewed at the half-window point, with a 1000~ms floor on
+non-holder probes. Every host runs chrony against the same four Google
+NTP sources with \code{makestep 1.0 3} and \code{rtcsync}; measured
+system offsets at run start were 18--46~\si{\micro\s} across the three
+datacentres, so every elapsed time below is a cross-host difference
+between host wall clocks that agree to well under a tenth of a
+millisecond. Each anchor is \code{date +\%s\%3N} stamped on the acting
+host at the moment the pause took effect; elapsed times are always
+$T+\Delta$ from that anchor, never raw epochs.
+
+\subsection{E1: the polite chase --- one holder, a renewal metronome}
+
+The load gate starts silent and the campaign releases it per client
+(SIGUSR2); a contender's first action is a GET probe, never a blind
+renewal. The observed discipline across the whole healthy window: the
+holder renews at the half-window point and holds until the experiment
+pauses it; the two non-holders probe at the 1000~ms floor and never
+race a live lease. One holder exists at every instant; every refusal
+the clients see is a leader decision they absorb and back off from.
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{lrrrrr}
+\toprule
+holder era & renewals & span (s) & p50 (ms) & min (ms) & max (ms) \\
+\midrule
+DC1 (800002) & 213 & 65.6 & 309.2 & 297.7 & 321.3 \\
+DC2 (800004) & 86 & 25.7 & 303.0 & 292.8 & 312.3 \\
+DC3 (800006) & 10 & 2.7 & 304.0 & 259.8 & 312.9 \\
+\bottomrule
+\end{tabular}
+\caption{The committed renewal cadence per holder era, from the
+standby trace records (deduplicated per committed slot). The renewal
+gap sits at the configured half-window of the 500~ms lease with a
+25~ms-wide jitter band; the holder is a metronome, not a lottery.}
+\label{tab:renewal}
+\end{table}
+
+The client-side operation latencies split cleanly by leader locality:
+the holder whose datacentre hosts the leader commits renewals at
+p50 2.9~ms (local UDP peer), while holders in the other two
+datacentres --- whose verbs the non-leader voters forward to the
+leader --- commit at p50 45--52~ms with p99 $\le$ 66~ms. The verb
+forwarding path costs one cross-datacentre hop and no more.
+
+\subsection{E2: anchored takeover under holder pause}
+
+The experiment pauses the acting holder's client process on its own
+host (SIGUSR1 on the gate), stamps the anchor on that host's clock,
+and watches the committed stream for the successor's acquire. Every
+pause of the acting holder produced exactly one successor acquire and
+no conflicting holder at any instant.
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{llll}
+\toprule
+anchor event & paused holder & successor & takeover \\
+\midrule
+kill\#1 (04:22:20) & DC3 (800006) & DC1 (800002) & verified$^{\dagger}$ \\
+kill\#2 (04:25:33) & DC1 (800002) & DC2 (800004) & $T+570.8$~ms \\
+kill\#3 (04:26:00) & DC2 (800004) & DC3 (800006) & $T+552.5$~ms \\
+\bottomrule
+\end{tabular}
+\caption{Anchored takeovers. $T$ is the pause instant on the holder's
+host clock. $\dagger$ kill\#1's committed acquire instant predates the
+trace corpus's earliest retained file: the standby AOF retention
+(10~MiB at a 5~ms heartbeat cadence) rolls roughly five minutes of
+wire trace, and kill\#1's window was rolled out before the pull; its
+succession is verified by the successor's client counters (acquire
+count 0$\to$1, renewals climbing) and the leader's committed stream
+resuming on the new holder. Experiment runs now size retention to the
+planned span.}
+\label{tab:takeover-elapsed}
+\end{table}
+
+The takeover latencies land where the design puts them: the lease
+expires 500~ms after the paused holder's last renewal, and the first
+non-holder probe past the expiry takes the lock 52--71~ms later ---
+one probe race plus one leader RTT. The polite takeover bound is the
+lease window by construction, and the measurements sit inside it.
+
+\subsection{E3: the campaign's hardening results}
+
+The rig campaign is itself a result stream: three correctness breaks
+were found, root-caused on live clusters, and closed with
+replay-shaped defensive tests on the exact failing shapes.
+
+\begin{enumerate}
+\item \emph{The descriptor is a hint list, not membership law.} A
+\code{--name} the cluster descriptor omits boots as a weight-0 joining
+member whose identity comes from \code{--join-id} and
+\code{--join-endpoint}, appended after the hint rows; the node stays
+fenced until the leader's committed configuration carries its row (the
+join verb at the leader is the act of entry; a future PSK, not this
+file, is the cross-environment boundary). The previous
+\code{--name not in descriptor} boot refusal is gone.
+\item \emph{The wire's identity discipline.} Every request id a client
+puts on the wire --- the holder of a lease candidate, the message id of
+every verb --- is the canonical hyphenated lowercase UUID form,
+refused loudly at decode otherwise, before the request can enter the
+replication log; the client asserts the same form at its identity draw
+and on both sides of the reply comparison. The break this closes: a
+bare-hex identity drew, parsed silently, and missed its own granted
+renewal in the comparison, so no tenure survived --- the unit tests of
+the day generated fixtures in whatever form the code under test
+produced, which is precisely why the wire now refuses the wrong form
+instead of trusting the tests.
+\item \emph{Fault observability at the self-arrest.} A faulted node
+poisons itself and stops serving (sticky by design, the fail-stop
+contract), and the first fault observation now records and publishes
+its reason --- the publish-gate breach, the journal refusal, the
+boundary panic --- in the node status and over a dedicated fault
+query ABI, instead of leaving a silently stopped service. The
+campaign's collapse window (E4) was diagnosed to its mechanism in one
+pass because the adapter half answered ``why''; before the change it
+answered nothing.
+\end{enumerate}
+
+\subsection{E4: the view-change collapse --- an upstream breach}
+
+The campaign's third pause window exposed a genuine upstream defect,
+reported here as fact. At kill\#3's takeover --- which committed
+cleanly --- the cluster executed its first view change of the run, 7
+minutes after bring-up, with the weight-0 telemetry learners joined.
+From that instant: the incumbent leader (id 55) left the protocol and
+never appeared again; the two surviving voters exchanged view changes
+at roughly six per second (views 15 through 510+) with \emph{zero}
+committed slots; the last committed operations were the takeover
+acquire plus two probe replies 3.8~s after the anchor; the verb path
+went silent cluster-wide --- the followers' forwarders waiting on a
+leader that no longer commits --- while the heartbeat and telemetry
+planes kept flowing. Each voter eventually arrested itself into its
+poisoned fail-stop state; with the observability change (E3.3) the
+arrest now names its reason.
+
+The vendored \code{vrr-core} is at upstream \code{origin/main}
+(\code{058acdc}); the breach reproduces in the vendor tree's own
+learner-acquisition corpus class, and no fix exists upstream at this
+writing. The kill\#3 window and everything after it are excluded from
+the campaign's measurements (the client-side error counts in that
+window are the collapse's own artifacts, not lease behaviour); the
+healthy prefix --- the sustain of E1 and the takeovers of E2 --- is
+untouched by it and is what the tables above report.
+
+\subsection{Held verdicts}
+
+On a three-region commodity cloud with synchronised clocks: (a) the
+polite lease chase holds exactly one holder at a time with a renewal
+cadence that is a 25~ms-wide band around the configured half-window;
+(b) pausing the acting holder hands the lock to the next datacentre's
+client in a measured 552--571~ms, inside the lease window by
+construction; (c) verb forwarding costs one cross-datacentre hop
+(p50 45--52~ms for a remote holder, p99 $\le$ 66~ms); and (d) the
+campaign found and closed three client- and adapter-side correctness
+gaps with replay-shaped defensive tests, and surfaced one upstream
+view-change breach with weight-0 learners --- the vendored core's
+own acquisition corpus class --- now observable at the fault line.

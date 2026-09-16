@@ -73,10 +73,10 @@ Local guidance for this repo. Keep it short, factual, and unsurprising.
 
 ## Runtime and upstream boundaries
 
-- The only service/smoke runtime is the project-local official Lunet `v0.8.0`
+- The only service/smoke runtime is the project-local official Lunet `v0.10.0`
   release. Run `make lunet-runtime` or `make smoke`; do not use a `lunet-run`
   from `PATH`. Its authoritative shipped LuaCATS/Teal docs are under
-  `.lunet/v0.8.0/types/`.
+  `.lunet/v0.10.0/types/`.
 - The authoritative uvrr-core source is the vendored submodule
   `ext/uvrr-core`, branch `lunet-locks/learner-era-fold`: upstream commit
   `0fc6380` plus the learner-acquisition and fence-under-load patch

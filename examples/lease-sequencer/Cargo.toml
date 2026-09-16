@@ -36,6 +36,11 @@ tokio = { version = "1", default-features = false, features = ["rt"], optional =
 [features]
 default = ["phi"]
 phi = ["dep:chrono", "dep:phi-accrual-detector", "dep:tokio"]
+# The Flight Recorder passthrough: the rig binary with the per-node
+# internal trace compiled in (the run's swap-in build —
+# `cargo build --release --features flight-recorder`). The recorded
+# nodes opt in per node via `LUNET_FLIGHT_RECORDER_DIR`.
+flight-recorder = ["lunet-advisory-lock/flight-recorder"]
 
 # The [patch] section is honored only in a workspace root's manifest — a
 # dependency's own [patch] is ignored — so the consumer restates it here.
@@ -48,3 +53,4 @@ vrr-core = { path = "../../ext/uvrr-core" }
 
 [dev-dependencies]
 serde_json = "1"
+serde = { version = "1", features = ["derive"] }

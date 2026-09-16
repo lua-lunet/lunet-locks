@@ -35,14 +35,14 @@ RUN cargo build --release --locked --manifest-path /app/examples/lease-sequencer
 
 FROM debian:bookworm-slim
 
-ARG LUNET_VERSION=v0.8.0
+ARG LUNET_VERSION=v0.10.0
 WORKDIR /app
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl libgcc-s1 libluajit-5.1-2 libstdc++6 libuv1 chrony tcpdump iperf3 netcat-openbsd procps \
     && rm -rf /var/lib/apt/lists/* \
     && case "$(dpkg --print-architecture)" in \
-        amd64) archive=lunet-linux-amd64.tar.gz; sha=3f884dbe03d0435af08253970e09eb134a8f1ebefa2c5f8a51ec6a8d31ee3d69 ;; \
-        arm64) archive=lunet-linux-arm64.tar.gz; sha=a7b009d31c6677b3aa4243b4811a988fb0d5fe80a8e82bd4a87ec9a83b0249a4 ;; \
+        amd64) archive=lunet-linux-amd64.tar.gz; sha=979acc8669d644fd2276d328016f7a54916b444b652452abd6cd16fcbbe8ba94 ;; \
+        arm64) archive=lunet-linux-arm64.tar.gz; sha=e651a9d7b75a53be631a74f5f7fffd332f8a2f3e388170385686369fe0c51d3f ;; \
         *) echo "unsupported Linux architecture: $(dpkg --print-architecture)" >&2; exit 1 ;; \
     esac \
     && curl --fail --location --retry 3 "https://github.com/lua-lunet/lunet/releases/download/${LUNET_VERSION}/${archive}" --output /tmp/lunet.tar.gz \

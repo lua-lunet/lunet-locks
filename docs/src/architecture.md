@@ -338,20 +338,24 @@ See [the event journal reference](event-journal.md) for record and metafile
 byte layouts, file naming, resume-on-reopen semantics, corrupt-tail
 tolerance, and the full console catch-up model.
 
-## Standby telemetry: the AOF write-behind series
+## The lock telemetry capture file: the write-behind series
 
-A zero-voting-weight standby member can host the console's telemetry: it
+A zero-voting-weight telemetry node can host the console's telemetry: it
 applies the replication stream like any member and writes its lock-event
-records to an async write-behind log (the AOF) instead of the blocking
-journal. The AOF writer never blocks or forces on the append path — events
-enqueue to a dedicated writer thread with drop-on-overflow, files roll at
-exactly 2 MiB (erasure-block aligned), and fsync happens only on a periodic
-timer, a checkpoint, or shutdown. The console's feed and SPA serve off the
-standby's own AOF series, never off a cluster replica's journal files, and
-the cluster's latency cadence is unaffected.
+records to an async write-behind log (the lock telemetry capture file)
+instead of the blocking journal. The writer never blocks or forces on the
+append path — events enqueue to a dedicated writer thread with
+drop-on-overflow, files roll at exactly 2 MiB (erasure-block aligned),
+the series rotates to a fresh unix-epoch-named file at every (re)start
+with the prior files left for admin pruning, and fsync happens only on a
+periodic timer, a checkpoint, or shutdown. The console's feed and SPA
+serve off the telemetry node's own capture series, never off a cluster
+replica's journal files, and the cluster's latency cadence is unaffected.
 
-See [standby telemetry](telemetry-aof.md) for the writer design, the rolling
-and reader-valid-prefix rules, and the headless console wiring.
+See [the lock telemetry capture file](telemetry-aof.md) for the writer
+design, the rotation, the rolling and reader-valid-prefix rules, and the
+headless console wiring. The per-node INTERNAL trace — everything the
+capture file never sees — is the [Flight Recorder](flight-recorder.md).
 
 ## Time, reincarnation, and durability
 
@@ -365,16 +369,32 @@ backup into the next view. The service's recovery loop drives the fenced-boot
 attempt while a replica is recovering: the drive ticks the core and, on a
 reincarnated node, re-announces its `(old, new)` pair.
 
-The `--state` file is the durable incarnation marker, the only bytes this
-service ever fsyncs. It holds one line, `<incarnation> <flushed|unflushed>`,
-written atomically (write, fsync, rename, parent-directory sync). The
-adopted membership facts keep a lazy, never-fsynced copy beside it — the
-membership sidecar described under
-[membership snapshots](membership-snapshots.md) — and the marker's boot
-classification reads the marker alone. The marker
-classifies the boot: `flushed` is a clean start under the same identity;
-`unflushed` is the running sentinel every operating process leaves behind,
-so a restart of a process that has been running classifies **dirty**.
+The `--state` file is the durable incarnation marker: one line,
+`<incarnation> <flushed|unflushed>`, written atomically (write, fsync,
+rename, parent-directory sync). The authoritative marker storage rides
+the vendored store's quorum-of-copies construction: a sibling
+`<state>.superblock` file holds four fixed, sector-aligned copies of the
+marker, each Aegis-checksummed and hash-chained by sequence — every
+lifecycle transition quorum-writes the copies with forced I/O (verified
+at the three-of-four write quorum) and the boot classification reads the
+highest-sequence read quorum (two of four), so a torn, rotted, or stale
+single copy cannot decide the classification and a marker write that did
+not reach its quorum is invisible to it. The single text file is written
+alongside at every transition as the compatibility projection: it is
+what legacy rig states boot from (their state seeds the copies on the
+first routed write) and the conservative fallback when the copies are
+unreadable. The
+adopted membership facts keep a lazy, never-fsynced copy beside them —
+the membership sidecar described under
+[membership snapshots](membership-snapshots.md).
+
+The marker classifies the boot: `flushed` is a clean start under the same
+identity; `unflushed` is the running sentinel every operating process
+leaves behind, so a restart of a process that has been running classifies
+**dirty**. A `stopped` or later marker — the graceful stop's first write
+— is the same clean continue: the wire was closed before the marker was
+written, so a shutdown that died between the marker writes still reads as
+a controlled ending, never as a crash.
 
 A dirty restart reincarnates the replica — the core's Crash-Stop-Self-Evict
 protocol. There is no same-identity recovery after volatile-state loss: the

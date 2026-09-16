@@ -40,6 +40,17 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(cdylib);
 
+    // The same ABI as a static archive: the advisory-lock adapter links the
+    // marker surface statically (its cdylib is loaded by the Lua runtime and
+    // must not grow a runtime dependency on this shared library). Both
+    // artifacts carry the same exports; the Rust build script picks the
+    // link mode.
+    const static_lib = b.addStaticLibrary(.{
+        .name = "lunet_locks_aof",
+        .root_module = srcs_module,
+    });
+    b.installArtifact(static_lib);
+
     const tests = b.addTest(.{
         .root_module = srcs_module,
     });

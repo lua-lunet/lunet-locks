@@ -17,7 +17,7 @@ end
 -- The request envelope the native Service decodes; message_id is the
 -- canonical UUID text form of the 16 raw bytes the reply output carries.
 local GET_JSON = '{"op":"get","message_id":"07070707-0707-0707-0707-070707070707","client_id":11,"request_num":13,"lock_id":17}'
-local SET_JSON = '{"op":"set","message_id":"08080808-0808-0808-0808-080808080808","client_id":11,"request_num":14,"lock_id":9001,"lease":{"lease_id":1,"holder":"09090909-0909-0909-0909-090909090909","expiry":99999999999999}}'
+local SET_JSON = '{"op":"set","message_id":"08080808-0808-0808-0808-080808080808","client_id":11,"request_num":14,"lock_id":9001,"lease":{"lease_id":1,"holder":"09090909-0909-0909-0909-090909090909","lease_ms":99999999999999}}'
 local MESSAGE_ID_BYTES = 16
 
 local function state_path(name: string): string
@@ -234,7 +234,7 @@ tested.test(
         end
         -- A contended set from a different holder is rejected, proving the
         -- first acquisition is still the only one on the lock.
-        local contested = '{"op":"set","message_id":"0a0a0a0a-0a0a-0a0a-0a0a-0a0a0a0a0a0a","client_id":12,"request_num":1,"lock_id":9001,"lease":{"lease_id":2,"holder":"0b0b0b0b-0b0b-0b0b-0b0b-0b0b0b0b0b0b","expiry":99999999999999}}'
+        local contested = '{"op":"set","message_id":"0a0a0a0a-0a0a-0a0a-0a0a-0a0a0a0a0a0a","client_id":12,"request_num":1,"lock_id":9001,"lease":{"lease_id":2,"holder":"0b0b0b0b-0b0b-0b0b-0b0b-0b0b0b0b0b0b","lease_ms":99999999999999}}'
         local ok_third = nodes[1]:request(contested)
         local third_replies: {advisory_lock.Output} = {}
         for _ = 1, 64 do

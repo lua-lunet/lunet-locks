@@ -22,12 +22,29 @@ vrr = { package = "vrr-core", git = "https://github.com/lua-lunet/uvrr-core.git"
 [patch."https://github.com/lua-lunet/uvrr-core.git"]
 vrr-core = { path = "../uvrr-core" }
 
+# The lifecycle marker rides the vendored Zig store's quorum-of-copies
+# superblock construction (the termination obligations' §4 marker). The
+# store links statically so this crate's own cdylib — the one the Lua
+# runtime loads — stays self-contained (no runtime dependency on the AOF
+# cdylib, no packaging change). The vendored AOF build is unix-only
+# (blocking POSIX file I/O); Windows keeps the single-file marker.
+[target.'cfg(not(target_os = "windows"))'.dependencies]
+lunet-locks-aof = { path = "../lunet-locks-aof", features = ["static"] }
+
 [features]
 default = ["io-uring"]
 # Linux appends go through an io_uring ring (page-cached buffered writes;
 # no O_DIRECT/O_SYNC). On non-Linux targets the feature is inert and the
 # writer thread uses plain buffered write_all.
 io-uring = ["dep:io-uring"]
+# The Flight Recorder: a per-node INTERNAL trace of everything the node
+# does — every inbound and outbound message (byte-exact), every drive
+# outcome, and the internal private events the telemetry never sees
+# (lock-state flushes, and which message tripped which assert / maybe /
+# arrest). OFF (the default) compiles none of it: the prod path is
+# unchanged. The ON build is a debug-level swap-in binary — never the
+# released prod shape (docs/src/flight-recorder.md).
+flight-recorder = []
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = { version = "0.7", optional = true }

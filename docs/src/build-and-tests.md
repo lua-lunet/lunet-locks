@@ -15,6 +15,22 @@ revision and its `[patch]` section builds the dependency from the
 submodule, so `cargo` fetches no git dependencies: local builds, the
 vendored Docker context, and CI all compile the submodule source directly.
 
+## The Flight Recorder build
+
+The Flight Recorder is a cargo feature, OFF by default; the prod path is
+unchanged without it. The recording build is an optimized release binary
+of the same tree — the panic discipline is unchanged — and it MUST come
+from a clean commit (the build fails on a dirty tree;
+`FLIGHT_RECORDER_ALLOW_DIRTY=1` overrides, stamping the recording dirty):
+
+```console
+cargo build --release --features flight-recorder                  # the cdylib shape
+cargo build --release --features flight-recorder -p lease-sequencer   # the rig binary
+```
+
+A node opts in per node via `LUNET_FLIGHT_RECORDER_DIR`; the reader is
+`skaffold_flight_tape`. See [the Flight Recorder](flight-recorder.md).
+
 ## Commands
 
 ```console
@@ -23,20 +39,20 @@ make lint            # reject unformatted Teal
 make build           # Rust checks/tests/release cdylib, then Cyan output
 make check           # build plus all Teal type checks
 make test            # check plus tested
-make lunet-runtime   # fetch and verify Lunet v0.8.0 locally
+make lunet-runtime   # fetch and verify Lunet v0.10.0 locally
 make smoke           # build and run the three-process service smoke test
 make simulation      # 30s TCP-NDJSON three-datacenter lease failover demo
 make simulation-test # focused std-Rust simulator unit tests
-make docker-build    # plain Docker image, including Linux Lunet v0.8.0
+make docker-build    # plain Docker image, including Linux Lunet v0.10.0
 make docker-simulation # the same 30s simulation against a stable Docker cluster
 make docs            # render the Zensical site
 ```
 
-`make lunet-runtime` downloads the host-specific official Lunet `v0.8.0`
-archive, verifies its SHA-256, and extracts it into `.lunet/v0.8.0/`. The
-service and smoke test always use `.lunet/v0.8.0/lunet-run`; they do not use a
+`make lunet-runtime` downloads the host-specific official Lunet `v0.10.0`
+archive, verifies its SHA-256, and extracts it into `.lunet/v0.10.0/`. The
+service and smoke test always use `.lunet/v0.10.0/lunet-run`; they do not use a
 runtime from `PATH`. The shipped LuaCATS/Teal runtime documentation is at
-`.lunet/v0.8.0/types/`.
+`.lunet/v0.10.0/types/`.
 
 `make smoke` starts three local nodes from a four-line deployment
 descriptor, connects through a nonleader, and covers acquire, GET,
@@ -55,7 +71,7 @@ timeline as measured. Temporary logs and process state live under
 `.tmp/`; the downloaded runtime does not.
 
 `make simulation` starts the same fixed three-node topology using only
-`.lunet/v0.8.0/lunet-run`, then drives it through the TCP NDJSON client API for
+`.lunet/v0.10.0/lunet-run`, then drives it through the TCP NDJSON client API for
 30 seconds. The std-Rust harness starts `DC1-0001`, `DC2-0001`, and
 `DC3-0001` with durable client ids 10001, 20001, and 30001, respectively.
 They GET before SET, renew their 1,000 ms lease every 900 ms, and contend for
@@ -75,7 +91,7 @@ carries the vendored dependency sources and the `ext/uvrr-core` submodule
 source at the relative position the manifest's `[patch]` section names, so
 the image build fetches nothing over the network and uses neither BuildKit
 features nor source/bind mounts. The image downloads and SHA-256 verifies its
-own Linux Lunet v0.8.0 runtime, compiles the native adapter for the Docker
+own Linux Lunet v0.10.0 runtime, compiles the native adapter for the Docker
 daemon's architecture, and contains Cyan output. The target builds and runs
 only for that native daemon platform, then verifies that the image matches it;
 it does not request cross-platform emulation.

@@ -22,6 +22,7 @@
 
 pub mod envelope;
 pub mod ffi;
+pub mod marker;
 pub mod retention;
 
 use std::io;

@@ -24,6 +24,7 @@ const assert = std.debug.assert;
 
 const aof = @import("aof.zig");
 const constants = @import("constants.zig");
+const marker = @import("marker.zig");
 const vsr = @import("vsr.zig");
 const io_backend = @import("io.zig");
 
@@ -294,4 +295,91 @@ export fn lunet_aof_iter_next(
 export fn lunet_aof_iter_close(it: *AofIter) void {
     it.iterator.close();
     std.heap.c_allocator.destroy(it);
+}
+
+// ---------------------------------------------------------------------------
+// The lifecycle marker surface (the superblock copies' quorum construction).
+//
+// The marker is the uVRR termination obligations' lifecycle marker
+// (`docs/uvrr-termination-obligations-v0.6.1.md` §2-§4): `unflushed` (the
+// running sentinel) → `stopped` (termination begins; the wire closed
+// before this write) → `flushed` (the durable-state write completed at the
+// drain point). The storage is the vendored superblock copies
+// construction — `marker.zig` for the details: four fixed sector-aligned
+// Aegis-checksummed copies, hash-chained sequence/parent, quorum write
+// verified at the `.verify` threshold (3/4), quorum read resolving by
+// highest sequence at the `.open` threshold (2/4), forced I/O (the fsync
+// lands before the write reports success).
+//
+// The single-threaded discipline applies verbatim (see the flush flag
+// below): marker calls stay on the caller's thread; no threads are
+// spawned, and every call opens, drives, and closes its own store.
+// ---------------------------------------------------------------------------
+
+/// The marker zone geometry: copy count and per-copy byte size. A C-ABI
+/// host derives its own diagnostic offsets from this (e.g. to rot one copy
+/// in a fault test) instead of hard-coding the vendored layout.
+export fn lunet_aof_marker_geometry(
+    out_copies: ?*usize,
+    out_copy_size: ?*usize,
+) i32 {
+    if (out_copies) |p| p.* = marker.copies_count;
+    if (out_copy_size) |p| p.* = marker.copy_size;
+    return OK;
+}
+
+/// One lifecycle transition: quorum-write `(incarnation, state)` into the
+/// marker file at `path` (creating it, never truncating it), forced I/O,
+/// verify read-back. Returns INVALID for a state code outside the
+/// lifecycle or an incarnation that would regress the marker; SERVICE for
+/// every storage-level failure (quorum lost, fork, I/O).
+export fn lunet_aof_marker_write(
+    path_data: [*]const u8,
+    path_len: usize,
+    incarnation: u64,
+    state: u32,
+) i32 {
+    if (path_len == 0 or path_len > std.fs.max_path_bytes) return INVALID;
+    const marker_state = marker.State.from_code(state) orelse return INVALID;
+    const path = path_data[0..path_len];
+
+    var store = marker.MarkerStore.open(path, std.heap.c_allocator) catch |err| {
+        return marker_error(err);
+    };
+    defer store.close(std.heap.c_allocator);
+    store.write(incarnation, marker_state) catch |err| return marker_error(err);
+    return OK;
+}
+
+/// The boot classification: read the marker's working quorum (the
+/// `.open` threshold) and report its `(incarnation, state)`. The caller
+/// classifies: `stopped`/`flushed` → a clean continue under the same
+/// incarnation; `unflushed` → the running sentinel → a DIRTY bump.
+/// SERVICE covers every unreadable-marker shape (no quorum, fork,
+/// rotted copies) — the caller refuses the boot rather than guessing an
+/// identity, exactly as it does for an unreadable single-file marker.
+export fn lunet_aof_marker_classify(
+    path_data: [*]const u8,
+    path_len: usize,
+    out_incarnation: *u64,
+    out_state: *u32,
+) i32 {
+    if (path_len == 0 or path_len > std.fs.max_path_bytes) return INVALID;
+    const path = path_data[0..path_len];
+
+    var store = marker.MarkerStore.open(path, std.heap.c_allocator) catch |err| {
+        return marker_error(err);
+    };
+    defer store.close(std.heap.c_allocator);
+    const classified = store.classify() catch |err| return marker_error(err);
+    out_incarnation.* = classified.incarnation;
+    out_state.* = @intFromEnum(classified.state);
+    return OK;
+}
+
+fn marker_error(err: anyerror) i32 {
+    return switch (err) {
+        error.IncarnationRegressed => INVALID,
+        else => SERVICE,
+    };
 }

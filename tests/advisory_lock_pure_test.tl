@@ -447,7 +447,7 @@ tested.test(
             .. name
             .. '","labels":["'
             .. table.concat(labels, '","')
-            .. '"],"lease":{"lease_id":3,"holder":"02020202-0202-0202-0202-020202020202","expiry":1722600001000}}'
+            .. '"],"lease":{"lease_id":3,"holder":"02020202-0202-0202-0202-020202020202","lease_ms":1722600001000}}'
         local limit = transport.MAX_DATAGRAM - transport.PEER_HEADER_BYTES - 1 - transport.MESSAGE_ID_BYTES
         assert(#json <= limit, "the test's extended SET must fit the client line bound")
         local messages, tail = transport.feed_ndjson("", json .. "\n", limit)
