@@ -281,9 +281,19 @@ pub const MarkerStore = struct {
 
 fn fsync_directory(path: []const u8) Error!void {
     const dirname = std.fs.path.dirname(path) orelse ".";
-    var dir = std.fs.cwd().openDir(dirname, .{}) catch return error.DirectorySyncFailed;
+    // A REAL directory fd: zig 0.14.1's non-iterating openDir opens with
+    // O_PATH on Linux, and fsync on an O_PATH fd is EBADF — which zig's
+    // posix.fsync spells `unreachable` (.BADF/.INVAL/.ROFS), aborting the
+    // process. `.iterate = true` opens O_RDONLY|O_DIRECTORY; the raw fsync
+    // below maps every failure (the whole EBADF/EINVAL family included) to
+    // the marker's fail-closed error, never unreachable.
+    var dir = std.fs.cwd().openDir(dirname, .{ .iterate = true }) catch return error.DirectorySyncFailed;
     defer dir.close();
-    posix.fsync(dir.fd) catch return error.DirectorySyncFailed;
+    const rc = posix.system.fsync(dir.fd);
+    switch (posix.errno(rc)) {
+        .SUCCESS => {},
+        else => return error.DirectorySyncFailed,
+    }
 }
 
 /// The marker header for one lifecycle transition: the vendored superblock
@@ -548,4 +558,81 @@ test "marker: a write refuses a regressing incarnation and an unquorum-able file
     defer rotted.close(testing.allocator);
     try testing.expectError(error.QuorumLost, rotted.write(9, .stopped));
     try testing.expectError(error.QuorumLost, rotted.classify());
+}
+
+// The rig's andon shape: the first boot over a wiped state dir. The state
+// dir exists (wiped), the marker file does not — the first quorum write
+// creates it and must fsync the containing directory through a REAL
+// directory fd (an O_PATH fd would abort the boot, zig spelling
+// fsync's .BADF `unreachable`).
+test "marker: first boot over a wiped state dir boots clean (empty dir)" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const file_path = try tmp_marker_path(&tmp, &buf);
+
+    var store = try opened(testing.allocator, file_path);
+    defer store.close(testing.allocator);
+    try store.write(7, .unflushed);
+    try testing.expectEqual(
+        Classified{ .state = .unflushed, .incarnation = 7 },
+        try store.classify(),
+    );
+}
+
+// The whole state tree is absent and the host creates it during the
+// boot; the first quorum write then dir-syncs the freshly created
+// directory.
+test "marker: first boot on a missing state dir boots clean (parent created)" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("state");
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try tmp.dir.realpath(".", &buf);
+    const suffix = try std.fmt.bufPrint(buf[root.len..], "/state/marker.superblock", .{});
+    const file_path = buf[0 .. root.len + suffix.len];
+
+    var store = try opened(testing.allocator, file_path);
+    defer store.close(testing.allocator);
+    try store.write(3, .flushed);
+    try testing.expectEqual(
+        Classified{ .state = .flushed, .incarnation = 3 },
+        try store.classify(),
+    );
+}
+
+// The boot with the marker file already present (`existed`): the dir
+// fsync is skipped, the classification reads the durable copies, and the
+// stop-path writes chain from them. Already passing — pinned.
+test "marker: a survivor boot over an existing marker chains unchanged" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const file_path = try tmp_marker_path(&tmp, &buf);
+
+    {
+        var first = try opened(testing.allocator, file_path);
+        defer first.close(testing.allocator);
+        try first.write(5, .unflushed);
+    }
+    // The survivor boot: the marker's copies are present, the boot reads
+    // them, and the stop path chains from them.
+    var survivor = try opened(testing.allocator, file_path);
+    defer survivor.close(testing.allocator);
+    try testing.expectEqual(
+        Classified{ .state = .unflushed, .incarnation = 5 },
+        try survivor.classify(),
+    );
+    try survivor.write(5, .flushed);
+    try testing.expectEqual(
+        Classified{ .state = .flushed, .incarnation = 5 },
+        try survivor.classify(),
+    );
+    // A third boot over the stopped copies keeps the chain.
+    var again = try opened(testing.allocator, file_path);
+    defer again.close(testing.allocator);
+    try testing.expectEqual(
+        Classified{ .state = .flushed, .incarnation = 5 },
+        try again.classify(),
+    );
 }
