@@ -48,6 +48,34 @@ Local guidance for this repo. Keep it short, factual, and unsurprising.
   lock client/server interaction) — a small skin, not new machinery.
 - Every fix carries a defensive test so the regression cannot return.
 
+## Dangling runs: no slop, no leftovers
+
+- Work ends in git, in the todo, moved out of the way, or terminated.
+  Nothing may dangle.
+- Before any outer commit, run `tools/dangling.sh`: processes started
+  by cancelled or completed agent attempts (smoke servers, simulators,
+  orphans holding ports) get listed, then terminated deliberately —
+  clear orphans only; NEVER the operator's own deliberate long-running
+  jobs (when in doubt, list and report instead of killing).
+- Files produced by cancelled attempts go to `.tmp/attic/`. At a
+  milestone tidy-up, on the operator's explicit order, attic content
+  moves to `/tmp/` (that order is the one sanctioned exception to the
+  write boundary below).
+
+## Legacy-free (alpha, unreleased)
+
+- THIS REPO IS ALPHA AND UNRELEASED. There is NO backwards
+  compatibility, NO migration, NO legacy support. Old logic, old paths,
+  old on-disk formats, and old tooling get deleted (deleting-dead-code
+  discipline) — never kept alive "for compatibility". The very latest
+  writes are the only ones documented in the MDD docs and doc comments.
+- If an on-disk format changes, old files are deleted before the next
+  cloud run. Legacy free. Period.
+- All markdown is MDD to the future target release state: no caveats,
+  no "not yet implemented", no contemporaneous commentary.
+- No file in git may name any `itemNN` identifier — such references are
+  purged on sight.
+
 ## Read boundary
 
 - Agents are FORBIDDEN from reading outside this repo. A dependency's code is
