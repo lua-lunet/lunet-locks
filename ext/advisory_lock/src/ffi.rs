@@ -699,6 +699,12 @@ impl Node {
             Input::Reincarnate { old } => {
                 serde_json::json!({"input": "reincarnate", "old": old.0})
             }
+            Input::SubmitPlan { .. } => {
+                serde_json::json!({"input": "submit-plan"})
+            }
+            Input::Abdicate { .. } => {
+                serde_json::json!({"input": "abdicate"})
+            }
         }
     }
 
