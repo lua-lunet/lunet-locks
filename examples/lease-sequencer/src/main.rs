@@ -1910,13 +1910,28 @@ fn timers(host: &mut Host, now: u64, rng: &mut Rng) {
     // on its leader it polls on the randomized schedule
     // `min + rand * (max - min)` — it may be pleasantly surprised when
     // the partition heals and the SAME leader returns, in which case a
-    // fresh commit disarms the poll and phi resumes.
+    // fresh commit disarms the poll and phi resumes. The poll's drive
+    // is `phi::poll_actuation`'s decision: inside the view-change
+    // limbo a bare tick cannot advance the attempt (the core's tick
+    // suspicion gate admits only `Normal` nodes), so the poll carries
+    // the §14.2 host-forced view — a NEW attempt re-broadcasts its
+    // fence, the peers join and vote, and a live primary installs.
     if host.timedout.timed_out() {
         if !host.viewchange.armed() {
             host.viewchange.arm(now, rng.unit());
         } else if host.viewchange.due(now) {
             host.viewchange.arm(now, rng.unit());
-            let _ = host.node.leader_timeout();
+            match phi::poll_actuation(true, status.state, true) {
+                phi::PollActuation::ForceView => {
+                    let forced = host.node.force_view(status.era, status.view + 1);
+                    if forced != 0 {
+                        let _ = host.node.leader_timeout();
+                    }
+                }
+                phi::PollActuation::LeaderTimeout | phi::PollActuation::None => {
+                    let _ = host.node.leader_timeout();
+                }
+            }
             host.flush_outputs(now, rng);
         }
     } else {
@@ -2970,8 +2985,7 @@ mod forward_tests {
         // into the counter.
         pump_udp(&mut b.host, millis(), &mut rng);
         assert_eq!(
-            b.host.late_acks,
-            1,
+            b.host.late_acks, 1,
             "the late ack was drained and counted, not aborted on"
         );
     }
