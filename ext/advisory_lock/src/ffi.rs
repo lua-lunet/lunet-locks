@@ -937,6 +937,12 @@ impl Node {
                 // without parking); treated as an invariant breach.
                 Err(FAULTED)
             }
+            Effect::AdminResponse { .. } => {
+                // Unreachable: the host never submits plans over the admin
+                // ingress, so no verdict can come back; treated as an
+                // invariant breach.
+                Err(FAULTED)
+            }
         }
     }
 
@@ -1643,7 +1649,7 @@ fn parse_member_entry(entry: &[u8]) -> Option<MemberEntry> {
 /// deployment's genesis. The journal and the era table hold exactly the
 /// entries `provision` installs — mirrored byte-for-byte so the joiner's
 /// slot-2 entry equals the cluster's committed one — and `reopen` fences the
-/// node to `Recovering` regardless. Nothing about a restart is pretended: the
+/// node to `Restarting` regardless. Nothing about a restart is pretended: the
 /// node holds the shared committed root and nothing else.
 fn joiner_replica(
     own: NodeId,
@@ -1687,7 +1693,7 @@ fn joiner_replica(
     let persisted = PersistedProgress {
         current: view,
         retained: view,
-        status: Status::Recovering,
+        status: Status::Joining,
         accepted: INIT_SLOT,
         committed: INIT_SLOT,
         applied: INIT_SLOT,
@@ -3085,7 +3091,7 @@ mod tests {
         for (index, node) in nodes.iter_mut().enumerate() {
             assert_eq!(
                 node.replica.progress().status(),
-                vrr::progress::Status::Recovering,
+                vrr::progress::Status::Joining,
                 "node {index} boots fenced"
             );
             node.outputs.clear();
@@ -3331,7 +3337,7 @@ mod tests {
             TEST_IDS[1],
             "no DIRTY bump after a stop inside the view-change window"
         );
-        assert_eq!(node.status().state, 2, "the reopened node boots fenced");
+        assert_eq!(node.status().state, 4, "the reopened node boots fenced");
         fs::remove_file(&path).unwrap();
         fs::remove_file(marker_store::superblock_path(&path)).unwrap();
     }
@@ -3387,7 +3393,7 @@ mod tests {
     fn boot_four_and_join() -> ([Node; 4], [u32; 4]) {
         let [one, two, three] = boot_cluster();
         let joiner = provision_joiner("cluster-joiner", 40, &TEST_IDS);
-        assert_eq!(joiner.replica.progress().status(), Status::Recovering);
+        assert_eq!(joiner.replica.progress().status(), Status::Restarting);
         let mut nodes = [one, two, three, joiner];
         let ids = [TEST_IDS[0], TEST_IDS[1], TEST_IDS[2], 40];
 
@@ -4715,7 +4721,7 @@ mod tests {
             },
             OK
         );
-        assert_eq!(status, 2, "recovering");
+        assert_eq!(status, 4, "joining");
         assert_eq!((era, view), (1, 0));
         assert_eq!(leader, 10);
 
@@ -4940,7 +4946,7 @@ mod tests {
         for node in &mut nodes {
             assert_eq!(
                 node.replica.progress().status(),
-                vrr::progress::Status::Recovering,
+                vrr::progress::Status::Joining,
                 "node boots fenced"
             );
             node.outputs.clear();
@@ -5015,7 +5021,7 @@ mod tests {
         // member of the configuration it can name.
         assert_eq!(
             nodes[2].replica.progress().status(),
-            vrr::progress::Status::Recovering,
+            vrr::progress::Status::Restarting,
             "the reincarnated node stays fenced"
         );
         let drained: VecDeque<Queued> = std::mem::take(&mut nodes[2].outputs);
@@ -5024,7 +5030,7 @@ mod tests {
             assert_eq!(output.kind, OUTPUT_SEND, "the boot announces only");
             let message = Message::unpack_from(&output.bytes).expect("wire round trip");
             assert_eq!(message.header.tag, vrr::wire::Tag::Reincarnation);
-            let Body::Reincarnation { old, new } = message.body else {
+            let Body::Reincarnation { old, new, .. } = message.body else {
                 panic!("the announcement body")
             };
             assert_eq!(old, NodeId(TEST_IDS[2]), "the superseded identity");
