@@ -514,7 +514,9 @@ impl Node {
                         self.record_fault(format!("sticky fault: {fault:?}"));
                         return Err(FAULTED);
                     }
-                    Err(refusal) => return Err(plan_error(refusal)),
+                    Err(refusal) => {
+                        return Err(plan_error(refusal));
+                    }
                 };
                 match self.replica.publish(planned) {
                     Ok(PublishOutcome::Published { effects, .. }) => Ok(effects),
@@ -709,7 +711,26 @@ impl Node {
     /// seqlock read per drive, level-gated formatting.
     fn report(&mut self) {
         let diagnostic = self.replica.observer().read_diagnostic();
-        if diagnostic != Diagnostic::None {
+        if let Diagnostic::ViewMismatch { got, current } = diagnostic
+            && got == current
+        {
+            // The views are EQUAL: the drop is the status gate, not the
+            // view (§4: a node in view change, replay, or recovery at a
+            // gap accepts no normal operation for its current view; §9.1:
+            // only the qualified StartView evidence installs). The plain
+            // `ViewMismatch { got: V, current: V }` print read as a
+            // self-contradictory drop bug (the n2 wedge, local-softball3
+            // 2026-09-17) — the line must name the gate and the status.
+            let snapshot = self.replica.observer().read();
+            let status_name = Status::from_word(snapshot.status)
+                .map(|status| format!("{status:?}"))
+                .unwrap_or_else(|| format!("unknown({})", snapshot.status));
+            warn!(
+                ?diagnostic,
+                status_name,
+                "peer input dropped with views EQUAL: the status gate, not the view"
+            );
+        } else if diagnostic != Diagnostic::None {
             warn!(?diagnostic, "peer input dropped with a named diagnostic");
         }
         let snapshot = self.replica.observer().read();
@@ -3244,6 +3265,226 @@ mod tests {
             TEST_IDS[0],
             "the dead id is not the primary"
         );
+    }
+
+    /// The got == current ViewMismatch tells the truth. The core's
+    /// `ViewMismatch` rejection also fires when the message's view EQUALS
+    /// the node's current view — the eligible gate's status half failed
+    /// (`replica/normal.rs`: a node in view change, replay, or recovery at
+    /// a gap accepts no normal operation for its own current view). The
+    /// drop is protocol-correct; the log line must say so, because the
+    /// self-contradictory `ViewMismatch { got: View(126), current:
+    /// View(126) }` print (the n2 wedge, local-softball3 2026-09-17) reads
+    /// as a bug when it is the status gate. This test drives both shapes:
+    /// a same-view Prepare at a node fencing that very view (status 1),
+    /// and a behind-view Prepare from a node still in the old view — and
+    /// requires the equal-views case to name the status gate while the
+    /// ordinary mismatch keeps the ordinary line.
+    #[test]
+    fn a_view_mismatch_with_equal_views_says_the_status_gate() {
+        let mut nodes = boot_cluster();
+        for node in nodes.iter_mut() {
+            assert_eq!(node.recover(), OK);
+        }
+        route_until_quiet(&mut nodes, &TEST_IDS);
+        let before = nodes[2].replica.observer().read();
+        assert_eq!(before.status, 0, "the cluster converged");
+        let target = ViewId {
+            era: Era(before.era),
+            view: View(before.view + 1),
+        };
+        // The node fences into the target view first (the phi actuation's
+        // drive): the view change enters, the current view is taken, no
+        // install yet.
+        assert_eq!(nodes[2].force_view(target.era.0, target.view.0), OK);
+        let window = nodes[2].replica.observer().read();
+        assert_eq!(
+            (window.status, window.era, window.view),
+            (1, before.era, target.view.0),
+            "the node sits inside the view-change window"
+        );
+        // The target view's designated primary, from the node's own era
+        // table (the §1.2 rotation).
+        let primary = nodes[2]
+            .replica
+            .progress()
+            .config()
+            .record(Era(before.era))
+            .expect("the current era is evaluable")
+            .config
+            .primary(View(target.view.0))
+            .expect("a view inside the era has a primary");
+        let equal_views = Message {
+            header: vrr::wire::Header {
+                tag: vrr::wire::Tag::Prepare,
+                view: target,
+                slot: Slot(1),
+            },
+            body: Body::Prepare {
+                entry: LogEntry {
+                    slot: Slot(1),
+                    era: Era(before.era),
+                    payload: Payload::Operation {
+                        id: OperationId { msb: 7, lsb: 7 },
+                        payload: Box::from(b"test".as_slice()),
+                    },
+                },
+                committed: Slot(0),
+            },
+        };
+        let capture = LineCapture::default();
+        tracing::subscriber::with_default(capture.clone(), || {
+            assert_eq!(
+                nodes[2].drive(Input::Peer {
+                    from: primary,
+                    message: equal_views,
+                }),
+                OK
+            );
+        });
+        let diagnostic = nodes[2].replica.observer().read_diagnostic();
+        assert!(
+            matches!(diagnostic, Diagnostic::ViewMismatch { got, current } if got == current),
+            "the same-view Prepare dropped with got == current: {diagnostic:?}"
+        );
+        let lines = capture.lines();
+        let line = lines
+            .iter()
+            .find(|line| line.contains("diagnostic=ViewMismatch"))
+            .expect("the drop was logged");
+        assert!(
+            line.contains("views EQUAL"),
+            "the equal-views drop names the status gate, not the view: {line}"
+        );
+        assert!(
+            line.contains("ViewChange"),
+            "the line names the ineligible status: {line}"
+        );
+
+        // The control: a genuinely different view (the node's fenced
+        // target sits ahead) keeps the ordinary named-diagnostic line.
+        let behind = ViewId {
+            era: Era(before.era),
+            view: View(before.view),
+        };
+        let old_primary = nodes[2]
+            .replica
+            .progress()
+            .config()
+            .record(Era(before.era))
+            .expect("the current era is evaluable")
+            .config
+            .primary(View(behind.view.0))
+            .expect("the old view has a primary");
+        let behind_view = Message {
+            header: vrr::wire::Header {
+                tag: vrr::wire::Tag::Prepare,
+                view: behind,
+                slot: Slot(1),
+            },
+            body: Body::Prepare {
+                entry: LogEntry {
+                    slot: Slot(1),
+                    era: Era(before.era),
+                    payload: Payload::Operation {
+                        id: OperationId { msb: 8, lsb: 8 },
+                        payload: Box::from(b"test".as_slice()),
+                    },
+                },
+                committed: Slot(0),
+            },
+        };
+        let control = LineCapture::default();
+        tracing::subscriber::with_default(control.clone(), || {
+            assert_eq!(
+                nodes[2].drive(Input::Peer {
+                    from: old_primary,
+                    message: behind_view,
+                }),
+                OK
+            );
+        });
+        let diagnostic = nodes[2].replica.observer().read_diagnostic();
+        assert!(
+            matches!(diagnostic, Diagnostic::ViewMismatch { got, current } if got != current),
+            "the behind-view Prepare dropped with got != current: {diagnostic:?}"
+        );
+        let lines = control.lines();
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("peer input dropped with a named diagnostic")),
+            "the ordinary mismatch keeps the ordinary line: {lines:?}"
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.contains("views EQUAL")),
+            "the unequal-views drop never claims the status gate: {lines:?}"
+        );
+        fs::remove_file(&nodes[2].state_path).unwrap();
+        fs::remove_file(marker_store::superblock_path(&nodes[2].state_path)).unwrap();
+    }
+
+    /// The tracing subscriber that captures rendered event lines: the
+    /// equal-views ViewMismatch's truth-telling log line is what the
+    /// status-gate test reads.
+    #[derive(Clone)]
+    struct LineCapture {
+        lines: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl LineCapture {
+        fn default() -> Self {
+            LineCapture {
+                lines: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            }
+        }
+
+        fn lines(&self) -> Vec<String> {
+            self.lines.lock().expect("capture lock").clone()
+        }
+    }
+
+    struct LineVisitor {
+        parts: Vec<String>,
+    }
+
+    impl tracing::field::Visit for LineVisitor {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.parts.push(format!("{}={}", field.name(), value));
+        }
+
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.parts.push(format!("{}={:?}", field.name(), value));
+        }
+    }
+
+    impl tracing::Subscriber for LineCapture {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _attrs: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut visitor = LineVisitor { parts: Vec::new() };
+            event.record(&mut visitor);
+            self.lines
+                .lock()
+                .expect("capture lock")
+                .push(visitor.parts.join(" "));
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
     }
 
     /// The phi/timeout plane meets the drain point
