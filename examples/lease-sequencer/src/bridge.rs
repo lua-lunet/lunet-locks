@@ -55,7 +55,7 @@ use vrr::wire::{Tag, Unpack};
 /// The wire alphabet's kind names, in tag order — the /metrics message
 /// table's keys. Total over the core's tags: a message kind is counted,
 /// never dropped.
-pub const TAG_NAMES: [&str; 13] = [
+pub const TAG_NAMES: [&str; 14] = [
     "Prepare",
     "PrepareOk",
     "Commit",
@@ -69,6 +69,7 @@ pub const TAG_NAMES: [&str; 13] = [
     "Fuse",
     "FuseOk",
     "CommitBatch",
+    "GossipRequest",
 ];
 
 fn tag_name(tag: Tag) -> &'static str {
@@ -86,6 +87,7 @@ fn tag_name(tag: Tag) -> &'static str {
         Tag::Fuse => "Fuse",
         Tag::FuseOk => "FuseOk",
         Tag::CommitBatch => "CommitBatch",
+        Tag::GossipRequest => "GossipRequest",
     }
 }
 
