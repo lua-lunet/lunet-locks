@@ -1460,7 +1460,8 @@ impl Node {
         let Some(session) = self.session.take() else {
             // The deferred window: no latched identity, no marker round.
             // The host still owes the durable sink drain.
-            if let Err(error) = drain_sink(&mut sink_guard(&self.sink)) {
+            let drained = drain_sink(&mut sink_guard(&self.sink));
+            if let Err(error) = drained {
                 eprintln!(
                     "lunet-advisory-lock: the stop drain failed ({error}); \
                            the markers hold the crash's evidence"
