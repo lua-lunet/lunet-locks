@@ -160,6 +160,66 @@ containers, bridge, and demonstration volumes on exit.
 `make docs` runs the `uv`-managed Zensical script at `docs/docs` and writes
 generated HTML under `docs/site/`.
 
+## Run-state snapshots and the shutdown consistency check
+
+Every trace capture — crash or no crash — snapshots the run's on-disk
+state. Distributed state is the thing that gets mishandled, so the
+capture copies aside every artifact class the run produced, per node:
+
+- the superblock files (`<state>.superblock`) and the single-file
+  `<incarnation> <state>` markers (`n1.state`, `n1.nonce`);
+- the membership sidecars (`<state>.membership`) next to the markers;
+- the flight-recorder tapes (`flight-*.jsonl`, rolled files included);
+- the AOF telemetry trees (`--aof-dir` series, `*.aof` / `ev-*.bin` +
+  metafiles);
+- the regular logs (`*.log`, `*.nohup`, `*.out`, `*.err`) — the
+  happens-before/happens-after evidence for shutdown correctness;
+- the anchors file (`anchors*`).
+
+`tools/snapshot_run.sh RUN_DIR [--out ARCHIVE.tar.gz]` walks the run
+directory and writes a gzip tar archive holding all of it, paths
+preserved, with a `SNAPSHOT_MANIFEST.txt` naming each captured file and
+its class. A crashed run may be missing any piece: missing classes and
+unreadable files are recorded as warnings in the manifest and on stderr,
+never fatal. The archive lands next to the run directory by default
+(`<RUN_DIR>.snapshot-<UTC timestamp>.tar.gz`).
+
+The default archive is the form the check reads. The check tool is
+`skaffold_flight_tape --check-shutdown RUN_DIR_OR_ARCHIVE`, and it reads
+a raw run directory or a snapshot archive transparently (an archive is
+extracted to a temporary directory first, so the superblock classifier
+sees real files). It cross-checks the logs against the markers:
+
+- every `drained and flushed` stop record in a node's logs demands a
+  final marker showing flushed (or stopped) at that node's identity:
+  the superblock quorum classification and the single-file marker must
+  agree in state and incarnation. A log claiming a clean flush whose
+  marker does not show it is INCONSISTENCY, reported with the log file
+  and line, the record's timestamp, and the copy states (the
+  single-file marker line and the superblock `(state, incarnation)`);
+- the reverse holds: a final marker showing flushed/stopped with no
+  stop record in any of the node's logs is INCONSISTENCY;
+- the stop path's records are ordered (stop-begin, drain, flushed) and
+  inversions are flagged: a stop record out of sequence, and any log
+  activity after the persist order completed — work the runtime did
+  after the stop path wrote its final marker;
+- the superblock's write time (from the filesystem, or the tar entry's
+  mtime for archives) is ordered against the stop records: a marker
+  written before the stop began is an inversion.
+
+The report exits 0 when every node is consistent, 1 when any
+INCONSISTENCY or inversion was found, 2 on usage or input errors.
+Earlier stop cycles inside one run directory are not contradicted by a
+final marker a later life rewrote: only the last stop cycle of a node
+is cross-checked against the final marker; a later boot (clean
+continue or crashed bump) after a flushed record supersedes it.
+
+Old on-disk state is removed before a new run only after a successful
+snapshot. Every wipe step (`tests/lunet_smoke.sh`, the
+`examples/lease-sequencer` run scripts) calls `snapshot_run.sh` on the
+directory it is about to remove and wipes only on its success; a failed
+snapshot refuses the wipe loudly and leaves the state in place.
+
 ## Relevant files
 
 | File | Responsibility |
@@ -171,6 +231,9 @@ generated HTML under `docs/site/`.
 | `src/admin.tl` | Admin verb decode, ADMIN peer payload, acknowledgments, dedup cache |
 | `src/server.tl` | TCP NDJSON server, UDP peers, leader forwarding, reconfiguration drives |
 | `tests/lunet_smoke.sh` | three-process runtime smoke test with restart and live-reconfiguration stages |
+| `tools/snapshot_run.sh` | the run-state snapshot: all six artifact classes into a dated gzip tar |
+| `tools/test_snapshot_run.sh` | the snapshot tool's acceptance: six classes, tolerance, archive-equals-raw |
+| `examples/lease-sequencer/src/shutdown_check.rs` | the shutdown-restart consistency check behind `--check-shutdown` |
 | `tools/lease_failover_sim.rs` | std-Rust live TCP lease-failover simulator |
 | `docker/Dockerfile.fastbuild` | the colima build stages: deps-layer cache, the sanity check payload, the release artifacts, the amd64 rootfs staging |
 | `docker/Dockerfile.release` | the release image (both cdylib shapes + both node binaries + the pinned runtime) |

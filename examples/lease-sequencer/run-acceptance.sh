@@ -41,7 +41,15 @@ sleep 0.2
 
 cargo build --release --quiet || fail "build"
 
-rm -rf "$RUN"
+# The snapshot rule gates the wipe: the old run state is removed only
+# after a successful snapshot of it; a failed snapshot refuses the wipe
+# loudly and the run stops rather than writing over unvouched state.
+if sh ../../tools/snapshot_run.sh "$RUN" && rm -rf "$RUN"; then
+    :
+else
+    echo "REFUSED to wipe $RUN: the snapshot failed; the run dir stays" >&2
+    exit 1
+fi
 mkdir -p "$RUN/logs" "$RUN/state" || exit 1
 : > "$RUN/pids"
 

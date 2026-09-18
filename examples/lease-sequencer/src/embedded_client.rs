@@ -1095,7 +1095,8 @@ mod tests {
                 extend_op.op, "extend",
                 "a holder renews its own lease; it never re-SETs it"
             );
-            let request: Value = serde_json::from_str(&extend_op.request).expect("the renewal is json");
+            let request: Value =
+                serde_json::from_str(&extend_op.request).expect("the renewal is json");
             let reply = execute(&mut service, &request, execution_tick);
             assert_eq!(
                 reply["granted"], true,

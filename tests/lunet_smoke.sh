@@ -27,12 +27,23 @@ stop_process() {
     wait "$pid" 2>/dev/null || true
 }
 
+# The snapshot rule gates the wipe: old on-disk state is removed only
+# after a successful snapshot of it. A failed snapshot refuses the wipe
+# loudly and leaves the run dir in place.
+wipe_run() {
+    if sh "$root/tools/snapshot_run.sh" "$work" && rm -rf "$work"; then
+        echo "lunet smoke: snapshotted and wiped $work" >&2
+    else
+        echo "lunet smoke: REFUSED to wipe $work: the snapshot failed; the run dir stays" >&2
+    fi
+}
+
 cleanup() {
     for pid in $pids; do
         stop_process "$pid"
     done
     if "$completed"; then
-        rm -rf "$work"
+        wipe_run
     else
         echo "lunet smoke: retained failure logs in $work" >&2
         # The runner (local or CI) is torn down with the job; the CI log is

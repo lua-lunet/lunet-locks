@@ -8,10 +8,15 @@
 //! `from,to,jsonl` playback slice; `--deep` (or any kind beyond `wire`)
 //! is the deep read of the full internal event log, allowed ONLY by the
 //! code as-at the recording's commit and loudly refused otherwise.
+//!
+//! The third read is not a tape at all: `--check-shutdown` reads a run
+//! directory or a `snapshot_run.sh` archive and cross-checks the logs
+//! against the durable markers (`src/shutdown_check.rs`).
 
 use lease_sequencer::flight_tape::{FlightTapeOptions, stream_recording};
+use lease_sequencer::shutdown_check;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 const HELP: &str = "\
@@ -20,6 +25,7 @@ skaffold_flight_tape — stream a node's Flight Recorder recording as the replay
 usage: skaffold_flight_tape --file PATH [--node N] [--from N] [--to N]
                              [--from-any] [--to-any] [--kinds LIST] [--deep]
                              [--out PATH]
+       skaffold_flight_tape --check-shutdown RUN_DIR_OR_ARCHIVE [--out PATH]
 
 The output: one CSV line per kept event, `from,to,{json}`, stdout (or --out),
 in recording order. The trivial shell filter works on the plain output:
@@ -64,7 +70,8 @@ hex-encoded — byte-exact playback needs the original datagram). The deep
 read stamps each line's seq.
 
 flags:
-  --file PATH       the recording (flight-<node>.jsonl; required)
+  --file PATH       the recording (flight-<node>.jsonl; required unless
+                    --check-shutdown)
   --node N          require the recording to be node N's.
   --from N          keep only lines whose derived from == N. '?' lines
                     are dropped unless --from-any.
@@ -79,7 +86,21 @@ flags:
   --deep            the full internal event log: every event with its
                     seq, plus the header facts and per-kind counts on
                     stderr. Same-commit only; --kinds does not narrow it.
-  --out PATH        write the tape to PATH (else stdout).
+  --check-shutdown PATH
+                    the shutdown-restart consistency check over a run
+                    directory (raw files) or a snapshot_run.sh gzip tar
+                    archive — both read transparently. Cross-checks the
+                    logs against the superblock/single-file markers
+                    (every drained-and-flushed stop record must stand on
+                    a final marker showing flushed/stopped at that
+                    identity, and the reverse), orders the stop-path
+                    records (stop-begin, drain, flushed) and flags
+                    inversions: records out of sequence, a marker
+                    written before the stop began, and work logged after
+                    the persist order completed. Exit 0 consistent, 1
+                    findings, 2 usage or input errors.
+  --out PATH        write the tape (or the check's report) to PATH
+                    (else stdout).
   --help            this text.
 ";
 
@@ -88,6 +109,7 @@ fn main() -> ExitCode {
     let mut file = None;
     let mut options = FlightTapeOptions::default();
     let mut out_path: Option<PathBuf> = None;
+    let mut check_shutdown_path: Option<PathBuf> = None;
     let mut index = 0;
     while index < args.len() {
         let arg = args[index].as_str();
@@ -143,6 +165,7 @@ fn main() -> ExitCode {
             },
             "--kinds" => options.kinds = value.split(',').map(|kind| kind.to_string()).collect(),
             "--out" => out_path = Some(PathBuf::from(value)),
+            "--check-shutdown" => check_shutdown_path = Some(PathBuf::from(value)),
             other => {
                 eprintln!("unknown flag {other}; see --help");
                 return ExitCode::from(2);
@@ -150,6 +173,11 @@ fn main() -> ExitCode {
         }
         index += 2;
     }
+
+    if let Some(input) = check_shutdown_path {
+        return run_check_shutdown(&input, out_path.as_deref());
+    }
+
     let Some(file) = file else {
         eprintln!("see --help");
         return ExitCode::from(2);
@@ -182,6 +210,27 @@ fn main() -> ExitCode {
             }
             ExitCode::SUCCESS
         }
+        Err(error) => {
+            eprintln!("skaffold_flight_tape: {error}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn run_check_shutdown(input: &Path, out_path: Option<&Path>) -> ExitCode {
+    let mut out: Box<dyn Write> = match out_path {
+        Some(path) => match std::fs::File::create(path) {
+            Ok(file) => Box::new(std::io::BufWriter::new(file)),
+            Err(error) => {
+                eprintln!("skaffold_flight_tape: --out create failed ({error})");
+                return ExitCode::from(2);
+            }
+        },
+        None => Box::new(std::io::stdout()),
+    };
+    match shutdown_check::check_shutdown_to(input, &mut out) {
+        Ok(shutdown_check::Verdict::Consistent) => ExitCode::SUCCESS,
+        Ok(shutdown_check::Verdict::Inconsistent) => ExitCode::from(1),
         Err(error) => {
             eprintln!("skaffold_flight_tape: {error}");
             ExitCode::from(2)
