@@ -1,19 +1,27 @@
-//! The phi-accrual leader-failure detector (item19): trailer codec,
-//! per-(era, leader, addr, monitor) sketches, and the FFI C-ABI wrapper
-//! embedding the `phi-accrual-detector` crate behind the `phi` feature.
-//! The core's wire contract (W3: exact lengths, trailing-byte rejection)
-//! is untouched — the trailer lives entirely at the adapter framing
-//! layer: the host strips it before `node.receive()` and appends it after
-//! the send is queued.
+//! The leader-failure detection surface (item19, item25.18): the
+//! trailer codec, the `timedout` toggle, the cluster viewchange timer,
+//! the sloppy leader timeout, and — behind the `experimental-phi`
+//! feature — the per-(era, leader, addr, monitor) sketches and the FFI
+//! C-ABI wrapper embedding the `phi-accrual-detector` crate.
 //!
-//! The detector's steady-state contract — the `timedout` toggle, the
+//! Two detectors, one actuation. The NORMAL build runs the sloppy
+//! timeout ([`SloppyLeader`]): a uniform random wait in
+//! `[min, max]` re-armed on leader evidence; the sketches, the wire
+//! trailer, and the crate embed compile ONLY into the
+//! `experimental-phi` build, where today's phi behaviour is verbatim.
+//! The core's wire contract (W3: exact lengths, trailing-byte
+//! rejection) is untouched either way — the trailer lives entirely at
+//! the adapter framing layer: the host strips it before
+//! `node.receive()` and appends it after the send is queued.
+//!
+//! The detectors' steady-state contract — the `timedout` toggle, the
 //! cluster viewchange timeout, and the failover-gap sketch protection —
-//! is stated in `docs/src/phi-and-timeouts.md`; the types here implement
-//! it and the doc governs.
+//! is stated in `docs/src/phi-and-timeouts.md`; the types here
+//! implement it and the doc governs.
 
-#[cfg(feature = "phi")]
+#[cfg(feature = "experimental-phi")]
 use std::sync::OnceLock;
-#[cfg(feature = "phi")]
+#[cfg(feature = "experimental-phi")]
 use tokio::runtime::Runtime;
 
 /// The trailer's 2-byte magic, inside the reserved high-band byte space
@@ -89,7 +97,8 @@ pub fn addr_text(addr: std::net::SocketAddr) -> String {
     addr.to_string()
 }
 
-/// The detector's policy knobs.
+/// The detector's policy knobs (`experimental-phi` only).
+#[cfg(feature = "experimental-phi")]
 #[derive(Clone, Debug)]
 pub struct PhiConfig {
     /// The phi value a sketch must reach before its monitor acts.
@@ -104,6 +113,7 @@ pub struct PhiConfig {
     pub window: u32,
 }
 
+#[cfg(feature = "experimental-phi")]
 impl Default for PhiConfig {
     fn default() -> Self {
         Self {
@@ -116,6 +126,8 @@ impl Default for PhiConfig {
 }
 
 /// One sketch's identity: the monitored view and who is watching.
+/// (`experimental-phi` only — the sketches ride the feature.)
+#[cfg(feature = "experimental-phi")]
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SketchKey {
     pub era: u32,
@@ -126,34 +138,33 @@ pub struct SketchKey {
 }
 
 /// One (era, leader, addr, monitor) sketch: the embedded crate's Detector
-/// (`phi` feature) or a disabled stub, plus the host's own mirror of the
-/// arrival intervals — the mirror feeds the JSON sample log and the
-/// learned-mean query, neither of which the crate exposes. A sketch with
-/// fewer than two learned intervals reports phi 0: there is no spread to
-/// deviate from, and the crate's single-interval case is degenerate.
+/// plus the host's own mirror of the arrival intervals — the mirror
+/// feeds the JSON sample log and the learned-mean query, neither of
+/// which the crate exposes. A sketch with fewer than two learned
+/// intervals reports phi 0: there is no spread to deviate from, and the
+/// crate's single-interval case is degenerate.
+#[cfg(feature = "experimental-phi")]
 pub struct Sketch {
     cfg: PhiConfig,
     intervals_ms: Vec<u64>,
     last_arrival_ms: u64,
     seed: bool,
-    #[cfg(feature = "phi")]
     detector: ffi::DetectorHandle,
 }
 
 // The host loop is single-threaded; the raw handle never crosses threads.
-#[cfg(feature = "phi")]
+#[cfg(feature = "experimental-phi")]
 unsafe impl Send for Sketch {}
 
+#[cfg(feature = "experimental-phi")]
 impl Sketch {
     pub fn new(cfg: PhiConfig) -> Self {
-        #[cfg(feature = "phi")]
         let detector = ffi::new(cfg.window);
         Self {
             cfg,
             intervals_ms: Vec::new(),
             last_arrival_ms: 0,
             seed: false,
-            #[cfg(feature = "phi")]
             detector,
         }
     }
@@ -171,10 +182,7 @@ impl Sketch {
             // hand the crate its baseline.
             self.last_arrival_ms = at_ms;
             self.seed = true;
-            #[cfg(feature = "phi")]
-            unsafe {
-                ffi::observe(self.detector, at_ms as i64)
-            };
+            unsafe { ffi::observe(self.detector, at_ms as i64) };
             return;
         }
         let interval = at_ms.saturating_sub(self.last_arrival_ms);
@@ -184,10 +192,7 @@ impl Sketch {
             self.intervals_ms.remove(0);
         }
         self.last_arrival_ms = at_ms;
-        #[cfg(feature = "phi")]
-        unsafe {
-            ffi::observe(self.detector, at_ms as i64)
-        };
+        unsafe { ffi::observe(self.detector, at_ms as i64) };
     }
 
     /// The count of learned intervals (0 for a fresh sketch).
@@ -204,20 +209,13 @@ impl Sketch {
     }
 
     /// The phi value at `now_ms` from the embedded detector. 0 with no
-    /// learned interval (the sketch is empty or the feature is off — no
-    /// evidence, no suspicion; the core's own timer remains the
-    /// detector).
+    /// learned interval (the sketch is empty — no evidence, no
+    /// suspicion).
     pub fn phi(&self, now_ms: u64) -> f64 {
         if self.intervals_ms.len() < 2 {
             return 0.0;
         }
-        #[cfg(feature = "phi")]
-        return unsafe { ffi::value(self.detector, now_ms as i64) };
-        #[cfg(not(feature = "phi"))]
-        {
-            let _ = now_ms;
-            0.0
-        }
+        unsafe { ffi::value(self.detector, now_ms as i64) }
     }
 }
 
@@ -227,6 +225,7 @@ impl Sketch {
 /// the leader's real cadence rides the host tick plus a full Prepare
 /// round, so the configured value alone can sit inside the normal
 /// distribution and fire on ordinary jitter.
+#[cfg(feature = "experimental-phi")]
 pub fn decide(sketch: &Sketch, now_ms: u64, cfg: &PhiConfig) -> bool {
     if sketch.intervals_ms.len() < 2 {
         return false;
@@ -241,6 +240,7 @@ pub fn decide(sketch: &Sketch, now_ms: u64, cfg: &PhiConfig) -> bool {
 
 /// The hard safety floor the decision respects: `safety_multiple` over the
 /// larger of the configured heartbeat and the learned mean interval.
+#[cfg(feature = "experimental-phi")]
 pub fn floor_ms(sketch: &Sketch, cfg: &PhiConfig) -> f64 {
     cfg.safety_multiple * (cfg.heartbeat_ms as f64).max(sketch.mean_interval_ms())
 }
@@ -249,11 +249,13 @@ pub fn floor_ms(sketch: &Sketch, cfg: &PhiConfig) -> f64 {
 /// observation for a key that is not the live one REPLACES the table
 /// (era/config change = fresh sketch); there is at most one live leader
 /// being monitored at a time, so the table holds one sketch.
+#[cfg(feature = "experimental-phi")]
 pub struct Table {
     cfg: PhiConfig,
     live: Option<(SketchKey, Sketch)>,
 }
 
+#[cfg(feature = "experimental-phi")]
 impl Table {
     pub fn new(cfg: PhiConfig) -> Self {
         Self { cfg, live: None }
@@ -389,6 +391,122 @@ impl TimeoutToggle {
     }
 }
 
+// ------------------------------------------------------ sloppy timeout ----
+
+/// The randomized delay law both the leader timeout and the cluster
+/// viewchange schedule arm with: `min + unit * (max - min)`
+/// (`docs/src/phi-and-timeouts.md`). The unit sample is clamped into
+/// [0, 1], so a hostile RNG sample can never escape the validated
+/// bounds; a degenerate `max <= min` schedule is the fixed wait.
+pub fn random_wait_ms(min_ms: u64, max_ms: u64, unit: f64) -> u64 {
+    if max_ms <= min_ms {
+        return min_ms;
+    }
+    let unit = unit.clamp(0.0, 1.0);
+    min_ms + (unit * (max_ms - min_ms) as f64) as u64
+}
+
+/// The host's xorshift RNG: the single randomness source the host loop
+/// feeds every randomised wait (the sloppy timeout's deadline, the
+/// cluster viewchange schedule, the lease driver's jitter).
+pub struct Rng(u64);
+
+impl Rng {
+    pub fn new(seed: u64) -> Self {
+        Self(seed | 1)
+    }
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+    pub fn below(&mut self, bound: u64) -> u64 {
+        self.next() % bound.max(1)
+    }
+    /// One unit sample in [0, 1): the injected randomness every
+    /// `random_wait_ms` consumer passes back in, so a test can drive a
+    /// wait deterministically.
+    pub fn unit(&mut self) -> f64 {
+        // 53 random bits into an f64 fraction: the full double mantissa,
+        // no bias toward either bound.
+        (self.next() >> 11) as f64 / (1u64 << 53) as f64
+    }
+}
+
+/// The sloppy leader timeout — the NORMAL build's leader-failure
+/// detector (item25.18). Per watched (era, leader) key the deadline is
+/// `now + uniform_random(min, max)` over the `--phi-timeout-min-ms/max`
+/// knobs, re-armed on leader evidence: the key's birth (a leader or era
+/// change), the fresh-commit resume, and each heartbeat Commit arriving
+/// from the current leader. A due deadline fires the §14.2 host-forced
+/// view change — the same actuation the `experimental-phi` build's phi
+/// crossing drives, a different verdict source.
+///
+/// The timing law is Raft's (Ongaro 2014): broadcastTime ≪
+/// electionTimeout ≪ MTBF, the wait RANDOMISED in a generous fixed
+/// interval — the randomisation is the liveness mechanism (a
+/// synchronised fleet must never time out in lockstep), the generosity
+/// is the stability mechanism.
+pub struct SloppyLeader {
+    min_ms: u64,
+    max_ms: u64,
+    watched: Option<(u32, u32)>,
+    deadline_ms: u64,
+    /// The ts of the last leader evidence: the key's birth, or the last
+    /// re-arm. The phi-detect note's silence measures against it.
+    last_evidence_ms: u64,
+}
+
+impl SloppyLeader {
+    pub fn new(min_ms: u64, max_ms: u64) -> Self {
+        Self {
+            min_ms,
+            max_ms,
+            watched: None,
+            deadline_ms: 0,
+            last_evidence_ms: 0,
+        }
+    }
+
+    /// Watches (era, leader): a NEW key (a leader change, a re-keying
+    /// era) re-arms the deadline at its birth; the same key is stable.
+    pub fn watch(&mut self, key: (u32, u32), now_ms: u64, unit: f64) {
+        if self.watched == Some(key) {
+            return;
+        }
+        self.watched = Some(key);
+        self.rearm(now_ms, unit);
+    }
+
+    /// Re-arms the deadline: `now + uniform_random(min, max)`. Every
+    /// leader-evidencing arrival runs this.
+    pub fn rearm(&mut self, now_ms: u64, unit: f64) {
+        self.deadline_ms = now_ms + random_wait_ms(self.min_ms, self.max_ms, unit);
+        self.last_evidence_ms = now_ms;
+    }
+
+    /// Whether the deadline has passed while a key is watched.
+    pub fn due(&self, now_ms: u64) -> bool {
+        self.watched.is_some() && now_ms >= self.deadline_ms
+    }
+
+    /// The watched (era, leader) key, when one is watched.
+    pub fn watched(&self) -> Option<(u32, u32)> {
+        self.watched
+    }
+
+    /// The armed deadline (meaningful while a key is watched).
+    pub fn deadline_ms(&self) -> u64 {
+        self.deadline_ms
+    }
+
+    /// The ts of the last leader evidence (birth or re-arm).
+    pub fn last_evidence_ms(&self) -> u64 {
+        self.last_evidence_ms
+    }
+}
+
 // ---------------------------------------------------- viewchange timer ----
 
 /// The cluster viewchange timeout's range error: the validated config
@@ -410,19 +528,6 @@ impl std::fmt::Display for ViewChangeRange {
 }
 
 impl std::error::Error for ViewChangeRange {}
-
-/// One poll delay in the randomized viewchange schedule:
-/// `min + unit * (max - min)` (`docs/src/phi-and-timeouts.md`). The
-/// unit sample is clamped into [0, 1], so a hostile RNG sample can
-/// never escape the validated bounds; a degenerate `max <= min`
-/// schedule is the fixed poll.
-pub fn viewchange_delay_ms(min_ms: u64, max_ms: u64, unit: f64) -> u64 {
-    if max_ms <= min_ms {
-        return min_ms;
-    }
-    let unit = unit.clamp(0.0, 1.0);
-    min_ms + (unit * (max_ms - min_ms) as f64) as u64
-}
 
 /// The cluster viewchange poll's actuation: what the due poll drives.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -494,7 +599,7 @@ impl ViewChangeTimer {
     /// sample. Re-arming after every poll is the randomisation — a
     /// synchronised fleet must never re-poll in lockstep.
     pub fn arm(&mut self, now_ms: u64, unit: f64) {
-        self.deadline_ms = now_ms + viewchange_delay_ms(self.min_ms, self.max_ms, unit);
+        self.deadline_ms = now_ms + random_wait_ms(self.min_ms, self.max_ms, unit);
         self.armed = true;
     }
 
@@ -522,14 +627,14 @@ impl ViewChangeTimer {
 
 // ------------------------------------------------------------------ ffi ----
 
-/// The C ABI surface (`phi` feature only): a non-Rust host drives the
+/// The C ABI surface (`experimental-phi` only): a non-Rust host drives the
 /// embedded `phi-accrual-detector` crate through raw handles. Every
 /// function is `#[no_mangle] extern "C"`, returns 0 on success / 1 on a
 /// null argument, and never panics across the boundary. The crate's async
 /// surface (tokio RwLock) is bridged with a shared current-thread
 /// runtime; every call blocks, which is exactly the contract a C caller
 /// expects.
-#[cfg(feature = "phi")]
+#[cfg(feature = "experimental-phi")]
 pub mod ffi {
     use super::*;
     use chrono::{Local, TimeZone};

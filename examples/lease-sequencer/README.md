@@ -208,13 +208,29 @@ reincarnates (identity bump, the `(old, new)` announcement, the peers'
 remap) — the run-sheets' node kills use `kill -9` wherever crash semantics
 are being exercised.
 
-The phi-informed election wait: the host tick loop derives the
-election/suspicion wait from the current leader's sketch — `safety *
-max(heartbeat, learned mean interval)`, clamped to
-`--phi-timeout-min-ms` / `--phi-timeout-max-ms` (defaults 500 / 1000) —
-falling back to the clamped fixed gate while the sketch has fewer than
-two intervals. Every changed wait logs one `TelemetryTimeoutDecision`
-record (phi, now, previous wait, next wait) plus the tracing line.
+The leader timeout: the host tick loop runs the **sloppy timeout** — a
+uniform random wait in `--phi-timeout-min-ms` / `--phi-timeout-max-ms`
+(defaults 500 / 1000) per watched (config era, leader) key, re-armed on
+leader change, on the fresh-commit resume, and on each heartbeat Commit
+arriving from the current leader. When the deadline passes the host
+drives the §14.2 forced view: the `phi-detect` note (silence and armed
+deadline), `force_view(era, view + 1)`, the `timedout` toggle, and the
+output flush. The timing law is Raft's (Ongaro 2014): broadcastTime ≪
+electionTimeout ≪ MTBF with the wait randomised in a generous interval —
+a cloud deploy at the 200 ms heartbeat sets 2000–4000 ms; the local rig
+at 5 ms heartbeats runs the 500/1000 defaults. One
+`TelemetryTimeoutDecision` record (previous wait, next wait; the phi
+column is 0 — the sloppy timeout computes no phi) plus the tracing line
+per changed armed wait.
+
+The phi-accrual detector — the wire trailer, the sketches, the
+learned-mean election wait, and the embedded crate — compiles only
+behind `experimental-phi`
+(`cargo build --features experimental-phi`); normal builds carry none
+of it and send bare core datagrams. The boot line and the boot trace
+name the compiled-in detector: `detector=sloppy-timeout` (normal) or
+`detector=experimental-phi`. See
+[phi and the timeouts](../../docs/src/phi-and-timeouts.md).
 
 The script also starts `lock-feed` against the standby's AOF directory and
 the console stack (static SPA + nginx edge with `/feed/` mapped to the

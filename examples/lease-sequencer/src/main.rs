@@ -30,6 +30,7 @@ mod membership;
 // The lib crate owns the phi module (its #[no_mangle] C-ABI surface must
 // exist in exactly one compilation unit — the lib rlib the bin links).
 pub use lease_sequencer::phi;
+use lease_sequencer::phi::Rng;
 pub mod telemetry;
 mod transport;
 
@@ -81,6 +82,14 @@ const STATE_RECOVERING: u32 = 2;
 /// Upstream `src/wire.rs` Tag::Commit; the adapter mirrors the tag the
 /// same way it mirrors Tag::Reincarnation in `transport.rs`.
 const VRR_COMMIT_TAG: u32 = 4;
+
+/// The compiled-in leader-failure detector, named on the boot line and
+/// in the boot trace: the sloppy randomised timeout (the normal build)
+/// or the phi-accrual detector (`experimental-phi`).
+#[cfg(feature = "experimental-phi")]
+const DETECTOR: &str = "experimental-phi";
+#[cfg(not(feature = "experimental-phi"))]
+const DETECTOR: &str = "sloppy-timeout";
 
 /// Whether one VRR payload is a `Commit` datagram: the 20-byte header's
 /// tag field is a big-endian `u32` at offset 0 (the same offset
@@ -204,12 +213,17 @@ struct Host {
     sidecar: membership::SidecarWriter,
     discovery: Discovery,
     /// The phi-accrual monitor (item19): per-(era, leader, addr, monitor)
-    /// sketches over the leader's heartbeat Commit arrivals. `None` when
-    /// phi is disabled (`--phi-threshold 0`).
+    /// sketches over the leader's heartbeat Commit arrivals. Compiles
+    /// only into the `experimental-phi` build; `None` when phi is
+    /// disabled (`--phi-threshold 0`).
+    #[cfg(feature = "experimental-phi")]
     phi_monitor: Option<phi::Table>,
     /// The phi policy (threshold, heartbeat, safety multiple, window).
+    #[cfg(feature = "experimental-phi")]
     phi_cfg: phi::PhiConfig,
-    /// The heartbeat sequence the leader stamps into trailers.
+    /// The heartbeat sequence the leader stamps into the experimental
+    /// build's trailers.
+    #[cfg(feature = "experimental-phi")]
     heartbeat_seq: u32,
     /// The last Commit-send time this leader produced — "when otherwise
     /// idle" is measured against it.
@@ -219,6 +233,7 @@ struct Host {
     heartbeat_request_num: u64,
     /// The last config era the phi monitor saw (era change = fresh
     /// sketch).
+    #[cfg(feature = "experimental-phi")]
     phi_last_era: Option<u32>,
     /// The (config era, leader) the current detection is latched for. A
     /// fresh era or a new leader re-arms; an arriving heartbeat from the
@@ -227,6 +242,7 @@ struct Host {
     /// The currently watched (config era, leader) key and when it became
     /// the watched one: the bootstrap deadline for a sketch that never
     /// learns two intervals. Re-stamped on every leader change.
+    #[cfg(feature = "experimental-phi")]
     phi_watch: Option<((u32, u32), u64)>,
     /// The `timedout` toggle (`docs/src/phi-and-timeouts.md`): true from
     /// the moment this node times out on its leader and issues or joins
@@ -239,6 +255,13 @@ struct Host {
     /// node polls on `min + rand * (max - min)`; a fresh commit disarms
     /// the poll. Validated `min <= max` at parse.
     viewchange: phi::ViewChangeTimer,
+    /// The sloppy leader timeout — the NORMAL build's leader-failure
+    /// detector (item25.18): a uniform random wait in
+    /// `[min, max]` per watched (era, leader) key, re-armed on leader
+    /// evidence, firing the §14.2 forced view when due. The
+    /// `experimental-phi` build compiles it out (the detector stands in).
+    #[cfg(not(feature = "experimental-phi"))]
+    sloppy: phi::SloppyLeader,
     /// The last replication state the transition recorder saw; a change
     /// emits a `TelemetryStateTransition` record.
     last_state: u32,
@@ -290,8 +313,10 @@ fn millis() -> u64 {
         .as_millis() as u64
 }
 
-/// The phi monitor's construction: `None` when phi is disabled
-/// (`--phi-threshold 0`), otherwise a table with the node's policy knobs.
+/// The phi monitor's construction (`experimental-phi` only): `None` when
+/// phi is disabled (`--phi-threshold 0`), otherwise a table with the
+/// node's policy knobs.
+#[cfg(feature = "experimental-phi")]
 fn phi_monitor(options: &Options) -> Option<phi::Table> {
     if options.phi_threshold <= 0.0 {
         return None;
@@ -335,31 +360,6 @@ fn init_tracing(log_path: &str) -> WorkerGuard {
         .with_writer(writer)
         .init();
     guard
-}
-
-struct Rng(u64);
-
-impl Rng {
-    fn new(seed: u64) -> Self {
-        Self(seed | 1)
-    }
-    fn next(&mut self) -> u64 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        self.0
-    }
-    fn below(&mut self, bound: u64) -> u64 {
-        self.next() % bound.max(1)
-    }
-    /// One unit sample in [0, 1): the injected randomness the cluster
-    /// viewchange schedule consumes (`viewchange_delay_ms` clamps it
-    /// into the validated bounds).
-    fn unit(&mut self) -> f64 {
-        // 53 random bits into an f64 fraction: the full double mantissa,
-        // no bias toward either bound.
-        (self.next() >> 11) as f64 / (1u64 << 53) as f64
-    }
 }
 
 fn parse_config(path: &str) -> Vec<ClusterNode> {
@@ -494,9 +494,13 @@ struct Options {
     recovery_ms: u64,
     /// The phi threshold a leader-failure sketch must cross before its
     /// monitor acts (item19). 0 disables phi monitoring entirely.
+    /// Compiles only into the `experimental-phi` build; the sloppy
+    /// timeout needs no threshold.
+    #[cfg(feature = "experimental-phi")]
     phi_threshold: f64,
     /// The hard safety multiple: no detection fires before
     /// `safety * heartbeat_ms` of leader silence, whatever phi says.
+    #[cfg(feature = "experimental-phi")]
     phi_safety: f64,
     /// The embedded lock client count (item04): N contender loops run
     /// in-process against the node's own service, behind the host's
@@ -538,7 +542,9 @@ fn parse_options() -> Options {
         heartbeat_ms: 10,
         election_ms: 1000,
         recovery_ms: 1000,
+        #[cfg(feature = "experimental-phi")]
         phi_threshold: 1.0,
+        #[cfg(feature = "experimental-phi")]
         phi_safety: 2.0,
         embedded_clients: 0,
         embedded_lock_id: EMBEDDED_LOCK_ID,
@@ -589,7 +595,9 @@ fn parse_options() -> Options {
             "--heartbeat-ms" => options.heartbeat_ms = value.parse().unwrap_or(10),
             "--election-ms" => options.election_ms = value.parse().unwrap_or(1000),
             "--recovery-ms" => options.recovery_ms = value.parse().unwrap_or(1000),
+            #[cfg(feature = "experimental-phi")]
             "--phi-threshold" => options.phi_threshold = value.parse().unwrap_or(1.0),
+            #[cfg(feature = "experimental-phi")]
             "--phi-safety" => options.phi_safety = value.parse().unwrap_or(2.0),
             "--embedded-client" => options.embedded_clients = value.parse().unwrap_or(0),
             "--lock" => options.embedded_lock_id = value.parse().unwrap_or(EMBEDDED_LOCK_ID),
@@ -621,17 +629,21 @@ fn parse_options() -> Options {
         || options.state.is_empty()
         || options.log.is_empty()
     {
+        #[cfg(feature = "experimental-phi")]
+        const USAGE_PHI: &str = "             [--phi-threshold F] [--phi-safety F] \\\n";
+        #[cfg(not(feature = "experimental-phi"))]
+        const USAGE_PHI: &str = "";
         eprintln!(
             "usage: lease-sequencer --name NAME --config PATH --client IPv4:PORT \
-             --state PATH --log PATH [--aof-dir PATH] [--aof-flush-ms N] \
-             [--aof-retention-mib N] [--telemetry-aof-dir PATH] \
-             [--telemetry-rollover-mib N] [--phi-timeout-min-ms N] [--phi-timeout-max-ms N] \
-             [--viewchange-timeout-min-ms N] [--viewchange-timeout-max-ms N] \
-             [--recovery-flush diskless|single|double-ring] [--recovery-scratch-dir PATH] \
-             [--heartbeat-ms N] [--election-ms N] [--recovery-ms N] \
-             [--phi-threshold F] [--phi-safety F] \
-             [--embedded-client N] [--lock N] [--client-ttl-ms N] [--renew-fraction F] \
-             [--join-id N --join-endpoint HOST:PORT]"
+         --state PATH --log PATH [--aof-dir PATH] [--aof-flush-ms N] \
+         [--aof-retention-mib N] [--telemetry-aof-dir PATH] \
+         [--telemetry-rollover-mib N] [--phi-timeout-min-ms N] [--phi-timeout-max-ms N] \
+         [--viewchange-timeout-min-ms N] [--viewchange-timeout-max-ms N] \
+         [--recovery-flush diskless|single|double-ring] [--recovery-scratch-dir PATH] \
+         [--heartbeat-ms N] [--election-ms N] [--recovery-ms N] \
+{USAGE_PHI}\
+         [--embedded-client N] [--lock N] [--client-ttl-ms N] [--renew-fraction F] \
+         [--join-id N --join-endpoint HOST:PORT]"
         );
         exit(2);
     }
@@ -640,6 +652,8 @@ fn parse_options() -> Options {
 
 /// The marker-5 interval-sample JSON: the arrival-interval sample the
 /// exported phi-samples kind plots (one record per learned interval).
+/// Rides the `experimental-phi` feature (the trailer-carried evidence).
+#[cfg(feature = "experimental-phi")]
 fn interval_sample_json(
     own_id: u32,
     trailer: &phi::Trailer,
@@ -734,12 +748,14 @@ impl Host {
         ));
     }
 
-    /// The phi-informed election wait (M3): the leader's sketch's learned
-    /// mean drives `safety * max(heartbeat, mean)`, clamped to the
-    /// [min, max] knobs; an unsettled sketch (<2 intervals) falls back to
-    /// the clamped fixed gate. Every CHANGED armed wait emits one
-    /// `TelemetryTimeoutDecision` record (phi, now, previous wait, next
-    /// wait) while the AOF gate is active, plus the tracing note.
+    /// The phi-informed election wait (M3, `experimental-phi`): the
+    /// leader's sketch's learned mean drives `safety * max(heartbeat,
+    /// mean)`, clamped to the [min, max] knobs; an unsettled sketch (<2
+    /// intervals) falls back to the clamped fixed gate. Every CHANGED
+    /// armed wait emits one `TelemetryTimeoutDecision` record (phi, now,
+    /// previous wait, next wait) while the AOF gate is active, plus the
+    /// tracing note.
+    #[cfg(feature = "experimental-phi")]
     fn election_wait(&mut self, now: u64) -> u64 {
         let status = self.node.status();
         let watchable = status.leader != LEADER_UNKNOWN && status.leader != self.own_id;
@@ -798,9 +814,55 @@ impl Host {
         wait
     }
 
-    /// One heartbeat arrival with a phi trailer: feed the (era, leader,
-    /// addr, monitor) sketch, and lazily log the arrival-interval sample
-    /// the normal-distribution chart plots.
+    /// The sloppy election wait (the normal build): the armed uniform
+    /// random in `[min, max]` — re-armed on a leader change and the
+    /// fresh-commit resume only (`rearm_election_wait`), stable
+    /// otherwise. One `TelemetryTimeoutDecision` record per CHANGED
+    /// armed wait (existing behaviour, unchanged); the record's phi
+    /// column is 0 — the sloppy timeout computes no phi.
+    #[cfg(not(feature = "experimental-phi"))]
+    fn election_wait(&mut self, _now: u64) -> u64 {
+        self.election_wait_armed
+    }
+
+    /// Re-arms the election wait on leader change / fresh-commit (the
+    /// normal build's arm points): one uniform random in
+    /// `[min, max]`, logged with the note and the timeout-decision
+    /// record when the armed wait changed.
+    #[cfg(not(feature = "experimental-phi"))]
+    fn rearm_election_wait(&mut self, now: u64, unit: f64) {
+        let wait = phi::random_wait_ms(self.timeout_knobs.min_ms, self.timeout_knobs.max_ms, unit);
+        if wait != self.election_wait_armed {
+            let previous = self.election_wait_armed;
+            self.election_wait_armed = wait;
+            let status = self.node.status();
+            self.note(&format!(
+                "phi-wait leader={} phi=0.000 prev_wait={previous} next_wait={wait}",
+                status.leader
+            ));
+            let json = format!(
+                "{{\"leader\":{},\"era\":{},\"view\":{},\"phi\":0.000,\
+                 \"mean_interval_ms\":null,\"prev_wait_ms\":{previous},\
+                 \"next_wait_ms\":{wait},\"min_ms\":{},\"max_ms\":{}}}",
+                status.leader,
+                status.era,
+                status.view,
+                self.timeout_knobs.min_ms,
+                self.timeout_knobs.max_ms
+            );
+            let ns = local_ns();
+            self.record_telemetry(Record::telemetry(
+                Marker::TelemetryTimeoutDecision,
+                ns,
+                json.as_bytes(),
+            ));
+        }
+    }
+
+    /// One heartbeat arrival with a phi trailer (`experimental-phi`):
+    /// feed the (era, leader, addr, monitor) sketch, and lazily log the
+    /// arrival-interval sample the normal-distribution chart plots.
+    #[cfg(feature = "experimental-phi")]
     fn observe_heartbeat(
         &mut self,
         _sender: u32,
@@ -864,12 +926,13 @@ impl Host {
         }
     }
 
-    /// One monitor tick: evaluate the current leader's sketch against the
-    /// threshold and the safety floor. On a crossing the host logs the
-    /// detection and drives the existing view-change path
-    /// (`leader_timeout`, the core's ordinary suspicion input); the core
-    /// self-gates the actual fence on its own primary-timeout knob, so
-    /// the drive is issued, not forced.
+    /// One monitor tick (`experimental-phi`): evaluate the current
+    /// leader's sketch against the threshold and the safety floor. On a
+    /// crossing the host logs the detection and drives the existing
+    /// view-change path (`leader_timeout`, the core's ordinary suspicion
+    /// input); the core self-gates the actual fence on its own
+    /// primary-timeout knob, so the drive is issued, not forced.
+    #[cfg(feature = "experimental-phi")]
     fn phi_step(&mut self, now: u64, rng: &mut Rng) {
         if self.phi_monitor.is_none() {
             return;
@@ -1010,6 +1073,117 @@ impl Host {
         self.flush_outputs(now, rng);
     }
 
+    /// One monitor tick — the normal build's sloppy timeout. The
+    /// watched (config era, leader) key arms a uniform random deadline
+    /// at its birth; every heartbeat Commit arriving from the current
+    /// leader re-arms it (`on_leader_commit`), as does the fresh-commit
+    /// resume. A due deadline fires the detection: the phi-detect note
+    /// (the silence and the armed deadline, no phi value), the §14.2
+    /// host-forced view, the `timedout` toggle, and the output flush —
+    /// the same actuation the experimental build's phi crossing drives,
+    /// a different verdict source.
+    #[cfg(not(feature = "experimental-phi"))]
+    fn phi_step(&mut self, now: u64, rng: &mut Rng) {
+        // `docs/src/phi-and-timeouts.md`: the detector timer checks `if
+        // not timedout` before doing anything — while the toggle holds
+        // the cluster viewchange timeout polls instead, and the next
+        // tick resumes on the fresh commit.
+        if self.timedout.timed_out() {
+            return;
+        }
+        let status = self.node.status();
+        // Detection stands down in the establishing-era window: a
+        // committed reconfiguration's new era awaits the view that enters
+        // it (§8.7.8), and inside that window a forced view restarts the
+        // fence instead of letting it close. The driver already holds the
+        // client stream for this bounded window; the detector stands down
+        // with it and re-arms when the era folds.
+        if status.config_era != status.era {
+            return;
+        }
+        if status.leader == self.own_id || status.leader == LEADER_UNKNOWN {
+            return;
+        }
+        let Some(&addr) = self.peers.get(&status.leader) else {
+            return;
+        };
+        let watched = (status.config_era, status.leader);
+        if self.sloppy.watched() != Some(watched) {
+            // The key's birth: a leader change (or a re-keying era)
+            // arms a fresh uniform random wait — a re-elected id can
+            // never inherit an old deadline and fire in a loop.
+            self.sloppy.watch(watched, now, rng.unit());
+        }
+        if !self.sloppy.due(now) {
+            return;
+        }
+        // One detection per (era, leader) — but only while THIS node is
+        // Normal: inside the limbo (the §14.2 forced view can name a
+        // primary that never arrives) the latch must not hold, or the
+        // wedged cluster has no driver left and sits in view_change
+        // forever. In the limbo the detection re-fires on each bootstrap
+        // window until a live primary takes the view.
+        let latched = self.phi_detected_key == Some(watched) && status.state == STATE_NORMAL;
+        if latched {
+            return;
+        }
+        self.phi_detected_key = Some(watched);
+        let silence = now.saturating_sub(self.sloppy.last_evidence_ms());
+        self.note(&format!(
+            "phi-detect node={} era={} leader={} silence={} deadline={} addr={}",
+            self.own_id,
+            status.config_era,
+            status.leader,
+            silence,
+            self.sloppy.deadline_ms(),
+            phi::addr_text(addr)
+        ));
+        // The sloppy actuation: the §14.2 host-forced view change — the
+        // detector's verdict drives it directly, falling back to the
+        // ordinary suspicion tick on refusal. A node below voting weight
+        // does not drive: a lagging learner's verdict is noise, and its
+        // local view churn wedges its own catch-up — the promotion walk
+        // then never completes. The detection note above still lands;
+        // only the drive is gated.
+        let drives = self.node.voting_weight().is_some_and(|weight| weight > 0);
+        if drives {
+            let forced = self.node.force_view(status.era, status.view + 1);
+            if forced != 0 {
+                let _ = self.node.leader_timeout();
+            }
+            // The detection IS the node timing out on its leader: the
+            // toggle flips true, the detector stands down, and the
+            // cluster viewchange timeout takes the polling
+            // (`docs/src/phi-and-timeouts.md`).
+            self.suspect(now, "phi-detect");
+        }
+        self.flush_outputs(now, rng);
+    }
+
+    /// One Commit datagram arrived from the replica the host currently
+    /// believes is its leader — the NORMAL build's heartbeat evidence
+    /// (no trailer rides the wire; the Commit tag at the header's head
+    /// is the evidence). Re-arms the sloppy deadline; while the node is
+    /// timed out the arrival IS the fresh-commit resume: the toggle
+    /// flips false, the detection latch clears, and both waits re-arm.
+    #[cfg(not(feature = "experimental-phi"))]
+    fn on_leader_commit(&mut self, replica: u32, is_commit: bool, now: u64, rng: &mut Rng) {
+        let status = self.node.status();
+        if !is_commit || status.leader != replica {
+            return;
+        }
+        if self.timedout.timed_out() {
+            if let Some(record) = self.timedout.on_commit(now) {
+                self.log_timeout_toggle(&record, "fresh-commit");
+                self.phi_detected_key = None;
+                self.sloppy.rearm(now, rng.unit());
+                self.rearm_election_wait(now, rng.unit());
+            }
+            return;
+        }
+        self.sloppy.rearm(now, rng.unit());
+    }
+
     /// The leader's idle heartbeat: when otherwise idle — no Commit left
     /// this node in the last interval — the leader proposes a read-only
     /// `get`, whose commit fan-out emits the heartbeat Commit every
@@ -1099,27 +1273,36 @@ impl Host {
                     );
                     continue;
                 };
-                // The phi trailer (item19) rides only the leader's Commit
-                // datagrams: the stream followers' sketches observe. The
-                // trailer lives OUTSIDE the core's message bytes — the
-                // receiving host strips it before node.receive() — so the
-                // core's exact-length wire contract (W3) is untouched.
+                // The phi trailer (item19, `experimental-phi` only) rides
+                // only the leader's Commit datagrams: the stream
+                // followers' sketches observe. The trailer lives OUTSIDE
+                // the core's message bytes — the receiving host strips it
+                // before node.receive() — so the core's exact-length wire
+                // contract (W3) is untouched. A normal build sends bare
+                // core datagrams: no trailer, nothing appended.
                 let status = self.node.status();
                 let payload = if status.state == STATE_NORMAL
                     && status.leader == self.own_id
                     && is_commit(&out.bytes)
                 {
                     self.last_leader_commit_ms = now;
-                    self.heartbeat_seq = self.heartbeat_seq.wrapping_add(1);
-                    let trailer = phi::Trailer {
-                        era: status.era,
-                        leader: status.leader,
-                        seq: self.heartbeat_seq,
-                        sent_at_ms: now,
-                    };
-                    let mut payload = out.bytes.clone();
-                    trailer.append_to(&mut payload);
-                    payload
+                    #[cfg(feature = "experimental-phi")]
+                    {
+                        self.heartbeat_seq = self.heartbeat_seq.wrapping_add(1);
+                        let trailer = phi::Trailer {
+                            era: status.era,
+                            leader: status.leader,
+                            seq: self.heartbeat_seq,
+                            sent_at_ms: now,
+                        };
+                        let mut payload = out.bytes.clone();
+                        trailer.append_to(&mut payload);
+                        payload
+                    }
+                    #[cfg(not(feature = "experimental-phi"))]
+                    {
+                        out.bytes.clone()
+                    }
                 } else {
                     out.bytes.clone()
                 };
@@ -1764,19 +1947,24 @@ fn main() {
             next_request_ms: 0,
             active: true,
         },
+        #[cfg(feature = "experimental-phi")]
         phi_monitor: phi_monitor(&options),
+        #[cfg(feature = "experimental-phi")]
         phi_cfg: phi::PhiConfig {
             phi_threshold: options.phi_threshold,
             heartbeat_ms: options.heartbeat_ms,
             safety_multiple: options.phi_safety,
             window: 100,
         },
+        #[cfg(feature = "experimental-phi")]
         heartbeat_seq: 0,
         last_leader_commit_ms: 0,
         heartbeat_client_id: 0x0BEEF000 + own_desc_id as u64,
         heartbeat_request_num: 0,
+        #[cfg(feature = "experimental-phi")]
         phi_last_era: None,
         phi_detected_key: None,
+        #[cfg(feature = "experimental-phi")]
         phi_watch: None,
         timedout: phi::TimeoutToggle::new(),
         viewchange: phi::ViewChangeTimer::new(
@@ -1784,6 +1972,8 @@ fn main() {
             options.viewchange_timeout_max_ms,
         )
         .expect("viewchange bounds validated at parse"),
+        #[cfg(not(feature = "experimental-phi"))]
+        sloppy: phi::SloppyLeader::new(options.phi_timeout_min_ms, options.phi_timeout_max_ms),
         last_state: STATE_RECOVERING,
         last_weight: None,
         election_wait_armed: options.election_ms,
@@ -1796,7 +1986,8 @@ fn main() {
         embedded,
     };
     host.note(&format!(
-        "boot name={} descriptor-id={own_desc_id} own={own_id} incarnation={incarnation}",
+        "boot name={} descriptor-id={own_desc_id} own={own_id} incarnation={incarnation} \
+         detector={DETECTOR}",
         options.name
     ));
     host.note(&format!("membership fingerprint={}", host.fingerprint));
@@ -1823,7 +2014,8 @@ fn main() {
             "joining"
         };
         host.record_state_transition(format!(
-            "{{\"event\":\"boot\",\"decision\":\"{decision}\",\"incarnation\":{incarnation},\
+            "{{\"event\":\"boot\",\"decision\":\"{decision}\",\"detector\":\"{DETECTOR}\",\
+             \"incarnation\":{incarnation},\
              \"state\":{},\"leader\":{},\"era\":{},\"view\":{},\"config_era\":{}}}",
             status.state, status.leader, status.era, status.view, status.config_era
         ));
@@ -1890,6 +2082,10 @@ fn timers(host: &mut Host, now: u64, rng: &mut Rng) {
             "leader leader={} era={} view={}",
             status.leader, status.era, status.view
         ));
+        // The normal build re-arms the election wait on a leader change
+        // (the fresh-commit resume re-arms it at `on_leader_commit`).
+        #[cfg(not(feature = "experimental-phi"))]
+        host.rearm_election_wait(now, rng.unit());
     }
     if now.saturating_sub(host.last_heartbeat) >= host.heartbeat_ms {
         host.last_heartbeat = now;
@@ -2087,21 +2283,30 @@ fn handle_packet(
         // reincarnation forced steps evict the old identity from the
         // serving configuration.
         //
-        // Before anything else: the phi trailer (item19) rides at the BACK
-        // of the leader's heartbeat Commits, entirely OUTSIDE the core's
-        // message bytes. Strip it here so the core sees the exact-length
-        // message its W3 contract demands, and feed the arrival to the
-        // sketch when the sender is the leader this monitor watches.
-        // The wire bytes AS THE NETWORK CARRIED THEM, trailer and all:
-        // the telemetry record's evidence for the leader's send clock.
+        // Before anything else: the phi trailer (item19, `experimental-phi`
+        // only) rides at the BACK of the leader's heartbeat Commits,
+        // entirely OUTSIDE the core's message bytes. Strip it here so the
+        // core sees the exact-length message its W3 contract demands, and
+        // feed the arrival to the sketch when the sender is the leader
+        // this monitor watches. The wire bytes AS THE NETWORK CARRIED
+        // THEM, trailer and all: the telemetry record's evidence for the
+        // leader's send clock. A NORMAL build strips nothing: bare core
+        // datagrams arrive, and the Commit-from-leader arrival is the
+        // heartbeat evidence `on_leader_commit` consumes.
         let wire_bytes = payload;
+        #[cfg(not(feature = "experimental-phi"))]
+        let commit_datagram = is_commit(payload);
+        #[cfg(feature = "experimental-phi")]
         let (payload, trailer) = match phi::Trailer::strip_from(payload) {
             Some((front, trailer)) => (front, Some(trailer)),
             None => (payload, None),
         };
+        #[cfg(feature = "experimental-phi")]
         if let Some(trailer) = &trailer {
             host.observe_heartbeat(replica, addr, trailer, now);
         }
+        #[cfg(not(feature = "experimental-phi"))]
+        host.on_leader_commit(replica, commit_datagram, now, rng);
         // The telemetry AOF stream (item22): EVERY VRR datagram this node
         // sees is one `Wire` envelope record — the datagram's VRR payload
         // byte-identical to what the network carried (the phi trailer's
@@ -2546,6 +2751,7 @@ fn handle_client_line(host: &mut Host, index: usize, line: &str, now: u64, rng: 
 }
 
 #[cfg(test)]
+#[cfg(feature = "experimental-phi")]
 mod interval_sample_tests {
     use super::*;
 
@@ -2699,23 +2905,30 @@ mod forward_tests {
                 next_request_ms: 0,
                 active: true,
             },
+            #[cfg(feature = "experimental-phi")]
             phi_monitor: None,
+            #[cfg(feature = "experimental-phi")]
             phi_cfg: phi::PhiConfig {
                 phi_threshold: 0.0,
                 heartbeat_ms: 100,
                 safety_multiple: 2.0,
                 window: 100,
             },
+            #[cfg(feature = "experimental-phi")]
             heartbeat_seq: 0,
             last_leader_commit_ms: 0,
             heartbeat_client_id: 0x0BEEF000,
             heartbeat_request_num: 0,
+            #[cfg(feature = "experimental-phi")]
             phi_last_era: None,
             phi_detected_key: None,
+            #[cfg(feature = "experimental-phi")]
             phi_watch: None,
             timedout: phi::TimeoutToggle::new(),
             viewchange: phi::ViewChangeTimer::new(100, 200)
                 .expect("the harness's viewchange bounds are valid"),
+            #[cfg(not(feature = "experimental-phi"))]
+            sloppy: phi::SloppyLeader::new(100, 300),
             last_state: STATE_RECOVERING,
             last_weight: None,
             election_wait_armed: 200,
@@ -3106,7 +3319,9 @@ mod boot_hint_tests {
             heartbeat_ms: 5,
             election_ms: 1000,
             recovery_ms: 1000,
+            #[cfg(feature = "experimental-phi")]
             phi_threshold: 1.0,
+            #[cfg(feature = "experimental-phi")]
             phi_safety: 2.0,
             embedded_clients: 0,
             embedded_lock_id: EMBEDDED_LOCK_ID,

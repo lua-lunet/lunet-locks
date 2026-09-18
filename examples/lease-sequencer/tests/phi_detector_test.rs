@@ -1,7 +1,11 @@
 //! The phi-accrual leader-failure detector (item19): red/green tests for
 //! the trailer codec, the per-(era, leader) sketch table, the phi math
 //! wrapper, the FFI C ABI surface, and the detection decision with the
-//! 2x-interval safety floor.
+//! 2x-interval safety floor. Runs ONLY under `experimental-phi` — the
+//! sketches, the detector math, and the FFI surface compile only into
+//! the flagged build.
+
+#![cfg(feature = "experimental-phi")]
 
 use lease_sequencer::phi::{self, PhiConfig, SketchKey, Trailer};
 
@@ -101,7 +105,7 @@ fn sketch_starts_at_phi_zero_and_learns_the_interval() {
     );
 }
 
-#[cfg(feature = "phi")]
+#[cfg(feature = "experimental-phi")]
 #[test]
 fn phi_rises_with_silence_and_crosses_threshold() {
     let cfg = PhiConfig::default();
@@ -160,7 +164,7 @@ fn leader_change_resets_the_sketch() {
     assert!(table.get(&key(1, 42)).is_none(), "old leader dropped");
 }
 
-#[cfg(feature = "phi")]
+#[cfg(feature = "experimental-phi")]
 #[test]
 fn detection_respects_the_two_interval_safety_floor() {
     let cfg = PhiConfig {
@@ -183,7 +187,7 @@ fn detection_respects_the_two_interval_safety_floor() {
     assert!(phi::decide(&sk, t + 25, &cfg), "past the floor, phi rules");
 }
 
-#[cfg(feature = "phi")]
+#[cfg(feature = "experimental-phi")]
 #[test]
 fn safety_floor_tracks_the_learned_interval_not_the_configured_one() {
     // The leader heartbeats every ~22 ms (the observed localhost cadence:
@@ -306,12 +310,12 @@ fn the_randomized_delay_stays_within_the_min_max_bounds() {
     // The injected RNG's unit sample spans the whole schedule:
     // unit 0 -> the floor, unit 1 -> the ceiling, mid -> the midpoint,
     // and a hostile out-of-range sample clamps into the bounds.
-    assert_eq!(phi::viewchange_delay_ms(100, 200, 0.0), 100);
-    assert_eq!(phi::viewchange_delay_ms(100, 200, 0.5), 150);
-    assert_eq!(phi::viewchange_delay_ms(100, 200, 1.0), 200);
-    assert_eq!(phi::viewchange_delay_ms(100, 200, -3.0), 100, "clamped low");
-    assert_eq!(phi::viewchange_delay_ms(100, 200, 9.0), 200, "clamped high");
-    assert_eq!(phi::viewchange_delay_ms(100, 200, 0.25), 125);
+    assert_eq!(phi::random_wait_ms(100, 200, 0.0), 100);
+    assert_eq!(phi::random_wait_ms(100, 200, 0.5), 150);
+    assert_eq!(phi::random_wait_ms(100, 200, 1.0), 200);
+    assert_eq!(phi::random_wait_ms(100, 200, -3.0), 100, "clamped low");
+    assert_eq!(phi::random_wait_ms(100, 200, 9.0), 200, "clamped high");
+    assert_eq!(phi::random_wait_ms(100, 200, 0.25), 125);
 }
 
 #[test]
@@ -425,7 +429,7 @@ fn the_old_to_new_leader_commit_gap_never_enters_the_sketch() {
 
 // ------------------------------------------------------------------ ffi ----
 
-#[cfg(feature = "phi")]
+#[cfg(feature = "experimental-phi")]
 mod ffi {
     use lease_sequencer::phi::ffi::PhiHandle;
 

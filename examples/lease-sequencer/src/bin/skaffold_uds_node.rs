@@ -36,7 +36,9 @@ fn main() {
             "--heartbeat-ms" => options.heartbeat_ms = value.parse().unwrap_or(10),
             "--election-ms" => options.election_ms = value.parse().unwrap_or(1000),
             "--recovery-ms" => options.recovery_ms = value.parse().unwrap_or(1000),
+            #[cfg(feature = "experimental-phi")]
             "--phi-threshold" => options.phi_threshold = value.parse().unwrap_or(1.0),
+            #[cfg(feature = "experimental-phi")]
             "--phi-safety" => options.phi_safety = value.parse().unwrap_or(2.0),
             "--phi-timeout-min-ms" => options.phi_timeout_min_ms = value.parse().unwrap_or(500),
             "--phi-timeout-max-ms" => options.phi_timeout_max_ms = value.parse().unwrap_or(1000),
@@ -51,8 +53,14 @@ fn main() {
     {
         eprintln!(
             "usage: skaffold_uds_node --name NAME --members 44:node44,55:node55 \
-             --request PATH --driver PATH --state PATH --log PATH \
-             [--heartbeat-ms N] [--election-ms N] [--phi-threshold F] [--phi-safety F]"
+         --request PATH --driver PATH --state PATH --log PATH \
+         [--heartbeat-ms N] [--election-ms N]\
+{}",
+            if cfg!(feature = "experimental-phi") {
+                " [--phi-threshold F] [--phi-safety F]"
+            } else {
+                ""
+            }
         );
         std::process::exit(2);
     }
