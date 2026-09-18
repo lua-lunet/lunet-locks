@@ -77,7 +77,7 @@ pub fn reply_granted(reply: &Value, op: &str) -> bool {
         return false;
     }
     match op {
-        "set" | "bump" => reply.get("granted").and_then(|g| g.as_bool()) == Some(true),
+        "set" | "extend" => reply.get("granted").and_then(|g| g.as_bool()) == Some(true),
         _ => true,
     }
 }
@@ -218,7 +218,7 @@ impl Contender {
         }
         match client_gate::next_op(&self.gate, now_ms)? {
             Op::Get => Some(self.build_get()),
-            Op::Bump => Some(self.build_set(now_ms, "bump")),
+            Op::Extend => Some(self.build_set(now_ms, "extend")),
             Op::Set => unreachable!("the gate schedules probes and renewals only"),
         }
     }
@@ -267,7 +267,7 @@ impl Contender {
                 self.gate.schedule = Some(now_ms);
                 Some(self.build_set(now_ms, "set"))
             }
-            ("bump", true, Some(remaining), true) => {
+            ("extend", true, Some(remaining), true) => {
                 // A renewal (BUMP) the leader GRANTED — the reply's
                 // lease names this contender: the same-holder regrant
                 // extends the lease by one window from now; the next
@@ -276,7 +276,7 @@ impl Contender {
                 self.gate.schedule = Some(now_ms + remaining.saturating_sub(self.renew_margin));
                 None
             }
-            ("bump", true, Some(_), false) => {
+            ("extend", true, Some(_), false) => {
                 // A denied renewal: the leader answered with a live
                 // lease that names a foreign holder (`granted:false`,
                 // the incumbent echoed — no error field). The stake is
@@ -783,7 +783,7 @@ mod tests {
         );
 
         // The holder's renewal is never floored: the free/probe race and
-        // the same-holder bump stay on the tight window.
+        // the same-holder extension stay on the tight window.
         let mut holder_client = Contender::new(
             Config {
                 probe_floor_ms: 5000,
@@ -851,7 +851,7 @@ mod tests {
         let renewal = contender
             .next_action(10_270)
             .expect("the renewal is due at the schedule");
-        assert_eq!(renewal.op, "bump");
+        assert_eq!(renewal.op, "extend");
     }
 
     #[test]
@@ -887,7 +887,7 @@ mod tests {
             "the re-adopt is inside the tight race window, got {at}"
         );
         // The rescheduled op is a renewal, not another probe.
-        assert_eq!(contender.next_action(at).expect("due").op, "bump");
+        assert_eq!(contender.next_action(at).expect("due").op, "extend");
     }
 
     #[test]
@@ -902,7 +902,7 @@ mod tests {
         let granted = set_reply(true, &holder);
         contender.absorb(10_020, &race, Some(&granted));
         let renewal = contender.next_action(10_270).expect("the renewal is due");
-        assert_eq!(renewal.op, "bump");
+        assert_eq!(renewal.op, "extend");
         // The leader echoed 300 ms remaining: the next renewal is
         // scheduled one renewal-margin inside that (300 - 250 = 50 ms).
         let renewed = get_reply(300, &holder);
@@ -913,7 +913,7 @@ mod tests {
     /// A renewal the leader DENIED, in the rig's exact reply shape: no
     /// error field, the foreign incumbent's live lease echoed with the
     /// leader's execution tick — the reply the run-2 leader sent the
-    /// two race losers' bumps for the whole run (locks2-2026-09-15).
+    /// two race losers' extensions for the whole run (locks2-2026-09-15).
     fn denied_renewal_reply(remaining: u64, holder: &str) -> Value {
         json!({
             "op": "set",
@@ -929,11 +929,11 @@ mod tests {
     }
 
     /// THE run-2 regression: a staked contender whose renewal is denied
-    /// must withdraw the stake and re-probe. The old bump arm keyed on
+    /// must withdraw the stake and re-probe. The old extension arm keyed on
     /// (no-error, lease-present) and absorbed this exact reply as a
-    /// successful renewal — the two race losers then bumped forever,
+    /// successful renewal — the two race losers then extended forever,
     /// never probing again, while the stats layer counted every denial
-    /// as an acked bump.
+    /// as an acked extension.
     #[test]
     fn denied_renewal_withdraws_the_stake_and_reprobes() {
         let mut contender = contender();
@@ -955,7 +955,7 @@ mod tests {
         let renewal = contender
             .next_action(10_270)
             .expect("the staked renewal is due");
-        assert_eq!(renewal.op, "bump");
+        assert_eq!(renewal.op, "extend");
         // The rig's exact denial shape: a live lease echoed with 300 ms
         // remaining on the leader's timeline.
         let denied = denied_renewal_reply(300, incumbent);
@@ -1007,7 +1007,7 @@ mod tests {
 
     /// The stats layer's granted-outcome semantics: a completed round
     /// trip is not a granted one. The rig's refusal shape is `reply_ok`
-    /// (no error field) yet must never count as an acked bump or set.
+    /// (no error field) yet must never count as an acked extension or set.
     #[test]
     fn granted_outcome_semantics_separate_completions_from_grants() {
         let get = json!({"op": "get", "lease": null, "executed_at": 10_000});
@@ -1018,16 +1018,16 @@ mod tests {
         let holder = "00000000-0000-0000-fb84-3133094f979d";
         let granted = set_reply(true, holder);
         assert!(reply_granted(&granted, "set"));
-        assert!(reply_granted(&granted, "bump"));
+        assert!(reply_granted(&granted, "extend"));
         let denied = denied_renewal_reply(300, holder);
         assert!(reply_ok(&denied), "the refusal is a completed round trip");
         assert!(
-            !reply_granted(&denied, "bump"),
-            "the rig's refusal shape is never a granted bump"
+            !reply_granted(&denied, "extend"),
+            "the rig's refusal shape is never a granted extension"
         );
         assert!(!reply_granted(&denied, "set"));
         let error = json!({"error": "not_leader"});
-        assert!(!reply_granted(&error, "bump"));
+        assert!(!reply_granted(&error, "extend"));
         assert!(!reply_granted(&error, "get"));
     }
 
@@ -1083,19 +1083,19 @@ mod tests {
         contender.absorb(10_020, &race, Some(&granted));
         assert!(contender.holds(), "the granted race stakes holdership");
 
-        // K consecutive renewals: each bump is built, executed by the
+        // K consecutive renewals: each extension is built, executed by the
         // real Service, and absorbed — the tenure holds at the renewal
         // cadence, never withdrawing, never building a SET.
         let mut execution_tick = 10_270;
         for renewal_index in 0..4 {
-            let bump = contender
+            let extend_op = contender
                 .next_action(execution_tick)
                 .expect("the renewal is due");
             assert_eq!(
-                bump.op, "bump",
+                extend_op.op, "extend",
                 "a holder renews its own lease; it never re-SETs it"
             );
-            let request: Value = serde_json::from_str(&bump.request).expect("the renewal is json");
+            let request: Value = serde_json::from_str(&extend_op.request).expect("the renewal is json");
             let reply = execute(&mut service, &request, execution_tick);
             assert_eq!(
                 reply["granted"], true,
@@ -1106,7 +1106,7 @@ mod tests {
                 renewal_index + 1,
                 "the Service's own counter says same-holder renewals: {reply}"
             );
-            contender.absorb(execution_tick, &bump, Some(&reply));
+            contender.absorb(execution_tick, &extend_op, Some(&reply));
             assert!(
                 contender.holds(),
                 "a granted renewal in the leader's encoding keeps the tenure: {reply}"
@@ -1241,11 +1241,11 @@ mod tests {
     }
 
     /// The runner path (the sequencer host's embedded clients): a denied
-    /// renewal returns the client to probing — the pending bump is
+    /// renewal returns the client to probing — the pending extension is
     /// absorbed with the rig's exact refusal shape, the stake is
     /// withdrawn, and the next submitted op is a GET probe. On the old
-    /// bump arm the denial was absorbed as a renewal and the runner
-    /// submitted bumps forever.
+    /// extension arm the denial was absorbed as a renewal and the runner
+    /// submitted extensions forever.
     #[test]
     fn runner_denied_renewal_returns_to_probing() {
         let mut runner = runner(1);
@@ -1276,7 +1276,7 @@ mod tests {
             true
         });
         assert_eq!(submitted.len(), 1);
-        assert_eq!(submitted[0].op, "bump", "the staked renewal fires first");
+        assert_eq!(submitted[0].op, "extend", "the staked renewal fires first");
         // The rig's exact denial shape on the renewal: the client must
         // withdraw and probe, never renew again.
         let denied = denied_renewal_reply(300, incumbent)

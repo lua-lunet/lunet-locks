@@ -60,7 +60,7 @@ recorded on every run.
 After every phase the runner takes two stats snapshots four seconds
 apart across all clients and reports the raw numbers. The gate is:
 
-- one holder sustaining — `bump_ok` climbing at the renewal rate on
+- one holder sustaining — `extend_ok` climbing at the renewal rate on
   exactly one client, the others probing at the 1 s floor;
 - zero errors in both post-stabilization windows — the phase's
   cumulative error delta is reported as its error cost, quantified, not
@@ -89,8 +89,8 @@ into the run's anchors file, live.
    and the stabilization gate is green.
 2. **Clean restart of the leader.** Same stop discipline on the leader.
    Takeover must occur within the sleep: a new leader is named by the
-   survivors' heartbeat trails, the client's bump gap across the kill is
-   measured, and the gate is green. The leader kill may transiently bump
+   survivors' heartbeat trails, the client's lease-extension gap across the kill is
+   measured, and the gate is green. The leader kill may transiently error
    errors — quantified.
 3. **Crash stop of a non-leader.** `kill -9`, no sleep, immediate
    restart, ten seconds to rejoin. The restarted node carries the dirty

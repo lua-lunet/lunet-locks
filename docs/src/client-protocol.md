@@ -44,7 +44,7 @@ Each stored lease carries two state-machine-tracked counters:
 
 - **`taken_at_ms`** (u64): the leader's execution tick at the holder-changing
   SET that installed the current holder. A same-ms holder change over a
-  replaced record bumps the stored value by 1 ms so consecutive takes remain
+  replaced record increments the stored value by 1 ms so consecutive takes remain
   distinguishable. Release, expiry, and break clear it.
 - **`renew_count`** (u32): incremented on each same-holder renewal. A holder
   change, a release, an expiry, and a break zero it.
@@ -117,13 +117,13 @@ BREAK is the privileged holder-break: an unconditional force-release that
 names no holder. It releases the live lease through the same replication path
 as every other transition — a proposed, committed operation that every
 replica's state machine applies — and journals a distinct break event. On the
-stored record it bumps `lease_id` by one, clears `holder`, `expiry`,
+stored record it increments `lease_id` by one, clears `holder`, `expiry`,
 `taken_at_ms`, and `renew_count`, and keeps `name` and `labels`.
 
 The reply has `op: "break"` and reports what happened:
 
 - A live lease existed: `broken: true` and `lease` is the post-break record —
-  the bumped `lease_id`, the retained `name` and `labels`, holder `nil`
+  the incremented `lease_id`, the retained `name` and `labels`, holder `nil`
   (`00000000-0000-0000-0000-000000000000`), and `expiry: 0`. That record is
   never live: a later GET reports `lease: null`, and the next grant replaces
   it while inheriting the retained `name` and `labels` unless the SET

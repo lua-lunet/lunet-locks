@@ -200,7 +200,7 @@ fn op_index(op: &str) -> usize {
     match op {
         "get" => 0,
         "set" => 1,
-        "bump" => 2,
+        "extend" => 2,
         _ => unreachable!("known op"),
     }
 }
@@ -246,7 +246,7 @@ fn summarize(stats: &Stats) -> Value {
         "by_op": {
             "get": {"ok": stats.by_op_ok[0], "err": stats.by_op_err[0]},
             "set": {"ok": stats.by_op_ok[1], "err": stats.by_op_err[1]},
-            "bump": {"ok": stats.by_op_ok[2], "err": stats.by_op_err[2]},
+            "extend": {"ok": stats.by_op_ok[2], "err": stats.by_op_err[2]},
         }
     })
 }
@@ -355,8 +355,8 @@ impl Link {
 }
 
 /// The contender loop: hold the lock under a lease (SET), renew it one
-/// window ahead of the leader-echoed deadline (BUMP as the same-holder
-/// regrant), poll as GET while a live incumbent stands, and race to SET
+/// window ahead of the leader-echoed deadline (the same-holder
+/// regrant EXTENDS the lease), poll as GET while a live incumbent stands, and race to SET
 /// when the lock is free or expired — the design's §1.2 cadence, driven
 /// through the shared decision machinery (the same module the sequencer
 /// host's embedded clients run in-process).

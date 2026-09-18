@@ -18,7 +18,7 @@ pub enum Mode {
 pub enum Op {
     Get,
     Set,
-    Bump,
+    Extend,
 }
 
 /// The gate state one worker carries: the mode, the wall-ms instant of
@@ -75,7 +75,7 @@ pub fn next_op(gate: &Gate, _now_ms: u64) -> Option<Op> {
     }
     match gate.schedule {
         None => Some(Op::Get),
-        Some(_) if gate.holder.is_some() => Some(Op::Bump),
+        Some(_) if gate.holder.is_some() => Some(Op::Extend),
         Some(_) => Some(Op::Get),
     }
 }
@@ -139,7 +139,7 @@ mod tests {
     }
 
     #[test]
-    fn usr1_mid_holdership_then_usr2_never_bumps_blindly() {
+    fn usr1_mid_holdership_then_usr2_never_extends_blindly() {
         let mut gate = probe_gate();
         gate.holder = Some("holder-identity".to_string());
         gate.schedule = Some(2000);
@@ -157,11 +157,11 @@ mod tests {
     }
 
     #[test]
-    fn on_gate_with_schedule_is_a_bump_only_while_its_holder_stands() {
+    fn on_gate_with_schedule_is_an_extension_only_while_its_holder_stands() {
         let mut gate = probe_gate();
         gate.holder = Some("holder-identity".to_string());
         gate.schedule = Some(2000);
-        assert_eq!(next_op(&gate, 2000), Some(Op::Bump));
+        assert_eq!(next_op(&gate, 2000), Some(Op::Extend));
         gate.holder = None;
         assert_eq!(next_op(&gate, 2000), Some(Op::Get));
     }

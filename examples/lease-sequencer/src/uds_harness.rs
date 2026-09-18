@@ -2434,19 +2434,19 @@ pub fn stage4(mut cluster: Cluster) -> Vec<Verdict> {
     // THE regression: a contender that staked on a denied race must
     // re-probe — its op mix shows a GET after the denied renewal. A
     // contender that keeps renewing against a foreign holder's lease
-    // echo never probes again (its ops stay get, set, bump, bump, …).
-    let bumped_then_probed = |client: &str| {
+    // echo never probes again (its ops stay get, set, extend, extend, …).
+    let extended_then_probed = |client: &str| {
         let ops = cluster.client_ops(client);
         ops.iter()
-            .position(|op| op == "bump")
+            .position(|op| op == "extend")
             .is_some_and(|at| ops[at + 1..].iter().any(|op| op == "get"))
     };
     for loser in &losers {
         out.push(verdict(
             "stage4: the denied contender returns to the probe cadence",
-            bumped_then_probed(loser),
+            extended_then_probed(loser),
             format!(
-                "client={loser} ops={:?} (a get after a bump: the stake withdrawn, the chase re-entered as a probe)",
+                "client={loser} ops={:?} (a get after an extension: the stake withdrawn, the chase re-entered as a probe)",
                 cluster.client_ops(loser)
             ),
         ));
