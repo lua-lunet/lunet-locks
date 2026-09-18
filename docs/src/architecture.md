@@ -382,8 +382,7 @@ single copy cannot decide the classification and a marker write that did
 not reach its quorum is invisible to it. The single text file is written
 alongside at every transition as the compatibility projection: it is
 what legacy rig states boot from (their state seeds the copies on the
-first routed write) and the conservative fallback when the copies are
-unreadable. The
+first routed write). The
 adopted membership facts keep a lazy, never-fsynced copy beside them —
 the membership sidecar described under
 [membership snapshots](membership-snapshots.md).
@@ -391,10 +390,7 @@ the membership sidecar described under
 The marker classifies the boot: `flushed` is a clean start under the same
 identity; `unflushed` is the running sentinel every operating process
 leaves behind, so a restart of a process that has been running classifies
-**dirty**. A `stopped` or later marker — the graceful stop's first write
-— is the same clean continue: the wire was closed before the marker was
-written, so a shutdown that died between the marker writes still reads as
-a controlled ending, never as a crash.
+**dirty**.
 
 A dirty restart reincarnates the replica — the core's Crash-Stop-Self-Evict
 protocol. There is no same-identity recovery after volatile-state loss: the
