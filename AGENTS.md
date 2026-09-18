@@ -189,3 +189,16 @@ The currently pinned surprises are:
 - No Windows asset: the Lua native loader has no `.dll` suffix handling.
 - Verify an archive with `make package-verify` (extracts it and runs the full
   three-replica smoke against the packaged tree using the pinned runtime).
+
+## Bug provenance
+
+Correctness and liveness defects are host-side until proven otherwise.
+A correctness bug may go upstream only when every resurrection
+requirement was met (the loop shut down, the state flushed) and a
+failure to comply with the safety obligations has been disproven. A
+liveness bug is an absence of messages: a node at rest must time out
+and send, so a wedge is direct evidence of a host-requirement failure
+leaving a livelock, and uVRR is suspect only when evidence shows
+reasonable timeouts producing unnecessary messages. Agents assume every
+bug is their own and must find the defect in the uVRR spec or protocol
+before raising anything upstream.
