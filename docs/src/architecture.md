@@ -377,12 +377,20 @@ the vendored store's quorum-of-copies construction: a sibling
 marker, each Aegis-checksummed and hash-chained by sequence — every
 lifecycle transition quorum-writes the copies with forced I/O (verified
 at the three-of-four write quorum) and the boot classification reads the
-highest-sequence read quorum (two of four), so a torn, rotted, or stale
-single copy cannot decide the classification and a marker write that did
-not reach its quorum is invisible to it. The single text file is written
-alongside at every transition as the compatibility projection: it is
-what legacy rig states boot from (their state seeds the copies on the
-first routed write). The
+highest-sequence read quorum (two of four), so a marker write that did
+not reach its quorum is invisible to it. The boot read validates every
+copy's checksum before any classification logic: a bad checksum on any
+copy is a loud log and a panic — the boot refuses, and the store never
+clears, repairs, or falls back from a bad block (deleting the marker
+file is the only recovery: the host re-seeds from the compatibility
+projection). A tear is the spread of writes being inconsistent across
+the four copies — checksum-valid copies at differing states — and it
+resolves by the stated thresholds, with the non-unanimity fully logged
+at the moment of resolution (which copies, their states, their
+sequences); a unanimous read logs nothing special. The single text file
+is written alongside at every transition as the compatibility
+projection: it is what legacy rig states boot from (their state seeds
+the copies on the first routed write). The
 adopted membership facts keep a lazy, never-fsynced copy beside them —
 the membership sidecar described under
 [membership snapshots](membership-snapshots.md).

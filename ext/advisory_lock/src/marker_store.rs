@@ -9,15 +9,25 @@
 //! plus the item08 single-file compatibility projection.
 //!
 //! - **Read** (`read_copies`) — the working quorum's verdict: the
-//!   highest-sequence valid copies at the `.open` threshold (2/4). The
-//!   on-disk states map onto the engine's markers: `flushed` is the
-//!   drain-proven `Stopped` (a controlled ending), `stopped` is
-//!   `Stopping` (the halt has begun — it vouches for nothing), and
-//!   `unflushed` is the running sentinel (`Joining` — an operating or
-//!   freshly-latched process). An existing copies file that cannot be
-//!   read to a verdict is an error — the boot refuses, it never falls
-//!   back to the projection. When the copies never existed (no
-//!   superblock file), the single file is the boot input: the legacy
+//!   highest-sequence valid copies at the `.open` threshold (2/4). THE
+//!   BOOT-READ SAFETY LAW: every block read validates its checksum
+//!   before any classification logic, and a checksum failure on ANY copy
+//!   is a loud log and a PANIC — the Zig store refuses with the distinct
+//!   `CORRUPT` code (the FFI boundary cannot panic across the ABI) and
+//!   this adapter panics on it: the boot never hangs, never clears,
+//!   never repairs, never falls back — deleting the marker file is the
+//!   recovery path. A tear is the spread writes being inconsistent
+//!   across the copies (checksum-valid copies at differing states), and
+//!   it resolves by the stated thresholds with the non-unanimity logged
+//!   in full at the moment of resolution (in the Zig store, which
+//!   resolves). The on-disk states map onto the engine's markers:
+//!   `flushed` is the drain-proven `Stopped` (a controlled ending),
+//!   `stopped` is `Stopping` (the halt has begun — it vouches for
+//!   nothing), and `unflushed` is the running sentinel (`Joining` — an
+//!   operating or freshly-latched process). An existing copies file that
+//!   cannot be read to a verdict is an error — the boot refuses, it
+//!   never falls back to the projection. When the copies never existed
+//!   (no superblock file), the single file is the boot input: the legacy
 //!   migration path, whose first routed write seeds the copies.
 //! - **Write** (`commit`) — the engine's decided rewrite: the quorum
 //!   write of `(identity, state)` — four fixed sector-aligned
@@ -74,6 +84,23 @@ pub(crate) fn drain_sink(sink: &mut Option<JournalSink>) -> io::Result<()> {
         Some(JournalSink::Blocking(journal)) => journal.flush(),
         None => Ok(()),
     }
+}
+
+/// THE BOOT-READ SAFETY LAW's panic: a readable marker copy failed its
+/// checksum. The Zig store already logged the copy in full (which slot,
+/// which checksum, which sequence); this adapter panics on the distinct
+/// refusal code — the loudest error that exits the boot — and the boot
+/// never clears, repairs, or falls back from a bad block. Deleting the
+/// marker file is the recovery path (the host re-seeds from the
+/// compatibility projection).
+fn boot_read_checksum_panic(superblock: &Path, what: &str) -> ! {
+    panic!(
+        "BOOT-READ SAFETY LAW: {what} of {} found a bad marker checksum \
+         (the store's refusal code); the marker store is never cleared, \
+         never repaired, never fallen back — delete the marker file to \
+         re-seed from the compatibility projection",
+        superblock.display(),
+    )
 }
 
 /// The engine marker's on-disk Zig state: `Stopping` is the halt's first
@@ -164,11 +191,17 @@ impl LifecycleStore for GateStore {
             let (incarnation, marker) = read_marker(&self.state)?;
             return Ok(Some(uniform(Incarnation(incarnation), marker)));
         }
-        // The copies exist: they are the authoritative read. An unreadable
-        // shape (rotted beyond the read quorum, a fork, any refusal) is an
-        // error — the boot refuses rather than guessing an identity or
-        // falling back to the projection.
+        // The copies exist: they are the authoritative read. THE
+        // BOOT-READ SAFETY LAW: a bad checksum on ANY copy is a loud log
+        // and a PANIC (the adapter panics on the Zig store's distinct
+        // refusal code) — never cleared, never repaired, never fallen
+        // back, never "unclear". Any other unreadable shape (no quorum, a
+        // fork, any refusal) is an error — the boot refuses rather than
+        // guessing an identity or falling back to the projection.
         let classified = lunet_locks_aof::marker::classify(&superblock).map_err(|code| {
+            if code == lunet_locks_aof::marker::CORRUPT {
+                boot_read_checksum_panic(&superblock, "the quorum read");
+            }
             io::Error::other(format!("the marker quorum read failed (FFI code {code})"))
         })?;
         Ok(Some(uniform(
@@ -202,6 +235,9 @@ impl LifecycleStore for GateStore {
             zig_state(copy.marker),
         )
         .map_err(|code| {
+            if code == lunet_locks_aof::marker::CORRUPT {
+                boot_read_checksum_panic(&superblock_path(&self.state), "the write's read");
+            }
             io::Error::other(format!("the marker quorum write failed (FFI code {code})"))
         })?;
         // The compatibility projection: the item08 single-file write,

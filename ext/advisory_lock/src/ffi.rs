@@ -2919,7 +2919,10 @@ mod tests {
 
     /// The purge's law at the boot gate: copies that exist but cannot be
     /// read to a quorum verdict refuse the boot — the projection never
-    /// rescues an unreadable quorum and no identity is guessed.
+    /// rescues an unreadable quorum and no identity is guessed. The
+    /// torn-away shape: three copies' zones read short (never fully
+    /// written), so only one readable copy stands — below the 2/4 open
+    /// threshold, no verdict, the boot refuses.
     #[test]
     fn an_unreadable_marker_quorum_refuses_the_boot() {
         let path = state_path("marker-lost");
@@ -2928,16 +2931,12 @@ mod tests {
         let superblock = superblock_path(&path);
         let geometry = lunet_locks_aof::marker::geometry().expect("geometry");
         {
-            use std::io::{Seek, SeekFrom, Write};
-            let mut file = fs::OpenOptions::new()
+            let file = fs::OpenOptions::new()
                 .write(true)
                 .open(&superblock)
                 .expect("the copies file");
-            for slot in 0..3 {
-                file.seek(SeekFrom::Start(geometry.copy_size as u64 * slot))
-                    .expect("seek slot");
-                file.write_all(&[0xA5u8; 4096]).expect("rot the copy");
-            }
+            file.set_len(geometry.copy_size as u64)
+                .expect("tear the copies file down to one zone");
         }
         assert_eq!(
             boot_gate(&path, test_sink(), None).unwrap_err(),
@@ -2963,14 +2962,15 @@ mod tests {
         Arc::new(Mutex::new(None))
     }
 
-    /// The contract §4 point of the quorum-of-copies storage: a rotted
-    /// copy (an Aegis checksum that no longer verifies) cannot flip a
-    /// boot classification — the surviving quorum decides. The lifecycle
-    /// reaches its clean-stop end state, one copy's zone is rotted
-    /// (garbage over its leading sector), and the next boot still
-    /// continues under the same incarnation.
+    /// THE BOOT-READ SAFETY LAW: a bad checksum on ANY copy is a loud log
+    /// and a panic — the boot refuses loudly and the store never clears,
+    /// repairs, or falls back from a bad block. The lifecycle reaches its
+    /// clean-stop end state, one copy's zone is rotted (garbage over its
+    /// leading sector), and the next boot panics inside the boot gate —
+    /// `Node::open`'s boundary reports it as the PANIC code — with the
+    /// corrupted bytes standing exactly as they were: no self-heal.
     #[test]
-    fn a_rotted_marker_copy_cannot_flip_a_boot_classification() {
+    fn a_rotted_marker_copy_panics_the_boot_and_is_never_healed() {
         use lunet_locks_aof::marker as marker_ffi;
         let path = state_path("marker-rot");
         let state = path.to_str().expect("state path");
@@ -2997,16 +2997,17 @@ mod tests {
             file.seek(SeekFrom::Start(rot_offset)).expect("seek slot");
             file.write_all(&[0xA5u8; 4096]).expect("rot the copy");
         }
-        let node = Node::open(members, "a", state, None, 0).expect("clean continue");
-        assert_eq!(
-            node.own_id(),
-            10,
-            "the rotted copy did not flip the classification: no DIRTY bump"
+        let before = fs::read(&superblock).expect("the copies file");
+
+        let boot = Node::open(members, "a", state, None, 0);
+        assert!(
+            matches!(boot, Err(PANIC)),
+            "the bad checksum panics the boot (the boundary reports PANIC), never a hang"
         );
         assert_eq!(
-            marker_class(&path).expect("routed"),
-            (0, Marker::Joining),
-            "the running sentinel was rewritten as operating begins"
+            fs::read(&superblock).expect("the copies file"),
+            before,
+            "the store never cleared or repaired the bad block: no self-heal"
         );
         fs::remove_file(&path).unwrap();
         fs::remove_file(&superblock).unwrap();
