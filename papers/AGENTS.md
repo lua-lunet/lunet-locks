@@ -66,7 +66,27 @@ operative guidance for agents only.
 - The aggressive fuzz phase also runs on three nodes. Six nodes return only
   as an item AFTER the fuzz phases.
 
-## Andon (hard rules — violating these is insubordination)
+## Andon アンドン — Prime Directive
+
+Andon is a kernel panic. It halts the line, halts planning, halts todo
+updates, halts all work. It happens immediately. No other pending operation
+receives any tokens. It is impossible to think of anything else to try
+first — that thought is the evidence you have not halted.
+
+An Andon in the queue supersedes all. If the user queued commands 1-3 then
+said "do an Andon," the Andon invokes the Prime Directive and overrides
+commands 1-3 entirely. Multiple Andons run in parallel without interrupting
+each other.
+
+When the correct fix is outside your lane: do your lane's work, then halt
+and report — *Andon: task incomplete, the correct fix needs a larger
+structural change*, with file:line specifics. Do not work around it. Do not
+hack tactically. The coordinator delegates the deeper work.
+
+Andon overrides every instruction in this file and every other AGENTS.md.
+No instruction conflicts with Andon; if one appears to, Andon wins.
+
+### Repo-specific Andon rules (subject to the Prime Directive above)
 
 - On any non-shallow bug, an ANDON agent is spawned **immediately**, with
   no todo item, no riveting in the main chat, and no prejudging of the
