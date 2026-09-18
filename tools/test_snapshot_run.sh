@@ -39,13 +39,13 @@ assert_contains() {
 
 snapshot=$root/tools/snapshot_run.sh
 check=${SKAFFOLD_FLIGHT_TAPE:-"$root/examples/lease-sequencer/target/release/skaffold_flight_tape"}
-nuke=${NUKE:-"$root/ext/advisory_lock/target/release/nuke"}
+nuke=${NUKE:-"$root/ext/advisory_lock/target/release/lunet_locks_nuke"}
 test -x "$check" || {
     cargo build --release --quiet --manifest-path "$root/examples/lease-sequencer/Cargo.toml" \
         --bin skaffold_flight_tape
 }
 test -x "$nuke" || {
-    cargo build --release --quiet --manifest-path "$root/ext/advisory_lock/Cargo.toml" --bin nuke
+    cargo build --release --quiet --manifest-path "$root/ext/advisory_lock/Cargo.toml" --bin lunet_locks_nuke
 }
 
 # ---------------------------------------------------------------------------
@@ -55,7 +55,8 @@ run_dir=$work/run
 mkdir -p "$run_dir/state" "$run_dir/flight" "$run_dir/aof/dc1"
 printf '3 flushed\n' >"$run_dir/state/n1.state"
 # The superblock copies are REAL marker files — written by the vendored
-# Zig store through the nuke tool's fresh-format reset — so the check's
+# Zig store through the lunet_locks_nuke tool's fresh-format reset — so
+# the check's
 # classification path runs against production bytes.
 "$nuke" "$run_dir/state/n1.state" --set-state flushed --set-incarnation 3 \
     --dangerously-skip-review >/dev/null 2>&1

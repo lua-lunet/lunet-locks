@@ -14,8 +14,9 @@ serde_json = "1"
 tracing = "0.1"
 uuid = { version = "1", features = ["serde"] }
 vrr = { package = "vrr-core", git = "https://github.com/lua-lunet/uvrr-core.git", tag = "v0.3.0" } # released upstream 2026-09-10, includes the learner-acquisition + fence-under-load patches (squash of PR #12)
-# The `nuke` bin's argument parsing (the operator review gate's flags).
-# Library code depends on none of it; the dependency exists for the bin.
+# The `lunet_locks_nuke` admin tool's argument parsing (the operator
+# review gate's flags). Library code depends on none of it; the
+# dependency exists for the bin.
 clap = { version = "4", features = ["derive"] }
 
 # The [patch] resolves the tagged dependency to the vendored submodule copy
