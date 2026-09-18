@@ -2016,8 +2016,12 @@ fn main() {
         host.record_state_transition(format!(
             "{{\"event\":\"boot\",\"decision\":\"{decision}\",\"detector\":\"{DETECTOR}\",\
              \"incarnation\":{incarnation},\
-             \"state\":{},\"leader\":{},\"era\":{},\"view\":{},\"config_era\":{}}}",
-            status.state, status.leader, status.era, status.view, status.config_era
+             \"state\":\"{}\",\"leader\":{},\"era\":{},\"view\":{},\"config_era\":{}}}",
+            lunet_advisory_lock::replication_state_name(status.state),
+            status.leader,
+            status.era,
+            status.view,
+            status.config_era
         ));
     }
     let now = millis();
@@ -2162,9 +2166,13 @@ fn timers(host: &mut Host, now: u64, rng: &mut Rng) {
     if status.state != host.last_state {
         host.last_state = status.state;
         host.record_state_transition(format!(
-            "{{\"event\":\"state\",\"state\":{},\"leader\":{},\"era\":{},\"view\":{},\
+            "{{\"event\":\"state\",\"state\":\"{}\",\"leader\":{},\"era\":{},\"view\":{},\
              \"config_era\":{}}}",
-            status.state, status.leader, status.era, status.view, status.config_era
+            lunet_advisory_lock::replication_state_name(status.state),
+            status.leader,
+            status.era,
+            status.view,
+            status.config_era
         ));
     }
     let weight_now = host.node.voting_weight();
@@ -2189,7 +2197,7 @@ fn timers(host: &mut Host, now: u64, rng: &mut Rng) {
         host.note(&format!(
             "status state={} leader={} era={} view={} config_era={} voting={voting} \
              sidecar_drops={}",
-            status.state,
+            lunet_advisory_lock::replication_state_name(status.state),
             status.leader,
             status.era,
             status.view,

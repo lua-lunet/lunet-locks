@@ -277,8 +277,22 @@ pub const FAULTED: i32 = -9;
 pub const STOPPED: i32 = -10;
 pub const PANIC: i32 = -127;
 
-const OUTPUT_SEND: u32 = 1;
-const OUTPUT_REPLY: u32 = 2;
+/// The queued output's kinds (`NodeOutput.kind`): a unicast peer datagram
+/// or a client reply. The names the human surfaces spell for them ride
+/// `output_kind_name`.
+pub const OUTPUT_SEND: u32 = 1;
+pub const OUTPUT_REPLY: u32 = 2;
+
+/// The output kind's name, for every surface a human reads: `send`,
+/// `reply`, or `unknown(N)` for anything else — never a bare integer for
+/// a human to memorise.
+pub fn output_kind_name(kind: u32) -> &'static str {
+    match kind {
+        OUTPUT_SEND => "send",
+        OUTPUT_REPLY => "reply",
+        _ => "unknown",
+    }
+}
 
 /// Host packetization bound (W5: the core owns no size limit). One IPv4/IPv6
 /// UDP datagram, matching `transport.tl`.
@@ -698,7 +712,7 @@ impl Node {
                 "era": message.header.view.era.0,
                 "view": message.header.view.view.0,
                 "slot": message.header.slot.0,
-                "tag": format!("{:?}", message.header.tag),
+                "tag": message.header.tag.name(),
             }),
             Input::Propose { operation } => serde_json::json!({
                 "input": "propose",
@@ -1032,6 +1046,27 @@ pub struct NodeStatus {
     pub poisoned: bool,
     /// The self-arrest's recorded reason, when the arrest named one.
     pub fault_note: Option<String>,
+}
+
+/// The replication state word's name, for every surface a human reads (a
+/// log line, a status note, a trace): `state=joining`, never `state=4`.
+/// The word and every comparison stay numeric; the name comes from the
+/// core's own const table (`vrr::progress::Status::name` — the snapshot
+/// word's numbering and its names are stated together there), and a word
+/// no status encodes renders `invalid`, never a bare integer.
+pub fn replication_state_name(word: u32) -> &'static str {
+    match vrr::progress::Status::from_word(word) {
+        Some(status) => status.name(),
+        None => "invalid",
+    }
+}
+
+impl NodeStatus {
+    /// The status's replication state spelled for humans (`state=normal`,
+    /// never `state=0`).
+    pub fn state_name(&self) -> &'static str {
+        replication_state_name(self.state)
+    }
 }
 
 impl Node {
@@ -1485,6 +1520,7 @@ impl Node {
             serde_json::json!({
                 "what": "the halt's first round (Stopping) begins",
                 "identity": session.identity().0,
+                "state": lunet_locks_aof::marker::MarkerState::Stopped.code(),
             }),
         );
         #[cfg(feature = "flight-recorder")]
@@ -1517,6 +1553,7 @@ impl Node {
             serde_json::json!({
                 "what": "the drain-proven second round (Stopped) begins",
                 "identity": identity.0,
+                "state": lunet_locks_aof::marker::MarkerState::Flushed.code(),
             }),
         );
         if let Err((_, error)) = draining.finish_stop() {

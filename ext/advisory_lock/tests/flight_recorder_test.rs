@@ -152,6 +152,18 @@ fn the_recorder_captures_the_internal_events() {
         2,
         "the stop path writes both marker events: {kinds:?}"
     );
+    // The operator's law, the capture half: the tape keeps the raw
+    // numbers (the on-disk marker codes: 1 = the first round's `stopped`,
+    // 2 = the second round's `flushed`) — the REPLAY path spells the
+    // names (pinned in the lease-sequencer flight-tape suite).
+    assert_eq!(
+        markers[0]["detail"]["state"], 1,
+        "the first round's raw code"
+    );
+    assert_eq!(
+        markers[1]["detail"]["state"], 2,
+        "the second round's raw code"
+    );
     // Sequence monotonicity across the whole tape: the header carries no
     // seq (it is the file's opening record), events count from 1.
     let seqs: Vec<u64> = lines

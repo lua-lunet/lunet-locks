@@ -57,6 +57,22 @@ pub const KIND_RENEW: u8 = 2;
 pub const KIND_RELEASE: u8 = 3;
 pub const KIND_BREAK: u8 = 4;
 
+/// The kind's name, for every surface a human reads (a trace line, a
+/// diagnostic dump, the flight recorder's replay): `kind=hold`, never
+/// `kind=1`. The discriminant and every comparison stay numeric; the
+/// name is stated next to the numbering it names so the two cannot drift
+/// apart, and a kind outside the table renders `unknown`, never a bare
+/// integer.
+pub const fn kind_name(kind: u8) -> &'static str {
+    match kind {
+        KIND_HOLD => "hold",
+        KIND_RENEW => "renew",
+        KIND_RELEASE => "release",
+        KIND_BREAK => "break",
+        _ => "unknown",
+    }
+}
+
 /// A single lock-event journal entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JournalEvent {

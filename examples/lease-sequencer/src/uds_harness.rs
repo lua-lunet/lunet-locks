@@ -968,7 +968,11 @@ impl NodeHost {
             let voting = u32::from(self.node.voting_weight().unwrap_or(0) > 0);
             self.note(&format!(
                 "status state={} leader={} era={} view={} config_era={} voting={voting}",
-                status.state, status.leader, status.era, status.view, status.config_era
+                lunet_advisory_lock::replication_state_name(status.state),
+                status.leader,
+                status.era,
+                status.view,
+                status.config_era
             ));
         }
     }

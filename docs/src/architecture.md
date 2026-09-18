@@ -378,9 +378,16 @@ marker, each Aegis-checksummed and hash-chained by sequence — every
 lifecycle transition quorum-writes the copies with forced I/O (verified
 at the three-of-four write quorum) and the boot classification reads the
 highest-sequence read quorum (two of four), so a marker write that did
-not reach its quorum is invisible to it. The boot read validates every
-copy's checksum before any classification logic: a bad checksum on any
-copy is a loud log and a panic — the boot refuses, and the store never
+not reach its quorum is invisible to it. Each copy carries its
+lifecycle state twice: the numeric code the store reads, and a
+fixed-width, space-padded name (`"flushed         "`) stamped into the
+header's spare bytes from the same constant table that names the codes —
+so a raw hexdump of a written block reads the state directly, and a
+write can never stamp disagreeing halves. The boot read validates every
+copy's checksum before any classification logic, and enforces the two
+halves' agreement: a bad checksum on any copy, or a checksum-valid copy
+whose padded name disagrees with its numeric state, is a loud log and a
+panic — the boot refuses, and the store never
 clears, repairs, or falls back from a bad block (deleting the marker
 file is the only recovery: the host re-seeds from the compatibility
 projection). A tear is the spread of writes being inconsistent across

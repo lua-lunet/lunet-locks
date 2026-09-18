@@ -355,6 +355,70 @@ fn the_stable_slice_streams_cross_commit_and_the_deep_read_does_not() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The operator's law on the replay: the tape keeps the raw numbers the
+/// recorder captured, and the extraction spells every name a human would
+/// otherwise have to look up — the emit's output kind, the journal
+/// flush's kind, and the node's replication state where an event carries
+/// one (the marker events' raw codes).
+#[test]
+fn the_extraction_stringifies_the_names_beside_the_raw_numbers() {
+    let dir = temp_dir("stringify");
+    let recording = dir.join("flight-44.jsonl");
+    write_recording(
+        &recording,
+        READER_COMMIT,
+        44,
+        &[
+            json!({"seq": 1, "kind": "marker", "ts_ms": 1789214915001u64,
+                   "detail": {"what": "the halt's first round (Stopping) begins",
+                              "identity": 42, "state": 1}}),
+            json!({"seq": 2, "kind": "emit", "ts_ms": 1789214915002u64,
+                   "detail": {"kind": 1, "to": 66, "era": 1, "view": 0, "slot": 1,
+                              "len": 3, "hex": "aabb00"}}),
+            json!({"seq": 3, "kind": "journal", "ts_ms": 1789214915003u64,
+                   "detail": {"what": "internal lock-state flush", "kind": 2,
+                              "lock_id": 17}}),
+            json!({"seq": 4, "kind": "marker", "ts_ms": 1789214915004u64,
+                   "detail": {"what": "the drain-proven second round (Stopped) begins",
+                              "identity": 42, "state": 2}}),
+            json!({"seq": 5, "kind": "status", "ts_ms": 1789214915005u64,
+                   "detail": {"state": 0, "leader": 10}}),
+        ],
+    );
+    let mut options = FlightTapeOptions::default();
+    options.kinds = vec!["internal".to_string(), "emit".to_string()];
+    let mut capture: Vec<u8> = Vec::new();
+    let (lines, _) = stream_recording(&recording, &options, &mut capture).expect("streams");
+    assert_eq!(lines, 5);
+    let tape: Vec<Value> = String::from_utf8(capture)
+        .unwrap()
+        .lines()
+        .map(|line| parse_tape_line(line).expect("the line parses").2)
+        .collect();
+
+    // The marker events: the raw codes stay, the names ride beside them —
+    // the MARKER lifecycle namespace (unflushed/stopped/flushed), not the
+    // replication-state words.
+    assert_eq!(tape[0]["state"], 1, "the tape keeps the raw number");
+    assert_eq!(
+        tape[0]["state_name"], "stopped",
+        "the extraction spells the name"
+    );
+    assert_eq!(tape[3]["state"], 2);
+    assert_eq!(tape[3]["state_name"], "flushed");
+    // The status event: the raw word stays, the name rides beside it —
+    // the REPLICATION state namespace (normal/view_change/…).
+    assert_eq!(tape[4]["state"], 0);
+    assert_eq!(tape[4]["state_name"], "normal");
+    // The emit: the raw output kind stays, the name rides beside it.
+    assert_eq!(tape[1]["out_kind"], 1, "the tape keeps the raw number");
+    assert_eq!(tape[1]["out_kind_name"], "send");
+    // The journal flush: the raw kind stays, the name rides beside it.
+    assert_eq!(tape[2]["out_kind"], 2, "the tape keeps the raw number");
+    assert_eq!(tape[2]["out_kind_name"], "renew");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The deep read on the SAME commit: the full internal event log — every
 /// event rendered with its `seq`, the internal story included, and the
 /// default read of the same recording staying the slice only.

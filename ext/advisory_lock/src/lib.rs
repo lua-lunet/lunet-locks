@@ -10,8 +10,9 @@ mod marker_store;
 pub mod recovery_flush;
 
 pub use ffi::{
-    Node, NodeOutput, NodeStatus, POSITION_APPEND, RECONFIGURE_DECREMENT, RECONFIGURE_INCREMENT,
-    RECONFIGURE_JOIN, RECONFIGURE_LEAVE,
+    Node, NodeOutput, NodeStatus, OUTPUT_REPLY, OUTPUT_SEND, POSITION_APPEND,
+    RECONFIGURE_DECREMENT, RECONFIGURE_INCREMENT, RECONFIGURE_JOIN, RECONFIGURE_LEAVE,
+    output_kind_name, replication_state_name,
 };
 
 pub use recovery_flush::{FlushOutcome, RecoveryFlush};

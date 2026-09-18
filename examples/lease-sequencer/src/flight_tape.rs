@@ -251,6 +251,8 @@ fn keeps_endpoints(from: &str, to: &str, options: &FlightTapeOptions) -> bool {
 /// `None` when the event carries no frame bytes (the internal events with
 /// `--kinds internal` still render — their JSON is the detail itself).
 pub fn event_tape_line(event: &FlightEvent, own_node: u32) -> Option<TapeLine> {
+    use lunet_advisory_lock::journal;
+    use lunet_advisory_lock::{output_kind_name, replication_state_name};
     let own = own_node.to_string();
     let detail = event.detail.as_object()?.clone();
     let mut json = Map::new();
@@ -265,6 +267,42 @@ pub fn event_tape_line(event: &FlightEvent, own_node: u32) -> Option<TapeLine> {
             other => other.to_string(),
         };
         json.insert(key, field);
+    }
+    // The operator's law on the replay: the tape keeps the raw numbers
+    // the recorder captured, and the extraction spells every name a human
+    // would otherwise have to look up — the output kind (an emit's
+    // send/reply, a journal flush's hold/renew/release/break), and the
+    // state where an event carries one. The state's namespace follows the
+    // event: a `marker` event carries the marker store's on-disk
+    // lifecycle code (unflushed/stopped/flushed); any other event's
+    // `state` is the node's replication state word (normal/view_change/…).
+    match event.kind.as_str() {
+        "emit" => {
+            if let Some(kind) = json.get("out_kind").and_then(serde_json::Value::as_u64) {
+                let name = output_kind_name(kind as u32);
+                json.insert("out_kind_name".into(), serde_json::Value::from(name));
+            }
+        }
+        "journal" => {
+            if let Some(kind) = json.get("out_kind").and_then(serde_json::Value::as_u64) {
+                let name = journal::kind_name(kind as u8);
+                json.insert("out_kind_name".into(), serde_json::Value::from(name));
+            }
+        }
+        "marker" => {
+            if let Some(code) = json.get("state").and_then(serde_json::Value::as_u64) {
+                match lunet_locks_aof::marker::state_name(code as u32) {
+                    Some(name) => json.insert("state_name".into(), serde_json::Value::from(name)),
+                    None => json.insert("state_name".into(), serde_json::Value::from("invalid")),
+                };
+            }
+        }
+        _ => {
+            if let Some(word) = json.get("state").and_then(serde_json::Value::as_u64) {
+                let name = replication_state_name(word as u32);
+                json.insert("state_name".into(), serde_json::Value::from(name));
+            }
+        }
     }
     json.insert("kind".into(), serde_json::Value::from(event.kind.as_str()));
     json.insert("ts_ms".into(), serde_json::Value::from(event.ts_ms));
