@@ -278,9 +278,14 @@ function Node:status(): Status
     elseif state_number == 1 then
         state = "view_change"
     elseif state_number == 2 then
+        -- Restarting: the fenced boot of a later life (resume/reincarnate).
         state = "recovering"
     elseif state_number == 3 then
         state = "replaying"
+    elseif state_number == 4 then
+        -- Joining: the fenced boot of the first life (provision). Both
+        -- fenced boot words drive the recovery loop's recover() ticks.
+        state = "recovering"
     else
         error("advisory_lock: invalid native status " .. tostring(state_number), 2)
     end

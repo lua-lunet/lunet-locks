@@ -1,16 +1,15 @@
 //! Host-side FFI adapter between the LuaJIT host and the uVRR core
-//! (vrr-core @ 0fc6380).
+//! (vrr-core @ 317f4fc, v0.7.0 — the lifecycle boot gate).
 //!
 //! Concrete core: `Replica<SegmentedLog, WeightedMajority>` running
-//! `Stability::Volatile` — nothing is persisted but the boot state file, so
-//! a process that died while operating has no same-identity clean restart
-//! in this embedder: its restart is DIRTY. A graceful stop is the one
-//! same-identity restart (the termination lifecycle below). The restart
-//! story is
-//! upstream's Crash-Stop-Self-Evict protocol
-//! (`src/replica/reincarnation.rs`): the durable state file is the
-//! incarnation marker (the four-superblock discipline collapsed to one
-//! copy), a dirty boot bumps the identity, the bumped node drives
+//! `Stability::Volatile` — nothing is persisted but the boot gate's
+//! markers, so a process that died while operating has no same-identity
+//! clean restart in this embedder: its restart is CRASHED. A graceful
+//! stop is the one same-identity restart (the boot gate's stopped
+//! quorum, below). The restart story is upstream's Crash-Stop-Self-Evict
+//! protocol (`src/replica/reincarnation.rs`): the durable markers carry
+//! the incarnation (the quorum-of-copies construction, `marker_store`),
+//! a crashed boot decides the bumped pair, the bumped node drives
 //! `Input::Reincarnate { old }` — the `Reincarnation(old, new)` entry
 //! ticket — and the stable leader computes `forced_steps` idempotently from
 //! the committed configuration, proposing each remaining era's batch
@@ -18,9 +17,9 @@
 //! until the new identity sits at weight 1 in the old succession position
 //! and the old identity is evicted. The reincarnated node reopens over the
 //! deployment's genesis (the only true shared history a Volatile process
-//! has) and acquires nothing beyond it — the learner's streamed catch-up is
-//! upstream §10 future work — so it replays no lock state it did not
-//! commit, exactly like the joiner.
+//! has) and acquires nothing beyond its genesis — the §10 learner
+//! acquisition streams it the committed history through its boot fence —
+//! so it replays no lock state it did not commit, exactly like the joiner.
 //!
 //! Adapter policies the core deliberately does not own:
 //!
@@ -41,9 +40,9 @@
 //!   (joined-later) entry carries a `:j` suffix: `<u32-id>:<name>:j`. Such
 //!   entries are outside the genesis order — the core's `provision` refuses
 //!   an `own` that is not a founding member — so a node whose `own` names a
-//!   `:j` entry boots as a JOINER: `Replica::reopen` over the deployment's
+//!   `:j` entry boots as a JOINER: `Replica::join` over the deployment's
 //!   genesis (the entries `provision` installs, mirrored byte-for-byte, plus
-//!   the era table folded from them), fenced `Recovering`, addressed but
+//!   the era table folded from them), fenced `Restarting`, addressed but
 //!   outside every configuration until a committed `Join` admits it. Upstream
 //!   has no fresh-node catch-up at this commit: the establishing operation's
 //!   fan-out reaches configuration members only and the `GetState` serving
@@ -51,65 +50,63 @@
 //!   the era-1 traffic its genesis table covers and drops everything past it
 //!   by name — the same boundary upstream's own learner corpus states
 //!   (§10 acquisition, future work). The joiner fabricates nothing.
-//! - **Incarnation (the restart story).** The durable state file is the
-//!   incarnation marker: one line `<incarnation> <flushed|unflushed>`,
-//!   written atomically (fsync+rename+dir-sync). The boot classifies
-//!   upstream-style (`SuperblockCopies::classify`): marker `flushed` -> a
-//!   clean continue under the same incarnation; `unflushed` (the running
-//!   sentinel every operating process leaves behind) -> DIRTY -> the
-//!   incarnation bumps and the marker is rewritten `(new, flushed)` — the
-//!   bump's commitment — then `(new, unflushed)` as operating begins. A
-//!   bumped identity is derived deterministically, without operator
-//!   intervention: descriptor ids are incarnation-0 ids in the low band
-//!   `[0, 16777214]`, and the k-th incarnation's identity is
-//!   `low + k * 2^24` — a unique high-band id that can never alias a
-//!   descriptor id (the low band is the whole descriptor space), never
-//!   overflow u32, and never reach the reserved LEADER_UNKNOWN value
-//!   `u32::MAX` (descriptor id 16777215 is forbidden precisely because
-//!   `255 * 2^24 + 16777215 = 4294967295`); the bump refuses at exhaustion
-//!   (incarnation 255), mirroring upstream's checked `Incarnation::bump`.
-//!   A bumped boot reopens the reincarnation way — a later life over the
-//!   deployment's genesis, the honest Volatile equivalent of upstream's
-//!   `restart_as` (`reopen` under the new `own`; there is no durable
-//!   journal to carry forward) — and drives `Input::Reincarnate { old }`
-//!   immediately and on every later fenced-boot drive (the §8 re-announce;
-//!   the core self-gates: a member already voting at weight ≥ 1 has
-//!   nothing to announce). `lunet_lock_node_own_id` reports the live
-//!   identity so the host can compare leaders against it after a bump.
-//! - **Termination (the stop story).** The adapter meets the uVRR
-//!   termination obligations (uvrr-core v0.6.1,
-//!   `docs/uvrr-termination-obligations.md`) host-side, with the core pin
-//!   untouched. The lifecycle is the contract's: startup writes the
-//!   running sentinel BEFORE the loop starts (every boot path ends
-//!   `unflushed`); a graceful stop — [`Node::stop`] and the C ABI's
-//!   `lunet_lock_node_stop` — first CLOSES THE WIRE (the mandatory drain
-//!   point: the `stopped` flag refuses every further inbound entry —
-//!   `request`, `receive`, `idle`, `leader_timeout`, `force_view`,
-//!   `recover`, `reconfigure` — before any marker write and before any
-//!   task processing, making the in-memory state final), then writes
-//!   `stopped` (termination begins), then drains the committed-transition
-//!   sink to quiescence (every queued record appended and fsynced — the
-//!   durable-state write), and only then writes `flushed` at the drain
-//!   point. The write ordering carries the safety argument: a marker at
-//!   `stopped` or later vouches for the state beneath it, so boot reads a
-//!   partial shutdown (died between the marker writes) as a CONTROLLED
-//!   ending, never as a crash. On-disk spelling: the contract spells the
-//!   operating state `running`; this adapter keeps the running sentinel's
-//!   on-disk word as `unflushed` for compatibility with every existing
-//!   rig state file — `flushed` and the new `stopped` spell as the
-//!   contract does. Startup classification: `stopped`/`flushed` → clean
-//!   continue under the SAME incarnation (no reincarnation), rewritten
-//!   `unflushed` before operating; `unflushed` → DIRTY bump (unchanged).
-//!   SIGKILL leaves the running sentinel behind and stays the crash
-//!   shape. Marker storage: the lifecycle rides the vendored Zig store's
-//!   quorum-of-copies superblock construction (four fixed sector-aligned
-//!   Aegis-checksummed copies, hash-chained sequence/parent, quorum write
-//!   with forced I/O verified at the 3/4 threshold, quorum read resolving
-//!   by highest sequence at the 2/4 threshold — the contract §4
-//!   construction, reached through the AOF C ABI's marker exports and
-//!   linked statically so this cdylib stays self-contained); the item08
-//!   single fsynced flag file remains as the compatibility projection and
-//!   the conservative fallback (see `marker_store`).
+//! - **Incarnation (the restart story).** The boot classification is the
+//!   engine's (`lifecycle::boot` over the superblock quorum store,
+//!   `vrr::lifecycle`): no marker ever written is the FIRST life — the
+//!   first latch anchors identity 0; a stopped quorum is a CLEAN
+//!   continue under the SAME identity (`Replica::resume` behind the
+//!   engine's `Vouched` token); no stopped quorum is a CRASH — the
+//!   identity is dead, the replacement pair is decided at boot
+//!   (`Crashed::pair`), and the durable bump lands with the DEFERRED
+//!   latch once the engine itself observes the node seated
+//!   (`Replica::rejoined` mints the witness; until then the markers hold
+//!   the crash's evidence, so a re-crash re-decides the same pair and
+//!   the replay is absorbed). A bumped identity is derived
+//!   deterministically, without operator intervention: descriptor ids
+//!   are incarnation-0 ids in the low band `[0, 16777214]`, and the
+//!   k-th incarnation's identity is `low + k * 2^24` — a unique
+//!   high-band id that can never alias a descriptor id (the low band is
+//!   the whole descriptor space), never overflow u32, and never reach
+//!   the reserved LEADER_UNKNOWN value `u32::MAX` (descriptor id
+//!   16777215 is forbidden precisely because `255 * 2^24 + 16777215 =
+//!   4294967295`); the boot refuses past incarnation 255, mirroring
+//!   upstream's checked `Incarnation::bump`. A crashed boot reopens the
+//!   reincarnation way — a later life over the deployment's genesis
+//!   (`Replica::reincarnate` under the bumped identity; there is no
+//!   durable journal to carry forward) — and drives
+//!   `Input::Reincarnate { old }` immediately and on every later
+//!   fenced-boot drive (the §8 re-announce; the core self-gates: a
+//!   member already voting at weight ≥ 1 has nothing to announce).
+//!   `lunet_lock_node_own_id` reports the live identity so the host can
+//!   compare leaders against it after a bump.
+//! - **Termination (the stop story).** The ENGINE owns the stop
+//!   schedule (`docs/uvrr-boot-gate.md` §3): the Running session's
+//!   `begin_stop` writes the halt's first round (`Stopping` — it
+//!   vouches for nothing), the host drain forces the committed-
+//!   transition sink to quiescence strictly between the rounds, and
+//!   `finish_stop` writes the drain-proven second round (`Stopped` — a
+//!   stopped quorum at the next boot proves the clean stop). The host
+//!   obligations stay ours: the wire closes FIRST (the `stopped` flag
+//!   refuses every further inbound entry — `request`, `receive`,
+//!   `idle`, `leader_timeout`, `force_view`, `recover`, `reconfigure` —
+//!   before any marker write and before any task processing, making the
+//!   in-memory state final), and the durable write is the existing
+//!   sink drain. A node still inside the crashed path's deferred window
+//!   (its identity not yet latched) cannot run the halt's rounds — the
+//!   stop closes the wire, drains the sink, and leaves the markers at
+//!   the crash's evidence; the next boot re-classifies crashed and
+//!   re-decides the same pair. Marker storage: the lifecycle rides the
+//!   vendored Zig store's quorum-of-copies superblock construction
+//!   (four fixed sector-aligned Aegis-checksummed copies, hash-chained
+//!   sequence/parent, quorum write with forced I/O verified at the 3/4
+//!   threshold, quorum read resolving by highest sequence at the 2/4
+//!   threshold, through the AOF C ABI's marker exports and linked
+//!   statically so this cdylib stays self-contained); the item08 single
+//!   fsynced flag file remains as the compatibility projection — written
+//!   after every quorum write, never a classification input. An
+//!   unreadable marker quorum refuses the boot
+//!   (`BootError::QuorumLost` shape): no projection fallback, no
+//!   guessed identity.
 //! - **Reconfiguration.** `lunet_lock_node_reconfigure` drives
 //!   `Input::Reconfigure { op, pivot }` (Join at weight 0 / Increment /
 //!   Decrement (voter to learner) / Leave at weight 0) on the current primary
@@ -190,7 +187,6 @@
 use crate::aof::{AofConfig, AofWriter};
 use crate::journal::{self, Journal as LockJournal, JournalEvent};
 use crate::locks::{Service, Transition};
-use crate::marker_store;
 use crate::recovery_flush::{self, FlushOutcome, RecoveryFlush};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{OsString, c_void};
@@ -199,13 +195,16 @@ use std::io::Write;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::ptr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, trace, warn};
 use vrr::configuration::{EraTable, INIT_SLOT, MAX_MEMBERS, SystemOperation, VOID_SLOT};
 use vrr::effects::{Effect, Stability};
 use vrr::ids::{Era, NodeId, Operation, OperationId, Slot, Tick, View, ViewId};
 use vrr::journal::{Journal, LogEntry, Payload, SegmentedLog};
+use vrr::lifecycle::{
+    self, BootError, BootOutcome, Bumped, Crashed, Incarnation, Marker, Running, Vouched,
+};
 use vrr::message::{Body, Message};
 use vrr::observe::Diagnostic;
 use vrr::progress::Status;
@@ -215,6 +214,8 @@ use vrr::replica::{
     TimedInput, ViewChangeKnobs,
 };
 use vrr::wire::{Pack, Unpack, UnpackError};
+
+use crate::marker_store::{GateStore, SinkDoor, drain_sink, sink_guard};
 
 /// An unexpected-but-not-provably-impossible condition — a "maybe" in the
 /// TigerBeetle model — reported where the path today logs nothing.
@@ -326,26 +327,6 @@ const INCARNATION_BASE: u64 = 1u64 << 24;
 /// `src/replica/reincarnation.rs:413-417`).
 const INCARNATION_MAX: u64 = 255;
 
-/// A superblock copy's marker, upstream-style
-/// (`src/replica/reincarnation.rs:423-430`), extended with the uVRR
-/// termination lifecycle (`docs/uvrr-termination-obligations.md` §2):
-///
-/// - `Unflushed` = the running sentinel, left behind by every process
-///   that has been operating on volatile state. On-disk spelling note:
-///   the contract spells this state `running`; the on-disk word stays
-///   `unflushed` so every existing rig state file boots unchanged.
-/// - `Stopped` = termination has begun at a graceful stop: the wire was
-///   closed before this write, so the state beneath the marker is final.
-///   A `stopped` copy mixed with `unflushed` copies (a death between the
-///   marker writes) is evidence of a controlled ending, never a crash.
-/// - `Flushed` = the durable-state write completed at the drain point.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum Marker {
-    Unflushed,
-    Stopped,
-    Flushed,
-}
-
 struct Queued {
     kind: u32,
     to: u32,
@@ -399,13 +380,23 @@ pub struct Node {
     ///   wait on disk, overflow drops (the writer's drop counter tracks
     ///   it), and fsync happens only on the timer, at roll, at checkpoint,
     ///   and at shutdown.
-    journal: Option<JournalSink>,
-    /// The durable incarnation-marker path, kept so the stop path can
-    /// write `stopped` and `flushed` against the boot's own marker file.
+    ///
+    /// The door is shared with the boot gate's store: the engine's halt
+    /// schedule forces it through `LifecycleStore::drain`, strictly
+    /// between the two marker rounds.
+    sink: SinkDoor,
+    /// The durable incarnation-marker path: the boot gate's store rides
+    /// it; the single-file projection the operators read mirrors it.
     state_path: PathBuf,
-    /// The boot's incarnation (0 for a first boot and for a clean
-    /// continue): the marker line's first field at stop time.
-    incarnation: u64,
+    /// The boot gate's latched session: the Running typestate whose
+    /// schedule the stop path drives. `None` while the crashed
+    /// classification's durable latch defers (the identity is not yet
+    /// seated) and after the halt consumed it.
+    session: Option<Running<GateStore>>,
+    /// The crashed classification's deferred latch: held until the
+    /// engine's seated observation (`Replica::rejoined`) mints the
+    /// witness, then fired once — the durable bump lands then.
+    deferred: Option<Crashed<GateStore>>,
     /// The drain point's wire-closed flag: set BEFORE any marker write at
     /// stop, and refusing every further inbound entry while set — the
     /// mandatory obligation that makes the in-memory state final.
@@ -419,7 +410,7 @@ pub struct Node {
 }
 
 /// The committed-transition sink behind `Node`'s journal hook.
-enum JournalSink {
+pub(crate) enum JournalSink {
     Blocking(LockJournal),
     Aof(AofWriter),
 }
@@ -467,7 +458,46 @@ impl Node {
         let code = self.drive_at_inner(at, event);
         #[cfg(feature = "flight-recorder")]
         self.flight_log("drive-out", serde_json::json!({ "code": code }));
+        self.settle_deferred_latch();
         code
+    }
+
+    /// The deferred latch's settle: the engine's seated observation
+    /// (`Replica::rejoined` — `Normal` at voting weight) mints the
+    /// witness, and the crashed classification's durable bump lands —
+    /// `(new, Joining)` written 4x through the machine. Checked after
+    /// every drive (the harness pattern: the latch fires on the first
+    /// step after which the witness mints). A failed latch write keeps
+    /// the deferral — the markers hold the crash's evidence, the next
+    /// boot re-decides the same pair, and the next drive retries.
+    fn settle_deferred_latch(&mut self) {
+        if self.poisoned || self.stopped {
+            return;
+        }
+        let Some(crashed) = self.deferred.take() else {
+            return;
+        };
+        let Some(witness) = self.replica.rejoined() else {
+            self.deferred = Some(crashed);
+            return;
+        };
+        match crashed.latch(witness) {
+            Ok(running) => {
+                info!(
+                    node = self.replica.own().0,
+                    identity = running.identity().0,
+                    "the deferred latch landed: the bumped identity is durable"
+                );
+                self.session = Some(running);
+            }
+            Err((crashed, error)) => {
+                eprintln!(
+                    "lunet-advisory-lock: the deferred latch write failed ({error:?}); \
+                     the marker stays at the crashed identity and the latch retries"
+                );
+                self.deferred = Some(crashed);
+            }
+        }
     }
 
     /// One plan/publish/effects cycle, looping on the host acknowledgements
@@ -886,7 +916,6 @@ impl Node {
                             expiry: *expiry,
                         },
                     };
-                    let mut disable_blocking = false;
                     #[cfg(feature = "flight-recorder")]
                     self.flight_log(
                         "journal",
@@ -900,22 +929,21 @@ impl Node {
                             "expiry": event.expiry,
                         }),
                     );
-                    match self.journal.as_mut() {
+                    let mut sink = sink_guard(&self.sink);
+                    match sink.as_mut() {
                         Some(JournalSink::Blocking(journal)) => {
                             if let Err(e) = journal.append(&event) {
                                 eprintln!(
                                     "lunet-advisory-lock: journal append failed ({e}); \
                                      journaling disabled for this process"
                                 );
-                                disable_blocking = true;
+                                *sink = None;
                             }
                         }
                         Some(JournalSink::Aof(writer)) => writer.enqueue(event),
                         None => {}
                     }
-                    if disable_blocking {
-                        self.journal = None;
-                    }
+                    drop(sink);
                 }
                 if let Some(message_id) = self.pending.remove(&operation_id) {
                     if response.len() > MAX_DATAGRAM {
@@ -1384,35 +1412,41 @@ impl Node {
         self.drive(Input::Reconfigure { op: system, pivot })
     }
 
-    /// The graceful stop (the uVRR termination lifecycle,
-    /// `docs/uvrr-termination-obligations.md` §1-§2, host-side):
+    /// The graceful stop (the engine's halt schedule,
+    /// `docs/uvrr-boot-gate.md` §3, driven through the Running
+    /// typestate):
     ///
-    /// 1. **The wire closes first** — the mandatory drain point. The
-    ///    `stopped` flag is set BEFORE any marker write, so every further
-    ///    inbound entry (`request`, `receive`, ticks, admin drives)
-    ///    refuses and processes nothing: the in-memory state becomes
-    ///    final and nothing arriving later can contradict it. The caller
-    ///    may still drain already-queued outputs (outbound flush is the
-    ///    desirable obligation and must never delay this one).
-    /// 2. **`stopped` is written** as termination begins.
-    /// 3. **The durable-state write completes**: the committed-transition
-    ///    sink drains to quiescence (the AOF writer's queue appended and
-    ///    fsynced; the blocking journal fsynced).
-    /// 4. **`flushed` is written** at the drain point — only after the
-    ///    durable write completed. A `stopped`-or-later marker vouches
-    ///    for the state beneath it, so a death between the writes is a
-    ///    partial shutdown that boot reads CLEAN.
+    /// 1. **The wire closes first** — the mandatory drain point, and the
+    ///    host obligation the engine assumes: the `stopped` flag is set
+    ///    BEFORE any marker write, so every further inbound entry
+    ///    (`request`, `receive`, ticks, admin drives) refuses and
+    ///    processes nothing: the in-memory state becomes final and
+    ///    nothing arriving later can contradict it. The caller may still
+    ///    drain already-queued outputs (outbound flush is the desirable
+    ///    obligation and must never delay this one).
+    /// 2. **`begin_stop`** — the engine writes the halt's first round
+    ///    (`Stopping`, 4x): termination has begun, it vouches for
+    ///    nothing.
+    /// 3. **The drain** — the host's, through the engine's schedule: the
+    ///    committed-transition sink drains to quiescence (the AOF
+    ///    writer's queue appended and fsynced; the blocking journal
+    ///    fsynced), strictly between the two rounds.
+    /// 4. **`finish_stop`** — the engine writes the drain-proven second
+    ///    round (`Stopped`, 4x): the next boot's stopped quorum proves
+    ///    the clean stop.
     ///
-    /// Both marker writes go through the routed storage
-    /// (`marker_store::write`): the quorum-of-copies superblock write
-    /// (forced I/O, verified at the write quorum) first, then the
-    /// compatibility projection.
+    /// A node still inside the crashed path's deferred window (its
+    /// identity not yet latched) has no Running session: the stop closes
+    /// the wire and drains the sink, and no marker round is lawful — the
+    /// markers hold the crash's evidence, the next boot re-classifies
+    /// crashed and re-decides the same pair.
     ///
-    /// Idempotent: a second stop reports OK without rewriting anything.
-    /// A failed marker write or drain reports SERVICE and leaves the
-    /// marker at `stopped` (still a controlled ending). SIGKILL takes
-    /// none of this path: the running sentinel stays behind and the next
-    /// boot classifies DIRTY.
+    /// Idempotent: a second stop reports OK without writing anything. A
+    /// failed round or drain reports SERVICE and the markers stand at
+    /// the last completed transition (a death past the first round reads
+    /// crashed — the purge's law: nothing vouches before the drain).
+    /// SIGKILL takes none of this path: the running sentinel stays
+    /// behind and the next boot classifies crashed.
     pub fn stop(&mut self) -> i32 {
         if self.stopped {
             return OK;
@@ -1423,46 +1457,75 @@ impl Node {
             node = self.replica.own().0,
             "stop: the wire is closed, the in-memory state is final"
         );
+        let Some(session) = self.session.take() else {
+            // The deferred window: no latched identity, no marker round.
+            // The host still owes the durable sink drain.
+            if let Err(error) = drain_sink(&mut sink_guard(&self.sink)) {
+                eprintln!(
+                    "lunet-advisory-lock: the stop drain failed ({error}); \
+                           the markers hold the crash's evidence"
+                );
+                #[cfg(feature = "flight-recorder")]
+                self.flight_log(
+                    "stop-drain",
+                    serde_json::json!({ "what": "the stop drain failed", "error": error.to_string() }),
+                );
+                return SERVICE;
+            }
+            info!(
+                node = self.replica.own().0,
+                "stop: the deferred window drains and exits; the next boot re-decides the pair"
+            );
+            return OK;
+        };
         #[cfg(feature = "flight-recorder")]
         self.flight_log(
             "marker",
             serde_json::json!({
-                "what": "stopped written as termination begins",
-                "incarnation": self.incarnation,
+                "what": "the halt's first round (Stopping) begins",
+                "identity": session.identity().0,
             }),
         );
-        if marker_store::write(&self.state_path, self.incarnation, Marker::Stopped).is_err() {
-            eprintln!("lunet-advisory-lock: the stopped marker write failed");
-            return SERVICE;
-        }
-        // The durable-state write, completing BEFORE the flushed marker.
-        if let Err(error) = drain_sink(&mut self.journal) {
-            eprintln!(
-                "lunet-advisory-lock: the stop drain failed ({error}); \
-                       the marker stays at stopped"
-            );
-            #[cfg(feature = "flight-recorder")]
-            self.flight_log(
-                "stop-drain",
-                serde_json::json!({ "what": "the stop drain failed", "error": error.to_string() }),
-            );
-            return SERVICE;
-        }
+        #[cfg(feature = "flight-recorder")]
+        let identity = session.identity();
+        let halting = match session.begin_stop() {
+            Ok(halting) => halting,
+            Err((_, error)) => {
+                eprintln!("lunet-advisory-lock: the stop's first marker round failed ({error:?})");
+                return SERVICE;
+            }
+        };
+        let draining = match halting.drain() {
+            Ok(draining) => draining,
+            Err((_, error)) => {
+                eprintln!(
+                    "lunet-advisory-lock: the stop drain failed ({error}); \
+                           the marker stays at the first round"
+                );
+                #[cfg(feature = "flight-recorder")]
+                self.flight_log(
+                    "stop-drain",
+                    serde_json::json!({ "what": "the stop drain failed", "error": error.to_string() }),
+                );
+                return SERVICE;
+            }
+        };
         #[cfg(feature = "flight-recorder")]
         self.flight_log(
             "marker",
             serde_json::json!({
-                "what": "flushed written at the drain point",
-                "incarnation": self.incarnation,
+                "what": "the drain-proven second round (Stopped) begins",
+                "identity": identity.0,
             }),
         );
-        if marker_store::write(&self.state_path, self.incarnation, Marker::Flushed).is_err() {
-            eprintln!("lunet-advisory-lock: the flushed marker write failed");
+        if let Err((_, error)) = draining.finish_stop() {
+            eprintln!("lunet-advisory-lock: the stop's second marker round failed ({error:?})");
             return SERVICE;
         }
         info!(
             node = self.replica.own().0,
-            "stop: drained and flushed; the next boot continues under the same incarnation"
+            state = %self.state_path.display(),
+            "stop: drained and the drain proven; the next boot continues under the same identity"
         );
         OK
     }
@@ -1651,17 +1714,20 @@ fn parse_member_entry(entry: &[u8]) -> Option<MemberEntry> {
     })
 }
 
-/// The joiner boot (see the module's Identity note): a later life over the
-/// deployment's genesis. The journal and the era table hold exactly the
-/// entries `provision` installs — mirrored byte-for-byte so the joiner's
-/// slot-2 entry equals the cluster's committed one — and `reopen` fences the
-/// node to `Restarting` regardless. Nothing about a restart is pretended: the
-/// node holds the shared committed root and nothing else.
-fn joiner_replica(
-    own: NodeId,
+/// The later-life knowledge every non-first constructor reopens over (see
+/// the module's Identity note): the deployment's genesis, and nothing
+/// else. The journal and the era table hold exactly the entries
+/// `provision` installs — mirrored byte-for-byte so the joiner's slot-2
+/// entry equals the cluster's committed one — and the constructors
+/// (`join`, `resume`, `reincarnate`) fence the node to `Restarting`
+/// regardless. Nothing about a restart is pretended: the node holds the
+/// shared committed root and nothing else. The persisted record carries
+/// the genesis frontiers; the constructor reconstitutes the boot status
+/// (`Restarting`), so the record's own status is the Joining ruling's
+/// spelling and is overridden.
+fn joiner_parts(
     genesis_order: Vec<NodeId>,
-    knobs: ViewChangeKnobs,
-) -> Result<Core, i32> {
+) -> Result<(SegmentedLog, PersistedProgress, Arc<EraTable>), i32> {
     let table = EraTable::genesis()
         .extend(&SystemOperation::Void, VOID_SLOT)
         .and_then(|table| {
@@ -1707,16 +1773,7 @@ fn joiner_replica(
         revision: 0,
         fault: None,
     };
-    Replica::reopen(
-        own,
-        WeightedMajority,
-        journal,
-        persisted,
-        Arc::new(table),
-        Stability::Volatile,
-        knobs,
-    )
-    .map_err(|_| CONFIG)
+    Ok((journal, persisted, Arc::new(table)))
 }
 
 unsafe fn bytes<'a>(len: usize, data: *const u8) -> Result<&'a [u8], i32> {
@@ -1734,18 +1791,21 @@ fn unix_millis() -> Result<u64, i32> {
 }
 
 /// The marker file's on-disk line: `<incarnation>
-/// <unflushed|stopped|flushed>`.
+/// <unflushed|stopped|flushed>` — the projection's spelling of the
+/// engine marker (`marker_store::projection_word`).
 fn marker_line(incarnation: u64, marker: Marker) -> String {
-    let marker_text = match marker {
-        Marker::Flushed => "flushed",
-        Marker::Stopped => "stopped",
-        Marker::Unflushed => "unflushed",
-    };
-    format!("{incarnation} {marker_text}\n")
+    format!(
+        "{incarnation} {}\n",
+        crate::marker_store::projection_word(marker)
+    )
 }
 
 /// Parses the marker line. Anything else is an unreadable marker: the boot
-/// refuses rather than guessing an identity.
+/// refuses rather than guessing an identity. The file's words map onto the
+/// engine's markers: `unflushed` is the running sentinel (`Joining` — an
+/// operating or freshly-latched process), `stopped` is the halt's first
+/// round (`Stopping` — it vouches for nothing), `flushed` is the
+/// drain-proven second round (`Stopped`).
 pub(crate) fn parse_marker(text: &str) -> Option<(u64, Marker)> {
     let line = text.trim();
     let (incarnation_text, marker_text) = line.split_once(' ')?;
@@ -1754,9 +1814,9 @@ pub(crate) fn parse_marker(text: &str) -> Option<(u64, Marker)> {
         return None;
     }
     let marker = match marker_text {
-        "flushed" => Marker::Flushed,
-        "stopped" => Marker::Stopped,
-        "unflushed" => Marker::Unflushed,
+        "flushed" => Marker::Stopped,
+        "stopped" => Marker::Stopping,
+        "unflushed" => Marker::Joining,
         _ => return None,
     };
     Some((incarnation, marker))
@@ -1803,105 +1863,153 @@ pub(crate) fn write_marker(path: &Path, incarnation: u64, marker: Marker) -> std
     result
 }
 
-/// Boot-time marker discipline (upstream `SuperblockCopies::restart`,
-/// `src/replica/reincarnation.rs:526-541`, extended with the uVRR
-/// termination lifecycle `docs/uvrr-termination-obligations.md` §2-§3):
-/// the classification reads the routed storage (`marker_store::current`)
-/// — the quorum-of-copies superblock copies when they exist (the
-/// authoritative read: the highest-sequence valid quorum, so a torn,
-/// rotted, or stale single copy cannot decide the classification), or the
-/// item08 single file when the copies predate the routing (legacy
-/// migration: the file's state is the truth; the first routed write below
-/// seeds the copies). A missing marker is a first boot at incarnation 0,
-/// left `unflushed` (the running sentinel — the contract's startup
-/// `running`, written before the loop starts). A `stopped` or `flushed`
-/// marker is a CLEAN STOP: the previous process reached the drain point
-/// (a `flushed` copy mixed with `stopped` copies is the normal mid-flush
-/// shape), so the state is final — the boot continues under the SAME
-/// incarnation, no reincarnation, rewritten `unflushed` as operating
-/// begins. An `unflushed` marker is DIRTY: the previous process cannot be
-/// shown to have reached the drain point, the incarnation bumps (refusing
-/// at exhaustion), the marker is rewritten `(new, flushed)` — the bump's
-/// commitment — and then `(new, unflushed)` as operating begins. On-disk
-/// spelling: the running sentinel stays `unflushed` for compatibility
-/// with every existing rig state file; the contract's `running` never
-/// appears on disk.
-///
-/// The DIRTY branch is the recovery boundary (the experiment design's §4):
-/// when a variant is configured, its forced flush executes right at the
-/// classification point — after the bump's commitment, before the
-/// reincarnated node rejoins serving — against the caller-provided scratch
-/// directory. Variant 0 (diskless) writes nothing. The flush carries fake
-/// data only and is never read back; its measured latency is returned so
-/// the boot can report it. A flush failure refuses the boot: the boundary
-/// is load-bearing for the measurement, and the marker's own fsync just
-/// succeeded, so a failure here means the disk is not usable.
-fn boot_marker(
-    path: &Path,
-    recovery: Option<(&RecoveryFlush, &Path)>,
-) -> Result<(u64, Option<FlushOutcome>), i32> {
-    let (incarnation, marker) = match marker_store::current(path).map_err(|_| CONFIG)? {
-        Some(current) => current,
-        None => {
-            // First boot: create the single-file projection (fsync +
-            // dir-sync, the item08 first-boot write, still the file the
-            // operators read), then seed the quorum copies with the
-            // running sentinel.
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(path)
-                .map_err(|_| CONFIG)?;
-            (|| {
-                file.write_all(marker_line(0, Marker::Unflushed).as_bytes())?;
-                file.sync_all()?;
-                sync_parent(path)
-            })()
-            .map_err(|_| CONFIG)?;
-            marker_store::write(path, 0, Marker::Unflushed).map_err(|_| CONFIG)?;
-            return Ok((0, None));
-        }
-    };
-    match marker {
-        // A clean stop (`docs/uvrr-termination-obligations.md`
-        // §3): `stopped` and `flushed` copies both show the
-        // previous process reached the drain point — the state is
-        // final, the node continues under the same incarnation
-        // with NO reincarnation, and the running sentinel is
-        // rewritten before operating begins.
-        Marker::Stopped | Marker::Flushed => {
-            marker_store::write(path, incarnation, Marker::Unflushed).map_err(|_| CONFIG)?;
-            Ok((incarnation, None))
-        }
-        Marker::Unflushed => {
-            let bumped = incarnation
-                .checked_add(1)
-                .filter(|next| *next <= INCARNATION_MAX)
-                .ok_or(CONFIG)?;
-            marker_store::write(path, bumped, Marker::Flushed).map_err(|_| CONFIG)?;
-            let outcome = match recovery {
-                None | Some((RecoveryFlush::Diskless, _)) => None,
-                Some((variant, scratch)) => {
-                    let outcome =
-                        recovery_flush::execute(scratch, *variant, bumped).map_err(|_| CONFIG)?;
-                    Some(outcome)
-                }
-            };
-            marker_store::write(path, bumped, Marker::Unflushed).map_err(|_| CONFIG)?;
-            Ok((bumped, outcome))
-        }
-    }
+/// The boot gate's decision record: the session whose type fixes the
+/// schedule, the identity the boot decided, and the tokens the replica
+/// constructors require.
+#[derive(Debug)]
+struct BootDecision {
+    /// The latched session (a First or Clean classification): the
+    /// Running typestate the stop path drives. `None` on the crashed
+    /// path, whose durable latch defers.
+    session: Option<Running<GateStore>>,
+    /// The crashed classification's deferred session: held until the
+    /// engine's seated observation mints the witness. `None` on the
+    /// latched paths.
+    deferred: Option<Crashed<GateStore>>,
+    /// The identity the boot decided: 0 for a first boot, the
+    /// quorum-resolved identity for a clean continue, the bumped
+    /// identity for a crashed boot.
+    incarnation: u64,
+    /// The clean start's proof token (`Replica::resume` requires it).
+    vouched: Option<Vouched>,
+    /// The crashed classification's replacement pair
+    /// (`Replica::reincarnate` requires it; the pair is the commitment
+    /// the wire announcement carries).
+    pair: Option<Bumped>,
+    /// The E2 experiment variant's flush outcome at the recovery
+    /// boundary. The C ABI's boot never configures a variant.
+    flush: Option<FlushOutcome>,
 }
 
-/// The stop path's durable-state write: drain the committed-transition
-/// sink to quiescence — every record the node enqueued is appended and
-/// fsynced (the AOF writer), or the journal file is fsynced (the blocking
-/// journal). A disabled sink (`None`) has nothing to drain.
-fn drain_sink(sink: &mut Option<JournalSink>) -> std::io::Result<()> {
-    match sink {
-        Some(JournalSink::Aof(writer)) => writer.drain(),
-        Some(JournalSink::Blocking(journal)) => journal.flush(),
-        None => Ok(()),
+/// The boot gate (`vrr::lifecycle::boot` over the superblock quorum
+/// store, `docs/uvrr-boot-gate.md`): the engine reads the durable
+/// markers, classifies the start, and hands back the session whose type
+/// fixes the write schedule. The verdicts:
+///
+/// * No marker ever written — the FIRST life: the first latch anchors
+///   identity 0 (the projection's running sentinel), so a later crash
+///   reads as a crash.
+/// * A stopped quorum — the CLEAN start: the drain was proven. One
+///   latch round (`Restarting`, the running sentinel) and the
+///   same-identity resume behind the `Vouched` token.
+/// * No stopped quorum — a CRASH: the identity is dead. The replacement
+///   pair is decided here and the durable bump DEFERS to the seated
+///   witness — no marker round is paid at the boundary of an
+///   uninitialised start; a re-crash re-decides the same pair.
+/// * An unreadable marker shape (rotted beyond the read quorum, a fork,
+///   any store refusal) — the boot REFUSES. A host that cannot classify
+///   from durable state is unsafe and must not start; there is no
+///   projection fallback and no guessed identity.
+///
+/// The crashed classification is the recovery boundary (the experiment
+/// design's §4): when a variant is configured, its forced flush executes
+/// right here — at the classification point, before the reincarnated
+/// node rejoins serving — against the caller-provided scratch directory.
+/// Variant 0 (diskless) writes nothing. The flush carries fake data only
+/// and is never read back; its measured latency is returned so the boot
+/// can report it. A flush failure refuses the boot: the boundary is
+/// load-bearing for the measurement, so a failure here means the disk is
+/// not usable.
+///
+/// The adapter's high-band identity law rides the engine's bump: the
+/// pair's replacement identity may not pass incarnation 255 (past it a
+/// bumped id would collide with the reserved `LEADER_UNKNOWN` value),
+/// so the boot refuses there exactly as the old ladder refused at
+/// exhaustion.
+fn boot_gate(
+    path: &Path,
+    sink: SinkDoor,
+    recovery: Option<(&RecoveryFlush, &Path)>,
+) -> Result<BootDecision, i32> {
+    let refuse = |what: String| -> i32 {
+        eprintln!(
+            "lunet-advisory-lock: the boot gate refuses to start ({what}); \
+             no identity is guessed from the durable state"
+        );
+        CONFIG
+    };
+    match lifecycle::boot(GateStore::new(path, sink)) {
+        Err((_, BootError::QuorumLost)) => Err(refuse(
+            "the marker set is torn beyond the quorum read".to_string(),
+        )),
+        Err((_, BootError::Exhausted(identity))) => Err(refuse(format!(
+            "the identity {identity:?} cannot be bumped"
+        ))),
+        Err((_, BootError::Store(error))) => Err(refuse(format!(
+            "the marker store refused the boot read: {error}"
+        ))),
+        Ok(BootOutcome::First(first)) => {
+            let session = match first.latch(Incarnation(0)) {
+                Ok(session) => session,
+                Err((_, error)) => {
+                    return Err(refuse(format!("the first latch write failed: {error}")));
+                }
+            };
+            Ok(BootDecision {
+                session: Some(session),
+                deferred: None,
+                incarnation: 0,
+                vouched: None,
+                pair: None,
+                flush: None,
+            })
+        }
+        Ok(BootOutcome::Clean(clean)) => {
+            let incarnation = clean.identity().0;
+            let (session, vouched) = match clean.latch() {
+                Ok(latched) => latched,
+                Err((_, error)) => {
+                    return Err(refuse(format!("the clean latch write failed: {error}")));
+                }
+            };
+            Ok(BootDecision {
+                session: Some(session),
+                deferred: None,
+                incarnation,
+                vouched: Some(vouched),
+                pair: None,
+                flush: None,
+            })
+        }
+        Ok(BootOutcome::Crashed(crashed)) => {
+            let pair = match crashed.pair() {
+                Ok(pair) => pair,
+                Err(refusal) => {
+                    return Err(refuse(format!("the replacement pair refused: {refusal:?}")));
+                }
+            };
+            if pair.new.0 > INCARNATION_MAX {
+                return Err(refuse(format!(
+                    "the bumped identity {} would leave the band (the high-band law refuses \
+                     past incarnation {})",
+                    pair.new.0, INCARNATION_MAX
+                )));
+            }
+            let flush = match recovery {
+                None | Some((RecoveryFlush::Diskless, _)) => None,
+                Some((variant, scratch)) => Some(
+                    recovery_flush::execute(scratch, *variant, pair.new.0).map_err(|_| CONFIG)?,
+                ),
+            };
+            Ok(BootDecision {
+                session: None,
+                deferred: Some(crashed),
+                incarnation: pair.new.0,
+                vouched: None,
+                pair: Some(pair),
+                flush,
+            })
+        }
     }
 }
 
@@ -2056,22 +2164,23 @@ fn node_from_sink(
         primary_timeout: PRIMARY_TIMEOUT_MS,
         view_change_budget: EVIDENCE_BUDGET,
     };
-    // The durable incarnation marker: first boot 0, a clean continue
-    // keeps the incarnation, a dirty boot bumps it (see the module's
-    // Incarnation note and `boot_marker`). The dirty branch is the
-    // recovery boundary: a configured E2 variant's forced flush executes
-    // there, against the caller-provided scratch directory.
+    // The boot gate: the engine reads the durable markers, classifies
+    // the start, and hands back the session whose type fixes the write
+    // schedule (see the module's Incarnation note and `boot_gate`). The
+    // crashed classification is the recovery boundary: a configured E2
+    // variant's forced flush executes there, against the caller-provided
+    // scratch directory.
     let state_path = PathBuf::from(state);
-    let (incarnation, flush_outcome) = match boot_marker(
+    let sink: SinkDoor = Arc::new(Mutex::new(journal));
+    let decision = boot_gate(
         &state_path,
+        Arc::clone(&sink),
         recovery
             .as_ref()
             .map(|(variant, dir)| (variant, dir.as_path())),
-    ) {
-        Ok(boot) => boot,
-        Err(_) => return Err(CONFIG),
-    };
-    if let Some(outcome) = flush_outcome {
+    )?;
+    let incarnation = decision.incarnation;
+    if let Some(outcome) = decision.flush {
         info!(
             variant = outcome.variant,
             bytes = outcome.bytes_written,
@@ -2106,7 +2215,7 @@ fn node_from_sink(
             old = own_member.id,
             new = own_id.0,
             incarnation,
-            "restart: the incarnation bumped, the node is a reincarnated later life"
+            "restart: the identity is a later life in the high band"
         );
     }
     info!(
@@ -2123,27 +2232,31 @@ fn node_from_sink(
         .iter()
         .map(|member| member.id)
         .collect::<HashSet<_>>();
-    // The superseded identity when this node booted a DIRTY restart: the
-    // bumped node re-announces `Reincarnation(old, new)` on every
-    // fenced-boot drive and, while it is below voting weight, on the host's
-    // §8 re-announce cadence. The old identity is the one the node LAST
-    // OPERATED AS — `low + (k-1) * INCARNATION_BASE` for the k-th bump —
-    // not the descriptor id: from the second bump on, the descriptor id was
+    // The superseded identity on the CRASHED path: the bumped node
+    // re-announces `Reincarnation(old, new)` on every fenced-boot drive
+    // and, while it is below voting weight, on the host's §8 re-announce
+    // cadence. The old identity is the one the node LAST OPERATED AS —
+    // `low + old * INCARNATION_BASE` for the pair's superseded band — not
+    // the descriptor id: from the second bump on, the descriptor id was
     // already evicted by the previous life's forced walk, so announcing it
     // would name a non-member, the transport's remap could never chain
     // (the previous bumped id is the row the peers still attribute the
     // socket to), and the leader-side `from == new` gate would refuse the
-    // announcement forever.
-    let reincarnate_from = if incarnation > 0 {
-        match (own_member.id as u64)
-            .checked_add((incarnation - 1) * INCARNATION_BASE)
-            .and_then(|value| u32::try_from(value).ok())
-        {
-            Some(previous) => Some(NodeId(previous)),
-            None => return Err(CONFIG),
+    // announcement forever. A clean resume or a first life carries no
+    // pair and announces nothing: the pair is the crashed path's
+    // commitment.
+    let reincarnate_from = match decision.pair.as_ref() {
+        Some(pair) => {
+            let previous = match (own_member.id as u64)
+                .checked_add(pair.old.0 * INCARNATION_BASE)
+                .and_then(|value| u32::try_from(value).ok())
+            {
+                Some(value) => value,
+                None => return Err(CONFIG),
+            };
+            Some(NodeId(previous))
         }
-    } else {
-        None
+        None => None,
     };
     // Invariant (asserted, always): a reincarnated identity never reuses
     // the old id — the bump moves the identity one band step past the
@@ -2158,37 +2271,66 @@ fn node_from_sink(
         reincarnate_from.map(|old| old.0),
         own_id.0
     );
-    let replica = match (incarnation > 0, own_member.joined) {
-        // A bumped boot is a later life over the deployment's genesis —
-        // the honest Volatile equivalent of upstream's `restart_as`
-        // (`Replica::reopen` under the new own; there is no durable
-        // journal to carry forward). The node holds exactly the shared
-        // committed root and nothing else, fenced until (if ever) the
-        // stream proves currency.
-        (true, _) => match joiner_replica(own_id, genesis_order, knobs) {
-            Ok(replica) => replica,
-            Err(_) => return Err(CONFIG),
-        },
-        // A post-genesis member boots as a joiner: a later life over the
+    // The constructor the classification chose. Every later life reopens
+    // over the deployment's genesis — the honest Volatile shape (there
+    // is no durable journal to carry forward) — fenced until the stream
+    // proves currency; only the FIRST life of a founding member
+    // provisions the genesis itself.
+    let replica = if let Some(pair) = decision.pair {
+        // The crashed classification: `Replica::reincarnate` behind the
+        // engine's `Bumped` pair. The durable bump defers — the marker
+        // machine latches the new identity only once the engine's seated
+        // observation mints the witness.
+        let (journal, persisted, config) = joiner_parts(genesis_order)?;
+        Replica::reincarnate(
+            pair,
+            own_id,
+            WeightedMajority,
+            journal,
+            persisted,
+            config,
+            Stability::Volatile,
+            knobs,
+        )
+    } else if let Some(vouched) = decision.vouched {
+        // The clean classification: `Replica::resume` behind the
+        // engine's `Vouched` token — the only same-identity constructor.
+        let (journal, persisted, config) = joiner_parts(genesis_order)?;
+        Replica::resume(
+            vouched,
+            own_id,
+            WeightedMajority,
+            journal,
+            persisted,
+            config,
+            Stability::Volatile,
+            knobs,
+        )
+    } else if own_member.joined {
+        // A post-genesis member's first life: `Replica::join` over the
         // deployment's genesis, fenced until the stream proves currency.
-        (false, true) => match joiner_replica(own_id, genesis_order, knobs) {
-            Ok(replica) => replica,
-            Err(_) => return Err(CONFIG),
-        },
-        (false, false) => {
-            match Replica::provision(
-                own_id,
-                genesis_order,
-                WeightedMajority,
-                SegmentedLog::new(),
-                Stability::Volatile,
-                knobs,
-            ) {
-                Ok(replica) => replica,
-                Err(_) => return Err(CONFIG),
-            }
-        }
-    };
+        let (journal, persisted, config) = joiner_parts(genesis_order)?;
+        Replica::join(
+            own_id,
+            WeightedMajority,
+            journal,
+            persisted,
+            config,
+            Stability::Volatile,
+            knobs,
+        )
+    } else {
+        // The first life of a founding member: the genesis provision.
+        Replica::provision(
+            own_id,
+            genesis_order,
+            WeightedMajority,
+            SegmentedLog::new(),
+            Stability::Volatile,
+            knobs,
+        )
+    }
+    .map_err(|_| CONFIG)?;
     let mut node = Node {
         replica,
         outputs: VecDeque::new(),
@@ -2203,9 +2345,10 @@ fn node_from_sink(
         last_view: None,
         last_leader: None,
         last_config_era: None,
-        journal,
+        sink,
         state_path: state_path.clone(),
-        incarnation,
+        session: decision.session,
+        deferred: decision.deferred,
         stopped: false,
         #[cfg(feature = "flight-recorder")]
         flight: crate::flight::FlightRecorder::open_from_env(own_id.0),
@@ -2577,6 +2720,7 @@ pub unsafe extern "C" fn lunet_lock_node_next(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::marker_store::superblock_path;
     use uuid::Uuid;
     use vrr::ids::Slot;
 
@@ -2595,150 +2739,227 @@ mod tests {
     }
 
     #[test]
-    fn incarnation_marker_is_created_then_bumps_and_continues() {
+    fn first_boot_anchors_identity_zero_and_the_dirty_boot_defers_its_latch() {
         let path = state_path("marker");
-        assert_eq!(boot_marker(&path, None).expect("first boot").0, 0);
+        // The first life: one anchor round — `(0, Joining)` 4x, the
+        // projection's running sentinel.
+        let decision = boot_gate(&path, test_sink(), None).expect("first boot");
+        assert_eq!(decision.incarnation, 0);
+        assert!(decision.session.is_some() && decision.deferred.is_none());
+        drop(decision);
         assert_eq!(fs::read_to_string(&path).unwrap(), "0 unflushed\n");
-        // The first boot seeds the quorum copies with the running
-        // sentinel.
+        // A restart over the anchor classifies crashed: the replacement
+        // pair is decided (0 -> 1) and NOTHING is written — the durable
+        // bump defers to the seated witness.
+        let decision = boot_gate(&path, test_sink(), None).expect("crashed boot");
+        assert_eq!(decision.incarnation, 1);
+        let pair = decision.pair.expect("the replacement pair");
+        assert_eq!((pair.old.0, pair.new.0), (0, 1));
+        assert!(decision.deferred.is_some() && decision.session.is_none());
+        drop(decision);
         assert_eq!(
-            marker_store::current(&path)
-                .expect("current")
-                .expect("the copies carry the sentinel"),
-            (0, Marker::Unflushed)
+            fs::read_to_string(&path).unwrap(),
+            "0 unflushed\n",
+            "no marker round before the seated witness"
         );
-        // A restart over the running sentinel is dirty: the incarnation
-        // bumps and the marker is rewritten (new, flushed), then
-        // (new, unflushed) as operating begins.
-        assert_eq!(boot_marker(&path, None).expect("dirty boot bumps").0, 1);
-        assert_eq!(fs::read_to_string(&path).unwrap(), "1 unflushed\n");
-        assert_eq!(boot_marker(&path, None).expect("second bump").0, 2);
-        assert_eq!(fs::read_to_string(&path).unwrap(), "2 unflushed\n");
-        // A clean checkpoint (flushed) continues under the same incarnation:
+        // The re-crash replay: the same markers re-decide the SAME pair —
+        // the bump is a pure function of the quorum-resolved identity.
+        let decision = boot_gate(&path, test_sink(), None).expect("replay");
+        assert_eq!(decision.pair.expect("the replayed pair").new.0, 1);
+        drop(decision);
+        // A clean checkpoint (flushed) continues under the same identity:
         // the running sentinel replaces it, the identity never regresses.
         // Hand-writing the single file here simulates the pre-routing
         // projection, so the copies are dropped: this is the legacy
         // migration path the copy-free rig states boot through.
-        fs::remove_file(marker_store::superblock_path(&path)).unwrap();
-        write_marker(&path, 7, Marker::Flushed).unwrap();
-        assert_eq!(boot_marker(&path, None).expect("clean continue").0, 7);
+        fs::remove_file(superblock_path(&path)).unwrap();
+        write_marker(&path, 7, Marker::Stopped).unwrap();
+        let decision = boot_gate(&path, test_sink(), None).expect("clean continue");
+        assert_eq!(decision.incarnation, 7);
+        assert!(decision.session.is_some() && decision.pair.is_none());
+        drop(decision);
         assert_eq!(fs::read_to_string(&path).unwrap(), "7 unflushed\n");
         // The migration seeded the copies from the single file: the next
         // classification reads them, not the projection.
         assert_eq!(
-            marker_store::current(&path)
-                .expect("current")
-                .expect("seeded"),
-            (7, Marker::Unflushed)
+            marker_class(&path).expect("seeded"),
+            (7, Marker::Joining),
+            "the copies carry the running sentinel"
         );
         fs::remove_file(&path).unwrap();
-        fs::remove_file(marker_store::superblock_path(&path)).unwrap();
+        fs::remove_file(superblock_path(&path)).unwrap();
     }
 
     #[test]
-    fn incarnation_marker_refuses_malformed_and_exhausted_identities() {
+    fn the_boot_gate_refuses_malformed_and_exhausted_identities() {
         let path = state_path("marker-bad");
         fs::write(&path, "not a marker\n").unwrap();
-        assert_eq!(boot_marker(&path, None), Err(CONFIG));
+        assert_eq!(boot_gate(&path, test_sink(), None).unwrap_err(), CONFIG);
         fs::write(&path, "999 unflushed\n").unwrap();
-        assert_eq!(boot_marker(&path, None), Err(CONFIG));
+        assert_eq!(boot_gate(&path, test_sink(), None).unwrap_err(), CONFIG);
         fs::write(&path, "3 stale\n").unwrap();
-        assert_eq!(boot_marker(&path, None), Err(CONFIG));
-        // The bump refuses at exhaustion instead of wrapping a superseded
-        // identity into circulation (upstream `Incarnation::bump`,
-        // reincarnation.rs:413-417).
+        assert_eq!(boot_gate(&path, test_sink(), None).unwrap_err(), CONFIG);
+        // The bump refuses past the band instead of wrapping a superseded
+        // identity into circulation (the high-band law: past incarnation
+        // 255 a bumped id would collide with the reserved LEADER_UNKNOWN
+        // value).
         fs::write(&path, format!("{} unflushed\n", INCARNATION_MAX)).unwrap();
-        assert_eq!(boot_marker(&path, None), Err(CONFIG));
+        assert_eq!(boot_gate(&path, test_sink(), None).unwrap_err(), CONFIG);
         fs::write(&path, format!("{} flushed\n", INCARNATION_MAX)).unwrap();
         assert_eq!(
-            boot_marker(&path, None)
+            boot_gate(&path, test_sink(), None)
                 .expect("the exhausted identity still continues")
-                .0,
+                .incarnation,
             255
         );
-        fs::remove_file(path).unwrap();
+        fs::remove_file(&path).unwrap();
+        fs::remove_file(superblock_path(&path)).unwrap();
     }
 
     /// The recovery boundary executes the configured variant's flush exactly
-    /// at the dirty-boot classification: the flush lands between the bump's
-    /// commitment and the running sentinel, its latency is reported, and a
-    /// clean continue never flushes.
+    /// at the crashed classification: its latency is reported, a re-crash
+    /// replay reports it again (the pair is re-decided), and a clean
+    /// continue never flushes.
     #[test]
     fn dirty_boot_executes_the_recovery_flush_clean_continue_does_not() {
         use crate::recovery_flush::RecoveryFlush;
         let path = state_path("marker-flush");
         let scratch = state_path("marker-flush-scratch");
         fs::remove_dir_all(&scratch).ok();
-        assert_eq!(boot_marker(&path, None).expect("first boot").1, None);
+        boot_gate(&path, test_sink(), None).expect("first boot");
         assert!(
             !scratch.exists(),
-            "boot_marker with no variant writes nothing"
+            "boot_gate with no variant writes nothing"
         );
-        let (incarnation, outcome) =
-            boot_marker(&path, Some((&RecoveryFlush::SingleBlock, &scratch)))
-                .expect("dirty boot with the flush variant");
-        assert_eq!(incarnation, 1);
-        let outcome = outcome.expect("the dirty boot reports the flush");
+        let decision = boot_gate(
+            &path,
+            test_sink(),
+            Some((&RecoveryFlush::SingleBlock, &scratch)),
+        )
+        .expect("crashed boot with the flush variant");
+        assert_eq!(decision.incarnation, 1);
+        let outcome = decision.flush.expect("the crashed boot reports the flush");
         assert_eq!(outcome.variant, "single");
         assert_eq!(outcome.bytes_written, 4096);
         assert!(outcome.latency.as_nanos() > 0);
         assert_eq!(
             fs::read_to_string(&path).unwrap(),
-            "1 unflushed\n",
-            "the marker discipline is unchanged by the flush"
+            "0 unflushed\n",
+            "the marker discipline is unchanged by the flush: the durable bump defers"
         );
-        let (incarnation, outcome) =
-            boot_marker(&path, Some((&RecoveryFlush::Diskless, &scratch))).expect("variant 0");
-        assert_eq!(incarnation, 2);
-        assert_eq!(outcome, None, "variant 0 writes nothing");
-        fs::remove_file(path).unwrap();
+        let decision = boot_gate(
+            &path,
+            test_sink(),
+            Some((&RecoveryFlush::Diskless, &scratch)),
+        )
+        .expect("variant 0");
+        assert_eq!(
+            decision.incarnation, 1,
+            "the replay re-decides the same pair"
+        );
+        assert_eq!(decision.flush, None, "variant 0 writes nothing");
+        fs::remove_file(&path).unwrap();
+        fs::remove_file(superblock_path(&path)).unwrap();
         fs::remove_dir_all(&scratch).unwrap();
     }
 
     /// On-disk compatibility: a marker file in the pre-lifecycle spelling
-    /// (`<incarnation> unflushed`) boots exactly as before — the DIRTY
-    /// bump — with no interpretation change.
+    /// (`<incarnation> unflushed`) boots exactly as before — the crashed
+    /// classification and the deferred bump — with no interpretation change.
     #[test]
     fn existing_unflushed_files_boot_unchanged() {
         let path = state_path("marker-compat");
         fs::write(&path, "0 unflushed\n").unwrap();
+        let decision = boot_gate(&path, test_sink(), None).expect("unchanged classification");
         assert_eq!(
-            boot_marker(&path, None)
-                .expect("unchanged classification")
-                .0,
-            1,
-            "the running sentinel still classifies DIRTY"
+            decision.incarnation, 1,
+            "the running sentinel still classifies crashed"
         );
-        assert_eq!(fs::read_to_string(&path).unwrap(), "1 unflushed\n");
+        assert_eq!(decision.pair.expect("the pair").new.0, 1);
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "0 unflushed\n",
+            "the durable bump defers to the seated witness"
+        );
+        assert!(
+            !superblock_path(&path).exists(),
+            "the crashed classification wrote nothing"
+        );
         fs::remove_file(&path).unwrap();
-        fs::remove_file(marker_store::superblock_path(&path)).unwrap();
     }
 
     /// On-disk compatibility, the clean-stop spelling: a copy-free rig
     /// state whose single file reads `flushed` (the pre-routing boot's
     /// end state) migrates at boot — the classification reads the file,
     /// the first routed write seeds the copies, and the boot continues
-    /// under the SAME incarnation.
+    /// under the SAME identity.
     #[test]
     fn legacy_flushed_file_migrates_and_continues_clean() {
         let path = state_path("marker-compat-clean");
         fs::write(&path, "4 flushed\n").unwrap();
+        let decision = boot_gate(&path, test_sink(), None).expect("migrated classification");
         assert_eq!(
-            boot_marker(&path, None).expect("migrated classification").0,
-            4,
+            decision.incarnation, 4,
             "the flush from the pre-routing era continues clean"
         );
+        assert!(decision.session.is_some() && decision.pair.is_none());
+        drop(decision);
         assert_eq!(fs::read_to_string(&path).unwrap(), "4 unflushed\n");
         // The migration seeded the copies: they now carry the running
         // sentinel, and the projection was rewritten alongside them.
         assert_eq!(
-            marker_store::current(&path)
-                .expect("current")
-                .expect("seeded"),
-            (4, Marker::Unflushed)
+            marker_class(&path).expect("seeded"),
+            (4, Marker::Joining),
+            "the copies carry the running sentinel"
         );
         fs::remove_file(&path).unwrap();
-        fs::remove_file(marker_store::superblock_path(&path)).unwrap();
+        fs::remove_file(superblock_path(&path)).unwrap();
+    }
+
+    /// The purge's law at the boot gate: copies that exist but cannot be
+    /// read to a quorum verdict refuse the boot — the projection never
+    /// rescues an unreadable quorum and no identity is guessed.
+    #[test]
+    fn an_unreadable_marker_quorum_refuses_the_boot() {
+        let path = state_path("marker-lost");
+        boot_gate(&path, test_sink(), None).expect("first boot");
+        drop(boot_gate(&path, test_sink(), None).expect("crashed boot"));
+        let superblock = superblock_path(&path);
+        let geometry = lunet_locks_aof::marker::geometry().expect("geometry");
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .open(&superblock)
+                .expect("the copies file");
+            for slot in 0..3 {
+                file.seek(SeekFrom::Start(geometry.copy_size as u64 * slot))
+                    .expect("seek slot");
+                file.write_all(&[0xA5u8; 4096]).expect("rot the copy");
+            }
+        }
+        assert_eq!(
+            boot_gate(&path, test_sink(), None).unwrap_err(),
+            CONFIG,
+            "the unreadable quorum refuses the boot"
+        );
+        assert!(
+            path.exists(),
+            "the readable projection never rescues the boot"
+        );
+        fs::remove_file(&path).unwrap();
+        fs::remove_file(&superblock).unwrap();
+    }
+
+    /// The projection word the engine marker spells on disk.
+    fn marker_class(path: &Path) -> std::io::Result<(u64, Marker)> {
+        read_marker(path)
+    }
+
+    /// A sink door over nothing: the marker-level boot tests never drive
+    /// a journal sink.
+    fn test_sink() -> SinkDoor {
+        Arc::new(Mutex::new(None))
     }
 
     /// The contract §4 point of the quorum-of-copies storage: a rotted
@@ -2752,16 +2973,15 @@ mod tests {
         use lunet_locks_aof::marker as marker_ffi;
         let path = state_path("marker-rot");
         let state = path.to_str().expect("state path");
-        let superblock = marker_store::superblock_path(&path);
+        let superblock = superblock_path(&path);
         let members = "10:a\x000:b\x0030:c";
         let mut node = Node::open(members, "a", state, None, 0).expect("first boot");
         assert_eq!(node.stop(), OK, "the stop leaves the copies at flushed");
         drop(node);
         assert_eq!(
-            marker_store::current(&path)
-                .expect("current")
-                .expect("routed"),
-            (0, Marker::Flushed)
+            marker_class(&path).expect("routed"),
+            (0, Marker::Stopped),
+            "the drained stop's copies prove the clean stop"
         );
 
         let geometry = marker_ffi::geometry().expect("geometry");
@@ -2783,38 +3003,12 @@ mod tests {
             "the rotted copy did not flip the classification: no DIRTY bump"
         );
         assert_eq!(
-            marker_store::current(&path)
-                .expect("current")
-                .expect("routed"),
-            (0, Marker::Unflushed),
+            marker_class(&path).expect("routed"),
+            (0, Marker::Joining),
             "the running sentinel was rewritten as operating begins"
         );
         fs::remove_file(&path).unwrap();
         fs::remove_file(&superblock).unwrap();
-    }
-
-    /// The contract's partial-marker-write rule
-    /// (`docs/uvrr-termination-obligations.md` §2): a death between the
-    /// marker writes leaves `stopped` without `flushed`, and the next
-    /// boot reads it CLEAN — a controlled ending, never a crash. RED
-    /// before the lifecycle landed: `stopped` did not parse at all.
-    #[test]
-    fn partial_shutdown_stopped_without_flushed_reads_clean() {
-        let path = state_path("marker-partial");
-        // An operating process's running sentinel, then the stop's first
-        // marker write, then death before the durable flush completed.
-        fs::write(&path, "5 unflushed\n").unwrap();
-        write_marker(&path, 5, Marker::Stopped).unwrap();
-        assert_eq!(
-            boot_marker(&path, None)
-                .expect("partial shutdown reads clean")
-                .0,
-            5,
-            "same incarnation, no DIRTY bump"
-        );
-        // The running sentinel is rewritten before operating begins.
-        assert_eq!(fs::read_to_string(&path).unwrap(), "5 unflushed\n");
-        fs::remove_file(path).unwrap();
     }
 
     /// The clean-stop lifecycle end to end through `Node::open` and
@@ -2848,7 +3042,7 @@ mod tests {
             "0 unflushed\n",
             "the running sentinel is rewritten before operating begins"
         );
-        fs::remove_file(path).unwrap();
+        fs::remove_file(&path).unwrap();
     }
 
     /// The mandatory obligation's proof
@@ -2938,7 +3132,10 @@ mod tests {
             ..AofConfig::default()
         };
         let writer = AofWriter::open(&dir, config).expect("aof opens");
-        nodes[0].journal = Some(JournalSink::Aof(writer));
+        *nodes[0]
+            .sink
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(JournalSink::Aof(writer));
         // A committed Hold transition enqueues its journal event onto the
         // writer thread (try_send — possibly still queued when the stop
         // begins; the drain must make it durable before `flushed` lands).
@@ -2992,50 +3189,36 @@ mod tests {
     /// deployment-descriptor (genesis succession) order.
     const TEST_IDS: [u32; 3] = [10, 20, 30];
 
-    fn provision(name: &str, own: u32, members: u32) -> Node {
-        provision_at(&state_path(name), own, members)
+    /// The member descriptor the test clusters boot through the real
+    /// construction path (`node_from_parts` — the same body the C ABI
+    /// drives): ids in genesis succession order, names derived from them.
+    fn test_members(genesis: &[u32], joiner: Option<u32>) -> String {
+        let mut entries: Vec<String> = genesis
+            .iter()
+            .map(|id| format!("{id}:member{id}"))
+            .collect();
+        if let Some(id) = joiner {
+            entries.push(format!("{id}:member{id}:j"));
+        }
+        entries.join("\0")
     }
 
     /// A provisioned node over an explicit state path, so the reincarnation
     /// test can restart the same durable marker file through the real ABI.
     fn provision_at(path: &Path, own: u32, members: u32) -> Node {
-        boot_marker(path, None).expect("marker file");
-        let replica = Replica::provision(
-            NodeId(own),
-            TEST_IDS[..members as usize]
-                .iter()
-                .map(|id| NodeId(*id))
-                .collect(),
-            WeightedMajority,
-            SegmentedLog::new(),
-            Stability::Volatile,
-            ViewChangeKnobs {
-                primary_timeout: PRIMARY_TIMEOUT_MS,
-                view_change_budget: EVIDENCE_BUDGET,
-            },
+        let descriptor = test_members(&TEST_IDS[..members as usize], None);
+        node_from_parts(
+            descriptor.as_bytes(),
+            format!("member{own}").as_bytes(),
+            path.as_os_str().as_encoded_bytes(),
+            None,
+            0,
         )
-        .expect("provision");
-        Node {
-            replica,
-            outputs: VecDeque::new(),
-            service: Service::default(),
-            replies: HashMap::new(),
-            pending: HashMap::new(),
-            last_tick: 0,
-            poisoned: false,
-            fault_note: None,
-            reincarnate_from: None,
-            known_ids: TEST_IDS.iter().copied().collect(),
-            state_path: path.to_path_buf(),
-            incarnation: 0,
-            stopped: false,
-            last_view: None,
-            last_leader: None,
-            last_config_era: None,
-            journal: None,
-            #[cfg(feature = "flight-recorder")]
-            flight: None,
-        }
+        .expect("provision")
+    }
+
+    fn provision(name: &str, own: u32, members: u32) -> Node {
+        provision_at(&state_path(name), own, members)
     }
 
     fn request_json(message_id: Uuid) -> Vec<u8> {
@@ -3343,49 +3526,29 @@ mod tests {
             TEST_IDS[1],
             "no DIRTY bump after a stop inside the view-change window"
         );
-        assert_eq!(node.status().state, 4, "the reopened node boots fenced");
+        assert_eq!(
+            node.status().state,
+            2,
+            "the resumed node boots fenced (Restarting)"
+        );
         fs::remove_file(&path).unwrap();
-        fs::remove_file(marker_store::superblock_path(&path)).unwrap();
+        fs::remove_file(superblock_path(&path)).unwrap();
     }
 
     /// The joiner member of the four-node tests: id 40, booted the joiner
     /// way — a later life over the deployment's genesis, fenced
-    /// `Recovering`, addressed, and outside every configuration until a
+    /// `Restarting`, addressed, and outside every configuration until a
     /// committed `Join` admits it.
     fn provision_joiner(name: &str, own: u32, genesis: &[u32]) -> Node {
-        boot_marker(&state_path(name), None).expect("marker file");
-        let replica = match joiner_replica(
-            NodeId(own),
-            genesis.iter().map(|id| NodeId(*id)).collect(),
-            ViewChangeKnobs {
-                primary_timeout: PRIMARY_TIMEOUT_MS,
-                view_change_budget: EVIDENCE_BUDGET,
-            },
-        ) {
-            Ok(replica) => replica,
-            Err(_) => panic!("joiner boot"),
-        };
-        Node {
-            replica,
-            outputs: VecDeque::new(),
-            service: Service::default(),
-            replies: HashMap::new(),
-            pending: HashMap::new(),
-            last_tick: 0,
-            poisoned: false,
-            fault_note: None,
-            reincarnate_from: None,
-            known_ids: genesis.iter().copied().chain([own]).collect(),
-            state_path: state_path(name),
-            incarnation: 0,
-            stopped: false,
-            last_view: None,
-            last_leader: None,
-            last_config_era: None,
-            journal: None,
-            #[cfg(feature = "flight-recorder")]
-            flight: None,
-        }
+        let descriptor = test_members(genesis, Some(own));
+        node_from_parts(
+            descriptor.as_bytes(),
+            format!("member{own}").as_bytes(),
+            state_path(name).as_os_str().as_encoded_bytes(),
+            None,
+            0,
+        )
+        .expect("joiner boot")
     }
 
     /// The four-node cluster at "the join committed": the three genesis
@@ -3717,25 +3880,10 @@ mod tests {
              incumbents' frontier"
         );
 
-        // The era-2 stream: the fan-out follows the view's configuration
-        // and reaches the weight-0 learner. The learner is still fenced at
-        // its boot view, so the stream is the higher-view signal: it
-        // fences into the leader's view and opens its own fetch — never
-        // installation evidence. An ordinary tick re-runs the retained
-        // offer and the install completes the catch-up.
-        assert_eq!(
-            request(&mut nodes[1], &request_json(Uuid::from_bytes([31; 16]))),
-            OK
-        );
-        let to_learner = pop_send(&mut nodes[1], 40, vrr::wire::Tag::Prepare)
-            .expect("the learner is in the view configuration's fan-out");
-        deliver_hop(&mut nodes, &ids, 1, to_learner);
-        let snapshot = nodes[3].replica.observer().read();
-        assert_eq!(
-            (snapshot.status, snapshot.era, snapshot.view),
-            (1, 2, 1),
-            "the learner fenced into the leader's view, never installation evidence"
-        );
+        // The retained offer installs on the ordinary tick — the §10
+        // acquisition's install is tick-driven, never delivery-driven:
+        // the learner ends Normal at the leader's view, caught up to the
+        // commit cascade's frontier, still vote-less.
         assert_eq!(nodes[3].drive(Input::Tick), OK);
         route_until_quiet(&mut nodes, &ids);
         let snapshot = nodes[3].replica.observer().read();
@@ -3746,28 +3894,31 @@ mod tests {
                 snapshot.view,
                 snapshot.committed
             ),
-            (0, 2, 1, 4),
-            "the retained offer installs: the learner is caught up to the commit cascade, \
-             still vote-less"
+            (0, 2, 1, 3),
+            "the retained offer installs: the learner is caught up to the commit \
+             cascade, still vote-less"
         );
         nodes[3].outputs.clear();
-        // The learner acknowledges the stream — and the primary discards
-        // the vote by name: weight 0 counts against no quorum. A fresh
-        // proposal commits on the leader's and one voting member's
-        // acknowledgment alone; the learner's alone does not clear it.
+
+        // The era-2 stream: the fan-out follows the view's configuration
+        // and reaches the weight-0 learner. The learner acknowledges the
+        // stream — and the primary discards the vote by name: weight 0
+        // counts against no quorum. A fresh proposal commits on the
+        // leader's and one voting member's acknowledgment alone; the
+        // learner's alone does not clear it.
         assert_eq!(
-            request(&mut nodes[1], &request_json(Uuid::from_bytes([32; 16]))),
+            request(&mut nodes[1], &request_json(Uuid::from_bytes([31; 16]))),
             OK
         );
         let to_learner = pop_send(&mut nodes[1], 40, vrr::wire::Tag::Prepare)
-            .expect("the caught-up learner is in the fan-out");
+            .expect("the learner is in the view configuration's fan-out");
         deliver_hop(&mut nodes, &ids, 1, to_learner);
         let ok_learner = pop_send(&mut nodes[3], TEST_IDS[1], vrr::wire::Tag::PrepareOk)
             .expect("the caught-up learner acknowledges");
         deliver_hop(&mut nodes, &ids, 3, ok_learner);
         assert_eq!(
             nodes[1].replica.progress().committed(),
-            Slot(4),
+            Slot(3),
             "the learner's vote is not counted"
         );
 
@@ -3785,7 +3936,7 @@ mod tests {
         deliver_hop(&mut nodes, &ids, 0, ok_one);
         assert_eq!(
             nodes[1].replica.progress().committed(),
-            Slot(5),
+            Slot(4),
             "the learner's weight is not needed"
         );
 
@@ -5312,6 +5463,16 @@ mod tests {
             nodes[1].replica.progress().committed(),
             Slot(7),
             "the rejoining member's vote counts under the era-3 arithmetic"
+        );
+
+        // The deferred latch's durable bump: once the engine seated the
+        // node (Normal at voting weight), the marker machine latched the
+        // bumped identity — the projection reads the new life's running
+        // sentinel, and the next boot continues under it.
+        assert_eq!(
+            fs::read_to_string(&third_path).unwrap(),
+            "1 unflushed\n",
+            "the deferred latch landed at the seat: the bumped identity is durable"
         );
     }
 

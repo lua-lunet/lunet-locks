@@ -145,16 +145,25 @@ fn a_first_boot_over_a_wiped_state_dir_boots_serves_and_a_crash_bumps() {
     );
 
     // A crash (no stop): the reopen classifies the running sentinel as a
-    // crash and bumps — unchanged.
+    // crash and the replacement pair is decided — the identity bumps into
+    // the high band, while the durable bump DEFERS to the seated witness:
+    // the markers hold the crash's evidence, and a re-crash re-decides
+    // the same pair.
     drop(n1);
     drop(n3);
     let mut n1 = TestNode::open(1, "a", &root);
     assert_eq!(n1.node.idle(), OK);
     drain_sends(&mut n1);
     assert_eq!(
+        n1.node.own_id(),
+        1 + (1 << 24),
+        "the crashed-state boot derives the bumped identity"
+    );
+    assert_eq!(
         std::fs::read_to_string(root.join("node1/state")).unwrap(),
-        "1 unflushed\n",
-        "the crashed-state boot bumps the incarnation"
+        "0 unflushed\n",
+        "the crashed-state boot writes nothing: the durable bump defers to the \
+         seated witness"
     );
 
     let _ = std::fs::remove_dir_all(&root);
