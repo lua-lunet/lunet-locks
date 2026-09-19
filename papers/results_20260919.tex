@@ -1,0 +1,606 @@
+% Set the text encoding before IEEEtran measures its Times fonts.
+\RequirePackage[T1]{fontenc}
+\documentclass[10pt,journal,letterpaper]{IEEEtran}
+\usepackage{amsmath,amssymb,amsthm,booktabs,array}
+\usepackage{graphicx}
+\usepackage{microtype}
+\usepackage[hidelinks]{hyperref}
+\usepackage{fancyhdr}
+% This file is the EXPERIMENTAL RESULTS SECTION draft of 19 September 2026.
+% It compiles standalone; the section body (\section{Experimental results}
+% through the claims--evidence table) is written to drop into the running
+% paper draft unmodified. The \ref{sec:demo} label resolves in the host
+% paper (results_20260915.tex); standalone builds show it as a reference
+% to be bound. Figures: the run charts live as SVG in the run directories
+% under .tmp/telemetry/; each figure below carries its source path and
+% conversion command in a leading comment, matching the diagrams/ PNG
+% convention of the host paper (diagrams/reincarnation.png).
+\hypersetup{pdftitle={Diskless Viewstamped Replication with Unbounded Crash-Stop Resurrection --- experimental results, 19 September 2026},
+  pdfauthor={Simon Massey}}
+\newcommand{\paperrevision}{RESEARCH CHECKPOINT --- 19 SEPTEMBER 2026}
+\newcommand{\paperversion}{UNSTAMPED}
+\IfFileExists{version.tex}{\input{version.tex}}{}
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[R]{\normalfont\footnotesize\thepage}
+\fancyfoot[C]{\normalfont\scriptsize\paperversion}
+\renewcommand{\headrulewidth}{0pt}
+\fancypagestyle{uvrrfirst}{%
+  \fancyhf{}
+  \fancyhead[L]{\normalfont\scriptsize DISKLESS VRR --- \paperrevision\ --- \paperversion}
+  \fancyhead[R]{\normalfont\footnotesize\thepage}
+  \fancyfoot[C]{\normalfont\scriptsize\paperversion}
+  \renewcommand{\headrulewidth}{0pt}}
+\setlength{\emergencystretch}{1em}
+\raggedbottom
+\newcommand{\code}[1]{\texttt{\small #1}}
+% Run-chart figure guard: the run charts are SVG in the run directories;
+% each figure below names its source SVG and the conversion command. Until
+% the converted PNG exists in diagrams/, the placeholder keeps the draft
+% compilable (the host paper's diagrams/reincarnation.png convention is
+% unchanged: drop the real PNG at the same path to replace the
+% placeholder).
+\newcommand{\runfigure}[1]{%
+  \IfFileExists{#1}%
+    {\includegraphics[width=\columnwidth]{#1}}%
+    {\fbox{\parbox{0.88\columnwidth}{\centering\small\vspace{2em}figure
+      pending: convert the source SVG to \code{#1}\vspace{2em}}}}}
+\title{Diskless Viewstamped Replication with\\Unbounded Crash-Stop Resurrection\\
+\large Experimental results --- 19 September 2026}
+\author{Simon Massey%
+\thanks{Research manuscript, 19 September 2026.}%
+\thanks{Simon Massey (email: \href{mailto:simon.massey@stenographer.cloud}{simon.massey@stenographer.cloud}).}}
+\date{}
+
+\begin{document}
+\maketitle
+\thispagestyle{uvrrfirst}
+
+\section{Experimental results}\label{sec:results20260919}
+
+All numbers in this section are exact counts or exact anchored spans from
+three captured runs of the \code{lunet-locks} demonstration
+(Section~\ref{sec:demo}), each with its run marker commit in the
+demonstration repository anchoring the claim: the steady-state polite run
+\code{local-softball7-2026-09-18} (marker \code{81d08ca}; the serving proof
+is tagged \code{polite-run-1}, whose message names that marker), the
+maintenance ladder \code{local-polite2-2026-09-19} (marker \code{d97b30c}),
+and the crash/partition run \code{local-softball8-2026-09-19} (marker
+\code{db42519}). Every elapsed time is a $T+\Delta$ difference on the
+single acting host's clock (all three runs execute on one host; the cluster
+is loopback), never a raw epoch; every distribution carries its sample size
+$n$ and its maximum; every headline figure is an exact count, not an
+estimate. The datasets, extraction JSONs, and charts live in the run
+directories \code{.tmp/telemetry/local-softball7-2026-09-18/},
+\code{.tmp/telemetry/local-polite2-2026-09-19/}, and
+\code{.tmp/telemetry/local-softball8-2026-09-19/}; each carries a
+\code{REPORT.md} whose headline counts were independently recomputed from
+the raw capture, with the recomputation recorded in
+\code{local-softball7-2026-09-18/ANALYSIS.md} (three corrections, folded
+into the figures below).
+
+\subsection{Setup}\label{sec:exp-setup}
+
+Each run is a three-voter cluster of the demonstration on one macOS host:
+genesis voters \code{n1}/\code{n2}/\code{n3} (ids 1/2/3) over raw UDP on
+loopback (ports 44801--44803 in the steady run, 45201--45203 plus the spare
+joiner row \code{n4} at 45204 in the maintenance ladder, 46201--46203 in the
+crash/partition run), with TCP client ports alongside. The workload is the
+lease API of Section~\ref{sec:demo}: \code{set} grants or renews a 500~ms
+lease, \code{get} reads it, \code{release} removes it; every committed
+operation is one full consensus round trip (client TCP $\to$ leader $\to$
+UDP Prepare/PrepareOk quorum $\to$ Commit fan-out $\to$ apply $\to$ reply).
+Three polite \code{lease-load} contenders (client id-bases 810000/820000/830000)
+chase one lock, id 14531090, renewing at the half-window point and probing
+at a 1{,}000~ms floor; the steady-state run adds a per-operation stream
+client (lock 9201) cycling acquire $\to$ 3$\times$extend $\to$ release $\to$
+\code{get}, one latency sample per operation. The crash/partition run adds
+an aggressive hammer window (2 contenders + 2 getters on the same lock).
+
+The detector configuration is the calm set on every run: heartbeats every
+5~ms, \code{--election-ms 3000 --recovery-ms 3000}, the randomized leader
+timeout drawn uniformly from 3{,}000--5{,}000~ms (the boot line names
+\code{detector=sloppy-timeout}; the Raft timing law, generous lower bound,
+random upper). The experimental phi accumulator is compiled out of the
+normal build; every leader-loss event in these runs is detected by the
+randomized timeout unless the leader is told to abdicate. The telemetry is
+the flight recorder: a trailing 200~MiB tape window per node, stringified
+state and tag names, every peer-input drop carrying a named diagnostic.
+The three runs retain 791,409 wire records (steady-state run, per-datagram
+deduplicated: 376,245 emitted + 339,517 received + 75,647 client request
+frames), 1,005 status lines, and 8 clean restarts; the crash/partition run
+records 783,988 flight records (n1 327,084 / n2 192,502 / n3 264,402).
+Every stop record stands on a flushed marker at the same identity: the
+shutdown-consistency check reads \code{CONSISTENT} on both the raw
+directory and the archive in all three runs (the reports' appendices
+reproduce both checks verbatim, 9 nodes checked each time).
+
+The fault-injection discipline differs by run and is stated per scenario:
+the steady-state run injects nothing (8 clean TERM stops, zero SIGKILLs,
+zero partitions, zero rebirths); the maintenance ladder uses clean TERMs,
+the operator verb \code{abdicate} (3 cycles), SIGKILL crashes, whole-cluster
+stops, and the controlled decrement/leave/join/increment swap; the
+crash/partition run uses SIGKILL (6 family kills + the compound's leader),
+SIGSTOP/SIGCONT process suspension as the partition shape (no sends, no
+receives, state intact; indistinguishable from a link cut at every other
+node's vantage, and the heal is a true partition heal --- the resumed node
+replays the socket backlog, no reboot, no identity bump), 126 abdication
+drives, and clean TERMs at every boundary.
+
+% Figure: steady-state latency histograms.
+% Source: .tmp/telemetry/local-softball7-2026-09-18/charts/latency_histogram_log.svg
+% Convert: rsvg-convert -f png -w 1800 -o diagrams/fig-steady-latency.png .tmp/telemetry/local-softball7-2026-09-18/charts/latency_histogram_log.svg
+\begin{figure}[t]
+\centering
+\runfigure{diagrams/fig-steady-latency.png}
+\caption{Per-operation round-trip histograms, 1~ms bins, log-count axis
+(steady-state run, $n=1{,}192$ stream-client operations, 1{,}189 ok).}
+\label{fig:steady-latency}
+\end{figure}
+
+% Figure: the abdication failover against the timeout-driven contrast.
+% Source: .tmp/telemetry/local-polite2-2026-09-19/charts/abdication_failover.svg
+% Convert: rsvg-convert -f png -w 1800 -o diagrams/fig-abdication-contrast.png .tmp/telemetry/local-polite2-2026-09-19/charts/abdication_failover.svg
+\begin{figure}[t]
+\centering
+\runfigure{diagrams/fig-abdication-contrast.png}
+\caption{The failover lower bound: three abdication cycles (30/27/26~ms,
+one bar per cycle, $n=1$ each) against the timeout-driven takeover on the
+same knobs (20,370~ms; 3{,}000--5{,}000~ms randomized detector).}
+\label{fig:abdication-contrast}
+\end{figure}
+
+\subsection{Steady state}\label{sec:exp-steady}
+
+The steady-state run (2026-09-18) serves 4,995 committed lease operations
+over a 692.2~s client window: 3,803 lease-load operations (1,904 + 1,236 +
+663 per client) and 1,192 individually-logged stream-client operations
+(200 acquire, 596 extend, 198 release, 198 get). Thirty-five client-visible
+errors occur across the whole run (0.70\%), and every one of them sits
+inside a deliberate clean-restart window or its rejoin-walk aftermath; in
+the 630.3~s of pure steady serving (four windows, 935 status samples) the
+error rate is 0.00\%. The committed rate is 7.91~ops/s in the pure steady
+window (2,136 operations over 270.0~s, zero errors) and 7.22~ops/s across
+the whole serving window (4,982 operations in the 2~s buckets covering
+689.9~s) --- the polite profile exactly: one holder renewing every 250~ms,
+two 1{,}000~ms-floor probes, the stream client's six-operation cycle.
+
+% Table data: .tmp/telemetry/local-softball7-2026-09-18/extraction/ops_stream.json
+% (latency percentiles) and extraction/analysis_bootstrap_ci.json (CIs).
+\begin{table}[t]
+\centering\small
+\caption{Stream-client round trips, client monotonic clock, ms, one sample
+per completed operation ($n=1{,}192$; 1{,}189 ok). The 5,003~ms extend
+sample is the R2 leader-stop outage timeout; excluding it the extend
+distribution tops at 33~ms.}
+\label{tab:steady-latency}
+\begin{tabular}{lrrrrrrr}
+\toprule
+op & $n$ & ok & min & p50 & p90 & p99 & max \\
+\midrule
+acquire & 200 & 200 & 5 & 16 & 21 & 27 & 29 \\
+extend  & 596 & 594 & 7 & 16 & 20 & 27 & 5{,}003 \\
+release & 198 & 198 & 6 & 16 & 19 & 25 & 27 \\
+get     & 198 & 197 & 4 & 16 & 20 & 25 & 35 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Every operation type's p50 is 16~ms and its p90 is 19--21~ms
+(Table~\ref{tab:steady-latency}); the middle of every distribution spans
+16--21~ms, and the maximum excluding the single outage-bound sample is
+35~ms. Percentiles are the order-statistic convention (the value at index
+$\lfloor n \cdot p/100 \rfloor$); linear interpolation moves p99 by at most
+2~ms (acquire 25.0, extend 26.0) and leaves the middle unchanged. Bootstrap
+95\% confidence intervals over the percentile point estimates (10{,}000
+resamples, percentile method): acquire p50 $[16,17]$~ms, p99 $[24,29]$~ms;
+extend (ok, $n=594$) p50 $[16,16]$~ms, p99 $[25,31]$~ms; release p50
+$[16,17]$~ms, p99 $[23,27]$~ms; get (ok, $n=197$) p50 $[15,16]$~ms, p99
+$[24,35]$~ms. One committed lease operation's p50 round trip of 16~ms is
+about 1.7 heartbeat rounds: the wait for the next plane slot is the whole
+cost.
+
+% Figure: heartbeat-arrival jitter CDFs per pair.
+% Source: .tmp/telemetry/local-softball7-2026-09-18/charts/jitter_cdf.svg
+% Convert: rsvg-convert -f png -w 1800 -o diagrams/fig-jitter-cdf.png .tmp/telemetry/local-softball7-2026-09-18/charts/jitter_cdf.svg
+\begin{figure}[t]
+\centering
+\runfigure{diagrams/fig-jitter-cdf.png}
+\caption{Heartbeat-arrival jitter CDFs (leader$\to$follower inbound
+inter-arrival deltas, receiver tape clock; steady samples with deltas
+$\le 1{,}000$~ms). leader$\to$n1: $n=73{,}399$; leader$\to$n3:
+$n=112{,}901$.}
+\label{fig:jitter-cdf}
+\end{figure}
+
+The heartbeat plane's own behaviour is measured from the retained tape
+(Table~\ref{tab:jitter}). The 5~ms cadence lands with p50 6~ms and p99
+14~ms at \code{n1} ($n=73{,}399$ steady samples, max 193~ms) and p50 6~ms,
+p99 12~ms at \code{n3} ($n=112{,}901$, max 185~ms); the mean jitter is
+$5.36 \pm 0.03$~ms and $4.47 \pm 0.02$~ms (95\% CI on the mean). The spread
+is the single-host event-loop tick quantisation (there is no network: one
+loopback host), and the steady class tops out under 200~ms. That measured
+ceiling is the false-positive safety floor for any detector window.
+
+\begin{table}[t]
+\centering\footnotesize
+\caption{Heartbeat-arrival jitter, leader$\to$follower inbound deltas,
+receiver tape clock, ms (steady samples, deltas $\le 1{,}000$~ms). Gap
+counts are the service outages and tape-retention boundaries, not network
+behaviour.}
+\label{tab:jitter}
+\begin{tabular}{lrrrrrrr}
+\toprule
+pair & $n$ & min & p50 & p90 & p99 & max & mean$\pm$ci95 \\
+\midrule
+n2$\to$n1 & 73{,}399 & 0 & 6 & 12 & 14 & 193 & $5.36\pm0.03$ \\
+n2$\to$n3 & 112{,}901 & 0 & 6 & 7 & 12 & 185 & $4.47\pm0.02$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% Figure: the load-independence of the heartbeat plane.
+% Source: .tmp/telemetry/local-softball7-2026-09-18/charts/message_rate.svg
+% Convert: rsvg-convert -f png -w 1800 -o diagrams/fig-plane-rate.png .tmp/telemetry/local-softball7-2026-09-18/charts/message_rate.svg
+\begin{figure}[t]
+\centering
+\runfigure{diagrams/fig-plane-rate.png}
+\caption{Emitted datagrams per 2~s per node across the steady-state run,
+steady windows shaded: the consensus plane is constant while the committed
+rate varies.}
+\label{fig:plane-rate}
+\end{figure}
+
+The design claim this run measures is the uVRR efficiency shape: the wire
+is one stream. The leader re-asserts the commit frontier every heartbeat
+(one Prepare fan-out of 2 datagrams + one Commit fan-out of 2), each
+follower answers with one PrepareOk, so the heartbeat round costs 6
+datagrams; the measured round is 16,301 rounds over the 150.0~s S4 window,
+a 9.20~ms mean period, that is 652 datagrams/s cluster-wide (651.6 in S1,
+652.0 in S4 under leader n2; 641.0 in S3 under leader n1). Client
+operations ride inside that already-running stream: in S4 only 7.3\% of
+rounds carried at least one operation (1,187 operations over 16,301
+rounds), so the per-operation marginal consensus cost is 0 extra datagrams
+when an operation batches into an existing round, bounded above by 6
+datagrams if it demanded a dedicated round. Client polls do not touch the
+consensus plane at all: in S4 the leader received 17,686 client request
+frames (117.9/s) and answered 16,302 TCP replies (108.7/s) while the
+consensus plane stayed at 652 datagrams/s. The plane's rate is constant
+across every pure steady window while the committed rate varies
+(Fig.~\ref{fig:plane-rate}); fast failure detection and nearly-free
+operations are the same 5~ms mechanism, not competing costs.
+
+\subsection{The failover lower bound}\label{sec:exp-lower-bound}
+
+The maintenance ladder (2026-09-19) measures the claim this paper makes
+about progress: abdication failover is detection-independent. The operator
+verb \code{abdicate} reads the leader's live (era, view), targets the
+next-in-era successor view, and drives the standard view change
+synchronously --- the detector never waits. Three cycles were driven so
+that every genesis node held leadership (n1 cycled first, then n2, then
+n3); every cycle answered \code{accepted:true}. The client-visible failover
+--- the cycle's begin anchor to the first client operation served on the
+abdicated node's connection --- is 30, 27, and 26~ms per cycle (the verb
+drive itself 8, 8, 7~ms; full settle of all three voters at their new view
+145--156~ms; $n=1$ per cycle, 3 cycles). The same ladder then stopped the
+leader cleanly and let the detector do the work: the timeout-driven
+takeover is 20,370~ms under the 3{,}000--5{,}000~ms randomized detector
+(new leader n2 at view 86's successor era; the stopped node rejoined
+42,991~ms after its boot). The contrast on identical knobs, identical load,
+and the same measurement rule (first client operation served) is
+679--784$\times$ (20,370~ms against 26--30~ms).
+
+The crash/partition run repeats the contrast under load and it holds:
+abdication under load failover is 30, 27, and 22~ms per cycle (drives 11,
+6, 9~ms; leadership rotated n1 $\to$ n2 $\to$ n3) with ZERO client-visible
+errors in all three windows --- both the polite fleet and the aggressive
+hammer (364 hammer gets, zero errors, p50 19.2~ms / p99 29.9~ms / max
+30.5~ms over the 29.6~s window). The detector-bound contrast on the
+partitioned view is 20,318~ms, so the cross-run factor spans 677--923$\times$
+(both runs' abdication cycles against both detector-bound takeovers). The
+detection-independent class also covers a whole-cluster restart: the
+leader's own view line stands 9~ms after its process start (restored from
+the superblock) and the first client operation is served 122~ms after the
+restart anchor (steady-state run, $n=1$ per scenario row) --- a timing no
+knob change moves, because no detector is involved.
+
+\subsection{Maintenance}\label{sec:exp-maintenance}
+
+The maintenance ladder walks the operational actions a real deployment
+does, each anchored on the acting host's clock ($T+\Delta$, never raw
+epochs).
+
+\begin{table}[t]
+\centering\small
+\caption{The maintenance ladder, exact anchored durations ($n=1$ per
+row). ``Stop'' is TERM-send to process-gone; ``rejoin'' is process-start
+to \code{state=normal}; takeover is leader-stop to first client operation
+served.}
+\label{tab:maintenance}
+\begin{tabular}{llr}
+\toprule
+action & quantity & value \\
+\midrule
+non-leader stop (n1, n3) & stop & 50 / 50 ms \\
+non-leader rotation n1 & rejoin & 15{,}618 ms \\
+non-leader rotation n3 & rejoin & 21{,}017 ms \\
+leader TERM (baseline) & takeover & 20{,}370 ms \\
+leader TERM (baseline) & rejoin & 42{,}991 ms \\
+whole-cluster reboot & first client op & 2{,}596 ms \\
+whole-cluster reboot & all voters normal & 2{,}578 ms \\
+reconfig swap (S6) & total & 23{,}542 ms \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Security-patch rotation (S1) stops each non-leader cleanly: the stop costs
+50~ms per node (TERM-send to process-gone), serving continued with the
+first successful probe 69~ms after the stop on n1's rotation, and the
+rejoining node is \code{state=normal} 15{,}618~ms (n1) and 21{,}017~ms
+(n3) after its own process start --- the catch-up walk under the calm
+knobs, during which the two-of-three cluster kept serving. The leader goes
+last: asked to abdicate (S2, Section~\ref{sec:exp-lower-bound}), then
+given the same polite stop-and-restart under the successor (S3,
+Table~\ref{tab:maintenance}). The whole-cluster stop/start (S5) restarts
+all three voters: the first client operation is served 2{,}596~ms after
+restart and all voters are \code{normal} 2{,}578~ms after --- the same
+superblock-resume class as the steady-state run's 122~ms figure, at the
+cost of one clean-stop flush at the recovery boundary. The fresh-boot
+recovery of the crash/partition run (after the snapshot-gated reprovision,
+Section~\ref{sec:exp-faults}) measures 3,209~ms to the first client
+operation and 3,187~ms to all voters \code{normal} --- the same class,
+independent of any detector.
+
+The controlled reconfiguration swap (S6) replaces a voting member with a
+spare (\code{n3} departs, \code{n4} joins) by the four-verb sequence:
+decrement 28~ms, leave 5,022~ms, join 5,017~ms, increment 5,026~ms ---
+total 23,542~ms, with the replacement serving at voting weight 11,383~ms
+into the swap and the cluster serving client operations across the whole
+sequence ($n=1$). The leave/join drives at 5,017--5,026~ms are the swap's
+own 5~s join-walk budget at work, not consensus latency.
+
+% Figure: every measured scenario duration, per run.
+% Source: .tmp/telemetry/local-softball8-2026-09-19/charts/scenario_durations.svg
+% Convert: rsvg-convert -f png -w 1800 -o diagrams/fig-scenario-durations.png .tmp/telemetry/local-softball8-2026-09-19/charts/scenario_durations.svg
+\begin{figure}[t]
+\centering
+\runfigure{diagrams/fig-scenario-durations.png}
+\caption{Every measured duration per scenario row of the crash/partition
+run (crash fences marked BLOCKED at the 150~s budget).}
+\label{fig:scenario-durations}
+\end{figure}
+
+\subsection{Faults}\label{sec:exp-faults}
+
+The crash/partition run (2026-09-19) injects the failure shapes the
+maintenance ladder does not: partitions, a leader crash under a partition,
+and abdication under load. Partitions are process suspension
+(SIGSTOP/SIGCONT) --- the honest loopback form of a link cut, the heal a
+true partition heal with no reboot and no identity bump.
+
+\begin{table}[t]
+\centering\small
+\caption{The partition and compound scenarios, exact anchored durations
+($n=1$ per row). ``Heal rejoin'' is SIGCONT to \code{state=normal} at the
+healed node.}
+\label{tab:faults}
+\begin{tabular}{llr}
+\toprule
+scenario & quantity & value \\
+\midrule
+P1 follower cut (20 s) & heal rejoin & 944 ms \\
+P1 follower cut & leader changes & 0 \\
+P2 leader cut & takeover & 20{,}318 ms \\
+P2 leader cut & leader rejoin & 3{,}012 ms \\
+X compound & no-quorum window & 20{,}661 ms \\
+X compound & elect after heal & 3{,}882 ms \\
+X compound & first client op after heal & 3{,}904 ms \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The follower cut (P1) is serve-through: the two-of-three cluster keeps
+serving for the whole 20~s cut with 1 client error, the heal rejoins the
+suspended node in 944~ms, its backlog burst surfaces as 8 named
+\code{GapDetected} drops, and the leader never changes. The leader cut
+(P2) is detector-bound: the survivors elect n2 in 20,318~ms (5 client
+errors), and the partitioned leader, once healed, rejoins 3,012~ms after
+the heal with zero leader changes on the new leader. The compound (X)
+kills the leader (SIGKILL) while a survivor is partitioned: one live voter,
+no quorum for 20,661~ms (13 client errors, zero operations ok); the heal
+then drives a two-voter view change that elects in 3,882~ms and serves the
+first client operation 3,904~ms after the cut's heal, with 1 error in the
+heal window. The scenario the earlier runs jammed on --- a compound view
+change with a weight-0 member present --- completes with no
+\code{ViewMismatch} jam: 116 leader-change status records during the heal
+and views to 134, the storm surface named and bounded. The killed leader's
+own rejoin fences (the limitation below). Abdication under load (A) closes
+the ladder: 30/27/22~ms failover per cycle, zero errors in every window,
+polite and hammer alike.
+
+\subsection{Safety}\label{sec:exp-safety}
+
+Across the crash/partition run's 783,988 flight records and 11,236
+lease-load operations (8,238 ok, 2,998 client-visible errors --- every
+error inside a disruption window or its fence/outage aftermath, zero in
+the 180~s steady window and all quiet windows; the per-window ledger
+recomputed from the raw cumulative stats: shallow family 948, deep family
+314, S5 pass~1 1,703, S5 pass~2 3, partitions 6, compound 14, conditioning
+2), the client outcome stream shows exactly one lease holder sustaining
+through every disruption: no lost leases, no double-holders in the record.
+Every peer-input drop carries a named diagnostic (the fence/dedup plane
+doing its job, all drops counted, none silently lost):
+\code{SlotNotOutstanding} 67,970 (the 5~ms heartbeat plane's stale-slot
+churn), \code{ViewMismatch} 64,602, \code{ReincarnationRefused} 1,155,
+\code{StaleTransfer} 900, \code{EvidenceNotCollected} 664,
+\code{GapDetected} 570, \code{StaleEvidence} 170, \code{StaleViewChange}
+141, \code{PrepareOkNotPrimary} 38, \code{StartViewFromStaleView} 4; the
+late-ack plane drained its 8 unclaimed verbs run-wide without an abort.
+The steady-state run's 791,409 wire records name their 10 drop reasons the
+same way (70,165 \code{SlotNotOutstanding} at the top, down to 1
+\code{TransferNotServed}), and both shutdown-consistency checks read
+\code{CONSISTENT} raw and archived in all three runs.
+
+% Figure: the fence storms and the recovery surface, whole run.
+% Source: .tmp/telemetry/local-softball8-2026-09-19/charts/views_timeline.svg
+% Convert: rsvg-convert -f png -w 1800 -o diagrams/fig-views-timeline.png .tmp/telemetry/local-softball8-2026-09-19/charts/views_timeline.svg
+\begin{figure}[t]
+\centering
+\runfigure{diagrams/fig-views-timeline.png}
+\caption{Per-node view number across the crash/partition run: the fence
+storms of the blocked crash-rejoin family (shallow family
+$0 \to 1{,}239$; deep family $122 \to 1{,}395$) against the serving
+surfaces.}
+\label{fig:views-timeline}
+\end{figure}
+
+\subsection{The crashed-member rejoin fence}\label{sec:exp-limitation}
+
+One path does not come back on this tree, and the paper states it as fact
+rather than narrating around it. A SIGKILL-crashed member whose process is
+restarted reads its durable state dirty, bumps its identity, announces the
+reincarnation to the peers --- and every peer refuses the announcement,
+because it carries the pre-kill view: \code{ReincarnationRefused} with the
+sender's old (era, view). The announced node then sits fenced
+(\code{restarting}/\code{view\_change}, \code{voting=0}) for the full 150~s
+measurement budget, no remap notice ever fires at any peer (0 of 9 family
+kills; remap counts 0/0/0 for the whole run), and 1,155 refusals are
+counted across the run (n1 387, n2 333, n3 435). The fence is
+depth-independent and deterministic: all 9 crash-rejoins across three
+attempts fence identically --- at view 0, view 1, view 122, and view
+1,395 --- and the newest named diagnostic at the fenced node varies
+(\code{ReincarnationRefused}, \code{EvidenceNotCollected},
+\code{ViewMismatch}) while the outcome does not. While a node sits fenced
+the serving pair's view counter storms (shallow family $0 \to 1{,}239$;
+deep family $122 \to 1{,}395$; Fig.~\ref{fig:views-timeline}), and a
+whole-cluster restart from that divergent state cannot converge (0 of 3
+voters \code{normal} after 120~s, twice reproduced); a fresh boot after the
+snapshot-gated reprovision recovers the cluster (first client operation
+3,209~ms after restart, all voters \code{normal} 3,187~ms). This is the
+parked boot-fence/era-fold defect family: the evidence --- the refused
+announcement with the pre-kill view, the never-firing remap walk, the
+depth-independent fence at four view depths, and the 9/9 repetition --- is
+captured in the run directories, the finding is core-side by the bug
+provenance of this demonstration (every resurrection requirement was met:
+the loop shut down, the state flushed, and the announcement was still
+refused), and the upstream engagement is pending; every scenario that did
+not need the crashed node completed on the two-of-three cluster.
+
+\subsection{Claims and their evidence}\label{sec:exp-claims}
+
+\begin{table*}[t]
+\centering\small
+\caption{Each claim of this section with the run that measured it, the
+exact figure, and its anchor (the run-marker commit; the tag
+\code{polite-run-1} names the steady-state marker \code{81d08ca}).}
+\label{tab:claims}
+\begin{tabular}{>{\raggedright\arraybackslash}p{44mm}>{\raggedright\arraybackslash}p{50mm}>{\raggedright\arraybackslash}p{20mm}>{\raggedright\arraybackslash}p{30mm}}
+\toprule
+Claim & Exact figure & Run & Anchor \\
+\midrule
+Lease operations complete through full quorum consensus at a few tens of
+milliseconds & p50 16 / p90 19--21 / p99 25--27 / max 35~ms, $n=1{,}192$
+stream ops (1,189 ok) & 2026-09-18 steady & \code{81d08ca} \\
+Steady-state error rate is zero & 0 errors in 630.3~s of pure steady
+serving (935 status samples); 35 total, all in restart windows (0.70\%) &
+2026-09-18 steady & \code{81d08ca} \\
+The heartbeat plane is load-independent & 641.0--652.0 datagrams/s across
+steady windows (S1 651.6, S4 652.0); 0 marginal datagrams per committed
+op, $\le 6$ dedicated; 7.3\% of rounds carried ops & 2026-09-18 steady &
+\code{81d08ca} \\
+Client polls do not touch the consensus plane & 17,686 client request
+frames in / 16,302 replies out in S4 at a constant 652 datagrams/s plane &
+2026-09-18 steady & \code{81d08ca} \\
+Heartbeat-arrival jitter is quantised and bounded & p50 6 / p99 14~ms,
+max 193~ms, $n=73{,}399$ (n2$\to$n1); p99 12~ms, max 185~ms,
+$n=112{,}901$ (n2$\to$n3) & 2026-09-18 steady & \code{81d08ca} \\
+Abdication failover is detection-independent & 30 / 27 / 26~ms per cycle
+(drives 8/8/7~ms), every node led, 3 cycles zero refusals &
+2026-09-19 ladder & \code{d97b30c} \\
+The same holds under load & 30 / 27 / 22~ms per cycle, zero client errors
+in all three windows (polite + hammer, 364 hammer gets) & 2026-09-19
+crash/partition & \code{db42519} \\
+Timeout-driven takeover on the same knobs & 20,370~ms (ladder S3);
+20,318~ms (partition P2); factor 677--923$\times$ against the abdication
+cycles & both 2026-09-19 runs & \code{d97b30c}, \code{db42519} \\
+Non-leader maintenance does not stop service & stop 50~ms, first ok probe
+$+69$~ms, rejoin 15{,}618 / 21{,}017~ms ($n=2$) & 2026-09-19 ladder &
+\code{d97b30c} \\
+Whole-cluster restart resumes from superblocks & first client op
+$+122$~ms, leader line $+9$~ms, all \code{normal} $+2.0$~s (steady run);
+$+2{,}596$/$+2{,}578$~ms (ladder S5); $+3{,}209$/$+3{,}187$~ms fresh
+(crash/partition) & all three runs & \code{81d08ca}, \code{d97b30c},
+\code{db42519} \\
+Controlled reconfiguration swap serves throughout & 23,542~ms total
+(decrement 28, leave 5,022, join 5,017, increment 5,026~ms); replacement
+at voting weight $+11{,}383$~ms & 2026-09-19 ladder & \code{d97b30c} \\
+Partitions recover & follower cut: serve-through, heal rejoin 944~ms;
+leader cut: takeover 20,318~ms, partitioned leader rejoin 3,012~ms &
+2026-09-19 crash/partition & \code{db42519} \\
+The compound scenario recovers without a jam & no-quorum 20,661~ms; elect
+3,882~ms; first op $+3{,}904$~ms after heal; 1 error in the heal window &
+2026-09-19 crash/partition & \code{db42519} \\
+No lost leases, no double-holders; every drop named & 11,236 ops, one
+holder at every instant; 10 named drop reasons (1,155
+\code{ReincarnationRefused}); checks \code{CONSISTENT} raw + archive &
+2026-09-19 crash/partition & \code{db42519} \\
+Crashed-member rejoin fences (the limitation) & 9/9 SIGKILL rejoins
+fenced, depth-independent (views 0--1,395), remap notices 0/9;
+\code{ReincarnationRefused} at the pre-kill view; fresh reboot recovers
+$+3{,}209$~ms & 2026-09-19 both runs & \code{d97b30c}, \code{db42519} \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+Held verdict: on a loopback three-voter rig under the polite single-lock
+load model, in three anchored campaigns --- (a) the steady state holds one
+leader, zero view changes while serving, and a load-independent 5~ms
+consensus plane on which operations are nearly free (p50 16~ms round
+trips, 0.00\% steady errors over 630.3~s); (b) abdication failover is a
+22--30~ms, detection-independent path, cycled through every node and
+re-measured zero-error under load, a factor of 677--923$\times$ below the
+20,318--20,370~ms timeout-driven takeover on identical knobs; (c)
+maintenance and fresh-boot recovery resume from superblocks in 122~ms to
+3.2~s; (d) partitions and the compound scenario recover with named
+diagnostics and bounded windows; and (e) safety holds in the record --- no
+lost leases, no double-holders, every drop named --- with one honest
+exception, the crashed member's own rejoin fence, pinned with evidence and
+stated as the limitation it is.
+
+\appendix[Reproduction commands]
+Each run's directory carries the anchor record written live
+(\code{anchors.md}: the epoch-ms anchor before every action, the
+\code{measure} lines whose figures this section quote), the
+\code{extraction/} JSON surfaces the numbers above were recomputed
+from --- \code{analysis\_recompute.json} and
+\code{analysis\_bootstrap\_ci.json} in the steady-state run record
+the recompute and the bootstrap confidence intervals --- the SVG
+charts referenced above, and the verbatim shutdown-consistency
+checks. The recompute corrections folded into this section are
+recorded in the steady-state run's \code{ANALYSIS.md}.
+
+\begin{thebibliography}{10}
+\bibitem{vsr} B.~M. Oki and B.~H. Liskov, ``Viewstamped Replication: A New
+Primary Copy Method to Support Highly-Available Distributed Systems,'' in
+\emph{Proc. Seventh Annual ACM Symp.\ Principles of Distributed Computing
+(PODC 1988)}, Edmonton, Alberta, Canada, Aug.\ 1988, pp.~8--17.
+\bibitem{vrr} B.~Liskov and J.~Cowling, ``Viewstamped Replication
+Revisited,'' MIT-CSAIL-TR-2012-021, MIT Computer Science and Artificial
+Intelligence Laboratory, Cambridge, MA, 23 July 2012.
+\url{https://hdl.handle.net/1721.1/71763}.
+\bibitem{turner} D.~C. Turner, ``Unbounded Pipelining in Dynamically
+Reconfigurable Paxos Clusters,'' revision 1A9DBA37, 14 August 2017.
+\url{https://tessanddave.com/paxos-reconf-latest.pdf}.
+\bibitem{alagappan2018} R.~Alagappan, A.~Ganesan, E.~Lee, A.~Albarghouthi,
+V.~Chidambaram, A.~C. Arpaci-Dusseau, and R.~H. Arpaci-Dusseau,
+``Protocol-Aware Recovery for Consensus-Based Storage,'' in \emph{Proc.\
+16th USENIX Conf.\ File and Storage Technologies (FAST 18)}, Oakland, CA,
+Feb.\ 2018, pp.~15--32. Best Paper Award.
+\bibitem{uvrr} simbo1905, ``Unbounded Viewstamped Replication Revisited?''
+12 August 2026.
+\url{https://simbo1905.wordpress.com/2026/08/12/viewstamped-replication-revisited/}.
+\bibitem{netdisk} simbo1905, ``The network is faster than the disk,'' 12 April
+2024, accessed 7 September 2026.
+\url{https://simbo1905.wordpress.com/2024/04/12/the-network-is-faster-than-the-disk/}.
+\end{thebibliography}
+\end{document}

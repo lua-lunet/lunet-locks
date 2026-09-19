@@ -1,0 +1,4 @@
+*.png
+# The paper's reincarnation figure is included via \includegraphics, so the
+# raster must be tracked for the paper to publish from a committed tree.
+!reincarnation.png

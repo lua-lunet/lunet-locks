@@ -1,0 +1,20 @@
+# uVRR reincarnation: the two-era forced weight sequence (unit scale)
+actors A B(leader) C D
+
+# Normal operation: B leads, {A, B, C} all voting at unit weight (1, 1, 1).
+1 B->A: append i
+2 B->C: append i
+
+crash C@3
+reincarnate D@4
+5 D->B: reincarnate (old=C, new=D)
+
+era Era 1 — crossing batch DECREMENT(C)+JOIN(D): weights (A,B,C,D) = (1,1,0,0); D joins at weight 0 (standby); forming quorum {A,B} = mass 2 of total 2
+6 B->A: prepare batch: DECREMENT(C)+JOIN(D)
+7 A->B: promised (quorum {A,B})
+8 B-->D: standby stream (weight 0; messages to D are fine)
+
+era Era 2 — INCREMENT(D)+LEAVE(C): weights (A,B,D) = (1,1,1); D promoted 0→1, C leaves at weight 0; forming quorum {A,B} = mass 2 of total 3 — the same set as era 1, so the quorums coincide and leader B carries both eras without a pivot
+9 B->A: prepare batch: INCREMENT(D)+LEAVE(C)
+10 A->B: promised (quorum {A,B})
+11 B-->D: standby stream (D now weight 1)

@@ -3,4 +3,4 @@
 	url = https://github.com/lua-lunet/uvrr-core.git
 [submodule "ext/lunet-locks-aof"]
 	path = ext/lunet-locks-aof
-	url = git@github.com:simbo1905/tbio-core.git
+	url = git@github.com:lua-lunet/tbio-core.git

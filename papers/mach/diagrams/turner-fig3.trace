@@ -1,0 +1,41 @@
+# Reproduction of Turner Fig. 3 ("Message flow during a reconfiguration"):
+# leader l prepares ballot b on a1, then proposes to a2 through era e; the
+# reconfiguration crosses into era e + 1 with ballot b' and the proposals
+# continue under the new configuration. `numbers off` matches his furniture
+# (his figures carry no message numbers); empty labels match his unlabeled
+# reply vectors.
+actors a1=a₁ l=ℓ a2=a₂
+numbers off
+era e
+1 l->a1: prepare(b)
+2 a1->l:
+3 l->a2: proposed_i(b)
+4 a2->l:
+5 l->a2: proposed_{i+1}(b)
+6 a2->l:
+7 l->a2: proposed_{i+2}(b)
+8 a2->l:
+9 l->a2: proposed_{i+3}(b)
+10 a2->l:
+11 l->a2: proposed_{i+4}(b)
+12 a2->l:
+13 l->a2: proposed_{i+5}(b)
+14 a2->l:
+era e + 1
+15 l->a1: prepare(b')
+16 a1->l:
+17 l->a2: proposed_{i+6}(b)
+18 a2->l:
+19 l->a2: proposed_{i+7}(b)
+20 a2->l:
+21 l->a2: proposed_{i+8}(b)
+22 a2->l:
+23 l->a2: proposed_{i+9}(b)
+24 a2->l:
+25 l->a2: proposed_{i+10}(b)
+26 a2->l:
+27 l->a2: proposed_{i+11}(b)
+28 a2->l:
+29 l->a2: proposed_{i+12}(b')
+30 a2->l:
+31 l->a2: proposed_{i+13}(b')

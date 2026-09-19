@@ -8,12 +8,12 @@
 -- into anchors.md) and every scenario's durations, states, drop deltas
 -- and client-error deltas are captured as key=value measure lines in
 -- the same anchors file. Cluster: three genesis voters on loopback.
--- Knobs: the calm profile (heartbeat 5 ms, election 3000 ms,
--- recovery 3000 ms — the randomized leader timeout 3000–5000 ms) on the
--- flight-recorder build. Every rejoin is bounded by its own gate
--- deadline (150 s); a bounded-out rejoin is recorded as BLOCKED with
--- its evidence and the node is parked — the run continues on the
--- serving remainder.
+-- Knobs: the hardened profile (heartbeat 5 ms, election 1000 ms,
+-- recovery 1000 ms — the randomized leader timeout 1000–2000 ms via
+-- --phi-timeout-min/max-ms) on the flight-recorder build. Every rejoin
+-- is bounded by its own gate deadline (150 s); a bounded-out rejoin is
+-- recorded as BLOCKED with its evidence and the node is parked — the
+-- run continues on the serving remainder.
 
 local clock = require("tools.lib.clock")
 local fs = require("tools.lib.fs")
@@ -202,9 +202,13 @@ local function start_node(name: string): integer
         "--heartbeat-ms",
         "5",
         "--election-ms",
-        "3000",
+        "1000",
         "--recovery-ms",
-        "3000",
+        "1000",
+        "--phi-timeout-min-ms",
+        "1000",
+        "--phi-timeout-max-ms",
+        "2000",
     }
     local p = proc.spawn(
         argv,
@@ -490,7 +494,11 @@ end
 -- client, one process each (the probe shape that never loses a reply),
 -- at the named node's client port. Returns the wall ts of the n-th ok
 -- probe — the failover-landing measurement — and -1 when the deadline
--- expired first. Each probe's duration is logged to probes.log.
+-- expired first. Each attempt is gtimeout-bounded at 2 s: a follower
+-- forwards the op to its believed leader and pends up to 30 s — without
+-- the bound one probe against a dead leader burns the client's whole
+-- 20 s read timeout (the calm runs' 20.3 s takeover artifact). Every
+-- attempt, ok or not, is logged to probes.log with its outcome.
 local function probe_serving(
     node: string, n: integer, deadline_ms: integer
 ): boolean, integer
@@ -504,7 +512,8 @@ local function probe_serving(
     while clock.now_ms() < t_deadline do
         local t0 = clock.mono_ms()
         local reply = shell.capture(
-            client_bin
+            "gtimeout 2 "
+                .. shell.quote(client_bin)
                 .. " --server 127.0.0.1:"
                 .. port
                 .. " --verb get --lock "
@@ -512,24 +521,32 @@ local function probe_serving(
                 .. " 2>/dev/null"
         )
         local dur = clock.mono_ms() - t0
+        local outcome = "empty_reply"
         if reply:find('"op":"get"', 1, true) ~= nil then
+            outcome = "ok"
             count = count + 1
             if landed < 0 then
                 landed = clock.now_ms() as integer
             end
-            fs.append_all(
-                fs.join(run_dir, "probes.log"),
-                "rel="
-                    .. (landed - (probe_epoch > 0 and probe_epoch or landed))
-                    .. " node="
-                    .. node
-                    .. " dur_ms="
-                    .. dur
-                    .. "\n"
-            )
-            if count >= n then
-                return true, landed
-            end
+        elseif reply:find('"error"', 1, true) ~= nil then
+            outcome = "error_reply"
+        elseif dur >= 1900 then
+            outcome = "probe_killed_at_bound"
+        end
+        fs.append_all(
+            fs.join(run_dir, "probes.log"),
+            "rel="
+                .. (clock.now_ms() - (probe_epoch > 0 and probe_epoch or clock.now_ms()))
+                .. " node="
+                .. node
+                .. " dur_ms="
+                .. dur
+                .. " outcome="
+                .. outcome
+                .. "\n"
+        )
+        if count >= n then
+            return true, landed
         end
         clock.sleep(0.3)
     end
@@ -850,6 +867,111 @@ local function scenario_steady()
             .. view_depth()
             .. " states=" .. states_snapshot()
     )
+end
+
+-- The quiet abdication ladder: three abdication cycles under the
+-- polite fleet (no hammer) — the detection-independent failover
+-- measurement, the comparison frame's anchor at the hardened window.
+local function scenario_abdication_quiet()
+    phase("S2: leader abdication x3 (quiet, the detection-independent anchor)")
+    for cycle = 1, 3 do
+        local leader = leader_name()
+        if leader == "" then
+            gate.fail("S2 cycle " .. cycle .. ": no leader to abdicate")
+        end
+        local t0_err = total_errors()
+        local t0 = anchor(
+            "S2-begin cycle=" .. cycle .. " leader=" .. leader
+                .. " view_depth=" .. view_depth()
+                .. " states=" .. states_snapshot()
+        )
+        local reply, drive_ms = drive_verb(leader, "abdicate", 0, {})
+        anchor("S2-abdicate-drive cycle=" .. cycle .. " reply=" .. reply)
+        if not reply:find('"accepted":true', 1, true) then
+            gate.fail("S2 cycle " .. cycle .. ": abdication refused: " .. reply)
+        end
+        local target = live_probe_target("")
+        local ok, landed = probe_serving(target, 1, 30000)
+        if not ok then
+            gate.fail(
+                "S2 cycle " .. cycle .. ": no client operation served within 30 s"
+            )
+        end
+        local failover_ms = landed - t0
+        local ok_conv, conv_report = wait_quorum(#GENESIS, LEADER_DEADLINE_MS)
+        if not ok_conv then
+            gate.fail("S2 cycle " .. cycle .. ": the view did not settle: " .. conv_report)
+        end
+        local t_err = total_errors()
+        measure(
+            "scenario=S2 cycle=" .. cycle .. " abdication_leader=" .. leader
+                .. " drive_ms=" .. drive_ms
+                .. " failover_ms=" .. failover_ms
+                .. " polite_errors_in_window=" .. (t_err - t0_err)
+                .. " states=" .. states_snapshot()
+        )
+        clock.sleep(5)
+    end
+end
+
+-- The timeout-driven takeover baseline: clean TERM of the leader, no
+-- abdication — the survivors detect at the hardened detector window and
+-- take over; then the old leader is restarted and rejoins. The
+-- detection-bound contrast to S2 (docs/src/softball-run.md, scenario 3).
+local function scenario_leader_term()
+    phase("S3: leader stop/start (timeout-driven takeover baseline)")
+    local leader = leader_name()
+    if leader == "" then
+        gate.fail("S3: no leader to stop")
+    end
+    anchor("S3-begin target=" .. leader .. " (the leader)")
+    local t0_err = total_errors()
+    local t_term = anchor("S3-TERM-begin " .. leader)
+    local code = term_node(leader, 2000)
+    local t_gone = anchor("S3-TERM-done " .. leader .. " exit=" .. code)
+    local target_probe = live_probe_target(leader)
+    local ok, landed = probe_serving(target_probe, 1, 30000)
+    if not ok then
+        gate.fail("S3: no client operation served within 30 s of the leader stop")
+    end
+    local takeover_ms = landed - t_term
+    local t_err = total_errors()
+    local new_leader = ""
+    for _, name in ipairs(GENESIS) do
+        if name ~= leader and procs[name] ~= nil and proc.alive(procs[name]) then
+            local kv = status_at(name, t_term)
+            if
+                kv.state == "normal" and (tonumber(kv.leader) or 0) == by_name[name].id
+            then
+                new_leader = name
+            end
+        end
+    end
+    anchor(
+        "S3-takeover new_leader=" .. new_leader .. " states=" .. states_snapshot()
+    )
+    measure(
+        "scenario=S3 node=" .. leader
+            .. " stop_ms=" .. (t_gone - t_term)
+            .. " takeover_ms=" .. takeover_ms
+            .. " new_leader=" .. new_leader
+            .. " client_errors_in_window=" .. (t_err - t0_err)
+            .. " states=" .. states_snapshot()
+    )
+    progress("S3: takeover under the hardened detector in " .. takeover_ms .. " ms")
+    clock.sleep(2)
+    local t_boot = anchor("S3-restart " .. leader)
+    start_node(leader)
+    local ok2, report2 = wait_node_normal(leader, t_boot, REJOIN_DEADLINE_MS)
+    if not ok2 then
+        gate.fail("S3: " .. leader .. " did not rejoin: " .. report2)
+    end
+    local t_rejoined = anchor("S3-rejoined " .. leader .. " " .. report2)
+    measure(
+        "scenario=S3 rejoin node=" .. leader .. " rejoin_ms=" .. (t_rejoined - t_boot)
+            .. " states=" .. states_snapshot()
+    )
+    clock.sleep(10)
 end
 
 -- The partition pair: P1 the follower cut (the serving 2-of-3
@@ -1510,12 +1632,19 @@ function M.run(root_path: string, run_dir_path: string): integer
     fs.write_all(fs.join(run_dir, "progress.log"), "")
     fs.write_all(
         fs.join(run_dir, "anchors.md"),
-        "# local-softball8-2026-09-19 — the crash/partition run (item25.30)\n"
-            .. "# knobs: heartbeat 5ms, election 3000ms (sloppy detector 3000-5000ms), recovery 3000ms\n"
+        "# local-harden-2026-09-19 — the hardened crash/partition run (item25.32)\n"
+            .. "# knobs: heartbeat 5ms, election 1000ms, recovery 1000ms, detector\n"
+            .. "#   --phi-timeout-min-ms 1000 --phi-timeout-max-ms 2000 (uniform draw\n"
+            .. "#   per node, re-armed on leader change / fresh-commit; the first\n"
+            .. "#   armed wait is the fixed --election-ms)\n"
             .. "# binary: flight-recorder build; load: lease-load polite x3 + aggressive hammer windows\n"
             .. "# partition injection: SIGSTOP/SIGCONT process suspension (loopback; heal = backlog burst)\n"
+            .. "# probe discipline: every serving probe is gtimeout-bounded at 2 s and\n"
+            .. "#   every attempt (ok or not) is logged to probes.log — the calm runs'\n"
+            .. "#   20.3 s takeover headlines were one 20 s lease-client read timeout\n"
+            .. "#   on an op forwarded to a dead leader, not the detector\n"
     )
-    anchor("run-begin softball8 crash/partition lane")
+    anchor("run-begin harden crash/partition lane (item25.32)")
     progress("run begin: " .. states_snapshot())
 
     phase("B: boot")
@@ -1544,6 +1673,8 @@ function M.run(root_path: string, run_dir_path: string): integer
     anchor("steady-serving-begin")
 
     scenario_steady()
+    scenario_abdication_quiet()
+    scenario_leader_term()
     scenario_crashes("shallow")
     fresh_files_boundary("after the shallow crash family")
     scenario_deep_family()

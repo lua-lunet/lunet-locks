@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="975" height="1447" viewBox="0 0 975 1447" font-family="Times New Roman, Times, serif">
+<rect width="975" height="1447" fill="#ffffff"/>
+<line x1="257" y1="557" x2="783" y2="557" stroke="#111111" stroke-width="1.2" stroke-dasharray="9 6"/>
+<text x="251" y="573" font-size="14" fill="#111111" text-anchor="end" font-weight="normal">Era 1 — crossing batch</text>
+<text x="251" y="588" font-size="14" fill="#111111" text-anchor="end" font-weight="normal">DECREMENT(C)+JOIN(D):</text>
+<text x="251" y="603" font-size="14" fill="#111111" text-anchor="end" font-weight="normal">weights (A,B,C,D) =</text>
+<text x="251" y="618" font-size="14" fill="#111111" text-anchor="end" font-weight="normal">(1,1,0,0); D joins at weight</text>
+<text x="251" y="633" font-size="14" fill="#111111" text-anchor="end" font-weight="normal">0 (standby); forming quorum</text>
+<text x="251" y="648" font-size="14" fill="#111111" text-anchor="end" font-weight="normal">{A,B} = mass 2 of total 2</text>
+<line x1="257" y1="956" x2="783" y2="956" stroke="#111111" stroke-width="1.2" stroke-dasharray="9 6"/>
+<text x="251" y="972" font-size="14" fill="#111111" text-anchor="end" font-weight="normal">Era 2 —</text>
+<text x="251" y="987" font-size="14" fill="#111111" text-anchor="end" font-weight="normal">INCREMENT(D)+LEAVE(C):</text>
+<text x="251" y="1002" font-size="14" fill="#111111" text-anchor="end" font-weight="normal">weights (A,B,D) = (1,1,1); D</text>
+<text x="251" y="1017" font-size="14" fill="#111111" text-anchor="end" font-weight="normal">promoted 0→1, C leaves at</text>
+<text x="251" y="1032" font-size="14" fill="#111111" text-anchor="end" font-weight="normal">weight 0; forming quorum</text>
+<text x="251" y="1047" font-size="14" fill="#111111" text-anchor="end" font-weight="normal">{A,B} = mass 2 of total 3 —</text>
+<text x="251" y="1062" font-size="14" fill="#111111" text-anchor="end" font-weight="normal">the same set as era 1, so</text>
+<text x="251" y="1077" font-size="14" fill="#111111" text-anchor="end" font-weight="normal">the quorums coincide and</text>
+<text x="251" y="1092" font-size="14" fill="#111111" text-anchor="end" font-weight="normal">leader B carries both eras</text>
+<text x="251" y="1107" font-size="14" fill="#111111" text-anchor="end" font-weight="normal">without a pivot</text>
+<line x1="265" y1="72" x2="265" y2="1431" stroke="#111111" stroke-width="1.2"/>
+<line x1="435" y1="72" x2="435" y2="1431" stroke="#111111" stroke-width="1.2"/>
+<line x1="605" y1="72" x2="605" y2="288" stroke="#111111" stroke-width="1.2"/>
+<line x1="605" y1="288" x2="605" y2="1431" stroke="#555555" stroke-width="1.2" stroke-dasharray="3 5"/>
+<line x1="775" y1="373" x2="775" y2="1431" stroke="#111111" stroke-width="1.2"/>
+<line x1="243" y1="72" x2="287" y2="72" stroke="#111111" stroke-width="1.4"/>
+<text x="265" y="58" font-size="18" fill="#111111" text-anchor="middle" font-weight="normal" font-style="italic">A</text>
+<line x1="413" y1="72" x2="457" y2="72" stroke="#111111" stroke-width="1.4"/>
+<text x="435" y="58" font-size="18" fill="#111111" text-anchor="middle" font-weight="normal" font-style="italic">B (leader)</text>
+<line x1="583" y1="72" x2="627" y2="72" stroke="#111111" stroke-width="1.4"/>
+<text x="605" y="58" font-size="18" fill="#111111" text-anchor="middle" font-weight="normal" font-style="italic">C</text>
+<line x1="753" y1="72" x2="797" y2="72" stroke="#111111" stroke-width="1.4"/>
+<text x="775" y="58" font-size="18" fill="#111111" text-anchor="middle" font-weight="normal" font-style="italic">D</text>
+<line x1="435" y1="118" x2="272.16" y2="199.42" stroke="#111111" stroke-width="1.3"/>
+<polygon points="265,203 271.26,195.40 274.84,202.55" fill="#111111"/>
+<text x="255" y="207" font-size="15" fill="#111111" text-anchor="end" font-weight="bold">1 append i</text>
+<line x1="435" y1="203" x2="597.84" y2="284.42" stroke="#111111" stroke-width="1.3"/>
+<polygon points="605,288 595.16,287.55 598.74,280.40" fill="#111111"/>
+<text x="615" y="292" font-size="15" fill="#111111" text-anchor="start" font-weight="bold">2 append i</text>
+<line x1="775" y1="458" x2="441.64" y2="682.53" stroke="#111111" stroke-width="1.3"/>
+<polygon points="435,687 440.23,678.65 444.70,685.29" fill="#111111"/>
+<text x="425" y="683.50" font-size="15" fill="#111111" text-anchor="end" font-weight="bold">5 reincarnate (old=C,</text>
+<text x="425" y="698.50" font-size="15" fill="#111111" text-anchor="end" font-weight="bold">new=D)</text>
+<line x1="435" y1="687" x2="272.16" y2="768.42" stroke="#111111" stroke-width="1.3"/>
+<polygon points="265,772 271.26,764.40 274.84,771.55" fill="#111111"/>
+<text x="255" y="768.50" font-size="15" fill="#111111" text-anchor="end" font-weight="bold">6 prepare batch:</text>
+<text x="255" y="783.50" font-size="15" fill="#111111" text-anchor="end" font-weight="bold">DECREMENT(C)+JOIN(D)</text>
+<line x1="265" y1="772" x2="427.84" y2="853.42" stroke="#111111" stroke-width="1.3"/>
+<polygon points="435,857 425.16,856.55 428.74,849.40" fill="#111111"/>
+<text x="445" y="853.50" font-size="15" fill="#111111" text-anchor="start" font-weight="bold">7 promised (quorum</text>
+<text x="445" y="868.50" font-size="15" fill="#111111" text-anchor="start" font-weight="bold">{A,B})</text>
+<line x1="435" y1="857" x2="768.90" y2="1140.82" stroke="#111111" stroke-width="1.3" stroke-dasharray="6 4"/>
+<polygon points="775,1146 765.55,1143.22 770.73,1137.12" fill="#111111"/>
+<text x="785" y="1135" font-size="15" fill="#111111" text-anchor="start" font-weight="bold">8 standby stream (weight</text>
+<text x="785" y="1150" font-size="15" fill="#111111" text-anchor="start" font-weight="bold">0; messages to D are</text>
+<text x="785" y="1165" font-size="15" fill="#111111" text-anchor="start" font-weight="bold">fine)</text>
+<line x1="435" y1="1146" x2="272.16" y2="1227.42" stroke="#111111" stroke-width="1.3"/>
+<polygon points="265,1231 271.26,1223.40 274.84,1230.55" fill="#111111"/>
+<text x="255" y="1227.50" font-size="15" fill="#111111" text-anchor="end" font-weight="bold">9 prepare batch:</text>
+<text x="255" y="1242.50" font-size="15" fill="#111111" text-anchor="end" font-weight="bold">INCREMENT(D)+LEAVE(C)</text>
+<line x1="265" y1="1231" x2="427.84" y2="1312.42" stroke="#111111" stroke-width="1.3"/>
+<polygon points="435,1316 425.16,1315.55 428.74,1308.40" fill="#111111"/>
+<text x="445" y="1312.50" font-size="15" fill="#111111" text-anchor="start" font-weight="bold">10 promised (quorum</text>
+<text x="445" y="1327.50" font-size="15" fill="#111111" text-anchor="start" font-weight="bold">{A,B})</text>
+<line x1="435" y1="1316" x2="767.24" y2="1399.06" stroke="#111111" stroke-width="1.3" stroke-dasharray="6 4"/>
+<polygon points="775,1401 765.30,1402.70 767.24,1394.94" fill="#111111"/>
+<text x="785" y="1397.50" font-size="15" fill="#111111" text-anchor="start" font-weight="bold">11 standby stream (D now</text>
+<text x="785" y="1412.50" font-size="15" fill="#111111" text-anchor="start" font-weight="bold">weight 1)</text>
+<line x1="613" y1="280" x2="597" y2="296" stroke="#111111" stroke-width="2.6" stroke-linecap="round"/>
+<line x1="597" y1="280" x2="613" y2="296" stroke="#111111" stroke-width="2.6" stroke-linecap="round"/>
+<text x="592" y="292" font-size="14" fill="#111111" text-anchor="end" font-weight="normal" font-style="italic">crash (fenced)</text>
+<circle cx="775" cy="373" r="6" fill="#ffffff" stroke="#111111" stroke-width="2"/>
+<text x="788" y="377" font-size="14" fill="#111111" text-anchor="start" font-weight="normal" font-style="italic">reincarnate</text>
+</svg>

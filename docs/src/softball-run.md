@@ -303,6 +303,46 @@ The lane runs in dependency order, each family with the same stat set:
 After the lane: the completeness checklist, the snapshot tool, and the
 shutdown-consistency check on the raw run directory AND on the archive.
 
+## The hardened knob profile
+
+The maintenance run and the softball-2 lane carry a knob profile per
+recording. Two variants are documented:
+
+- **The calm profile** — `--heartbeat-ms 5 --election-ms 3000
+  --recovery-ms 3000`. The detector's randomized leader timeout is a
+  uniform draw per node, re-armed on every leader change and every
+  fresh-commit resume: `--phi-timeout-min-ms 500 --phi-timeout-max-ms
+  1000` (the binary defaults), with the first armed wait the fixed
+  `--election-ms` value. Every knob is recorded on the run's anchors
+  header.
+- **The hardened profile** — the same heartbeat plane under a tighter,
+  host-plausible detector: `--heartbeat-ms 5 --election-ms 1000
+  --recovery-ms 1000 --phi-timeout-min-ms 1000 --phi-timeout-max-ms
+  2000`. The detector window shrinks to the uniform [1000, 2000] ms
+  draw (mean 1500 ms); the election and recovery waits scale with it
+  (3000 → 1000 ms); the cluster viewchange timeout stays at its
+  [100, 200] ms default — the documented floor (its minimum must stay
+  above four times the loaded RTT) already binds. The 5 ms heartbeat
+  plane is unchanged: the loopback plane is load-independent and its
+  steady inbound inter-arrival max (193 ms, n = 73,399 pairs, the
+  softball-7 recording) clears the 1000 ms draw floor with margin.
+
+The hardened variant exists to test two claims of the comparison frame:
+the abdication failover is detection-independent (it must stay inside
+the calm run's measured band at any detector window — drift outside it
+is a finding, quantified), and the timeout-driven takeover scales with
+the detector window (its client-visible landing is the detection draw
+plus one ordinary view change, not a fixed constant). A false-positive
+check rides the hardened steady window: zero client errors and zero
+view changes while serving, else the tightened window is false-positive
+on the loopback's event-loop quantisation and the recording says so.
+
+The crash-partition lane's fence behaviour is detector-independent by
+construction (the fence is the rejoin path, not the detector), so the
+hardened lane re-runs the same scenario order with the same 150 s
+rejoin budget and the same stat set — the crash-family comparison is
+the calibration point.
+
 ## The re-run methodology
 
 Check softball, then polite. If ANY bug is found — or a test parameter
