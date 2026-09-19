@@ -1,7 +1,7 @@
 //! The routed lifecycle marker: the engine's `LifecycleStore` over the
 //! superblock copies.
 //!
-//! The engine (`vrr::lifecycle`, uvrr-core v0.7.0) owns the marker
+//! The engine (`vrr::lifecycle`, uvrr-core tag v0.7.4 @ e5b0a79) owns the marker
 //! machine — which marker, which copies, when, and in what order
 //! (`docs/uvrr-boot-gate.md` §3). This module is the host's durable
 //! mechanics: the vendored Zig store's quorum-of-copies construction,

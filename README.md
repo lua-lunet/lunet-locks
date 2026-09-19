@@ -88,14 +88,14 @@ consumption story.
 
 ## The ordering core
 
-The core is vendored as the `ext/uvrr-core` git submodule on the branch
-`lunet-locks/learner-era-fold`: upstream commit `0fc6380` plus two patch
-commits — learner acquisition, which lets a weight-0 member fold the era
-that admitted it so a joined learner converges, and fence-under-load, which
-lets a stop-the-world era transition complete under the leader's own client
-stream. The adapter manifest pins upstream `0fc6380` and its `[patch]`
-section builds the dependency from the submodule, so this tree always
-builds against the patched branch.
+The core is vendored as the `ext/uvrr-core` git submodule, checked out on
+upstream main at tag `v0.7.4` (commit `e5b0a79`, released 2026-09-19): the
+lifecycle boot gate, the learner acquisition that lets a weight-0 member
+fold the era that admitted it so a joined learner converges, and the
+fence-under-load completion that lets a stop-the-world era transition
+complete under the leader's own client stream. The adapter manifest pins
+upstream tag `v0.7.4` and its `[patch]` section builds the dependency from
+the submodule, so this tree always builds against the vendored tag.
 
 ## The lock telemetry capture file
 

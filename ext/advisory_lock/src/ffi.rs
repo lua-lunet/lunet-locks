@@ -1,5 +1,5 @@
 //! Host-side FFI adapter between the LuaJIT host and the uVRR core
-//! (vrr-core @ 317f4fc, v0.7.0 — the lifecycle boot gate).
+//! (vrr-core, uvrr-core tag v0.7.4 @ e5b0a79 — the lifecycle boot gate; the core's constructors all sit in `node_from_sink` in this file: `lifecycle::boot` :2035, `Replica::reincarnate` :2379, `Replica::resume` :2393, `Replica::join` :2407, `Replica::provision` :2418).
 //!
 //! Concrete core: `Replica<SegmentedLog, WeightedMajority>` running
 //! `Stability::Volatile` — nothing is persisted but the boot gate's
