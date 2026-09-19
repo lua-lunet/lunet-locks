@@ -22,7 +22,7 @@ lunet-locks-aof = { path = "../../ext/lunet-locks-aof" }
 vrr = { package = "vrr-core", git = "https://github.com/lua-lunet/uvrr-core.git", tag = "v0.3.0" }
 serde_json = "1"
 # The run-state snapshot archives (the snapshot rule): the check tool
-# reads `snapshot_run.sh`'s gzip tars transparently next to raw run dirs.
+# reads `snapshot_run.lua`'s gzip tars transparently next to raw run dirs.
 tar = "0.4"
 flate2 = "1"
 signal-hook = "0.3"

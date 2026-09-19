@@ -4,7 +4,7 @@ return {
    source_dir = "src",
    build_dir = "build",
 
-   include_dir = { "tests" },
+   include_dir = { "tests", "tools/lib" },
 
    -- lunet embeds LuaJIT (Lua 5.1). Keep generated code 5.1-clean and do
    -- not emit compat53 shims, since the runtime does not ship compat53.

@@ -60,7 +60,7 @@ flushes on an orderly shutdown.
 **Loss window.** `NonBlocking` is drop-on-overflow: when a node writes
 faster than the worker drains, events are dropped, never backpressured
 and never blocking the datagram path. Events written in the last moments
-before a `SIGKILL` (the kill cycles in `run.sh`) are likewise lost — the
+before a `SIGKILL` (the kill cycles in `run.lua`) are likewise lost — the
 worker had no chance to flush. The stability check therefore asserts on
 steady-state streams, never on a tail. Under the default `RUST_LOG=info`
 the per-datagram `trace!` events are compiled in but filtered before any
@@ -137,7 +137,7 @@ start (SIGUSR2) at wall=<ms>`).
 
 `config/cluster.jsonl`: one genesis voter per DC (`dc1-node1`, `dc2-node1`,
 `dc3-node1`) and one joiner per DC (`dc1-node2`, `dc2-node2`, `dc3-node2`)
-that enters at weight 0 through the join verb. `run.sh` promotes `dc1-node2`
+that enters at weight 0 through the join verb. `run.lua` promotes `dc1-node2`
 and `dc2-node2` with the increment verb; `dc3-node2` stays at weight 0 —
 the zero-voting-weight member the downstream design wants. The TCP client
 port is the descriptor's UDP peer port + 1000.
@@ -160,7 +160,7 @@ descriptor.
 
 ## The standby telemetry node
 
-`check-standby.sh` runs the same six-node cluster with `dc1-node2` as the
+`check-standby.lua` runs the same six-node cluster with `dc1-node2` as the
 **standby telemetry node**: it enters at weight 0 through the join verb —
 first, so its learner fold is the clean one — is never promoted, and holds
 no vote. The `--aof-dir` option turns the node into the AOF host: its
@@ -249,12 +249,12 @@ Every spawned process (nodes, feed, mock, nginx) is killed on exit.
 ## Running
 
 ```
-./run.sh             # the stability check (also as ./check.sh)
-./check-standby.sh   # the standby AOF + console demo check
-./run-acceptance.sh  # the membership-snapshot acceptance run
+./run.lua             # the stability check (also as ./check.lua)
+./check-standby.lua   # the standby AOF + console demo check
+./run-acceptance.lua  # the membership-snapshot acceptance run
 ```
 
-`run.sh` builds the crate, starts the six nodes with fresh state (each
+`run.lua` builds the crate, starts the six nodes with fresh state (each
 node's file at `RUST_LOG=info` unless the operator exports another
 `RUST_LOG` — e.g. `RUST_LOG=debug` or
 `RUST_LOG="lunet_advisory_lock=trace,info"` opts a run into per-datagram
@@ -266,7 +266,7 @@ the lease, restart the killed leader on the same state file, assert the
 reincarnation rejoin (identity bump, the peers' remap notice), and assert
 the cluster re-stabilizes. Every spawned process is killed on exit.
 
-`run-acceptance.sh` boots a 7th node on the GENESIS descriptor
+`run-acceptance.lua` boots a 7th node on the GENESIS descriptor
 (`config/cluster-genesis.jsonl` — the founding membership and the
 joining node's own line only) while the live cluster is at era 6, after
 the three joins and the two increments. The node escalates through the
@@ -313,5 +313,5 @@ as this repo does:
   process gate, and the message-id reply correlation for both
   in-process and forwarded ops.
 - `config/cluster.jsonl` — the six-node deployment descriptor.
-- `run.sh`, `check.sh` — the stability check.
-- `check-standby.sh` — the standby AOF + console demo check.
+- `run.lua`, `check.lua` — the stability check.
+- `check-standby.lua` — the standby AOF + console demo check.

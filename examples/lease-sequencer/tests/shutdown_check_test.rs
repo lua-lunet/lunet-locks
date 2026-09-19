@@ -377,7 +377,7 @@ fn the_archive_read_equals_the_raw_read() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// A snapshot_run.sh archive (the system tar's own bytes) reads exactly
+/// A snapshot_run.lua archive (the system tar's own bytes) reads exactly
 /// like the raw directory: the check is transparent over the tool's
 /// archive format.
 #[test]
@@ -393,9 +393,9 @@ fn the_snapshot_tool_archive_reads_like_the_raw_dir() {
 
     let raw = check_shutdown(&dir).expect("the raw read runs");
 
-    // The same gzip tar snapshot_run.sh produces: bsdtar -czf with the
+    // The same gzip tar snapshot_run.lua produces: bsdtar -czf with the
     // run dir's contents at the archive root. The archive lands outside
-    // the run dir, as snapshot_run.sh's own default does.
+    // the run dir, as snapshot_run.lua's own default does.
     let archive = std::env::temp_dir().join(format!(
         "skaffold-shutdown-check-snapshot-{}-{}.tar.gz",
         std::process::id(),

@@ -165,7 +165,7 @@ request_lines() {
     done
 }
 
-# Identical scenario to tests/lunet_smoke.sh: three replicas, client traffic
+# Identical scenario to tools/smoke.lua: three replicas, client traffic
 # through n2 (forwarding), lease expiry takeover, then n3 restart recovery.
 start n1 28101 27101
 start n2 28102 27102

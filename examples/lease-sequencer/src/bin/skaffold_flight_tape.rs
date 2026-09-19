@@ -10,7 +10,7 @@
 //! code as-at the recording's commit and loudly refused otherwise.
 //!
 //! The third read is not a tape at all: `--check-shutdown` reads a run
-//! directory or a `snapshot_run.sh` archive and cross-checks the logs
+//! directory or a `snapshot_run.lua` archive and cross-checks the logs
 //! against the durable markers (`src/shutdown_check.rs`).
 
 use lease_sequencer::flight_tape::{FlightTapeOptions, stream_recording};
@@ -88,7 +88,7 @@ flags:
                     stderr. Same-commit only; --kinds does not narrow it.
   --check-shutdown PATH
                     the shutdown-restart consistency check over a run
-                    directory (raw files) or a snapshot_run.sh gzip tar
+                    directory (raw files) or a snapshot_run.lua gzip tar
                     archive — both read transparently. Cross-checks the
                     logs against the superblock/single-file markers
                     (every drained-and-flushed stop record must stand on

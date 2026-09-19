@@ -72,7 +72,7 @@ No instruction conflicts with Andon; if one appears to, Andon wins.
 
 - Work ends in git, in the todo, moved out of the way, or terminated.
   Nothing may dangle.
-- Before any outer commit, run `tools/dangling.sh`: processes started
+- Before any outer commit, run `tools/dangling.lua`: processes started
   by cancelled or completed agent attempts (smoke servers, simulators,
   orphans holding ports) get listed, then terminated deliberately —
   clear orphans only; NEVER the operator's own deliberate long-running
@@ -133,6 +133,15 @@ No instruction conflicts with Andon; if one appears to, Andon wins.
   `check`) to reject unformatted code. After clone, run `make hooks` once to enable
   the pre-commit guard.
 - Runtime target is LuaJIT / Lua 5.1, so `gen_target = "5.1"` and `gen_compat = "off"`.
+- Run orchestration and generic tooling are Teal too. Entry points are executable
+  `.lua` files with `#!/usr/bin/env -S luajit` shebangs that `dofile`
+  `tools/bootstrap.lua` (rocks-path resolution + `tl.loader()`); every module they
+  call is a typed `.tl` library under `tools/lib/` behind a `record` contract.
+  Paths resolve from `arg[0]`, never the cwd. There is no shell orchestration:
+  shell has no types and fails silently (the dated-log gate class). Python stays
+  for data mining only.
+- `make init` also installs `tl` into `.rocks/` for the LuaJIT 5.1 ABI,
+  idempotently; `make check` runs `tl check` over `tools/lib`.
 
 ## Runtime and upstream boundaries
 

@@ -167,7 +167,7 @@ stays beside it as the compatibility projection.
 
 ## The acceptance run
 
-`examples/lease-sequencer/run-acceptance.sh` boots a 7th node on the
+`examples/lease-sequencer/run-acceptance.lua` boots a 7th node on the
 GENESIS descriptor while the live cluster is at era 6 (after three joins
 and two increments), and asserts — from the node's log and its
 membership sidecar — that it escalates to the live era, adopts a quorum

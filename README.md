@@ -84,7 +84,7 @@ advisory-lock adapter directly in Rust (`Node::open`, no C ABI, no Lunet)
 and binding a UDP peer port plus a TCP client NDJSON port. One node holds
 the sequencer lease (500 ms, renewed at 250 ms); every other node polls the
 lease and re-polls at the reported expiry plus `rand()*100 ms`. The stability
-check (`examples/lease-sequencer/run.sh`) drives the three joins and two
+check (`examples/lease-sequencer/run.lua`) drives the three joins and two
 increments, asserts the renewal and poll cadences from the per-node logs,
 and runs three SIGKILL/restart cycles asserting the lease steal and the
 reincarnation rejoin. See that directory's README for the downstream

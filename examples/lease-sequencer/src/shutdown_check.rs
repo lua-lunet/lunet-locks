@@ -1,7 +1,7 @@
 //! The shutdown-restart consistency check (the snapshot rule's
 //! verification half): the run's logs are cross-checked against the
 //! run's durable markers, from a raw run directory or a
-//! `snapshot_run.sh` archive alike.
+//! `snapshot_run.lua` archive alike.
 //!
 //! The stop path (the termination obligations' §2 write order) leaves
 //! both a log record trail and a durable marker trail, and the two must

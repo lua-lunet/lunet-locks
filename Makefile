@@ -34,6 +34,7 @@ CHECK_SOURCES = tests/teal_learning_test.tl \
                 tests/admin_test.tl \
                 tests/remap_test.tl \
                 tests/snapshot_test.tl
+TOOL_SOURCES = $(wildcard tools/lib/*.tl)
 # POSIX bin helpers carry no logic and still get the discipline: shellcheck
 # plus the client-signal behavioural smoke.
 SIGNAL_BIN := examples/lease-sequencer/bin
@@ -52,6 +53,10 @@ deps:
 	$(LUAROCKS) install cyan 0.4.1-1
 	$(LUAROCKS) install tested 0.3.0-1
 	$(LUAROCKS) install cerulean 1.9.0-1
+	# tl (Teal) for the LuaJIT 5.1 ABI: the tooling loader and the
+	# `tl check` gate over tools/lib. A 5.5-tree tl is invisible under
+	# LuaJIT, so the Lua version is pinned here like everywhere else.
+	@$(LUAROCKS) list tl 2>/dev/null | grep -q "^tl$$" || $(LUAROCKS) install tl
 
 fmt:
 	$(CERU) src tests
@@ -73,6 +78,7 @@ sh-smoke:
 
 check: build lint sh-check sh-smoke
 	$(CYAN) check $(CHECK_SOURCES)
+	$(CYAN) check $(TOOL_SOURCES)
 
 test: check
 	LUA_PATH="$(abspath build)/?.lua;;" $(TESTED) tests
@@ -93,7 +99,7 @@ $(LUNET_RUN):
 	@test -x $(LUNET_RUN)
 
 smoke: lunet-runtime
-	LUNET_RUN=$(abspath $(LUNET_RUN)) CYAN=$(abspath $(CYAN)) tests/lunet_smoke.sh
+	LUNET_RUN=$(abspath $(LUNET_RUN)) CYAN=$(abspath $(CYAN)) tools/smoke.lua
 
 # A real TCP-NDJSON three-replica failover demonstration. It uses only the
 # pinned project-local runtime, never a host `lunet-run` on PATH.

@@ -3,7 +3,7 @@
 Install the project tools into their local locations:
 
 ```console
-make init       # mise tools, then Cyan, Cerulean, and tested in .rocks/
+make init       # mise tools, then Cyan, Cerulean, tested, and tl in .rocks/
 make hooks      # enable the formatting pre-commit hook once after clone
 ```
 
@@ -14,6 +14,38 @@ fence-under-load patch commits. The adapter manifest pins the upstream
 revision and its `[patch]` section builds the dependency from the
 submodule, so `cargo` fetches no git dependencies: local builds, the
 vendored Docker context, and CI all compile the submodule source directly.
+
+## Teal tooling
+
+Run orchestration and generic tooling are typed Teal (typed Lua on LuaJIT)
+alongside the shipped source. There is no shell orchestration: shell has
+no types, no data structures, and fails silently — the class of defect
+where a gate greps `$RUN/logs/n1.log` while the appender writes dated
+files (`n1.<date>.log`) and the runner runs blind.
+
+- Entry points are executable `.lua` files with `#!/usr/bin/env -S
+  luajit` shebangs (`tools/smoke.lua`, `tools/snapshot_run.lua`,
+  `tools/dangling.lua`, `examples/lease-sequencer/run.lua`, ...). Every
+  module they call is a typed `.tl` library under `tools/lib/` behind a
+  `record` contract; `tl check` verifies the implementations against the
+  contracts.
+- Each entry `dofile`s `tools/bootstrap.lua`: the prelude resolves the
+  project-local `.rocks/` tree and the LuaRocks 5.1 paths (skipped when
+  the environment already provides them), activates `tl.loader()`, and
+  makes the sibling libraries requirable from any cwd. Paths resolve
+  from `arg[0]`, never the cwd, so every target works under
+  `env -u LUA_PATH -u LUA_CPATH`.
+- `make init` installs `tl` into `.rocks/` for the LuaJIT 5.1 ABI
+  (`--lua-version=5.1` throughout; a 5.5-tree `tl` is invisible under
+  LuaJIT), idempotently. `make check` runs `tl check` over `tools/lib`.
+- Processes are typed records (`Process { pid, name, argv, state,
+  exit_code, signal }`) spawned through fork/exec with file redirects;
+  log gates read the logs DIRECTORY and select files by node-name
+  prefix — no globs, no exact dated names. On LuaJIT 5.1 `os.execute`
+  returns a number; the tooling normalizes both shapes through one
+  typed helper.
+- Python stays for data mining (percentiles, plots, extraction of
+  analysis series) and is not used for orchestration.
 
 ## The Flight Recorder build
 
@@ -176,7 +208,7 @@ capture copies aside every artifact class the run produced, per node:
   happens-before/happens-after evidence for shutdown correctness;
 - the anchors file (`anchors*`).
 
-`tools/snapshot_run.sh RUN_DIR [--out ARCHIVE.tar.gz]` walks the run
+`tools/snapshot_run.lua RUN_DIR [--out ARCHIVE.tar.gz]` walks the run
 directory and writes a gzip tar archive holding all of it, paths
 preserved, with a `SNAPSHOT_MANIFEST.txt` naming each captured file and
 its class. A crashed run may be missing any piece: missing classes and
@@ -215,8 +247,8 @@ is cross-checked against the final marker; a later boot (clean
 continue or crashed bump) after a flushed record supersedes it.
 
 Old on-disk state is removed before a new run only after a successful
-snapshot. Every wipe step (`tests/lunet_smoke.sh`, the
-`examples/lease-sequencer` run scripts) calls `snapshot_run.sh` on the
+snapshot. Every wipe step (`tools/smoke.lua`, the
+`examples/lease-sequencer` run entries) calls the snapshot tool on the
 directory it is about to remove and wipes only on its success; a failed
 snapshot refuses the wipe loudly and leaves the state in place.
 
@@ -230,9 +262,9 @@ snapshot refuses the wipe loudly and leaves the state in place.
 | `src/cluster_config.tl` | JSONL deployment descriptor: parse, encode, genesis succession |
 | `src/admin.tl` | Admin verb decode, ADMIN peer payload, acknowledgments, dedup cache |
 | `src/server.tl` | TCP NDJSON server, UDP peers, leader forwarding, reconfiguration drives |
-| `tests/lunet_smoke.sh` | three-process runtime smoke test with restart and live-reconfiguration stages |
-| `tools/snapshot_run.sh` | the run-state snapshot: all six artifact classes into a dated gzip tar |
-| `tools/test_snapshot_run.sh` | the snapshot tool's acceptance: six classes, tolerance, archive-equals-raw |
+| `tools/smoke.lua` | the three-process runtime smoke test with restart and live-reconfiguration stages |
+| `tools/snapshot_run.lua` | the run-state snapshot: all six artifact classes into a dated gzip tar |
+| `tools/test_snapshot_run.lua` | the snapshot tool's acceptance: six classes, tolerance, archive-equals-raw |
 | `examples/lease-sequencer/src/shutdown_check.rs` | the shutdown-restart consistency check behind `--check-shutdown` |
 | `tools/lease_failover_sim.rs` | std-Rust live TCP lease-failover simulator |
 | `docker/Dockerfile.fastbuild` | the colima build stages: deps-layer cache, the sanity check payload, the release artifacts, the amd64 rootfs staging |
