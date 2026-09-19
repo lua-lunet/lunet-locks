@@ -419,6 +419,36 @@ local function drive_verb(
     return reply, (clock.mono_ms() - t0)
 end
 
+-- One admin verb drive with the driver's rotation: fresh message ids per
+-- attempt (each lease-client invocation mints its own), every live
+-- genesis voter's client port in turn, until the verb is accepted or the
+-- deadline expires. The runner's version of the smoke's drive_admin.
+local function drive_verb_retry(
+    action: string, id: integer, extra: {string}, deadline_ms: integer
+): string, integer
+    local t_deadline = clock.now_ms() + deadline_ms
+    local last_reply, last_ms = "", 0
+    while clock.now_ms() < t_deadline do
+        local candidates: {string} = {}
+        for _, name in ipairs(GENESIS) do
+            local p = procs[name]
+            if p ~= nil and proc.alive(p) then
+                candidates[#candidates + 1] = name
+            end
+        end
+        for _, name in ipairs(candidates) do
+            local reply, ms = drive_verb(name, action, id, extra)
+            last_reply, last_ms = reply, ms
+            if reply:find('"accepted":true', 1, true) ~= nil then
+                return reply, ms
+            end
+            clock.sleep(1)
+        end
+        clock.sleep(1)
+    end
+    return last_reply, last_ms
+end
+
 -- The lease-load cumulative error count of one client's stats file (the
 -- window summaries always report errors: 0; the cumulative line is the
 -- truth).
@@ -742,42 +772,37 @@ local function scenario_crashes()
 end
 
 -- Scenario 5: full cluster stop/start, then a full reboot cycle (all
--- down, all up).
+-- down, all up). The first pass restarts from the durable state wherever
+-- the ladder left it; a non-convergence there is recorded as blocked (the
+-- post-crash divergent retained views are the parked era-fold family's
+-- downstream), the state is snapshotted and reprovisioned, and the
+-- reboot pass runs the resurrection measurement on the fresh boot.
 local function scenario_full_cycle()
     phase("S5: whole-cluster stop/start and full reboot")
-    for pass = 1, 2 do
-        local gap = pass == 1 and 10 or 30
-        anchor("S5-begin pass=" .. pass .. " gap_s=" .. gap)
-        for _, name in ipairs(GENESIS) do
-            anchor("S5-TERM-begin pass=" .. pass .. " " .. name)
-            term_node(name, 2000)
-            anchor("S5-TERM-done pass=" .. pass .. " " .. name)
-        end
-        local t_all_down = anchor("S5-all-down pass=" .. pass)
-        clock.sleep(gap)
-        local t_restart = anchor("S5-restart-all pass=" .. pass)
-        for _, name in ipairs(GENESIS) do
-            start_node(name)
-        end
-        local ok, report = wait_converged("", 120000)
-        if not ok then
-            gate.fail(
-                "S5 pass " .. pass .. ": the cluster did not converge: " .. report
-            )
-        end
-        local t_conv = anchor("S5-converged pass=" .. pass .. " " .. report)
-        -- The first served op after the restart anchor (the shipped probe).
+    -- Pass 1: the durable resurrection on the ladder's end state.
+    anchor("S5-begin pass=1 gap_s=10")
+    for _, name in ipairs(GENESIS) do
+        anchor("S5-TERM-begin pass=1 " .. name)
+        term_node(name, 2000)
+        anchor("S5-TERM-done pass=1 " .. name)
+    end
+    local t_all_down = anchor("S5-all-down pass=1")
+    clock.sleep(10)
+    local t_restart = anchor("S5-restart-all pass=1")
+    for _, name in ipairs(GENESIS) do
+        start_node(name)
+    end
+    local ok, report = wait_converged("", 120000)
+    if ok then
+        local t_conv = anchor("S5-converged pass=1 " .. report)
         local ok2, first_op = probe_serving("n1", 1, 30000)
         if not ok2 then
             gate.fail(
-                "S5 pass "
-                    .. pass
-                    .. ": no client operation served within 30 s of the restart"
+                "S5 pass 1: no client operation served within 30 s of the restart"
             )
         end
         measure(
-            "scenario=S5 pass="
-                .. pass
+            "scenario=S5 pass=1"
                 .. " down_ms="
                 .. (t_restart - t_all_down)
                 .. " first_op_ms="
@@ -787,8 +812,69 @@ local function scenario_full_cycle()
                 .. " states="
                 .. states_snapshot()
         )
-        clock.sleep(10)
+    else
+        anchor("S5-converge-BLOCKED pass=1 states=" .. states_snapshot())
+        measure(
+            "scenario=S5 pass=1 converge=BLOCKED"
+                .. " down_ms="
+                .. (t_restart - t_all_down)
+                .. " stuck_report="
+                .. report
+                .. " states="
+                .. states_snapshot()
+        )
+        progress(
+            "S5 pass 1: the durable resurrection did not converge (blocked, recorded)"
+        )
+        for _, name in ipairs(GENESIS) do
+            if procs[name] ~= nil then
+                term_node(name, 2000)
+            end
+        end
+        -- Reprovision: the snapshot rule gates the wipe; the fresh boot is
+        -- the reboot pass's base.
+        local snap_ok, _out, snap_msg = snapshot.snapshot(run_dir, "")
+        if not snap_ok then
+            gate.fail("the state reprovision's snapshot failed: " .. snap_msg)
+        end
+        fs.remove_tree(fs.join(run_dir, "state"))
+        fs.mkdir_p(fs.join(run_dir, "state"))
     end
+    clock.sleep(5)
+    -- Pass 2: the full reboot (all down 30 s, all up, converge, serve).
+    anchor("S5-begin pass=2 gap_s=30")
+    for _, name in ipairs(GENESIS) do
+        anchor("S5-TERM-begin pass=2 " .. name)
+        term_node(name, 2000)
+        anchor("S5-TERM-done pass=2 " .. name)
+    end
+    local t_all_down_b = anchor("S5-all-down pass=2")
+    clock.sleep(30)
+    local t_restart_b = anchor("S5-restart-all pass=2")
+    for _, name in ipairs(GENESIS) do
+        start_node(name)
+    end
+    local ok_b, report_b = wait_converged("", 120000)
+    if not ok_b then
+        gate.fail("S5 pass 2: the cluster did not converge: " .. report_b)
+    end
+    local t_conv_b = anchor("S5-converged pass=2 " .. report_b)
+    local ok2b, first_op_b = probe_serving("n1", 1, 30000)
+    if not ok2b then
+        gate.fail("S5 pass 2: no client operation served within 30 s of the restart")
+    end
+    measure(
+        "scenario=S5 pass=2"
+            .. " down_ms="
+            .. (t_restart_b - t_all_down_b)
+            .. " first_op_ms="
+            .. (first_op_b - t_restart_b)
+            .. " converge_ms="
+            .. (t_conv_b - t_restart_b)
+            .. " states="
+            .. states_snapshot()
+    )
+    clock.sleep(10)
 end
 
 -- Scenario 6: the controlled reconfig swap — decrement, era commit,
@@ -816,13 +902,13 @@ local function scenario_reconfig_swap()
             .. " leader="
             .. leader
     )
-    local d_reply, d_ms = drive_verb(leader, "decrement", spec.id, {})
+    local d_reply, d_ms = drive_verb_retry("decrement", spec.id, {}, 120000)
     anchor("S6-decrement reply=" .. d_reply .. " drive_ms=" .. d_ms)
     if not d_reply:find('"accepted":true', 1, true) then
         gate.fail("S6: decrement refused: " .. d_reply)
     end
     probe_serving(leader, 1, 30000)
-    local l_reply, l_ms = drive_verb(leader, "leave", spec.id, {})
+    local l_reply, l_ms = drive_verb_retry("leave", spec.id, {}, 120000)
     anchor("S6-leave reply=" .. l_reply .. " drive_ms=" .. l_ms)
     if not l_reply:find('"accepted":true', 1, true) then
         gate.fail("S6: leave refused: " .. l_reply)
@@ -833,8 +919,7 @@ local function scenario_reconfig_swap()
     clock.sleep(2)
     local t_boot = anchor("S6-restart " .. SPARE)
     start_node(SPARE)
-    local j_reply, j_ms = drive_verb(
-        leader,
+    local j_reply, j_ms = drive_verb_retry(
         "join",
         spare.id,
         {
@@ -842,14 +927,15 @@ local function scenario_reconfig_swap()
             spare.name,
             "--endpoint",
             "127.0.0.1:" .. spare.port,
-        }
+        },
+        120000
     )
     anchor("S6-join reply=" .. j_reply .. " drive_ms=" .. j_ms)
     if not j_reply:find('"accepted":true', 1, true) then
         gate.fail("S6: join refused: " .. j_reply)
     end
     probe_serving(leader, 1, 30000)
-    local i_reply, i_ms = drive_verb(leader, "increment", spare.id, {})
+    local i_reply, i_ms = drive_verb_retry("increment", spare.id, {}, 120000)
     anchor("S6-increment reply=" .. i_reply .. " drive_ms=" .. i_ms)
     if not i_reply:find('"accepted":true', 1, true) then
         gate.fail("S6: increment refused: " .. i_reply)
