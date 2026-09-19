@@ -22,6 +22,25 @@
 //! outbound evidence the cluster can act on: a join gossip / GossipRequest
 //! at any view, or a state-transfer request the leader accepts.
 //!
+//! The join gossip is the rejoin gossip's joiner half — a HOST obligation
+//! (`lease_sequencer::rejoin`, uvrr-core
+//! `docs/uvrr-rejoin-gossip-and-witnesses.md` §2: rejoining is a gossip
+//! protocol OUTSIDE the main uVRR protocol, and the joiner keeps its own
+//! resend timer). The core emits no `GossipRequest` — a `Joining` node's
+//! tick drives only an already-open fetch (`ext/uvrr-core/src/replica/
+//! mod.rs` `plan_tick`), and the fetch opens only through paths a fenced
+//! fresh boot never reaches — while the core HANDLES the message on
+//! receive (`plan_gossip_request`: every node that hears it records the
+//! sender as a gossip-witness; the leader answers with the missed-range
+//! push above the sender's frontier plus a fresh commit, and the echo of
+//! the request's own view is what qualifies that push at the boot fence
+//! — `plan_new_state`). The datagram therefore carries the node's
+//! CURRENT view, never a view it has merely heard of: an entry ticket
+//! naming a foreign view would draw an answer the fence drops as
+//! `StaleTransfer` — evidence dressed up, not evidence. This harness
+//! drives the host's resend timer exactly as `main.rs::timers` does:
+//! delete the drive and the strand returns.
+//!
 //! Why the strand is deterministic (the drop rules, cited):
 //! - `ext/uvrr-core/src/replica/normal.rs` (`plan_prepare`, the
 //!   higher-view branch): a Prepare from the legitimate primary of a
@@ -55,10 +74,12 @@
 //! recorded race, deterministically.
 //!
 //! The test then gives the fenced node a generous bounded budget of its
-//! own timeout drives and demands the contract: adopt, or emit something
-//! addressed to the cluster naming a view at or above the cluster's.
+//! own timeout drives and demands the contract: adopt, or emit a join
+//! gossip / GossipRequest at any view — the entry ticket the leader acts
+//! on whatever view it names.
 
 use lease_sequencer::phi::{self, PollActuation};
+use lease_sequencer::rejoin;
 use lunet_advisory_lock::Node;
 use std::collections::VecDeque;
 
@@ -87,6 +108,10 @@ struct Host {
     last_fire: u64,
     last_poll: u64,
     last_commit_ms: u64,
+    /// The last join-gossip resend (`rejoin::GOSSIP_RESEND_MS`), the
+    /// host-loop timer `main.rs::timers` runs for a fenced `Joining`
+    /// boot.
+    last_gossip: u64,
     serving: bool,
     request_num: u64,
     /// Inbound datagrams actually delivered into the node.
@@ -156,6 +181,11 @@ struct Fabric {
     /// the settled view). Their outbound still flows — the contract under
     /// test is what the fenced node SENDS, never what it suppresses.
     held: Vec<u32>,
+    /// Whether the partition has healed: the join gossips the heal
+    /// window counts are the post-heal resends the cluster can act on.
+    post_heal: bool,
+    /// Join gossips the hosts sent since the heal.
+    gossips: u64,
     hosts: Vec<Host>,
     queue: VecDeque<Delivery>,
 }
@@ -174,6 +204,20 @@ impl Fabric {
                 None => continue,
             };
             self.hosts[index].received += 1;
+            if std::env::var("STRAND_DEBUG").is_ok() {
+                let tag = if bytes.len() >= 4 {
+                    u32::from_be_bytes(bytes[0..4].try_into().unwrap())
+                } else {
+                    0
+                };
+                eprintln!(
+                    "DBG pump t={} to=n{} from=n{} tag={}",
+                    self.now,
+                    to,
+                    from,
+                    tag
+                );
+            }
             // The fresh-commit arrival re-arms the watch: a received
             // Commit datagram is live-leader evidence (the same evidence
             // class the host's phi plane consumes).
@@ -251,6 +295,30 @@ fn step(fabric: &mut Fabric, dt: u64, serving: bool) {
             fabric.hosts[index].drain(&mut fabric.queue, fabric.now);
         }
 
+        // The rejoin gossip's joiner half, the host-loop drive
+        // (`main.rs::timers`): a fenced `Joining` boot gossips its entry
+        // ticket to every peer on `rejoin::GOSSIP_RESEND_MS`. The held
+        // node's outbound still flows — the resend timer is the gossip's
+        // own reliability mechanism — and the heal window counts the
+        // post-heal resends.
+        if fabric.hosts[index].state() == STATE_JOINING
+            && fabric.now.saturating_sub(fabric.hosts[index].last_gossip) >= rejoin::GOSSIP_RESEND_MS
+        {
+            fabric.hosts[index].last_gossip = fabric.now;
+            let status = fabric.hosts[index].node.status();
+            let payload = rejoin::gossip_datagram(status.era, status.view);
+            for to in [1u32, 2, 3] {
+                if to != fabric.hosts[index].own() {
+                    fabric
+                        .queue
+                        .push_back((fabric.hosts[index].own(), to, payload.clone()));
+                }
+            }
+            if fabric.post_heal {
+                fabric.gossips += 1;
+            }
+        }
+
         let _ = fabric.hosts[index].node.idle();
         fabric.hosts[index].drain(&mut fabric.queue, fabric.now);
     }
@@ -287,6 +355,8 @@ fn a_boot_fenced_voter_must_adopt_or_emit_actionable_evidence() {
         now: 0,
         live: vec![1, 2, 3],
         held: vec![3],
+        post_heal: false,
+        gossips: 0,
         hosts: [1usize, 2, 3]
             .iter()
             .map(|id| Host {
@@ -301,6 +371,7 @@ fn a_boot_fenced_voter_must_adopt_or_emit_actionable_evidence() {
                 last_fire: 0,
                 last_poll: 0,
                 last_commit_ms: 0,
+                last_gossip: 0,
                 serving: *id != 3,
                 request_num: 0,
                 received: 0,
@@ -404,11 +475,14 @@ fn a_boot_fenced_voter_must_adopt_or_emit_actionable_evidence() {
     // quiet — every further datagram is a higher-view Prepare/Commit,
     // provably ignorable at the fence per the drop rules in this file's
     // header. The fenced node's own timeout machinery keeps polling (the
-    // poll's LeaderTimeout tick) — the contract demands it still reach
-    // the cluster: adopt a view, or emit a join gossip / GossipRequest /
-    // state-transfer request the cluster can act on, naming a view at or
-    // above the cluster's. Generous but finite budget.
+    // poll's LeaderTimeout tick) and its join-gossip resend timer keeps
+    // sending the entry ticket at the node's current view — the contract
+    // demands it still reach the cluster: adopt a view, or emit a join
+    // gossip / GossipRequest the cluster can act on (any view — the
+    // leader answers the entry ticket whatever view it names). Generous
+    // but finite budget.
     fabric.held.clear();
+    fabric.post_heal = true;
     let deadline = fabric.now + 12_000;
     let mut saved = false;
     while fabric.now < deadline {
@@ -418,7 +492,7 @@ fn a_boot_fenced_voter_must_adopt_or_emit_actionable_evidence() {
             .max(fabric.hosts[0].view())
             .max(fabric.hosts[1].view());
         if fenced.state() == STATE_NORMAL && fenced.view() >= cluster_view
-            || fenced.max_out_view >= cluster_view
+            || fabric.gossips > 0
         {
             saved = true;
             break;
@@ -448,7 +522,9 @@ fn a_boot_fenced_voter_must_adopt_or_emit_actionable_evidence() {
          datagrams, highest named view {} (ext/uvrr-core/src/replica/mod.rs \
          `plan_tick`: a Joining node is excluded from the suspicion gate, \
          not promotable off the genesis primary, and with no open fetch its \
-         tick emits nothing).\n\
+         tick emits nothing); {} join gossips sent since the heal \
+         (`lease_sequencer::rejoin`: the resend-timer drive the host loop \
+         runs for a fenced Joining boot).\n\
          The fenced node sent nothing the cluster can act on and never \
          adopted. n3 final status: {:?}",
         fenced.state(),
@@ -457,6 +533,7 @@ fn a_boot_fenced_voter_must_adopt_or_emit_actionable_evidence() {
         fenced.received,
         fenced.emitted,
         fenced.max_out_view,
+        fabric.gossips,
         fenced.node.status(),
     );
 

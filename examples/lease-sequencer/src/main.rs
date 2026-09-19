@@ -31,6 +31,7 @@ mod membership;
 // exist in exactly one compilation unit — the lib rlib the bin links).
 pub use lease_sequencer::phi;
 use lease_sequencer::phi::Rng;
+use lease_sequencer::rejoin;
 pub mod telemetry;
 mod transport;
 
@@ -78,6 +79,10 @@ const STATE_NORMAL: u32 = 0;
 /// the `timedout` toggle holds (`docs/src/phi-and-timeouts.md`).
 const STATE_VIEW_CHANGE: u32 = 1;
 const STATE_RECOVERING: u32 = 2;
+/// The boot fence of a fresh provisioned member (`vrr::progress`
+/// `Status::Joining`'s snapshot word): the node has adopted nothing and
+/// its own tick emits nothing — the rejoin gossip is the host's drive.
+const STATE_JOINING: u32 = 4;
 
 const VRR_COMMIT_TAG: u32 = 4;
 
@@ -179,6 +184,10 @@ struct Host {
     last_heartbeat: u64,
     leader_elapsed: u64,
     last_recovery: u64,
+    /// The last join-gossip resend (the rejoin gossip's own timer,
+    /// `rejoin::GOSSIP_RESEND_MS`): a fenced `Joining` boot gossips its
+    /// entry ticket to every peer until the cluster's answer installs.
+    last_gossip: u64,
     last_status_note: u64,
     last_seen_leader: u32,
     /// This node booted a dirty restart (incarnation >= 1): the §8
@@ -1242,6 +1251,30 @@ impl Host {
         self.send_application(addr, &payload);
     }
 
+    /// The join gossip's resend (the rejoin gossip's joiner half,
+    /// `rejoin`): the entry ticket at the node's current view to every
+    /// peer it knows. The datagram rides the ordinary VRR peer channel;
+    /// every peer that hears it records this node as a gossip-witness and
+    /// the leader answers with the missed-range push the boot fence
+    /// qualifies.
+    fn join_gossip(&mut self) {
+        let status = self.node.status();
+        let payload = rejoin::gossip_datagram(status.era, status.view);
+        let packet = transport::encode_peer(transport::PEER_VRR, &self.fingerprint, &payload);
+        let mut sent = 0u32;
+        for (id, addr) in &self.peers {
+            if *id == self.own_id {
+                continue;
+            }
+            let _ = self.sock.send_to(&packet, *addr);
+            sent += 1;
+        }
+        self.note(&format!(
+            "join-gossip era={} view={} peers={sent}",
+            status.era, status.view
+        ));
+    }
+
     fn flush_outputs(&mut self, now: u64, rng: &mut Rng) -> u64 {
         let mut established_slot = 0u64;
         while let Some(out) = self.node.next_output() {
@@ -1935,6 +1968,7 @@ fn main() {
         last_heartbeat: 0,
         leader_elapsed: 0,
         last_recovery: 0,
+        last_gossip: 0,
         last_status_note: 0,
         last_seen_leader: LEADER_UNKNOWN,
         reincarnated: incarnation > 0,
@@ -2217,6 +2251,17 @@ fn timers(host: &mut Host, now: u64, rng: &mut Rng) {
         host.last_recovery = now;
         let _ = host.node.recover();
         host.flush_outputs(now, rng);
+    }
+    // The rejoin gossip's joiner half (`rejoin`): a fenced `Joining` boot
+    // — a fresh provisioned voter whose engine sits at the boot fence —
+    // never assumes the cluster will come to it. Its own resend timer
+    // gossips the entry ticket to every peer; the leader's answering push
+    // is the evidence the boot fence qualifies, so the node catches up
+    // and stays a streamed witness until a view change seats it.
+    if status.state == STATE_JOINING && now.saturating_sub(host.last_gossip) >= rejoin::GOSSIP_RESEND_MS
+    {
+        host.last_gossip = now;
+        host.join_gossip();
     }
 }
 
@@ -2922,6 +2967,7 @@ mod forward_tests {
             last_heartbeat: 0,
             leader_elapsed: 0,
             last_recovery: 0,
+            last_gossip: 0,
             last_status_note: 0,
             last_seen_leader: LEADER_UNKNOWN,
             reincarnated: false,
@@ -3536,6 +3582,7 @@ mod reincarnation_remap_tests {
             last_heartbeat: 0,
             leader_elapsed: 0,
             last_recovery: 0,
+            last_gossip: 0,
             last_status_note: 0,
             last_seen_leader: LEADER_UNKNOWN,
             reincarnated: false,
