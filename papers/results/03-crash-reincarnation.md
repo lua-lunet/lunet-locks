@@ -133,8 +133,23 @@ millisecond. The half-round-trip of the 2×RTT claim left the node.
 
 ### And here is where the rig stopped — shown, not hidden
 
-The leader's response to that announcement is where the liveness
-defect lives. On the leader's own log, the announcement is visible —
+**The binary question, answered from the tapes: did the leader commit
+the new identity? No — it never received it.** Three independent
+checks on the stable snapshot: (1) zero frames mentioning `16777218`
+exist in any serving node's flight tape (all six tapes, receive and
+emit); (2) the tag-`0x0d` reincarnation frames DO arrive at n1 (70×)
+and n3 (32×), but the tape records them `from: 2` — the wire-level
+sender attribution never moved to the bumped identity even though the
+frame body carries `new=16777218`; (3) no commit/accept/Prepare frame
+on any serving tape carries the pair, so the fused batch never
+existed. The node is NOT "joined but never learnt"; it was never
+proposed. The harness transport stamps outbound sender attribution
+from its learned map, which still maps the process to the old
+identity after the bump — the partition is at the identity-attribution
+layer, not the commit layer. (Filed downstream as lunet-locks
+issue #26.)
+
+On the leader's own log, the mis-attributed announcement is visible —
 and refused, named, hundreds of times:
 
 ```sh
@@ -148,3 +163,44 @@ head -2 data/s4-refusal-samples.txt; echo; echo "refusals per node:"; grep -c Re
 refusals per node:
 30
 ```
+
+**Reading the refusal.** `ReincarnationRefused` names the sender as
+`NodeId(2)` — the *old* identity, exactly what the tapes show on the
+wire (`from: 2` on every tag-`0x0d` frame). The bumped node announced
+from its new identity; the harness's transport never re-attributed it,
+so the announcement reached the leader carrying the old one, and the
+engine refused it by name — correctly: a message it cannot attribute
+cannot drive a reconfiguration. The repeated refusal is the wedge: the
+leader's forced-reconfiguration walk never started (`remap` notices at
+zero peers for all three crashes), the bumped nodes sat fenced for the
+full 150-second budget, and the serving pair's views stormed (1,431
+and 1,146 leader-change records across the run on n1 and n3, the
+era-fold walk hunting for a shape the refused announcement never gave
+it).
+
+### The 2×RTT floor, with the pieces that are measured
+
+The paper's claim is the floor, not this rig's current walk. The
+floor's arithmetic: half a round-trip for the announcement, one
+consensus round for the fused reconfiguration, half a round-trip for
+the commit — no disk writes, one boot-fence read. Of its pieces:
+
+| piece | status on this rig | where |
+|---|---|---|
+| dirty classification + identity bump | works, 3/3 crashes | `data/s4-bump-witness.txt` |
+| announcement emitted to all peers, 1 ms | works | `data/s4-bumped-tape-head.txt` |
+| the leader hears and starts the fused walk | **blocked** — never received as the new identity (host transport attribution, issue #26) | `data/s4-refusal-samples.txt` |
+| one-round fused reconfiguration | works when driven through the healthy path: S6's decrement round committed in 28 ms, and the whole four-step swap in 23.5 s | book 04, `data/s6-anchors.txt` |
+| no disk on the path | structural: the only writes in the run were the clean stops of book 01 | — |
+| safety under the wedge | held, measured: zero lost operations, zero superseded votes | teardown anchor |
+
+The crash-stop-reincarnation end-to-end run on *this* harness is
+therefore recorded as blocked — with the precise localisation now
+established from the tapes: the protocol's messages were correct, the
+announcement was sent and arrived, and the harness's transport layer
+failed to re-attribute the sender after the bump, so the leader could
+not lawfully act on it. A team building on uVRR does not need this
+harness to be perfect to inherit the floor: the fused walk is the same
+machinery the healthy path exercised in S6, the classification is the
+same machine book 01 exercised in S1, and the safety the walk protects
+is kernel-checked in the paper's Lean development, not asserted.
