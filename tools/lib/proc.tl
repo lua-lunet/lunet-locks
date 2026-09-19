@@ -26,6 +26,8 @@ local O_WRONLY = 0x0001
 local O_TRUNC = 0x0400
 local SIGTERM = 15
 local SIGKILL = 9
+local SIGSTOP = 17
+local SIGCONT = 19
 local WNOHANG = 1
 
 local enum ProcState
@@ -73,6 +75,8 @@ local record M
     poll: function(Process): boolean
     wait: function(Process): integer
     kill: function(Process): boolean
+    suspend: function(Process): boolean
+    resume: function(Process): boolean
     stop: function(Process, integer): integer
     stop_all: function()
     tracked: {Process}
@@ -222,6 +226,18 @@ end
 
 function M.kill(p: Process): boolean
     return C.kill(p.pid, SIGKILL) == 0
+end
+
+-- The partition injection on a loopback rig: SIGSTOP freezes the member
+-- whole (no sends, no receives, in-memory and durable state intact — the
+-- partition-heal shape, no reboot, no identity bump); SIGCONT is the
+-- heal and its backlog burst is the delayed-delivery data.
+function M.suspend(p: Process): boolean
+    return C.kill(p.pid, SIGSTOP) == 0
+end
+
+function M.resume(p: Process): boolean
+    return C.kill(p.pid, SIGCONT) == 0
 end
 
 -- The polite stop: TERM, wait `grace_ms` for the exit, KILL only if the

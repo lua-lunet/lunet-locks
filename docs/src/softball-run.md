@@ -220,6 +220,89 @@ the snapshot tool over the run directory, and the shutdown-consistency
 check on the raw run directory AND on the archive — both must read
 consistent or the inconsistency is the finding.
 
+## The crash and partition lane: the softball-2 run
+
+The maintenance ladder above forbids crashes and partitions. The
+softball-2 lane is the same three-voter loopback rig and the same polite
+client fleet with the two forbidden fault shapes enabled, and it answers
+two questions with numbers: does a crashed or partitioned member come
+back, and does the cluster survive the deep state the crashes leave
+behind. Every action is anchored live, every scenario captures the same
+stat set (per-action durations from the anchors, client error deltas,
+per-node states and views, the named wire-surface drops, superblock and
+state snapshots at every restart), and a rejoin is bounded at a 150 s
+budget — a bounded-out rejoin is recorded as BLOCKED with its evidence
+(states, boot note, remap-notice count, newest named diagnostic) and the
+node is parked; the run continues on the serving remainder. A 2-of-3
+serving cluster is an acceptable recording, not a failure of the run.
+
+The lane runs in dependency order, each family with the same stat set:
+
+1. **The crash family (SIGKILL, non-leaders first, leader last) at
+   shallow and at deep views.** A shallow kill lands in the first views
+   after genesis; a deep kill lands after the view has been driven high
+   by abdication cycles and rejoin walks (the view depth is recorded at
+   every anchor). Each kill: SIGKILL, cluster serving window probe,
+   restart with the same boot line, dirty-boot evidence (identity bump,
+   reincarnation announcement), remap-notice count at the peers,
+   rejoin-to-`Normal` inside the budget, and superblock/state snapshots
+   of the killed node taken before the restart and after the settle.
+   The shallow/deep pair is the family table: crash-restart-to-serving
+   per view depth, with the fenced outcomes (the boot-fence/era-fold
+   strand) quantified, not narrated. A fenced rejoin is bounded at the
+   budget, recorded, and its node is parked; because a fenced rejoin
+   storms the serving voters' view counter (views 1 to 1,200+ within
+   minutes on this defect family), every kill after the first lands at
+   whatever depth the previous fence's storm drove — the family table
+   records the view depth AT each kill, and the storm is part of the
+   row, not noise.
+2. **The fresh-files boundary, then the deep family.** The shallow
+   family leaves parked members and the deep-conditioning hammer needs
+   a serving leader, so the shallow family ends at the runbook's
+   fresh-files rule: all processes down, the run's snapshot taken (the
+   crash evidence preserved), the durable state wiped, and the cluster
+   booted fresh. No mid-run wipes of live state, ever — the boundary is
+   a full stop, snapshot, and reprovision. Then the abdication-cycle
+   hammer drives the view counter past 120 and the deep family repeats
+   the kills at the deep views — every node killed twice across the run
+   including the leader.
+3. **The whole-cluster stop/start passes** (the ladder's finale,
+   scenario 5): pass 1 the durable resurrection from the deep state the
+   crashes left behind — the divergence observation (recovered or
+   0/3-`Normal`) — then, on a pass-1 block, the snapshot-gated
+   reprovision and the pass 2 fresh reboot with the resurrection
+   measurement.
+4. **Network partitions.** On the fresh post-reboot cluster the
+   injection is process suspension: the partitioned member is SIGSTOPped
+   — it sends nothing and receives nothing, the exact partition shape
+   from every other node's vantage, with the node's durable and
+   in-memory state intact so the heal is a true partition heal (no
+   reboot, no identity bump); the heal is SIGCONT and the backlog burst
+   that follows is recorded as the delayed-delivery data. On the cloud
+   rig the same scenario cuts the link at the host firewall. Two
+   partitions: a follower cut (the serving 2-of-3 continues; detection,
+   serving continuity, the cut node's client-visible errors, heal,
+   rejoin) and the leader cut (the survivors detect at the randomized
+   leader timeout and take over on the partitioned view; detection,
+   takeover, drop counts during the partition, heal, the old leader's
+   rejoin and its storm).
+5. **The compound: leader SIGKILL with partition timing.** The leader
+   crashes and a survivor is partitioned in the same window, so the
+   cluster sits at one live voter with no quorum; the partition then
+   heals into a two-voter view change and the crashed leader restarts
+   into the resulting higher view. Measured: the no-quorum window, the
+   storm size (view-change records and the view counter's climb), the
+   recovery, and the duplicate-suppression surface (late-ack drains and
+   the named stale-evidence drops).
+6. **Abdication under load.** The abdication verb driven while the load
+   fleet hammers the lock (the polite contenders plus the aggressive
+   shape for the window): failover time under load and the
+   client-visible error count inside the window, contrasted with the
+   quiet-ladder abdication numbers.
+
+After the lane: the completeness checklist, the snapshot tool, and the
+shutdown-consistency check on the raw run directory AND on the archive.
+
 ## The re-run methodology
 
 Check softball, then polite. If ANY bug is found — or a test parameter
