@@ -143,11 +143,24 @@ sender attribution never moved to the bumped identity even though the
 frame body carries `new=16777218`; (3) no commit/accept/Prepare frame
 on any serving tape carries the pair, so the fused batch never
 existed. The node is NOT "joined but never learnt"; it was never
-proposed. The harness transport stamps outbound sender attribution
-from its learned map, which still maps the process to the old
-identity after the bump — the partition is at the identity-attribution
-layer, not the commit layer. (Filed downstream as lunet-locks
-issue #26.)
+proposed.
+
+**The frame-level decode** (against `uvrr-core/src/wire.rs`, no
+inference): the 45-byte announcement unpacks as header `tag=13 era=1
+view=0`, body `old=2 new=16777218 committed=2 prepared=2` — a correct
+stride-2^24 bump with the frontiers present. All three bumped nodes
+emit it correctly. The serving nodes' tapes record it arriving
+`from: 2`, the old identity. The engine's guard
+(`src/replica/reincarnation.rs:135`) accepts the announcement only
+when `is_leader && from == new && old != new`: with `from=2` and
+`new=16777218`, `from != new`, so it refuses — protocol-correct given
+what the transport reported, and the same guard is the anti-spoof
+check on a forged reincarnation. The harness transport stamps outbound
+sender attribution from its learned map, which still maps the process
+to the old identity after the bump — the partition is at the
+identity-attribution layer, not the commit layer, and the protocol's
+message is clean at the wire. (Filed downstream as lunet-locks
+issue #26 with the decode.)
 
 On the leader's own log, the mis-attributed announcement is visible —
 and refused, named, hundreds of times:
