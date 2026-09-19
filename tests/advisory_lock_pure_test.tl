@@ -297,7 +297,10 @@ tested.test(
     end
 )
 
--- Big-endian u32 encoder for the wire fixtures below.
+-- Big-endian wire encoders for the Reincarnation fixtures below: the
+-- announcement frame the core packs is a 20-byte header (tag, era,
+-- view, slot) + a 1-byte body discriminant + `old` + `new` +
+-- `committed` + `prepared`.
 local function be32(value: integer): string
     return string.char(
         math.floor(value / 16777216) % 256,
@@ -307,37 +310,56 @@ local function be32(value: integer): string
     )
 end
 
+local function be64(value: integer): string
+    return be32(math.floor(value / 4294967296)) .. be32(value % 4294967296)
+end
+
+local function announcement_frame(old: integer, new: integer): string
+    return be32(13)
+        .. be32(2)
+        .. be32(1)
+        .. be64(0)
+        .. string.char(13)
+        .. be32(old)
+        .. be32(new)
+        .. be64(2)
+        .. be64(2)
+end
+
 tested.test(
-    "transport decodes the Reincarnation announcement pair from its exact wire shape",
+    "transport decodes the Reincarnation pair from its exact 45-byte wire shape",
     function()
-        -- 20-byte header (tag 13, era 2, view 1, slot 0) + 1-byte
-        -- discriminant 13 + old and new ids: the upstream codec's layout.
-        local announcement = be32(13)
-            .. be32(2)
-            .. be32(1)
-            .. "\0\0\0\0\0\0\0\0"
-            .. string.char(13)
-            .. be32(303)
-            .. be32(16777246)
-        local valid, old, new = transport.reincarnation_pair(announcement)
-        -- A wrong tag, a wrong body discriminant, a truncation, and a
-        -- longer ordinary datagram are all not announcements.
+        -- The frame the core packs for `Reincarnation(old, new)`: the
+        -- 20-byte big-endian header carries tag 13 with the era, view,
+        -- and slot; the body discriminant at offset 20 mirrors the tag;
+        -- `old` and `new` follow, then the past-life `committed` and
+        -- `prepared` frontiers — 45 bytes total.
+        local frame = announcement_frame(303, 16777246)
+        assert(#frame == 45, "the fixture must sit at the core's exact frame size")
+        local valid, old, new = transport.reincarnation_pair(frame)
+        -- A wrong header tag, a wrong body discriminant, a truncation,
+        -- an over-length datagram, and an empty payload are all not
+        -- announcements.
         local wrong_tag = be32(9)
             .. be32(2)
             .. be32(1)
-            .. "\0\0\0\0\0\0\0\0"
+            .. be64(0)
             .. string.char(13)
             .. be32(303)
             .. be32(16777246)
+            .. be64(2)
+            .. be64(2)
         local wrong_discriminant = be32(13)
             .. be32(2)
             .. be32(1)
-            .. "\0\0\0\0\0\0\0\0"
+            .. be64(0)
             .. string.char(9)
             .. be32(303)
             .. be32(16777246)
-        local truncated = announcement:sub(1, 28)
-        local longer = announcement .. "\0"
+            .. be64(2)
+            .. be64(2)
+        local truncated = frame:sub(1, 44)
+        local over_length = frame .. "\0"
         local tag_valid, tag_old, tag_new = transport.reincarnation_pair(wrong_tag)
         local disc_valid, disc_old, disc_new = transport.reincarnation_pair(
             wrong_discriminant
@@ -345,12 +367,18 @@ tested.test(
         local trunc_valid, trunc_old, trunc_new = transport.reincarnation_pair(
             truncated
         )
-        local long_valid, long_old, long_new = transport.reincarnation_pair(longer)
+        local long_valid, long_old, long_new = transport.reincarnation_pair(over_length)
+        local empty_valid, empty_old, empty_new = transport.reincarnation_pair("")
         tested.assert(
             {
-                given = "a 29-byte Reincarnation announcement and four near-miss datagrams",
-                should = "decode the (old, new) pair from the exact shape and refuse every near miss",
-                expected = "true:303:16777246:false:0:0:false:0:0:false:0:0:false:0:0",
+                given = "the core's own 45-byte Reincarnation frame and five near-miss datagrams",
+                should = "decode the (old, new) pair from the exact frame and refuse every near miss",
+                expected = "true:303:16777246"
+                    .. ":false:0:0"
+                    .. ":false:0:0"
+                    .. ":false:0:0"
+                    .. ":false:0:0"
+                    .. ":false:0:0",
                 actual = tostring(valid)
                     .. ":"
                     .. tostring(old)
@@ -379,9 +407,62 @@ tested.test(
                     .. ":"
                     .. tostring(long_old)
                     .. ":"
-                    .. tostring(long_new),
+                    .. tostring(long_new)
+                    .. ":"
+                    .. tostring(empty_valid)
+                    .. ":"
+                    .. tostring(empty_old)
+                    .. ":"
+                    .. tostring(empty_new),
             }
         )
+    end
+)
+
+tested.test(
+    "a decoded low-band or degenerate pair never arms the reincarnation remap",
+    function()
+        -- The wire shape decodes for any pair, but the remap arms only
+        -- for a real bump: a `new` in the descriptor band is not a
+        -- bumped identity, and `old == new` names no transition at all.
+        local low_valid, low_old, low_new = transport.reincarnation_pair(
+            announcement_frame(303, 404)
+        )
+        local deg_valid, deg_old, deg_new = transport.reincarnation_pair(
+            announcement_frame(303, 303)
+        )
+        local endpoint_by_id: {integer: string} = {[303] = "127.0.0.1:7002"}
+        local id_by_endpoint: {string: integer} = {["127.0.0.1:7002"] = 303}
+        local low_applied = transport.apply_reincarnation_remap(
+            endpoint_by_id, id_by_endpoint, "127.0.0.1:7002", low_old, low_new
+        )
+        local degenerate_applied = transport.apply_reincarnation_remap(
+            endpoint_by_id, id_by_endpoint, "127.0.0.1:7002", deg_old, deg_new
+        )
+        tested.assert(
+            {
+                given = "exact 45-byte frames whose pairs are not real bumps",
+                should = "decode the pair yet refuse the remap: no row, no re-attribution",
+                expected = "true:303:404:false:true:303:303:false",
+                actual = tostring(low_valid)
+                    .. ":"
+                    .. tostring(low_old)
+                    .. ":"
+                    .. tostring(low_new)
+                    .. ":"
+                    .. tostring(low_applied)
+                    .. ":"
+                    .. tostring(deg_valid)
+                    .. ":"
+                    .. tostring(deg_old)
+                    .. ":"
+                    .. tostring(deg_new)
+                    .. ":"
+                    .. tostring(degenerate_applied),
+            }
+        )
+        assert(endpoint_by_id[404] == nil)
+        assert(id_by_endpoint["127.0.0.1:7002"] == 303)
     end
 )
 

@@ -139,11 +139,7 @@ runtime from `PATH`. The shipped LuaCATS/Teal runtime documentation is at
 
 `make smoke` starts three local nodes from a four-line deployment
 descriptor, connects through a nonleader, and covers acquire, GET,
-contention, RELEASE, reacquisition, and expiry takeover. It then kills one
-replica and restarts it against the live quorum — a dirty restart whose
-durable state file classifies the boot, so the replica reincarnates: the
-identity bumps, the restart announces the `(old, new)` pair, and the leader
-drives the two-era resurrection. Finally, while a client keeps acquiring,
+contention, RELEASE, reacquisition, and expiry takeover. Finally, while a client keeps acquiring,
 renewing, releasing, and reading a lock through the nonleader without
 interruption, a fourth replica boots the joiner way and the admin verbs
 drive a full membership lifecycle: the replica joins at weight 0, is

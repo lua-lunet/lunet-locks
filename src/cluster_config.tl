@@ -34,10 +34,7 @@
 --   with `"genesis":false` — the descriptor relation between processes is a
 --   superset with the new member appended and identical line order for
 --   shared members. Running processes never reload the file; live members
---   learn a joining member's endpoint through the admin broadcast. A
---   reincarnated replica needs no descriptor change and no broadcast: its
---   peers learn the `old -> new` id remap from the `Reincarnation` wire
---   body itself.
+--   learn a joining member's endpoint through the admin broadcast.
 -- - The membership fingerprint (config.tl) is over the genesis lines only:
 --   the deployment's identity is its founding membership, stable across
 --   live superset growth and across reincarnations.

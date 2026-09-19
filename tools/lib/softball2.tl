@@ -1117,7 +1117,6 @@ local function scenario_partitions()
 end
 
 -- The SIGKILL crash family, non-leaders first, the leader LAST: the
--- dirty boot (identity bump, reincarnation announcement, remap), the
 -- 150 s rejoin budget, superblock snapshots before the restart and at
 -- the settle, and the BLOCKED path (bounded rejoin: evidence captured,
 -- node parked, run continues).

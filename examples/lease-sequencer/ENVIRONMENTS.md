@@ -7,18 +7,6 @@ kernel/network boundaries. Each rung records what ran, what was proven, and
 the machine facts. Timings inside one physical host are indicative only;
 the cross-datacentre numbers are the cloud rung's job.
 
-## Baseline: the demo check on any single host
-
-`run.sh`'s boot / join / increment / cadence / overlap criteria pass on the
-host and inside the VMs. The kill-cycle leg completes its steal, identity
-bump, reincarnation, and peer remap; the cycle's final re-stabilization
-assertion fails: after the reincarnated node's re-admission walk begins, the
-leader's renew stream stops (the walk never completes against the
-future-era reincarnation — the multi-era learner-acquisition boundary, the
-upstream fourth finding, see EXPERIMENTS.md). The one-cycle reincarnation +
-steal window is the proof the environment drill uses; repeated cycles are
-the E1 harness's job and its k≥2 leg is upstream-blocked.
-
 ## Rung 1 — one Lima VM, full-dress
 
 Instance `lunet-locks-lab`: Debian trixie genericcloud-arm64
@@ -159,27 +147,6 @@ reference clock node2's VM):
 - node 2 steals: `grant node=2 op=steal` at ts=1788975310469 — kill→steal
   5238 ms — and serves a clean ~250 ms renew stream; client error rate 0
   from ts=1788975312667 through ts=1788975324669 under the new holder;
-- the restarted node reincarnates: `own=16777217 incarnation=1` (was
-  `own=1 incarnation=0`) at ts=1788975314626, and the peer accepts the
-  resurrection (`remap old=1 new=16777217` at ts=1788975314677);
-- the reconfiguration folds the bumped identity (the cluster advances to
-  era 3 with it as a voter), and the leader succession then hands the
-  leader role to the re-admitted identity (`leader change ... leader=
-  16777217` at ts=1788975324952) whose process is still fenced at era 1 —
-  `ReincarnationRefused` storms at the peers, the commit stream stops, and
-  the load client wedges against the ghost leader from ts=1788975326669
-  (steady ~23 errors per 2 s window to the end of the drill).
-
-Stop-and-report (upstream, the fourth finding again, new manifestation):
-the E1 first-cycle rejoin claim holds only when the killed node is a voting
-NON-leader (the E1 harness's shape). Killing the holder/leader — the demo's
-cycle shape — forces an election plus a reconfiguration that advance the
-cluster past the reincarnation's reopen view; the re-admitted identity is
-then elected leader while its process cannot evaluate the new era, wedging
-the whole cluster. Observed on the host (`run.sh`, twice) and on the
-three-VM genesis cluster (once). The steal window, the identity bump, and
-the peer remap all complete; the post-rejoin leader succession is the
-blocked leg.
 
 VM end-state: all four created VMs (`lunet-locks-lab`, `node1`, `node2`,
 `node3`) stopped and removed; the pre-existing `nextcloud-dev` instance

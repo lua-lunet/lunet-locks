@@ -143,9 +143,6 @@ above) — while the cluster's disruptions land under it:
 3. the anchored kill loop: the holder client is silenced and requeued
    one anchored action at a time, the successor verified before the
    next anchor — the takeover path measured, not narrated;
-4. replace-one-node: a voter is crash-stopped and reincarnated under a
-   fresh identity joining through the leader — the descriptor is a
-   hint, membership evolves;
 5. the storm window: a first view change with learners joined may
    storm — it is let run and fully recorded, never wiped mid-run;
 6. teardown: the completeness checklist (above) applied to ALL the
@@ -195,7 +192,7 @@ sizes on every figure; a headline number is never an estimate.
    restarted afterwards and its rejoin time measured.
 4. **Crash kills** — SIGKILL nodes (non-leaders first, the leader LAST)
    and let each come back. A crash boot is the dirty shape: identity bump,
-   reincarnation announcement, remap. Stats per kill: crash-to-takeover
+   reincarnation announcement. Stats per kill: crash-to-takeover
    (detection under the detector, the leader-last case), restart-to-
    serving (process start → the node serving again, and the lease
    stream's state), and the error window.

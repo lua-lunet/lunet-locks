@@ -393,9 +393,6 @@ function M.main(root: string, _argv: {string}): integer
         ) then
             fail("the post-restart read failed")
         end
-        -- The restart's remap window: a healthy reincarnation addresses
-        -- every datagram — the old id's row stays until the forced steps
-        -- evict the identity, so no send is dropped for lack of a row.
         -- The evidence set is every node's stderr/stdout capture, matched
         -- by node-name prefix over the logs DIRECTORY (no globs, no exact
         -- dated names).

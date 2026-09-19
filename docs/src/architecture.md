@@ -417,18 +417,7 @@ incarnation's identity is `low + k * 16777216` — a unique high-band id that
 can never alias a descriptor id, never overflow an unsigned 32-bit value, and
 never reach the reserved `LEADER_UNKNOWN` value; the bump refuses at
 incarnation 255 rather than wrap a superseded identity back into
-circulation. The bumped replica announces `Reincarnation(old, new)` on the
-VRR channel at boot and on every later fenced drive. The wire body *is* the
-addressing notice: a replica that receives the pair from the socket the
-deployment attributes to `old` moves that endpoint row to the new id and
-delivers the announcement attributed to the new identity, where the core's
-own gates apply — only the leader acts on it, and a forged or degenerate
-pair is dropped by name. No descriptor change and no application broadcast
-accompany a reincarnation. The leader drives the resurrection through the
-ordinary reconfiguration pipeline — the forced two-era sequence that ends
-with the new identity at weight 1 in the old succession position and the old
-identity evicted — and the sequence continues tick-driven, recomputed
-idempotently from the committed configuration, across leadership changes.
+circulation.
 
 Durability is a stated property of the design. Under `Stability::Volatile`
 the core keeps protocol state in quorum memory, not local storage: a rolling

@@ -40,10 +40,6 @@ Every attempt is logged at `info` as
 lease-attempt ts=<ms> node=<id> op=set|renew|get|steal expiry=<ms>
 ```
 
-with further `info` events for boot, membership, leader changes, grants,
-the reincarnation remap, and periodic status, and `warn` events for the
-unexpected-but-survivable.
-
 ## Tracing
 
 The node logs through `tracing`; the library (`lunet_advisory_lock`)
@@ -204,8 +200,8 @@ clean stop — the node closes the wire, writes the `stopped` marker, drains
 the AOF sink to quiescence, writes the `flushed` marker, and the next boot
 continues under the same incarnation with no resurrection. SIGKILL is the
 crash shape: the running sentinel stays behind and the next boot
-reincarnates (identity bump, the `(old, new)` announcement, the peers'
-remap) — the run-sheets' node kills use `kill -9` wherever crash semantics
+reincarnates (identity bump, the `(old, new)` announcement) — the
+run-sheets' node kills use `kill -9` wherever crash semantics
 are being exercised.
 
 The leader timeout: the host tick loop runs the **sloppy timeout** — a

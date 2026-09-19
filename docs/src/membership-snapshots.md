@@ -160,10 +160,6 @@ stays beside it as the compatibility projection.
   the model below the live configuration until the next snapshot or
   dissemination arrives; the model never regresses and the core's folded
   configuration remains the commit truth.
-- The addressing rows an adopted snapshot teaches grow additively and
-  never regress: a departed member's rows leave through the leave verb's
-  broadcast, and a reincarnated member's rows keep resolving through the
-  reincarnation remap.
 
 ## The acceptance run
 

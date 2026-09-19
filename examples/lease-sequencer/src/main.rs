@@ -79,8 +79,6 @@ const STATE_NORMAL: u32 = 0;
 const STATE_VIEW_CHANGE: u32 = 1;
 const STATE_RECOVERING: u32 = 2;
 
-/// Upstream `src/wire.rs` Tag::Commit; the adapter mirrors the tag the
-/// same way it mirrors Tag::Reincarnation in `transport.rs`.
 const VRR_COMMIT_TAG: u32 = 4;
 
 /// The compiled-in leader-failure detector, named on the boot line and
@@ -91,9 +89,6 @@ const DETECTOR: &str = "experimental-phi";
 #[cfg(not(feature = "experimental-phi"))]
 const DETECTOR: &str = "sloppy-timeout";
 
-/// Whether one VRR payload is a `Commit` datagram: the 20-byte header's
-/// tag field is a big-endian `u32` at offset 0 (the same offset
-/// `transport::reincarnation_pair` reads).
 fn is_commit(payload: &[u8]) -> bool {
     payload.len() >= 21
         && u32::from_be_bytes(payload[0..4].try_into().expect("4 bytes")) == VRR_COMMIT_TAG
@@ -1255,12 +1250,6 @@ impl Host {
                     established_slot = out.slot;
                 }
                 let Some(&addr) = self.peers.get(&out.to) else {
-                    // The maybe: a send to an unaddressable replica. Not
-                    // provably impossible (the peer may be down mid-remap —
-                    // the known "cannot address replica <old-id>" window
-                    // after a reincarnation remap) and survivable: the
-                    // datagram is dropped. Test/debug builds crash so the
-                    // smokes surface it; release warns with full context.
                     maybe_invariant!(
                         "cannot address replica (to={} kind={} era={} view={} slot={} len={}); \
                          datagram dropped",
@@ -2298,15 +2287,6 @@ fn handle_packet(
         return;
     }
     if kind == transport::PEER_VRR {
-        // The reincarnation remap: a `Reincarnation(old, new)` announcement
-        // arriving from the socket the deployment attributes to `old` IS the
-        // restarted process's entry ticket; the row for the bumped id is
-        // ADDED at the source socket and the old id's row STAYS — the old
-        // era's configuration still names it, its send targets the same
-        // socket the new identity binds, and the row leaves only when the
-        // reincarnation forced steps evict the old identity from the
-        // serving configuration.
-        //
         // Before anything else: the phi trailer (item19, `experimental-phi`
         // only) rides at the BACK of the leader's heartbeat Commits,
         // entirely OUTSIDE the core's message bytes. Strip it here so the
@@ -2343,6 +2323,17 @@ fn handle_packet(
         if host.telemetry.is_some() {
             host.record_telemetry(Record::wire(local_ns(), wire_bytes));
         }
+        // The reincarnation remap: a `Reincarnation(old, new)` announcement
+        // arriving from the socket the learned map attributes to `old` IS
+        // the restarted process's entry ticket. The row for the bumped id
+        // is ADDED at the source socket and the socket is re-attributed to
+        // the bumped id, so THIS datagram and every later one from the
+        // same socket are delivered as the new identity — the core's own
+        // anti-spoof guard then sees `from == new` and the leader drives
+        // the two-era resurrection. The old id's row STAYS: the serving
+        // configuration still names it, its sends target the same socket
+        // the new identity binds, and the row leaves only when the forced
+        // steps evict the old identity.
         if let Some((old, new)) = transport::reincarnation_pair(payload)
             && old == replica
             && old != new
@@ -2899,6 +2890,7 @@ mod forward_tests {
         let rows = vec![
             (1u32, "127.0.0.1".to_string(), 42901u16, true),
             (2u32, "127.0.0.1".to_string(), 42902u16, true),
+            (3u32, "127.0.0.1".to_string(), 42903u16, true),
         ];
         let model = membership::Model {
             era: 1,
@@ -3434,5 +3426,409 @@ mod boot_hint_tests {
                 "{bad} must be rejected"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod reincarnation_remap_tests {
+    //! The transport attribution obligation: a `Reincarnation(old, new)`
+    //! announcement arriving from the socket the learned map attributes to
+    //! `old` is the restarted process's entry ticket — the row for the
+    //! bumped id is added at the source socket, the source socket is
+    //! re-attributed to the bumped id (so THIS and every later datagram
+    //! from it are delivered as the new identity, where the core's own
+    //! anti-spoof gates apply), and the old id's row stays (the serving
+    //! configuration still names it; it leaves only when the forced steps
+    //! evict the identity). An announcement whose body's `old` is not the
+    //! socket's current attribution is delivered under the current
+    //! attribution and the core refuses it by name — zero reconfiguration,
+    //! the lawful outcome for a mis-attributed sender.
+
+    use super::*;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+    use vrr::ids::{Era, NodeId, Slot, View, ViewId};
+    use vrr::message::{Body, Message};
+    use vrr::wire::{Header, Pack, Tag};
+
+    struct NodeHost {
+        host: Host,
+        udp: SocketAddr,
+    }
+
+    /// Distinct scratch roots per harness instance: the wall clock alone
+    /// does not separate parallel test threads, and two harnesses sharing
+    /// one root would reopen each other's in-flight state files (a torn
+    /// reopen classifies as a crashed restart and boots a bumped
+    /// identity), so every root carries a process-global sequence.
+    static SCRATCH_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_root() -> PathBuf {
+        // Test scratch stays inside the repository's `.tmp/` directory;
+        // this crate sits two levels below the repository root, and the
+        // crate directory is baked in at compile time.
+        let repo_tmp = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join(".tmp");
+        let seq = SCRATCH_SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = repo_tmp.join(format!(
+            "lease-sequencer-remap-{}-{}-{seq}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp root");
+        dir
+    }
+
+    fn boot_host(name: &str, root: &PathBuf) -> NodeHost {
+        let state = root.join(format!("{name}.state"));
+        let node = match Node::open("1:a\x002:b\x003:c", name, state.to_str().expect("path"), None, 0) {
+            Ok(node) => node,
+            Err(_) => {
+                let root = temp_root();
+                let state = root.join(format!("{name}.state"));
+                Node::open("1:a\x002:b\x003:c", name, state.to_str().expect("path"), None, 0)
+                    .expect("node boots")
+            }
+        };
+        let own_id = node.own_id();
+        let sock = UdpSocket::bind("127.0.0.1:0").expect("udp bind");
+        sock.set_nonblocking(true).expect("nonblocking udp");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("tcp bind");
+        listener.set_nonblocking(true).expect("nonblocking tcp");
+        let udp_addr = sock.local_addr().expect("udp local");
+        let rows = vec![
+            (1u32, "127.0.0.1".to_string(), 42901u16, true),
+            (2u32, "127.0.0.1".to_string(), 42902u16, true),
+            (3u32, "127.0.0.1".to_string(), 42903u16, true),
+        ];
+        let model = membership::Model {
+            era: 1,
+            slot: 0,
+            members: membership::descriptor_model(&rows),
+        };
+        let sidecar =
+            membership::SidecarWriter::open(state.to_str().expect("path")).expect("sidecar opens");
+        let fingerprint = transport::genesis_fingerprint(&[transport::GenesisMember {
+            id: 1,
+            name: "a",
+            host: "127.0.0.1",
+            port: 42901,
+        }]);
+        let host = Host {
+            node,
+            sock,
+            listener,
+            peers: HashMap::new(),
+            addr_to_id: HashMap::new(),
+            fingerprint,
+            own_id,
+            heartbeat_ms: 100,
+            election_ms: 200,
+            recovery_ms: 200,
+            stagger_ms: 200,
+            last_heartbeat: 0,
+            leader_elapsed: 0,
+            last_recovery: 0,
+            last_status_note: 0,
+            last_seen_leader: LEADER_UNKNOWN,
+            reincarnated: false,
+            driver: Driver {
+                client_id: 900_000,
+                request_num: 0,
+                holder: uuid::Uuid::new_v4(),
+                lease_id: 0,
+                held_expiry: None,
+                last_get_foreign: false,
+                next_action_at: millis() + 300,
+                pending: None,
+            },
+            forwarded_from: HashMap::new(),
+            late_acks: 0,
+            conns: Vec::new(),
+            model,
+            sidecar,
+            discovery: Discovery {
+                era: 1,
+                slot: 0,
+                tallies: HashMap::new(),
+                deadline_ms: millis() + 15000,
+                next_request_ms: 0,
+                active: true,
+            },
+            #[cfg(feature = "experimental-phi")]
+            phi_monitor: None,
+            #[cfg(feature = "experimental-phi")]
+            phi_cfg: phi::PhiConfig {
+                heartbeat_ms: 100,
+                safety_multiple: 2.0,
+                window: 100,
+            },
+            #[cfg(feature = "experimental-phi")]
+            heartbeat_seq: 0,
+            last_leader_commit_ms: 0,
+            heartbeat_client_id: 0x0BEEF000,
+            heartbeat_request_num: 0,
+            #[cfg(feature = "experimental-phi")]
+            phi_last_era: None,
+            phi_detected_key: None,
+            #[cfg(feature = "experimental-phi")]
+            phi_watch: None,
+            timedout: phi::TimeoutToggle::new(),
+            viewchange: phi::ViewChangeTimer::new(100, 200)
+                .expect("the harness's viewchange bounds are valid"),
+            #[cfg(not(feature = "experimental-phi"))]
+            sloppy: phi::SloppyLeader::new(100, 300),
+            last_state: STATE_RECOVERING,
+            last_weight: None,
+            election_wait_armed: 200,
+            timeout_knobs: telemetry::TimeoutKnobs {
+                min_ms: 100,
+                max_ms: 300,
+                fixed_ms: 200,
+            },
+            telemetry: None,
+            embedded: None,
+        };
+        NodeHost { host, udp: udp_addr }
+    }
+
+    /// Three hosts — the three-voter genesis the forced weight sequence
+    /// needs (a `Decrement` that would leave fewer voters than the
+    /// quorum names is refused by the fold) — each peer row wired to the
+    /// others' real sockets.
+    fn wire() -> (NodeHost, NodeHost, NodeHost, Rng) {
+        let root = temp_root();
+        let mut a = boot_host("a", &root);
+        let mut b = boot_host("b", &root);
+        let mut c = boot_host("c", &root);
+        let a_udp = a.udp;
+        let b_udp = b.udp;
+        let c_udp = c.udp;
+        for (host, others) in [
+            (&mut a, [(2u32, b_udp), (3u32, c_udp)]),
+            (&mut b, [(1u32, a_udp), (3u32, c_udp)]),
+            (&mut c, [(1u32, a_udp), (2u32, b_udp)]),
+        ] {
+            for (id, addr) in others {
+                host.host.peers.insert(id, addr);
+                host.host.addr_to_id.insert(addr, id);
+            }
+        }
+        let seed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_millis() as u64;
+        (a, b, c, Rng::new(seed))
+    }
+
+    /// The settled three-node harness: every node Normal under the
+    /// genesis primary `a` (id 1).
+    fn settled() -> (NodeHost, NodeHost, NodeHost, Rng) {
+        let (mut a, mut b, mut c, mut rng) = wire();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while a.host.node.status().state != STATE_NORMAL
+            || b.host.node.status().state != STATE_NORMAL
+            || c.host.node.status().state != STATE_NORMAL
+        {
+            assert!(
+                Instant::now() < deadline,
+                "the three-node remap harness never settled"
+            );
+            tick(&mut a, &mut b, &mut c, &mut rng);
+        }
+        (a, b, c, rng)
+    }
+
+    fn tick(a: &mut NodeHost, b: &mut NodeHost, c: &mut NodeHost, rng: &mut Rng) {
+        for host in [&mut *a, &mut *b, &mut *c] {
+            let now = millis();
+            pump_udp(&mut host.host, now, rng);
+            pump_tcp(&mut host.host, now, rng);
+            host.host.discovery_step(now);
+            host.host.driver_step(now, rng);
+            let _ = host.host.node.idle();
+            host.host.flush_outputs(now, rng);
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    /// The core's own packed announcement frame for `(old, new)`.
+    fn announcement(view: ViewId, old: u32, new: u32) -> Vec<u8> {
+        let message = Message {
+            header: Header {
+                tag: Tag::Reincarnation,
+                view,
+                slot: Slot(0),
+            },
+            body: Body::Reincarnation {
+                old: NodeId(old),
+                new: NodeId(new),
+                committed: Slot(2),
+                prepared: Slot(2),
+            },
+        };
+        let mut frame = vec![0u8; message.packed_len()];
+        let written = message.pack_into(&mut frame).expect("the core packs its own body");
+        assert_eq!(written, frame.len());
+        frame
+    }
+
+    fn send(from: &NodeHost, to_addr: SocketAddr, to_fingerprint: &str, frame: &[u8]) {
+        let packet = transport::encode_peer(transport::PEER_VRR, to_fingerprint, frame);
+        from.host
+            .sock
+            .send_to(&packet, to_addr)
+            .expect("the announcement datagram leaves the wire");
+    }
+
+    /// One announcement's full delivery: the datagram leaves the source
+    /// socket, then a brief pause lets loopback delivery land it in the
+    /// recipient's non-blocking socket buffer before the pump reads.
+    fn deliver(
+        from: &NodeHost,
+        to: &mut NodeHost,
+        to_fingerprint: &str,
+        frame: &[u8],
+        rng: &mut Rng,
+    ) {
+        send(from, to.udp, to_fingerprint, frame);
+        std::thread::sleep(Duration::from_millis(20));
+        pump_udp(&mut to.host, millis(), rng);
+    }
+
+    #[test]
+    fn the_remap_rebinds_the_source_socket_and_keeps_the_old_row() {
+        let (mut a, b, _c, mut rng) = wire();
+        let fingerprint = a.host.fingerprint.clone();
+        let new = 2 + (1 << 24);
+        let frame = announcement(ViewId { era: Era(1), view: View(0) }, 2, new);
+        deliver(&b, &mut a, &fingerprint, &frame, &mut rng);
+        assert_eq!(
+            a.host.peers.get(&new),
+            Some(&b.udp),
+            "the bumped id's row is added at the source socket"
+        );
+        assert_eq!(
+            a.host.addr_to_id.get(&b.udp),
+            Some(&new),
+            "the source socket is re-attributed to the bumped id"
+        );
+        assert_eq!(
+            a.host.peers.get(&2),
+            Some(&b.udp),
+            "the old id's row stays: the serving configuration still names it"
+        );
+        // The same announcement a second time changes nothing: the socket
+        // is now attributed to the bumped id, so `old` no longer names
+        // the source, and the bumped id already has its row. The map
+        // still carries the wired rows for ids 2 and 3 plus the bumped
+        // id's row: three rows, none added by the repeat.
+        deliver(&b, &mut a, &fingerprint, &frame, &mut rng);
+        assert_eq!(a.host.peers.len(), 3, "no second row is learned");
+        assert_eq!(
+            a.host.addr_to_id.get(&b.udp),
+            Some(&new),
+            "the attribution is not rewritten"
+        );
+    }
+
+    #[test]
+    fn the_remap_arms_only_on_the_bumped_identity_band_and_a_real_pair() {
+        let (mut a, b, _c, mut rng) = wire();
+        // A low-band `new` is not a bumped identity: no row, no rebind.
+        let fingerprint = a.host.fingerprint.clone();
+        let low_band = announcement(ViewId { era: Era(1), view: View(0) }, 2, 5);
+        deliver(&b, &mut a, &fingerprint, &low_band, &mut rng);
+        assert_eq!(a.host.peers.get(&5), None, "a low-band id gains no row");
+        assert_eq!(
+            a.host.addr_to_id.get(&b.udp),
+            Some(&2),
+            "a low-band pair does not re-attribute the socket"
+        );
+        // A degenerate pair (`old == new`) is not an announcement of a
+        // bumped identity: no row, no rebind.
+        let degenerate = announcement(ViewId { era: Era(1), view: View(0) }, 2, 2);
+        deliver(&b, &mut a, &fingerprint, &degenerate, &mut rng);
+        assert_eq!(
+            a.host.addr_to_id.get(&b.udp),
+            Some(&2),
+            "a degenerate pair does not re-attribute the socket"
+        );
+        // No row was learned: the map still carries exactly the two rows
+        // the three-voter wiring gave this host (ids 2 and 3).
+        assert_eq!(a.host.peers.len(), 2, "no row was learned");
+    }
+
+    #[test]
+    fn correct_attribution_drives_the_one_pass_fused_batch() {
+        let (mut a, mut b, mut c, mut rng) = settled();
+        let status = a.host.node.status();
+        assert_eq!(status.leader, 1, "the genesis primary leads the harness");
+        let view = ViewId {
+            era: Era(status.era),
+            view: View(status.view),
+        };
+        let new = 2 + (1 << 24);
+        let frame = announcement(view, 2, new);
+        let fingerprint = a.host.fingerprint.clone();
+        deliver(&b, &mut a, &fingerprint, &frame, &mut rng);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while a.host.node.status().config_era == status.config_era {
+            assert!(
+                Instant::now() < deadline,
+                "the fused batch never committed: the announcement was not attributed to the bumped identity"
+            );
+            tick(&mut a, &mut b, &mut c, &mut rng);
+        }
+        assert_eq!(
+            a.host.node.status().config_era,
+            status.config_era + 1,
+            "the establishing Batch([Decrement, Join]) committed in one pass"
+        );
+    }
+
+    #[test]
+    fn a_mis_attributed_announcement_leaves_zero_reconfiguration() {
+        let (mut a, mut b, mut c, mut rng) = settled();
+        let status = a.host.node.status();
+        let view = ViewId {
+            era: Era(status.era),
+            view: View(status.view),
+        };
+        // The announcement body names an `old` that is NOT the socket's
+        // current attribution: the remap lawfully refuses, the datagram is
+        // delivered under the current attribution, and the core's
+        // anti-spoof guard refuses it by name — no reconfiguration.
+        let forged_old = 999;
+        let new = forged_old + (1 << 24);
+        let frame = announcement(view, forged_old, new);
+        let fingerprint = a.host.fingerprint.clone();
+        deliver(&b, &mut a, &fingerprint, &frame, &mut rng);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            tick(&mut a, &mut b, &mut c, &mut rng);
+        }
+        assert_eq!(
+            a.host.node.status().config_era,
+            status.config_era,
+            "a mis-attributed announcement drives no reconfiguration"
+        );
+        assert_eq!(
+            a.host.peers.get(&new),
+            None,
+            "a mis-attributed announcement learns no row"
+        );
+        assert_eq!(
+            a.host.addr_to_id.get(&b.udp),
+            Some(&2),
+            "the source socket keeps its current attribution"
+        );
     }
 }

@@ -16,17 +16,39 @@ pub const FORWARD_NOT_LEADER: u8 = 3;
 pub const PEER_HEADER_BYTES: usize = PEER_MAGIC.len() + 1 + 16;
 
 const MEMBERSHIP_DOMAIN: &[u8] = b"lunet-advisory-lock/membership/v3\x00";
+
 /// Upstream `src/wire.rs` Tag::Reincarnation; the wire body is the
 /// restarted replica's addressing notice.
 const REINCARNATION_TAG: u32 = 13;
 /// The core's `Reincarnation` frame, stated once and pinned by the
-/// round-trip test against the core's own `Message::pack`: 20-byte
-/// header (tag, era, view, slot) + `old: NodeId(u32)` +
-/// `new: NodeId(u32)` + `committed: Slot(u64)` + `prepared: Slot(u64)`.
-/// The host's obligation (upstream PR #72): the announcement is
-/// attributed to the bumped identity, and the remap below is what
-/// discharges it — this parser is what arms the remap.
-const REINCARNATION_BYTES: usize = 20 + 4 + 4 + 8 + 8;
+/// round-trip test against the core's own `Message::pack`: 20-byte header
+/// (tag, era, view, slot) + 1-byte body discriminant (= 13) +
+/// `old: NodeId(u32)` + `new: NodeId(u32)` + `committed: Slot(u64)` +
+/// `prepared: Slot(u64)` — 45 bytes total. The host's obligation (upstream
+/// PR #72): the announcement is attributed to the bumped identity, and
+/// the remap is what discharges it — this parser is what arms the remap.
+const REINCARNATION_BYTES: usize = 20 + 1 + 4 + 4 + 8 + 8;
+
+/// The `Reincarnation(old, new)` pair inside a VRR payload: the core's
+/// 20-byte big-endian header (tag, era, view, slot), then the 1-byte body
+/// discriminant at offset 20 (it mirrors the header tag), then the body
+/// fields at offsets 21 (`old`), 25 (`new`), 29 (`committed`), 37
+/// (`prepared`) — the exact frame `vrr::message::Message::pack` emits for
+/// `Body::Reincarnation`.
+pub fn reincarnation_pair(payload: &[u8]) -> Option<(u32, u32)> {
+    if payload.len() != REINCARNATION_BYTES {
+        return None;
+    }
+    if u32::from_be_bytes(payload[0..4].try_into().ok()?) != REINCARNATION_TAG {
+        return None;
+    }
+    if payload[20] != REINCARNATION_TAG as u8 {
+        return None;
+    }
+    let old = u32::from_be_bytes(payload[21..25].try_into().ok()?);
+    let new = u32::from_be_bytes(payload[25..29].try_into().ok()?);
+    Some((old, new))
+}
 
 pub fn encode_peer(kind: u8, fingerprint: &str, payload: &[u8]) -> Vec<u8> {
     let mut packet = Vec::with_capacity(PEER_HEADER_BYTES + payload.len());
@@ -52,23 +74,6 @@ pub fn decode_peer(packet: &[u8]) -> Option<(u8, &str, &[u8])> {
         return None;
     }
     Some((kind, fingerprint, &packet[PEER_HEADER_BYTES..]))
-}
-
-/// The `Reincarnation(old, new)` pair inside a VRR payload: the core's
-/// 20-byte big-endian header (tag, era, view, slot) then the body
-/// `old: NodeId(u32), new: NodeId(u32), committed: Slot(u64),
-/// prepared: Slot(u64)` — 44 bytes total, the exact frame
-/// `vrr::message::Message::pack` emits for `Body::Reincarnation`.
-pub fn reincarnation_pair(payload: &[u8]) -> Option<(u32, u32)> {
-    if payload.len() != REINCARNATION_BYTES {
-        return None;
-    }
-    if u32::from_be_bytes(payload[0..4].try_into().ok()?) != REINCARNATION_TAG {
-        return None;
-    }
-    let old = u32::from_be_bytes(payload[20..24].try_into().ok()?);
-    let new = u32::from_be_bytes(payload[24..28].try_into().ok()?);
-    Some((old, new))
 }
 
 pub fn uuid_bytes(text: &str) -> Option<[u8; 16]> {
@@ -202,7 +207,7 @@ mod tests {
     /// emits — the contract is derived from the wire, not hand-copied
     /// constants. A body-layout change upstream fails here before it can
     /// silently disarm the remap that attributes a reincarnation
-    /// announcement to its bumped identity (upstream PR #72's obligation).
+    /// announcement to its bumped identity.
     #[test]
     fn reincarnation_pair_reads_the_cores_packed_frame() {
         let message = Message {
@@ -220,8 +225,21 @@ mod tests {
         };
         let mut frame = vec![0u8; message.packed_len()];
         let written = message.pack_into(&mut frame).expect("the core packs its own body");
-        eprintln!("frame[0..45]: {:02x?}", &frame[..written]);
         assert_eq!(written, REINCARNATION_BYTES, "the constant tracks the core's frame");
+        assert_eq!(
+            frame[20], 13,
+            "the body discriminant mirrors the header tag at offset 20"
+        );
+        assert_eq!(
+            u64::from_be_bytes(frame[29..37].try_into().expect("8 bytes")),
+            2,
+            "committed occupies offsets 29..37"
+        );
+        assert_eq!(
+            u64::from_be_bytes(frame[37..45].try_into().expect("8 bytes")),
+            2,
+            "prepared occupies offsets 37..45"
+        );
         assert_eq!(
             reincarnation_pair(&frame),
             Some((2, 2 + (1 << 24) + 1)),
@@ -233,21 +251,68 @@ mod tests {
     fn reincarnation_pair_refuses_everything_else() {
         let message = Message {
             header: Header {
+                tag: Tag::Reincarnation,
+                view: ViewId { era: Era(1), view: View(0) },
+                slot: Slot(0),
+            },
+            body: Body::Reincarnation {
+                old: NodeId(2),
+                new: NodeId(2 + (1 << 24) + 1),
+                committed: Slot(2),
+                prepared: Slot(2),
+            },
+        };
+        let mut frame = vec![0u8; message.packed_len()];
+        let written = message.pack_into(&mut frame).expect("the core packs its own body");
+        assert_eq!(written, frame.len());
+        let wrong_discriminant = {
+            let mut patched = frame.clone();
+            patched[20] = 9;
+            patched
+        };
+        assert_eq!(
+            reincarnation_pair(&wrong_discriminant),
+            None,
+            "a body discriminant that disagrees with the header tag never arms the remap"
+        );
+        assert_eq!(
+            reincarnation_pair(&frame[..44]),
+            None,
+            "a truncated frame never arms the remap"
+        );
+        assert_eq!(
+            reincarnation_pair(frame[..45].to_vec().as_slice()),
+            Some((2, 2 + (1 << 24) + 1)),
+            "the exact-length frame decodes"
+        );
+        let mut over_length = frame.clone();
+        over_length.push(0);
+        assert_eq!(
+            reincarnation_pair(&over_length),
+            None,
+            "a frame with trailing bytes never arms the remap"
+        );
+        assert_eq!(reincarnation_pair(&[]), None, "an empty payload never arms the remap");
+        assert_eq!(
+            reincarnation_pair(&[0u8; REINCARNATION_BYTES]),
+            None,
+            "a zeroed frame of the right length never arms the remap"
+        );
+        let commit = Message {
+            header: Header {
                 tag: Tag::Commit,
                 view: ViewId { era: Era(1), view: View(0) },
                 slot: Slot(0),
             },
             body: Body::Commit { committed: Slot(0) },
         };
-        let mut frame = vec![0u8; message.packed_len()];
-        let written = message.pack_into(&mut frame).expect("the core packs its own body");
-        assert_eq!(written, frame.len());
-        assert_eq!(reincarnation_pair(&frame), None, "a non-announcement frame never arms the remap");
-        assert_eq!(reincarnation_pair(&[]), None, "an empty payload never arms the remap");
+        let mut commit_frame = vec![0u8; commit.packed_len()];
+        let commit_written = commit.pack_into(&mut commit_frame).expect("the core packs its own body");
+        assert_eq!(commit_written, commit_frame.len());
         assert_eq!(
-            reincarnation_pair(&[0u8; REINCARNATION_BYTES]),
+            reincarnation_pair(&commit_frame),
             None,
-            "a zeroed frame of the right length never arms the remap"
+            "a non-announcement frame never arms the remap"
         );
     }
 }

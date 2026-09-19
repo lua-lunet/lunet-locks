@@ -666,9 +666,6 @@ local function scenario_leader_term()
     clock.sleep(10)
 end
 
--- Scenario 4: crash kills, non-leaders first, the leader LAST; each node
--- comes back and the crash-restart-to-serving time is measured (the dirty
--- boot: identity bump, reincarnation announcement, remap).
 local function scenario_crashes()
     phase("S4: crash kills (SIGKILL), non-leaders first, leader last")
     local leader = leader_name()

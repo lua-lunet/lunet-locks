@@ -114,24 +114,6 @@ remaining window as `expiry − executed_at` against the leader's timeline
 without assuming synchronized clocks. The load client schedules its
 renewals and polls from that leader-echoed remaining window.
 
-## The rejoin boundary in this tree
-
-The reincarnated node reopens over the deployment's genesis — the era-1
-table — and adopts only traffic that view covers. The measured rejoin
-therefore works when the cluster's live view is still the reopen view
-(the first kill/rejoin cycle: the node adopts, rides the walk's fence
-transitions, and returns to `voting=1`), and does not work once the
-cluster's live view is past the genesis era: the walk still folds the
-reincarnated identity to voting weight, but the node itself stays fenced
-(`UnevaluableEra` on every future-era message, the `StartView` included,
-so the §10 stalled-offer repair never engages). A kill/rejoin series
-beyond the first cycle is the multi-era learner-acquisition boundary —
-the upstream fourth finding — and runs of `e1`/`e2v*` with `k > 1` on a
-persistent cluster fail loudly on it rather than reporting a stranded
-node as serving. The harness, the knobs, and the flush variants are
-complete; the second and later rejoins are blocked upstream, exactly
-like the promoted-joiner legs.
-
 ## Note for the upstream doc PR: the design doc's §1.1 is stale against this tree
 
 The upstream design document is the source of record for the experiment
@@ -143,11 +125,6 @@ stale against this tree on three points:
   fingerprint** (domain-separated SHA-256 over the length-delimited genesis
   member list, first 16 lowercase hex chars — `config.tl` /
   `transport.tl`), not an earlier fingerprint scheme.
-- Membership is **live**: the reincarnation announcement remaps the peer
-  address tables (the `Reincarnation(old, new)` entry ticket adds the
-  bumped identity's row at the source socket, the old row leaves when the
-  forced reconfiguration evicts it), so the id→endpoint map changes during
-  a process lifetime.
 - The restart story is **reincarnation**, not the nonce-recovery story:
   the durable state file is the incarnation marker, a dirty boot bumps the
   identity deterministically (`low + k·2^24`), and the bumped node

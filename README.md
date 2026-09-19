@@ -20,11 +20,7 @@ same TCP NDJSON client channel as the lock operations, and the cluster's
 era advances exactly at each establishing operation's commit. A transition
 runs the core's non-stop overlap path whenever a pivot exists for the
 leader; otherwise it takes the stop-the-world fallback, a latency outcome,
-never an error. A restarted process whose durable state file shows the
-running sentinel reincarnates: its identity bumps, it announces the
-`(old, new)` pair to the cluster, and the leader drives the two-era
-resurrection that seats the new identity at weight 1 in the old succession
-position and evicts the old one.
+never an error.
 
 Termination follows the uVRR termination obligations. A graceful stop —
 SIGTERM or SIGINT on the embedded-sequencer hosts, `lunet_lock_node_stop`

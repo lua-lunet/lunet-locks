@@ -5417,11 +5417,6 @@ mod tests {
             "cluster-wide: every member of the genesis configuration it can name"
         );
         nodes[2].outputs = drained;
-        // The copies to the live members are delivered attributed to the new
-        // identity; the copy addressed to the old identity's socket
-        // self-delivers through the transport's remap and is refused by
-        // name at the fenced node (a non-leader never arms the machine) —
-        // here it is asserted present and dropped with the dead socket.
         let announce_one = pop_send(&mut nodes[2], TEST_IDS[0], vrr::wire::Tag::Reincarnation)
             .expect("announce to the leader");
         deliver_hop(&mut nodes, &ids, 2, announce_one);
