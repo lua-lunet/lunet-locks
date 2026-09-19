@@ -184,3 +184,40 @@ becomes a voter); remove a member with `decrement` (the voter returns to
 weight 0), wait for that era to commit, then `leave` — a leave of a member
 above weight 0 is refused. Ids are the deployment descriptor's
 admin-assigned, never-recycled member ids.
+
+## Leader abdication
+
+The `abdicate` verb hands the leader's role over immediately, without
+waiting for any failure detector:
+
+```json
+{"action":"abdicate","message_id":"03030303-0303-0303-0303-030303030307"}
+```
+
+The verb names no member: it is addressed to the leader itself, and a
+non-leader replica forwards it through the ordinary redirect machinery. The
+leader validates the abdication (rules §12 of the reconfiguration rules) in
+order: the CAS naming the view the cluster is in, the receiver-is-primary
+check, and the delta rule `0 < (target − current) ≤ N` — each a named
+refusal. A valid abdication moves the cluster to view `v+1` through the
+standard view-change message set — the existing `StartViewChange` tag, no
+new wire encoding — and the leader steps down in the same transition: it
+stops accepting new operations (every proposal is refused until the view
+settles) and rejoins as an ordinary member when the new view installs. The
+successor the succession schedule names resumes as primary through the
+ordinary fence/evidence/install pipeline.
+
+The leader answers with one of the three acknowledgment shapes:
+
+- `{"action":"abdicate","accepted":true}` — the view-change emission is
+  armed and flushed; the failover itself is the ordinary view change the
+  successor completes. Unlike the membership verbs, the acknowledgment does
+  not wait for a commit: abdication commits nothing, it moves the view.
+- `{"action":"abdicate","accepted":false}` — the abdication was refused
+  (the CAS named a stale view, a non-positive delta, or a delta above the
+  member count); nothing entered the log and no wire traffic moved.
+- `{"error":"not_leader"}` — the addressed replica is not the leader; the
+  ordinary redirect machinery carries the verb onward.
+
+An abdication at the last succession term of an era has no nameable
+successor and is refused on the delta rule.

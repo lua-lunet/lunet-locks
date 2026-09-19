@@ -1330,6 +1330,7 @@ impl Host {
                 } else if self.embedded_reply(now, rng, &out.message_id, &out.bytes) {
                     // An embedded contender's op completed in-process.
                 } else {
+                    let mut matched = false;
                     for conn in &mut self.conns {
                         let matches = matches!(
                             conn.pending,
@@ -1337,12 +1338,27 @@ impl Host {
                                 if message_id == out.message_id
                         );
                         if matches {
+                            matched = true;
                             conn.pending = None;
                             let _ = conn.stream.write_all(&out.bytes);
                             let _ = conn.stream.write_all(b"\n");
                             let _ = conn.stream.flush();
                             break;
                         }
+                    }
+                    if !matched {
+                        // The maybe: an operation's committed reply reached
+                        // the drain with no live claimant (the conn's 30 s
+                        // pending expired and its client retried with a
+                        // fresh id in the window). Unexpected, not provably
+                        // impossible, survivable — reported with full
+                        // context, never silent.
+                        self.late_acks += 1;
+                        tracing::warn!(
+                            message_id = %uuid::Uuid::from_bytes(out.message_id),
+                            bytes = out.bytes.len(),
+                            "committed reply drained with no live conn claimant"
+                        );
                     }
                 }
             }
@@ -2696,6 +2712,33 @@ fn handle_client_line(host: &mut Host, index: usize, line: &str, now: u64, rng: 
     };
     // An admin verb: leader-only in this host; the run.sh driver retries the
     // next replica until one accepts.
+    // The abdication is not a reconfiguration: nothing enters the log and
+    // no era advances. The leader drives the abdication through the
+    // adapter — the standard view-change emission for v+1 arms and the
+    // leader steps down in the same synchronous drive — and answers
+    // immediately: the emission is flushed before the ack, and the
+    // failover itself is the ordinary view change the successor completes.
+    // A non-leader answers not_leader; the driver rotates to the next
+    // replica (the same shape every admin verb here has).
+    if action == "abdicate" {
+        let status = host.node.status();
+        if status.state != STATE_NORMAL || status.leader != host.own_id {
+            let _ = host.conns[index]
+                .stream
+                .write_all(b"{\"error\":\"not_leader\"}\n");
+            return true;
+        }
+        let rc = host.node.abdicate();
+        host.flush_outputs(now, rng);
+        let reply = if rc == OK {
+            "{\"action\":\"abdicate\",\"accepted\":true}\n"
+        } else {
+            "{\"action\":\"abdicate\",\"accepted\":false}\n"
+        };
+        let _ = host.conns[index].stream.write_all(reply.as_bytes());
+        let _ = host.conns[index].stream.flush();
+        return true;
+    }
     let op = match action.as_str() {
         "join" => RECONFIGURE_JOIN,
         "increment" => RECONFIGURE_INCREMENT,

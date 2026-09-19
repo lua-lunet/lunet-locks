@@ -670,6 +670,27 @@ local function main(options: Options)
     local function handle_admin(
         action: string, id: integer, name: string, endpoint: string
     ): (boolean, string)
+        -- The abdication is not a reconfiguration: nothing enters the log
+        -- and no era advances. The drive's outcome is final in the same
+        -- drive — the leader either arms the standard view-change emission
+        -- for v+1 and steps down (the emission flushed here, before the
+        -- ack), or a named refusal reports accepted:false. A non-leader
+        -- receiver returns the actionable not_leader so the caller
+        -- redirects; the joined-membership bookkeeping below does not
+        -- apply.
+        if action == "abdicate" then
+            local driven, proposed, leader_error = pcall(
+                function(): (boolean, string) return node:abdicate() end
+            )
+            if not driven then
+                return true, admin.encode_abdicate_ack(false, "refused")
+            end
+            if proposed == nil then
+                return false, leader_error or "not_leader"
+            end
+            flush(node:outputs() as {Output})
+            return true, admin.encode_abdicate_ack(true, "")
+        end
         if action == "join" and endpoint_by_id[id] == nil then
             endpoint_by_id[id] = endpoint
             id_by_endpoint[endpoint] = id

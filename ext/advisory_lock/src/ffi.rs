@@ -209,6 +209,7 @@ use vrr::message::{Body, Message};
 use vrr::observe::Diagnostic;
 use vrr::progress::Status;
 use vrr::quorum::{WeightedMajority, construct_pivot};
+use vrr::reconfiguration::AbdicationRefusal;
 use vrr::replica::{
     Input, PersistedProgress, Pivot, PlanRefusal, PublishOutcome, PublishRefusal, Replica,
     TimedInput, ViewChangeKnobs,
@@ -746,9 +747,12 @@ impl Node {
             Input::SubmitPlan { .. } => {
                 serde_json::json!({"input": "submit-plan"})
             }
-            Input::Abdicate { .. } => {
-                serde_json::json!({"input": "abdicate"})
-            }
+            Input::Abdicate { message } => serde_json::json!({
+                "input": "abdicate",
+                "era": message.current.era.0,
+                "view": message.current.view.0,
+                "target": message.target.0,
+            }),
         }
     }
 
@@ -1328,6 +1332,54 @@ impl Node {
         })
     }
 
+    /// The administrator's abdication (rules §12): the node, on host
+    /// request, immediately starts the view-change sequence for the view
+    /// after its own (the CAS pair is read from the node's live progress in
+    /// the same synchronous drive, so the CAS can only fail on a node
+    /// already inside a view change) and steps down — no new wire message
+    /// exists, the emission is the ordinary `StartViewChange` fence, the
+    /// successor the succession schedule names resumes as primary, and this
+    /// node rejoins as a member when the view settles. A proposal arriving
+    /// after the step-down is refused until the new view installs (the
+    /// ordinary status gate), which is the abdication's "stops accepting
+    /// new operations" property. `ReceiverNotPrimary` — the one refusal a
+    /// caller can act on — reports NOT_LEADER; the rest report SERVICE.
+    pub fn abdicate(&mut self) -> i32 {
+        if self.stopped {
+            // The drain point closed the wire: no further task processing.
+            return STOPPED;
+        }
+        let snapshot = self.replica.observer().read();
+        let current = ViewId {
+            era: Era(snapshot.era),
+            view: View(snapshot.view),
+        };
+        let Some(target) = current.next_in_era() else {
+            // The last succession term of the era has no nameable successor:
+            // the delta rule refuses every nameable target.
+            info!(
+                node = self.replica.own().0,
+                era = snapshot.era,
+                view = snapshot.view,
+                "abdicate refused: the succession space is exhausted"
+            );
+            return CONFIG;
+        };
+        trace!(
+            node = self.replica.own().0,
+            era = snapshot.era,
+            view = snapshot.view,
+            target = target.view.0,
+            "node abdicate entry"
+        );
+        self.drive(Input::Abdicate {
+            message: vrr::reconfiguration::Abdication {
+                current,
+                target: target.view,
+            },
+        })
+    }
+
     /// One timeout toggle's event capture (`docs/src/phi-and-timeouts.md`):
     /// the host's phi/timeout plane records EVERY toggle of its
     /// `timedout` state — the new state, the toggle's local-clock ts, and
@@ -1656,13 +1708,17 @@ fn folded_era_regressed(previous: Option<u32>, current: u32) -> bool {
 }
 
 /// Map a plan refusal onto the ABI error codes. `NotPrimary` is the one a
-/// caller can act on (re-forward to the named primary); the rest — the
-/// fault, the reconfiguration gates, the outstanding-transition bookkeeping
-/// — are internal states the host cannot repair in place.
+/// caller can act on (re-forward to the named primary); the abdication's
+/// `ReceiverNotPrimary` is the same actionable refusal for the §12 verb (a
+/// non-leader answered an abdication addressed to the leader); the rest —
+/// the fault, the reconfiguration gates, the outstanding-transition
+/// bookkeeping, the abdication's CAS and delta-rule refusals — are internal
+/// states the host cannot repair in place.
 fn plan_error(rejection: PlanRefusal) -> i32 {
     debug!(?rejection, "plan refused");
     match rejection {
         PlanRefusal::NotPrimary { .. } => NOT_LEADER,
+        PlanRefusal::Abdication(AbdicationRefusal::ReceiverNotPrimary { .. }) => NOT_LEADER,
         PlanRefusal::Faulted(_) => FAULTED,
         _ => SERVICE,
     }
@@ -2601,6 +2657,21 @@ pub unsafe extern "C" fn lunet_lock_node_force_view(node: *mut c_void, era: u32,
     })
 }
 
+/// The administrator's abdication (rules §12): the leader, on host request,
+/// immediately starts the view-change sequence for the view after its own
+/// (the ordinary `StartViewChange` fence — no new wire encoding) and steps
+/// down. Returns [`OK`], [`NOT_LEADER`] (the receiver is not the primary —
+/// the actionable refusal), [`SERVICE`] (the CAS or delta rule refused, or
+/// the node is poisoned), or [`STOPPED`] after the drain point.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lunet_lock_node_abdicate(node: *mut c_void) -> i32 {
+    guarded(|| unsafe {
+        node.cast::<Node>()
+            .as_mut()
+            .map_or(INVALID, |node| node.abdicate())
+    })
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lunet_lock_node_recover(node: *mut c_void) -> i32 {
     guarded(|| unsafe { node.cast::<Node>().as_mut().map_or(INVALID, Node::recover) })
@@ -3354,6 +3425,10 @@ mod tests {
         unsafe { lunet_lock_node_reconfigure((&raw mut *node).cast(), op, member, position) }
     }
 
+    fn abdicate(node: &mut Node) -> i32 {
+        unsafe { lunet_lock_node_abdicate((&raw mut *node).cast()) }
+    }
+
     fn pop_send(node: &mut Node, to: u32, tag: vrr::wire::Tag) -> Option<Queued> {
         let drained: VecDeque<Queued> = std::mem::take(&mut node.outputs);
         let mut found = None;
@@ -3477,6 +3552,108 @@ mod tests {
             nodes[1].status().leader,
             TEST_IDS[0],
             "the dead id is not the primary"
+        );
+    }
+
+    /// The abdication ABI (rules §12): the leader, on host request, arms
+    /// the standard view-change emission for view v+1 in the SAME
+    /// synchronous drive — the ordinary `StartViewChange` fence, no new
+    /// wire encoding, no timeout wait, no tick — and steps down in the
+    /// same transition: its status leaves `Normal` and a further proposal
+    /// is refused until the view settles.
+    #[test]
+    fn abdicate_abi_emits_the_immediate_fence_and_steps_the_leader_down() {
+        let mut nodes = boot_cluster();
+        assert_eq!(
+            request(&mut nodes[0], &request_json(Uuid::from_bytes([70; 16]))),
+            OK
+        );
+        route_until_quiet(&mut nodes, &TEST_IDS);
+
+        // The drive: no tick, no detector, no wait.
+        assert_eq!(abdicate(&mut nodes[0]), OK);
+        // The immediate emission: one StartViewChange fence to every other
+        // member, right in the drive's outputs.
+        for to in [TEST_IDS[1], TEST_IDS[2]] {
+            assert!(
+                pop_send(&mut nodes[0], to, vrr::wire::Tag::StartViewChange).is_some(),
+                "the fence to member {to} is in the drive's own outputs"
+            );
+        }
+        assert!(
+            pop_send(&mut nodes[0], 40, vrr::wire::Tag::StartViewChange).is_none(),
+            "no fence leaves the member set"
+        );
+        // The step-down in the same transition: the node left `Normal`.
+        assert_ne!(
+            nodes[0].replica.observer().read().status,
+            0,
+            "the leader stepped down inside the drive"
+        );
+        // And it stops accepting new operations: every proposal refuses
+        // with the redirect until the new view installs.
+        assert_eq!(
+            request(&mut nodes[0], &request_json(Uuid::from_bytes([71; 16]))),
+            NOT_LEADER
+        );
+    }
+
+    /// The abdication's cluster completion: the standard view change the
+    /// emission armed settles at view v+1 with the succession schedule's
+    /// primary serving, and the old leader rejoins as an ordinary member.
+    #[test]
+    fn abdicate_abi_completes_the_view_change_new_leader_serves_old_leader_rejoins() {
+        let mut nodes = boot_cluster();
+        assert_eq!(
+            request(&mut nodes[0], &request_json(Uuid::from_bytes([72; 16]))),
+            OK
+        );
+        route_until_quiet(&mut nodes, &TEST_IDS);
+
+        assert_eq!(abdicate(&mut nodes[0]), OK);
+        route_until_quiet(&mut nodes, &TEST_IDS);
+
+        // The view installed everywhere: `Normal` at view 1 under the same
+        // era, and the schedule's successor — the second member — leads.
+        for (index, node) in nodes.iter_mut().enumerate() {
+            let snapshot = node.replica.observer().read();
+            assert_eq!(
+                (snapshot.status, snapshot.era, snapshot.view),
+                (0, 1, 1),
+                "node {index} rejoined the settled view"
+            );
+            assert_eq!(
+                node.status().leader,
+                TEST_IDS[1],
+                "node {index} names the successor as primary"
+            );
+        }
+        // The new leader serves.
+        assert_eq!(
+            request(&mut nodes[1], &request_json(Uuid::from_bytes([73; 16]))),
+            OK
+        );
+        route_until_quiet(&mut nodes, &TEST_IDS);
+        // And the old leader is a member that redirects, not a server.
+        assert_eq!(
+            request(&mut nodes[0], &request_json(Uuid::from_bytes([74; 16]))),
+            NOT_LEADER
+        );
+    }
+
+    /// The abdication addressed away from the leader is the actionable
+    /// refusal: NOT_LEADER, no wire traffic, no state move.
+    #[test]
+    fn abdicate_at_a_nonleader_reports_not_leader_and_moves_nothing() {
+        let mut nodes = boot_cluster();
+        let before = nodes[1].replica.observer().read();
+        assert_eq!(abdicate(&mut nodes[1]), NOT_LEADER);
+        route_until_quiet(&mut nodes, &TEST_IDS);
+        let after = nodes[1].replica.observer().read();
+        assert_eq!(
+            (after.status, after.era, after.view),
+            (before.status, before.era, before.view),
+            "the refused abdication moved no state"
         );
     }
 

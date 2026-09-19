@@ -155,6 +155,71 @@ above) — while the cluster's disruptions land under it:
 The knobs in force are recorded on the run. The polite run's numbers —
 takeover deltas, error costs, heartbeat spacing — are the paper's data.
 
+## The maintenance run: the polite block's disruption ladder
+
+The polite block drives its disruptions in a fixed ladder, in this order,
+under one continuous polite client fleet (one contender per voter plus the
+per-operation stream client, the client profile above). Every action is
+anchored live (epoch millisecond before the action) and every scenario
+captures the same stat set: per-action durations from the anchors, the
+client error window around the action (cumulative error deltas, never the
+window summaries), the states and views every node held at every step, and
+the wire surface the disruption produced. Exact counts, units and sample
+sizes on every figure; a headline number is never an estimate.
+
+1. **Security-patch rotation** — clean TERM stop and restart of every
+   non-leader voting node in turn. Serving must continue through each
+   stop (the surviving voters keep committing), the node must rejoin
+   `Normal` under the same incarnation with no reincarnation notice, and
+   the client error window must close. Stats per node: stop duration
+   (TERM sent → process gone), rejoin time (boot → `state=Normal`),
+   gap-to-error-free (last error → first ok operation), states at each
+   step, and the error count inside the rejoin walk.
+2. **Leader abdication, cycled ×3** — the operator verb
+   [`abdicate`](client-protocol.md#leader-abdication) at the leader
+   rotates the leadership around the cluster: each cycle measures
+   abdication-to-new-leader-serving, the failover lower bound that is
+   independent of failure detection. The measurement anchor is the verb
+   drive; the landing is the successor's first committed client
+   operation under the new view. The view states are captured throughout
+   (view id per node at every step), and the pass gate is: the old leader
+   stops accepting operations immediately, a single new leader serves
+   inside the ordinary view change (no timeout wait), and the old leader
+   rejoins `Normal` as a member. The cycle repeats until every node has
+   held leadership (a 3-voter cluster: 3 cycles).
+3. **Leader stop/start, the timeout-driven baseline** — clean TERM of the
+   leader, no abdication: the survivors detect at the randomized leader
+   timeout (the detector knobs in force) and take over. This scenario is
+   the detection-bound contrast to scenario 2: same stop discipline, same
+   measurement anchors, the detector's cost quantified. The leader is
+   restarted afterwards and its rejoin time measured.
+4. **Crash kills** — SIGKILL nodes (non-leaders first, the leader LAST)
+   and let each come back. A crash boot is the dirty shape: identity bump,
+   reincarnation announcement, remap. Stats per kill: crash-to-takeover
+   (detection under the detector, the leader-last case), restart-to-
+   serving (process start → the node serving again, and the lease
+   stream's state), and the error window.
+5. **Full cluster stop/start and full reboot** — every voter TERM'd
+   (staggered, per-PID), the client fleet kept running and counted
+   honestly, then all restarted: the resurrection measurement (first
+   leader line after its own process start, first client operation
+   served after the restart anchor, all voters `Normal`). The full reboot
+   is the same shape with every process down before the first boot.
+6. **Controlled reconfig swap** — a member departs without a crash and a
+   replacement joins while serving: `decrement` the departing voter, wait
+   for the era to commit, `leave` it, stop its process, then `join` the
+   replacement (the same host under a fresh admin-assigned id is
+   acceptable) and `increment` it. Stats: the swap's total duration, the
+   per-verb commit latencies, the serving continuity across the swap,
+   and the error window. The pass gate: the replacement serves at voting
+   weight, the departed id is gone from the serving configuration, and
+   the client stream never recorded a crash-shaped disruption.
+
+After the ladder: the completeness checklist (above) over the whole run,
+the snapshot tool over the run directory, and the shutdown-consistency
+check on the raw run directory AND on the archive — both must read
+consistent or the inconsistency is the finding.
+
 ## The re-run methodology
 
 Check softball, then polite. If ANY bug is found — or a test parameter

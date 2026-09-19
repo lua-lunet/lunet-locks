@@ -19,6 +19,7 @@ ffi.cdef(
     int32_t lunet_lock_node_idle(void* node);
     int32_t lunet_lock_node_leader_timeout(void* node);
     int32_t lunet_lock_node_recover(void* node);
+    int32_t lunet_lock_node_abdicate(void* node);
     int32_t lunet_lock_node_own_id(void* node, uint32_t* id);
     int32_t lunet_lock_node_status(
         void* node, uint32_t* status, uint32_t* leader,
@@ -73,6 +74,7 @@ local record Native
     lunet_lock_node_idle: function(any): number
     lunet_lock_node_leader_timeout: function(any): number
     lunet_lock_node_recover: function(any): number
+    lunet_lock_node_abdicate: function(any): number
     lunet_lock_node_own_id: function(any, {number}): number
     lunet_lock_node_status: function(
         any, {number}, {number}, {number}, {number}
@@ -134,6 +136,7 @@ local record advisory_lock
         idle: function(Node): boolean
         leader_timeout: function(Node): boolean
         recover: function(Node): boolean
+        abdicate: function(Node): boolean, string
         own_id: function(Node): integer
         status: function(Node): Status
         leader_for_view: function(Node, integer, integer): integer
@@ -248,6 +251,22 @@ function Node:recover(): boolean
     return check(
         (tonumber(native.lunet_lock_node_recover(self._handle)) or -127) as integer
     )
+end
+
+-- The administrator's abdication: the leader, on host request, immediately
+-- starts the view-change sequence for the view after its own (the ordinary
+-- StartViewChange fence — no new wire encoding) and steps down in the same
+-- synchronous drive; it rejoins as a member when the new view settles.
+-- NotPrimary — the one actionable refusal — returns the non-raising
+-- "not_leader" so the caller re-forwards to the leader, exactly as for
+-- lock requests and reconfigurations.
+function Node:abdicate(): boolean, string
+    local rc = (tonumber(native.lunet_lock_node_abdicate(self._handle)) or -127)
+        as integer
+    if rc == NOT_LEADER then
+        return nil, "not_leader"
+    end
+    return check(rc)
 end
 
 -- The node's live identity: the descriptor id at incarnation 0, the bumped
@@ -468,6 +487,7 @@ function M.new(
         idle = Node.idle,
         leader_timeout = Node.leader_timeout,
         recover = Node.recover,
+        abdicate = Node.abdicate,
         own_id = Node.own_id,
         status = Node.status,
         leader_for_view = Node.leader_for_view,

@@ -51,6 +51,50 @@ tested.test(
 )
 
 tested.test(
+    "admin decodes the abdicate verb with no member id and refuses a broken one",
+    function()
+        local valid, verb = admin.decode_verb(
+            '{"action":"abdicate","message_id":"' .. UUID .. '"}'
+        )
+        assert(valid)
+        local without_message_id = admin.decode_verb('{"action":"abdicate"}')
+        local broken_uuid = admin.decode_verb(
+            '{"action":"abdicate","message_id":"not-a-uuid"}'
+        )
+        tested.assert(
+            {
+                given = "one well-formed abdicate verb and two malformed ones",
+                should = "decode the well-formed verb with id 0 and refuse a missing or malformed message id",
+                expected = "abdicate:0|true|true",
+                actual = verb.action
+                    .. ":"
+                    .. tostring(verb.id)
+                    .. "|"
+                    .. tostring(without_message_id == false)
+                    .. "|"
+                    .. tostring(broken_uuid == false),
+            }
+        )
+    end
+)
+
+tested.test(
+    "the abdicate acknowledgments carry no member id and the refused one carries its reason",
+    function()
+        tested.assert(
+            {
+                given = "the abdication's drive outcomes",
+                should = "encode the accepted and refused shapes without an id field",
+                expected = '{"action":"abdicate","accepted":true}|{"action":"abdicate","accepted":false,"reason":"refused"}',
+                actual = admin.encode_abdicate_ack(true, "")
+                    .. "|"
+                    .. admin.encode_abdicate_ack(false, "refused"),
+            }
+        )
+    end
+)
+
+tested.test(
     "admin refuses unknown actions, malformed ids, bad message ids and bad endpoints",
     function()
         local checks: {boolean} = {}

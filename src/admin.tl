@@ -64,6 +64,7 @@ local function valid_action(action: string): boolean
         or action == "increment"
         or action == "decrement"
         or action == "leave"
+        or action == "abdicate"
 end
 
 local function valid_uuid(message_id: string): boolean
@@ -110,7 +111,9 @@ local function decode_verb(json: string): (boolean, Verb)
                 endpoint = "",
             }
     end
-    if id_text == nil or not valid_member_id(id_text) then
+    -- The abdicate verb names no member: it is addressed to the leader
+    -- itself. Every membership verb names the id.
+    if action ~= "abdicate" and (id_text == nil or not valid_member_id(id_text)) then
         return false,
             {
                 action = "",
@@ -151,7 +154,7 @@ local function decode_verb(json: string): (boolean, Verb)
         {
             action = action,
             message_id = message_id,
-            id = tonumber(id_text) as integer,
+            id = (id_text and tonumber(id_text) or 0) as integer,
             name = name,
             endpoint = endpoint,
         }
@@ -271,6 +274,19 @@ local function encode_deadline_ack(action: string, id: integer): string
         .. '","id":'
         .. tostring(id)
         .. ',"accepted":false,"reason":"deadline"}'
+end
+
+-- The abdicate verb names no member, so its acknowledgments carry no id.
+-- The accepted shape reports the armed view-change emission; the refused
+-- shape reports the named refusal (the CAS, the delta rule). Unlike the
+-- membership verbs there is no deadline shape: abdication commits
+-- nothing, so the drive's outcome is final in the same drive.
+local function encode_abdicate_ack(accepted: boolean, reason: string): string
+    local line = '{"action":"abdicate","accepted":' .. tostring(accepted)
+    if not accepted and reason ~= "" then
+        line = line .. ',"reason":"' .. reason .. '"'
+    end
+    return line .. "}"
 end
 
 -- The verb dedup cache: correlates a driven verb by its message_id so the
@@ -407,6 +423,7 @@ return {
     decode_change = decode_change,
     encode_ack = encode_ack,
     encode_deadline_ack = encode_deadline_ack,
+    encode_abdicate_ack = encode_abdicate_ack,
     new_cache = cache.new,
     next_in_rotation = next_in_rotation,
 }

@@ -76,7 +76,7 @@ fn parse_options() -> Options {
     if options.verb.is_empty() {
         eprintln!(
             "usage: lease-client now | lease-client --server IPv4:PORT --verb \
-             get|set|release|join|increment|decrement|leave [--lock N] [--lease-ms N] \
+             get|set|release|join|increment|decrement|leave|abdicate [--lock N] [--lease-ms N] \
              [--id N] [--name NAME] [--endpoint IPv4:PORT]"
         );
         std::process::exit(2);
@@ -124,6 +124,9 @@ fn main() {
             "{{\"action\":\"{}\",\"message_id\":\"{message_id}\",\"id\":{}}}",
             options.verb,
             options.id.unwrap_or_else(|| die("--id required"))
+        ),
+        "abdicate" => format!(
+            "{{\"action\":\"abdicate\",\"message_id\":\"{message_id}\"}}"
         ),
         other => {
             eprintln!("lease-client: unknown verb {other}");
