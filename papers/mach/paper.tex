@@ -1359,14 +1359,14 @@ nodes reporting \code{normal} in the new view.}
 \toprule
 Cycle & Abdicating leader & drive & failover & settle\\
 \midrule
-1 & n2 & 11 & 30 & 150\\
-2 & n3 & 11 & 38 & 181\\
-3 & n1 & 10 & 28 & 164\\
+1 & n2 & 7 & 30 & 145\\
+2 & n3 & 8 & 27 & 156\\
+3 & n1 & 8 & 26 & 148\\
 \bottomrule
 \end{tabular}
 \end{table}
 
-Table~\ref{tab:s2} gives the cycles. Failover is 28--38~ms against an
+Table~\ref{tab:s2} gives the cycles. Failover is 26--30~ms against an
 election-timeout floor of 3{,}000~ms: two orders of magnitude below the
 timeout-driven takeover the same cluster would otherwise pay, and
 independent of the detector by construction. Under load the gap is
@@ -1401,22 +1401,32 @@ measure precisely it at sample counts.
 \subsection{Baseline: the timeout-driven takeover}
 \label{sec:baseline}
 
-The contrast case is the softball campaign's kill-the-leader gate
-(attempt 3, tight timeouts: 5~ms heartbeat, 1{,}000~ms election
-timeout): a \code{SIGTERM} to the leader saw a successor elected
-correctly, but the restarted leader's rejoin took approximately 78~s
-against a 30~s gate --- the boot-fenced node chasing a churning view
-space, the failure class analysed in Section~\ref{sec:experiments}'s
-E1. The maintenance run's S3 measures the same takeover on the calm
-configuration; the run whose numbers appear above stopped at S3 for a
-harness reason (the serving probe was single-shot rather than
-retry-to-deadline) and is in flight at the time of writing, with the
-crash-restart, full-cluster reboot, and reconfiguration scenarios
-behind it. Their numbers complete this section when the run lands.
+The contrast case is measured twice. On the same calm configuration,
+the run's S3 \code{SIGTERM}'d the leader: the takeover --- successor
+elected and serving --- completed in 20{,}370~ms (the sloppy detector's
+window plus the catch-up fold), against S2's 26--30~ms on identical
+hardware and knobs: three orders of magnitude apart. On the tight
+timeout cell (heartbeat 5~ms, election 1{,}000~ms; the softball
+campaign's attempt-3 gate) the same \code{SIGTERM} elected a successor
+correctly but the restarted leader's rejoin took approximately 78~s ---
+the boot-fenced node chasing a churning view space, the failure class
+Section~\ref{sec:experiments}'s E1 analyses. The remaining ladder
+scenarios completed: the full-cluster reboot (all down 30~s, all up)
+served its first client operation 2{,}596~ms after restart with all
+voters \code{normal} at 2{,}578~ms, and the controlled reconfiguration
+swap (decrement, leave, join, increment) completed in 23{,}542~ms with
+the cluster serving throughout. The crash-restart scenario is recorded
+blocked-with-evidence: a crashed node's rejoin at a deep view sat
+fenced for the full 150~s budget (the era-fold/boot-fence defect
+family, a liveness defect of the harness's rejoin walk, under active
+debugging); the flight tapes show no committed state lost and no
+superseded identity voting again. The full detail, with anchors and
+provenance, is Supplement~S1 and the lab books of
+\code{papers/results/}.
 
 \subsection{Status}
 
-The evidence state is: abdication failover measured at 28--38~ms,
+The evidence state is: abdication failover measured at 26--30~ms,
 detection-independent, client-invisible (Section~\ref{sec:s2});
 non-leader stop/start measured at 50~ms stop plus a churn-dominated
 rejoin tail (Section~\ref{sec:s1}); the timeout-driven baseline
