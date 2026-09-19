@@ -24,7 +24,10 @@
 #      and flight-recorder), tagged lunet-locks:<tag>-amd64 / -arm64;
 #      the aarch64 image builds natively in the aarch64 VM; the amd64
 #      image is assembled COPY-only on an amd64 base — no amd64 code
-#      runs at build time, no emulation anywhere;
+#      runs at build time, no emulation anywhere; each architecture
+#      resolves its own digest-pinned base reference
+#      (debian:bookworm-slim-arm64 / -amd64) — the shared
+#      debian:bookworm-slim tag is never re-pointed by a build;
 #   6. with --push: authenticate via `gh`, push both arch images and
 #      the aggregate manifest to ghcr.io.
 set -eu
@@ -109,6 +112,40 @@ docker cp "$cid:/out/amd64-rootfs" "$staging"
 docker rm "$cid" >/dev/null
 
 # 5. Assemble the dual-arch release images.
+#    Each architecture resolves its own base reference. The cross-arch
+#    base poisoning root cause: a `--platform` pull under the shared
+#    `debian:bookworm-slim` tag re-points that reference to the pulling
+#    architecture, so the other architecture's build then resolves the
+#    tag against a stale manifest digest (NotFound) or the wrong base.
+#    base_pull creates a per-arch local base reference from a
+#    digest-pinned pull of that platform's manifest (a registry read of
+#    the manifest list; the shared tag is never touched and never
+#    resolved by a build). Every run re-resolves the digest fresh, so
+#    re-runs and arch orders (arm64-then-amd64, amd64-then-arm64) all
+#    build on the right base.
+base_pull() {
+    arch=$1
+    platform=$2
+    digest=$(docker manifest inspect debian:bookworm-slim \
+        | awk -v arch="$arch" '
+            /"digest":/ { d=$0; sub(/.*"digest": *"/, "", d); sub(/".*/, "", d) }
+            /"architecture":/ {
+                a=$0; sub(/.*"architecture": *"/, "", a); sub(/".*/, "", a)
+                if (a == arch) { print d; exit }
+            }')
+    if [ -z "$digest" ]; then
+        echo "release images: no linux/$arch manifest digest in the debian:bookworm-slim manifest list" >&2
+        exit 1
+    fi
+    docker pull --platform "$platform" "debian@$digest" >/dev/null
+    docker tag "debian@$digest" "debian:bookworm-slim-$arch"
+    got=$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "debian:bookworm-slim-$arch")
+    if [ "$got" != "linux/$arch" ]; then
+        echo "release images: the $arch base is $got, expected linux/$arch" >&2
+        exit 1
+    fi
+}
+
 #    arm64: native build (context: lib/, demo/bin/, build/, docker/).
 stage_aarch64="$staging/.aarch64"
 mkdir -p "$stage_aarch64/lib" "$stage_aarch64/demo/bin" "$stage_aarch64/docker"
@@ -117,15 +154,18 @@ cp "$staging/aarch64"/lease-sequencer "$stage_aarch64/demo/bin/lease-sequencer"
 cp "$staging/aarch64"/lease-sequencer-flight "$stage_aarch64/demo/bin/lease-sequencer-flight"
 cp -R build "$stage_aarch64/build"
 cp docker/entrypoint.sh docker/cluster.jsonl "$stage_aarch64/docker/"
+base_pull arm64 linux/arm64
 env DOCKER_BUILDKIT=0 docker build \
+    --build-arg BASE_IMAGE=debian:bookworm-slim-arm64 \
     -f docker/Dockerfile.release -t "lunet-locks:$tag-arm64" "$stage_aarch64"
 
 #    amd64: COPY-only on the amd64 base. The base image's layers are
-#    pulled for amd64 (a data pull), the runtime-rootfs overlay (the
-#    amd64 packages unpacked in the fastbuild stage) and the app tree
-#    are copied into the created-but-never-run container, and the image
-#    is committed with the entrypoint config. No RUN step, so nothing
-#    amd64 executes to build the image.
+#    pulled for amd64 (a data pull of the digest-pinned amd64 base
+#    reference), the runtime-rootfs overlay (the amd64 packages unpacked
+#    in the fastbuild stage) and the app tree are copied into the
+#    created-but-never-run container, and the image is committed with
+#    the entrypoint config. No RUN step, so nothing amd64 executes to
+#    build the image.
 stage_amd64="$staging/.amd64"
 mkdir -p "$stage_amd64/app/lib" "$stage_amd64/app/demo/bin" "$stage_amd64/app/docker"
 cp "$staging/amd64"/liblunet_advisory_lock*.so "$stage_amd64/app/lib/"
@@ -133,10 +173,9 @@ cp "$staging/amd64"/lease-sequencer "$stage_amd64/app/demo/bin/lease-sequencer"
 cp "$staging/amd64"/lease-sequencer-flight "$stage_amd64/app/demo/bin/lease-sequencer-flight"
 cp -R build "$stage_amd64/app/build"
 cp docker/entrypoint.sh docker/cluster.jsonl "$stage_amd64/app/docker/"
-docker pull --platform linux/amd64 debian:bookworm-slim >/dev/null
-cid=$(docker create --platform linux/amd64 debian:bookworm-slim)
+base_pull amd64 linux/amd64
+cid=$(docker create --platform linux/amd64 debian:bookworm-slim-amd64)
 docker cp "$staging/amd64-rootfs/." "$cid:/"
-cp docker/entrypoint.sh docker/cluster.jsonl "$stage_amd64/app/docker/"
 docker cp "$stage_amd64/app" "$cid:/app/"
 docker commit \
     --change 'ENTRYPOINT ["/app/docker/entrypoint.sh"]' \

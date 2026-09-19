@@ -7,7 +7,13 @@
 # script assembles (tools/release_images.sh): the fastbuild artifacts
 # (cross-built for the x86 shape — built natively in the aarch64 image),
 # the build tree, and the entrypoint. No BuildKit features.
-FROM debian:bookworm-slim
+# The base is resolved through BASE_IMAGE so each architecture build
+# resolves its own reference (tools/release_images.sh creates the
+# per-arch base references); no build ever resolves the shared
+# `debian:bookworm-slim` tag, which whichever architecture pulled last
+# re-points.
+ARG BASE_IMAGE=debian:bookworm-slim
+FROM ${BASE_IMAGE}
 
 ARG LUNET_VERSION=v0.10.0
 WORKDIR /app

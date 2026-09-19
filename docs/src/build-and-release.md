@@ -130,13 +130,20 @@ no volume mounts, no platform emulation at any step):
 2. The `artifacts` and `rootfs` stages lay `/out/` out for extraction,
    and the flow extracts them with `docker create` + `docker cp`.
 3. The **aarch64 image** builds natively: the classic builder
-   `FROM debian:bookworm-slim` for the daemon's own architecture, the
+   `FROM ${BASE_IMAGE}` — the per-arch base reference
+   `debian:bookworm-slim-arm64` — for the daemon's own architecture, the
    runtime `apt-get` set inside, the extracted payloads COPYed on top
    (`docker/Dockerfile.release`).
 4. The **amd64 image** is assembled COPY-only on the amd64 base and
    no amd64 code ever runs to build it:
-   - `docker pull --platform linux/amd64 debian:bookworm-slim` — the
-     base image's layers are a DATA pull, never executed;
+   - `docker pull --platform linux/amd64
+     debian@sha256:<the amd64 manifest digest from the
+     debian:bookworm-slim manifest list>` tagged
+     `debian:bookworm-slim-amd64` — the base image's layers are a DATA
+     pull, never executed. Each architecture resolves its own
+     digest-pinned base reference; the shared `debian:bookworm-slim`
+     tag is never re-pointed by a build, so arch order across runs
+     (arm64-then-amd64, amd64-then-arm64) cannot poison a base.
    - the fastbuild's `rootfs` stage (running on the aarch64 host)
      `dpkg --add-architecture amd64` + `apt-get --download-only` the
      amd64 runtime packages (another data pull) and unpacks them with
