@@ -1,0 +1,18 @@
+9781: INFO leader leader=2 era=1 view=85 ts=1789802982068
+9782: INFO phi-wait leader=2 phi=0.000 prev_wait=891 next_wait=969 ts=1789802982068
+9783: INFO timedout=true ts=1789802982068 last_toggle=1789802957563 why=view-change ts=1789802982068
+9784: INFO timeout toggle node=3 timedout=true ts=1789802982068 last_toggle=1789802957563 previous_known=true
+9785: INFO timedout=false ts=1789802982081 last_toggle=1789802982068 why=fresh-commit ts=1789802982081
+9786: INFO timeout toggle node=3 timedout=false ts=1789802982081 last_toggle=1789802982068 previous_known=true
+9787: INFO phi-wait leader=2 phi=0.000 prev_wait=969 next_wait=911 ts=1789802982081
+10007: INFO leader leader=3 era=1 view=86 ts=1789802994325
+10008: INFO phi-wait leader=3 phi=0.000 prev_wait=911 next_wait=680 ts=1789802994325
+10009: INFO timedout=true ts=1789802994325 last_toggle=1789802982081 why=view-change ts=1789802994325
+10010: INFO timeout toggle node=3 timedout=true ts=1789802994325 last_toggle=1789802982081 previous_known=true
+11561: INFO leader leader=1 era=1 view=87 ts=1789803006607
+11562: INFO phi-wait leader=1 phi=0.000 prev_wait=680 next_wait=977 ts=1789803006607
+11563: INFO timedout=false ts=1789803006626 last_toggle=1789802994325 why=fresh-commit ts=1789803006626
+11564: INFO timeout toggle node=3 timedout=false ts=1789803006626 last_toggle=1789802994325 previous_known=true
+11565: INFO phi-wait leader=1 phi=0.000 prev_wait=977 next_wait=561 ts=1789803006626
+11794: INFO timedout=true ts=1789803019606 last_toggle=1789803006626 why=phi-detect ts=1789803019606
+11795: INFO timeout toggle node=3 timedout=true ts=1789803019606 last_toggle=1789803006626 previous_known=true

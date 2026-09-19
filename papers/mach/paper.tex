@@ -1427,13 +1427,43 @@ provenance, is Supplement~S1 and the lab books of
 \subsection{Status}
 
 The evidence state is: abdication failover measured at 26--30~ms,
-detection-independent, client-invisible (Section~\ref{sec:s2});
+detection-independent, client-invisible (Section~\ref{sec:s2};
+evidence chain: Supplement~S1~\S2, lab book
+\code{papers/results/02-abdication-failover.md}, snapshot
+\code{...T062106Z} and the ladder's final snapshot);
 non-leader stop/start measured at 50~ms stop plus a churn-dominated
-rejoin tail (Section~\ref{sec:s1}); the timeout-driven baseline
-measured as the softball campaign's 78~s rejoin gate failure
-(Section~\ref{sec:baseline}). Nothing here yet measures the E1--E4
-campaigns at their designed sample counts; the placeholders of
-Section~\ref{sec:experiments} stand until those runs.
+rejoin tail (Section~\ref{sec:s1}; lab book \code{01});
+the whole-cluster reboot serving at 2{,}596~ms and the live member
+swap at 23{,}542~ms (lab book \code{04}); the timeout-driven
+baselines measured at 20{,}370~ms on the calm configuration and
+$\approx$78~s on the tight cell (Section~\ref{sec:baseline}); and the
+crash-restart scenario recorded blocked-with-evidence, its safety
+checked on the tapes (Section~\ref{sec:s4-block}; lab book \code{03}).
+Nothing here yet measures the E1--E4 campaigns at their designed
+sample counts; the placeholders of Section~\ref{sec:experiments}
+stand until those runs.
+
+\subsection{The crash path: the floor, the pieces, and the named block}
+\label{sec:s4-block}
+
+The paper's central claim is the crash-stop-reincarnation floor: half
+a round-trip for the bumped node's announcement, one consensus round
+for the leader's fused reconfiguration, half a round-trip for the
+commit --- 2$\times$RTT, with zero disk writes on the path and only
+the boot-fence read. Of its pieces on this rig: the dirty
+classification and identity bump worked on all three crashes (3/3,
+log-witnessed); the announcement went to all peers in the boot
+millisecond (flight-tape-witnessed); and the leader's fused walk
+wedged on a host-layer identity-mapping defect --- the announcement
+arriving attributable to the old identity, refused by name
+(\code{ReincarnationRefused}), the safe direction to fail, 686 times
+recorded. The same fused machinery, driven through the healthy path,
+committed the swap's decrement round in 28~ms. The block is a liveness
+defect of the lab harness's rejoin walk (the era-fold family), under
+active downstream repair; it is recorded with its diagnostics in
+Supplement~S1~\S\ref{sec:s4} and lab book \code{03}, and the
+safety properties were checked, not assumed: zero committed operations
+lost in the whole ladder, no superseded identity voting again.
 
 \section{Reproducibility and research methodology}\label{sec:repro}
 \subsection{Executable evidence}

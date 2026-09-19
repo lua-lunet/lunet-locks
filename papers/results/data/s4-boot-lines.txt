@@ -1,0 +1,14 @@
+logs/n4.2026-09-19.log:1: INFO node provisioned own=4 incarnation=0 boot="joiner"
+logs/n4.2026-09-19.log:2: INFO boot name=n4 descriptor-id=4 own=4 incarnation=0 detector=sloppy-timeout ts=1789803832932
+logs/n1.2026-09-19.log:1: INFO node provisioned own=1 incarnation=0 boot="genesis"
+logs/n1.2026-09-19.log:2: INFO boot name=n1 descriptor-id=1 own=1 incarnation=0 detector=sloppy-timeout ts=1789802661590
+logs/n1.2026-09-19.log:4335: INFO node provisioned own=1 incarnation=0 boot="genesis"
+logs/n1.2026-09-19.log:4336: INFO boot name=n1 descriptor-id=1 own=1 incarnation=0 detector=sloppy-timeout ts=1789802906954
+logs/n1.2026-09-19.log:12411: INFO node provisioned own=1 incarnation=0 boot="genesis"
+logs/n1.2026-09-19.log:12412: INFO boot name=n1 descriptor-id=1 own=1 incarnation=0 detector=sloppy-timeout ts=1789803041229
+logs/n1.2026-09-19.log:27485: INFO restart: the identity is a later life in the high band old=1 new=16777217 incarnation=1
+logs/n1.2026-09-19.log:27486: INFO node provisioned own=16777217 incarnation=1 boot="genesis"
+logs/n1.2026-09-19.log:27488: INFO boot name=n1 descriptor-id=1 own=16777217 incarnation=1 detector=sloppy-timeout ts=1789803482427
+logs/n1.2026-09-19.log:51935: INFO restart: the identity is a later life in the high band old=1 new=16777217 incarnation=1
+logs/n1.2026-09-19.log:51936: INFO node provisioned own=16777217 incarnation=1 boot="genesis"
+logs/n1.2026-09-19.log:51938: INFO boot name=n1 descriptor-id=1 own=16777217 incarnation=1 detector=sloppy-timeout ts=1789803647897

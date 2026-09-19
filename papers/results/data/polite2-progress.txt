@@ -1,0 +1,33 @@
+07:24:21 run begin: n1:down n2:down n3:down
+07:24:21 == B: boot ==
+07:24:24 == S: clients start ==
+07:24:24 == steady serving 240 s ==
+07:28:24 measure scenario=S0 steady_s=240 client_errors=0 states=n1:normal:v1:l2 n2:normal:v1:l2 n3:normal:v1:l2
+07:28:24 == S1: security-patch rotation through the non-leaders ==
+07:28:24 S1 n1: serving continued=true first_ok_rel=69
+07:28:42 measure scenario=S1 node=n1 stop_ms=50 rejoin_ms=15618 serving_continued=1 first_ok_gap_ms=69
+07:29:10 S1 n3: serving continued=false first_ok_rel=none
+07:29:33 measure scenario=S1 node=n3 stop_ms=50 rejoin_ms=21017 serving_continued=0 first_ok_gap_ms=-1
+07:29:41 == S2: leader abdication x3 (leadership rotation) ==
+07:29:42 measure scenario=S2 cycle=1 abdication_leader=n1 drive_ms=8 failover_ms=30 settle_ms=145
+07:29:54 measure scenario=S2 cycle=2 abdication_leader=n2 drive_ms=8 failover_ms=27 settle_ms=153
+07:30:06 measure scenario=S2 cycle=3 abdication_leader=n3 drive_ms=7 failover_ms=26 settle_ms=156
+07:30:18 S2 leadership rotation complete: n1=cycle1 n2=cycle2 n3=cycle3
+07:30:18 == S3: leader stop/start (timeout-driven takeover baseline) ==
+07:30:39 S3: takeover under the detector in 20370 ms; new leader n2
+07:31:24 measure scenario=S3 node=n1 stop_ms=50 takeover_ms=20370 new_leader=n2 rejoin_ms=42991
+07:31:34 == S4: crash kills (SIGKILL), non-leaders first, leader last ==
+07:34:07 measure scenario=S4 node=n2 crash_restart_to_serving_ms=BLOCKED rejoin_ms=BLOCKED incarnation=1 own=16777218 remap_notices=0 stuck_status=latest status=restarting voting=0 diagnostic=GapDetected states=n1:normal:v147:l1 n2:restarting:v0:l1 n3:normal:v147:l1
+07:34:07 S4 n2: the crashed rejoin stayed fenced (blocked, recorded)
+07:37:25 measure scenario=S4 node=n3 crash_restart_to_serving_ms=BLOCKED rejoin_ms=BLOCKED incarnation=1 own=16777219 remap_notices=0 stuck_status=latest status=view_change voting=0 diagnostic=GapDetected states=n1:view_change:v1381:l2 n2:down n3:view_change:v1383:l1
+07:37:25 S4 n3: the crashed rejoin stayed fenced (blocked, recorded)
+07:40:32 measure scenario=S4 node=n1 crash_restart_to_serving_ms=BLOCKED rejoin_ms=BLOCKED incarnation=1 own=16777217 remap_notices=0 stuck_status=latest status=restarting voting=0 diagnostic=GapDetected states=n1:restarting:v0:l1 n2:down n3:down
+07:40:32 S4 n1: the crashed rejoin stayed fenced (blocked, recorded)
+07:40:37 == S5: whole-cluster stop/start and full reboot ==
+07:42:49 measure scenario=S5 pass=1 converge=BLOCKED down_ms=10001 stuck_report=normal voters: 0/3 states=n1:restarting:v0:l1 n2:restarting:v0:l1 n3:restarting:v0:l1
+07:42:49 S5 pass 1: the durable resurrection did not converge (blocked, recorded)
+07:43:30 measure scenario=S5 pass=2 down_ms=30001 first_op_ms=2596 converge_ms=2578 states=n1:normal:v0:l1 n2:normal:v0:l1 n3:normal:v0:l1
+07:43:40 == S6: controlled reconfig swap (decrement/leave + join/increment) ==
+07:44:04 measure scenario=S6 departing=n3 replacement=n4 decrement_ms=28 leave_ms=5022 join_ms=5017 increment_ms=5026 total_ms=23542 rejoin_ms=11383 states=n1:normal:v6:l1 n2:normal:v6:l1 n3:down
+07:44:14 == T: teardown ==
+07:44:16 teardown complete

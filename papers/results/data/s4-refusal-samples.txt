@@ -1,0 +1,3 @@
+20536: WARN peer input dropped with a named diagnostic diagnostic=ReincarnationRefused { sender: NodeId(2), view: ViewId { era: Era(1), view: View(147) } }
+20537: WARN peer input dropped with a named diagnostic diagnostic=ReincarnationRefused { sender: NodeId(2), view: ViewId { era: Era(1), view: View(147) } }
+20601: WARN peer input dropped with a named diagnostic diagnostic=ReincarnationRefused { sender: NodeId(2), view: ViewId { era: Era(1), view: View(147) } }

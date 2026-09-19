@@ -1,0 +1,15 @@
+12:anchor=1789802904552 S1-begin target=n1 leader=n2
+13:anchor=1789802904552 S1-TERM-begin n1
+14:anchor=1789802904602 S1-TERM-done n1 exit=0
+15:anchor=1789802906941 S1-restart n1
+16:anchor=1789802922559 S1-rejoined n1 state=normal leader=3 view=35
+18:anchor=1789802930570 S1-begin target=n3 leader=n2
+19:anchor=1789802930573 S1-TERM-begin n3
+20:anchor=1789802930623 S1-TERM-done n3 exit=0
+21:anchor=1789802952940 S1-restart n3
+22:anchor=1789802973957 S1-rejoined n3 state=normal leader=1 view=84
+39:anchor=1789803018776 S3-begin target=n1 (the leader)
+40:anchor=1789803018776 S3-TERM-begin n1
+41:anchor=1789803018826 S3-TERM-done n1 exit=0
+42:anchor=1789803041214 S3-restart n1
+43:anchor=1789803084205 S3-rejoined n1 state=normal leader=3 view=146

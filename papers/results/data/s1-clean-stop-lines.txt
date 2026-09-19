@@ -1,0 +1,10 @@
+logs/n4.2026-09-19.log:1228: INFO sigterm: clean stop ts=1789803856013
+logs/n4.2026-09-19.log:1230: INFO stop: drained and the drain proven; the next boot continues under the same identity node=4 state=/Users/Shared/lua-lunet/lunet-locks/.tmp/telemetry/local-polite2-2026-09-19/state/n4.state
+logs/n3.2026-09-19.log:7108: INFO sigterm: clean stop ts=1789802930575
+logs/n3.2026-09-19.log:7110: INFO stop: drained and the drain proven; the next boot continues under the same identity node=3 state=/Users/Shared/lua-lunet/lunet-locks/.tmp/telemetry/local-polite2-2026-09-19/state/n3.state
+logs/n3.2026-09-19.log:19783: INFO sigterm: clean stop ts=1789803445232
+logs/n3.2026-09-19.log:39633: INFO sigterm: clean stop ts=1789803769115
+logs/n3.2026-09-19.log:40716: INFO sigterm: clean stop ts=1789803830873
+logs/n3.2026-09-19.log:40718: INFO stop: drained and the drain proven; the next boot continues under the same identity node=3 state=/Users/Shared/lua-lunet/lunet-locks/.tmp/telemetry/local-polite2-2026-09-19/state/n3.state
+logs/n1.2026-09-19.log:4332: INFO sigterm: clean stop ts=1789802904554
+logs/n1.2026-09-19.log:4334: INFO stop: drained and the drain proven; the next boot continues under the same identity node=1 state=/Users/Shared/lua-lunet/lunet-locks/.tmp/telemetry/local-polite2-2026-09-19/state/n1.state

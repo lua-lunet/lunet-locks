@@ -1,0 +1,15 @@
+45:anchor=1789803094243 S4-begin target=n2
+46:anchor=1789803094244 S4-SIGKILL-done n2
+47:anchor=1789803096264 S4-restart n2
+48:anchor=1789803246956 S4-rejoin-BLOCKED n2 states=n1:normal:v147:l1 n2:restarting:v0:l1 n3:normal:v147:l1
+49:measure scenario=S4 node=n2 crash_restart_to_serving_ms=BLOCKED rejoin_ms=BLOCKED incarnation=1 own=16777218 remap_notices=0 stuck_status=latest status=restarting voting=0 diagnostic=GapDetected states=n1:normal:v147:l1 n2:restarting:v0:l1 n3:normal:v147:l1
+50:anchor=1789803252162 S4-begin target=n3
+51:anchor=1789803252166 S4-SIGKILL-done n3
+52:anchor=1789803294788 S4-restart n3
+53:anchor=1789803445181 S4-rejoin-BLOCKED n3 states=n1:view_change:v1381:l2 n2:down n3:view_change:v1383:l1
+54:measure scenario=S4 node=n3 crash_restart_to_serving_ms=BLOCKED rejoin_ms=BLOCKED incarnation=1 own=16777219 remap_notices=0 stuck_status=latest status=view_change voting=0 diagnostic=GapDetected states=n1:view_change:v1381:l2 n2:down n3:view_change:v1383:l1
+55:anchor=1789803450282 S4-begin target=n1
+56:anchor=1789803450284 S4-SIGKILL-done n1
+57:anchor=1789803482422 S4-restart n1
+58:anchor=1789803632777 S4-rejoin-BLOCKED n1 states=n1:restarting:v0:l1 n2:down n3:down
+59:measure scenario=S4 node=n1 crash_restart_to_serving_ms=BLOCKED rejoin_ms=BLOCKED incarnation=1 own=16777217 remap_notices=0 stuck_status=latest status=restarting voting=0 diagnostic=GapDetected states=n1:restarting:v0:l1 n2:down n3:down

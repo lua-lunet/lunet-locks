@@ -1,0 +1,9 @@
+82:anchor=1789803820761 S6-begin departing=n3 replacement=n4 leader=n1
+83:anchor=1789803820789 S6-decrement reply={"action":"decrement","id":3,"accepted":true}
+85:anchor=1789803830868 S6-leave reply={"action":"leave","id":3,"accepted":true}
+87:anchor=1789803830868 S6-departed n3
+88:anchor=1789803830918 S6-n3-stopped
+89:anchor=1789803832920 S6-restart n4
+90:anchor=1789803838953 S6-join reply={"action":"join","id":4,"accepted":true}
+92:anchor=1789803844301 S6-increment reply={"action":"increment","id":4,"accepted":true}
+94:anchor=1789803844303 S6-swap-complete state=normal leader=1 view=6

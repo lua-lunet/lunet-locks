@@ -1,0 +1,8 @@
+logs/n3.2026-09-19.log:9: WARN peer input dropped with a named diagnostic diagnostic=GapDetected { expected: Slot(3), got: Slot(5) }
+logs/n3.2026-09-19.log:10: WARN peer input dropped with a named diagnostic diagnostic=GapDetected { expected: Slot(3), got: Slot(6) }
+logs/n3.2026-09-19.log:12: WARN peer input dropped with a named diagnostic diagnostic=GapDetected { expected: Slot(3), got: Slot(7) }
+logs/n3.2026-09-19.log:13: WARN peer input dropped with a named diagnostic diagnostic=GapDetected { expected: Slot(3), got: Slot(8) }
+logs/n3.2026-09-19.log:14: WARN peer input dropped with a named diagnostic diagnostic=GapDetected { expected: Slot(3), got: Slot(9) }
+logs/n3.2026-09-19.log:15: WARN peer input dropped with a named diagnostic diagnostic=GapDetected { expected: Slot(3), got: Slot(10) }
+logs/n3.2026-09-19.log:16: WARN peer input dropped with a named diagnostic diagnostic=GapDetected { expected: Slot(3), got: Slot(11) }
+logs/n3.2026-09-19.log:17: WARN peer input dropped with a named diagnostic diagnostic=GapDetected { expected: Slot(3), got: Slot(12) }

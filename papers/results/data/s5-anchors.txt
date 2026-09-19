@@ -1,0 +1,20 @@
+60:anchor=1789803637888 S5-begin pass=1 gap_s=10
+61:anchor=1789803637888 S5-TERM-begin pass=1 n1
+62:anchor=1789803637889 S5-TERM-done pass=1 n1
+63:anchor=1789803637889 S5-TERM-begin pass=1 n2
+64:anchor=1789803637889 S5-TERM-done pass=1 n2
+65:anchor=1789803637889 S5-TERM-begin pass=1 n3
+66:anchor=1789803637889 S5-TERM-done pass=1 n3
+67:anchor=1789803637889 S5-all-down pass=1
+68:anchor=1789803647890 S5-restart-all pass=1
+69:anchor=1789803768740 S5-converge-BLOCKED pass=1 states=n1:restarting:v0:l1 n2:restarting:v0:l1 n3:restarting:v0:l1
+71:anchor=1789803777795 S5-begin pass=2 gap_s=30
+72:anchor=1789803777795 S5-TERM-begin pass=2 n1
+73:anchor=1789803777796 S5-TERM-done pass=2 n1
+74:anchor=1789803777796 S5-TERM-begin pass=2 n2
+75:anchor=1789803777796 S5-TERM-done pass=2 n2
+76:anchor=1789803777796 S5-TERM-begin pass=2 n3
+77:anchor=1789803777796 S5-TERM-done pass=2 n3
+78:anchor=1789803777796 S5-all-down pass=2
+79:anchor=1789803807797 S5-restart-all pass=2
+80:anchor=1789803810375 S5-converged pass=2 leader=n1

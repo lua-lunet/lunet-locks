@@ -1,0 +1,40 @@
+7: INFO leader leader=1 era=1 view=0 ts=1789802661613
+79: INFO leader leader=2 era=1 view=1 ts=1789802662389
+81: INFO timedout=true ts=1789802662379 last_toggle=none why=view-change ts=1789802662389
+82: INFO timeout toggle node=2 timedout=true ts=1789802662379 last_toggle=1789802662379 previous_known=false
+30357: INFO leader leader=3 era=1 view=2 ts=1789802907100
+30359: INFO timedout=false ts=1789802907113 last_toggle=1789802662379 why=fresh-commit ts=1789802907113
+30360: INFO timeout toggle node=2 timedout=false ts=1789802907113 last_toggle=1789802662379 previous_known=true
+30365: INFO leader leader=1 era=1 view=3 ts=1789802907255
+30367: INFO timedout=true ts=1789802907255 last_toggle=1789802907113 why=view-change ts=1789802907255
+30368: INFO timeout toggle node=2 timedout=true ts=1789802907255 last_toggle=1789802907113 previous_known=true
+30372: INFO leader leader=2 era=1 view=4 ts=1789802907394
+30379: INFO leader leader=3 era=1 view=5 ts=1789802907447
+30381: INFO timedout=false ts=1789802907460 last_toggle=1789802907255 why=fresh-commit ts=1789802907460
+30382: INFO timeout toggle node=2 timedout=false ts=1789802907460 last_toggle=1789802907255 previous_known=true
+30390: INFO leader leader=1 era=1 view=6 ts=1789802907619
+30392: INFO timedout=true ts=1789802907619 last_toggle=1789802907460 why=view-change ts=1789802907619
+30393: INFO timeout toggle node=2 timedout=true ts=1789802907619 last_toggle=1789802907460 previous_known=true
+30395: INFO leader leader=2 era=1 view=7 ts=1789802907734
+30399: INFO leader leader=3 era=1 view=8 ts=1789802907793
+30401: INFO timedout=false ts=1789802907805 last_toggle=1789802907619 why=fresh-commit ts=1789802907805
+30402: INFO timeout toggle node=2 timedout=false ts=1789802907805 last_toggle=1789802907619 previous_known=true
+30407: INFO leader leader=1 era=1 view=9 ts=1789802907908
+30409: INFO timedout=true ts=1789802907907 last_toggle=1789802907805 why=view-change ts=1789802907908
+30410: INFO timeout toggle node=2 timedout=true ts=1789802907907 last_toggle=1789802907805 previous_known=true
+30416: INFO leader leader=3 era=1 view=11 ts=1789802908025
+30418: INFO timedout=false ts=1789802908038 last_toggle=1789802907907 why=fresh-commit ts=1789802908038
+30419: INFO timeout toggle node=2 timedout=false ts=1789802908038 last_toggle=1789802907907 previous_known=true
+30425: INFO leader leader=1 era=1 view=12 ts=1789802908106
+30427: INFO timedout=true ts=1789802908106 last_toggle=1789802908038 why=view-change ts=1789802908106
+30428: INFO timeout toggle node=2 timedout=true ts=1789802908106 last_toggle=1789802908038 previous_known=true
+30430: INFO leader leader=2 era=1 view=13 ts=1789802908143
+30434: INFO leader leader=3 era=1 view=14 ts=1789802908211
+30436: INFO timedout=false ts=1789802908229 last_toggle=1789802908106 why=fresh-commit ts=1789802908229
+30437: INFO timeout toggle node=2 timedout=false ts=1789802908229 last_toggle=1789802908106 previous_known=true
+30446: INFO leader leader=1 era=1 view=15 ts=1789802908399
+30448: INFO timedout=true ts=1789802908399 last_toggle=1789802908229 why=view-change ts=1789802908399
+30449: INFO timeout toggle node=2 timedout=true ts=1789802908399 last_toggle=1789802908229 previous_known=true
+30451: INFO leader leader=2 era=1 view=16 ts=1789802908443
+30455: INFO leader leader=3 era=1 view=17 ts=1789802908509
+30457: INFO timedout=false ts=1789802908522 last_toggle=1789802908399 why=fresh-commit ts=1789802908522

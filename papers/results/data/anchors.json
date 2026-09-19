@@ -1,0 +1,459 @@
+{
+ "anchors": [
+  {
+   "ts": 1789802661571,
+   "label": "run-begin polite2 calm maintenance ladder"
+  },
+  {
+   "ts": 1789802661571,
+   "label": "boot n1"
+  },
+  {
+   "ts": 1789802661573,
+   "label": "boot n2"
+  },
+  {
+   "ts": 1789802661589,
+   "label": "boot n3"
+  },
+  {
+   "ts": 1789802664117,
+   "label": "converged leader=n2 states=n1:normal:v1:l2 n2:normal:v1:l2 n3:normal:v1:l2"
+  },
+  {
+   "ts": 1789802664117,
+   "label": "USR2 start all clients"
+  },
+  {
+   "ts": 1789802664470,
+   "label": "steady-serving-begin"
+  },
+  {
+   "ts": 1789802904552,
+   "label": "S1-begin target=n1 leader=n2"
+  },
+  {
+   "ts": 1789802904552,
+   "label": "S1-TERM-begin n1"
+  },
+  {
+   "ts": 1789802904602,
+   "label": "S1-TERM-done n1 exit=0"
+  },
+  {
+   "ts": 1789802906941,
+   "label": "S1-restart n1"
+  },
+  {
+   "ts": 1789802922559,
+   "label": "S1-rejoined n1 state=normal leader=3 view=35"
+  },
+  {
+   "ts": 1789802930570,
+   "label": "S1-begin target=n3 leader=n2"
+  },
+  {
+   "ts": 1789802930573,
+   "label": "S1-TERM-begin n3"
+  },
+  {
+   "ts": 1789802930623,
+   "label": "S1-TERM-done n3 exit=0"
+  },
+  {
+   "ts": 1789802952940,
+   "label": "S1-restart n3"
+  },
+  {
+   "ts": 1789802973957,
+   "label": "S1-rejoined n3 state=normal leader=1 view=84"
+  },
+  {
+   "ts": 1789802982055,
+   "label": "S2-begin cycle=1 leader=n1 states=n1:normal:v84:l1 n2:normal:v84:l1 n3:normal:v84:l1"
+  },
+  {
+   "ts": 1789802982066,
+   "label": "S2-abdicate-drive cycle=1 reply={\"action\":\"abdicate\",\"accepted\":true}"
+  },
+  {
+   "ts": 1789802982200,
+   "label": "S2-settled cycle=1 states=n1:normal:v84:l1 n2:normal:v84:l1 n3:normal:v84:l1"
+  },
+  {
+   "ts": 1789802994314,
+   "label": "S2-begin cycle=2 leader=n2 states=n1:normal:v85:l2 n2:normal:v85:l2 n3:normal:v85:l2"
+  },
+  {
+   "ts": 1789802994322,
+   "label": "S2-abdicate-drive cycle=2 reply={\"action\":\"abdicate\",\"accepted\":true}"
+  },
+  {
+   "ts": 1789802994467,
+   "label": "S2-settled cycle=2 states=n1:normal:v86:l3 n2:normal:v85:l2 n3:normal:v85:l2"
+  },
+  {
+   "ts": 1789803006601,
+   "label": "S2-begin cycle=3 leader=n3 states=n1:normal:v86:l3 n2:normal:v86:l3 n3:normal:v86:l3"
+  },
+  {
+   "ts": 1789803006608,
+   "label": "S2-abdicate-drive cycle=3 reply={\"action\":\"abdicate\",\"accepted\":true}"
+  },
+  {
+   "ts": 1789803006757,
+   "label": "S2-settled cycle=3 states=n1:normal:v86:l3 n2:normal:v86:l3 n3:normal:v86:l3"
+  },
+  {
+   "ts": 1789803018776,
+   "label": "S3-begin target=n1 (the leader)"
+  },
+  {
+   "ts": 1789803018776,
+   "label": "S3-TERM-begin n1"
+  },
+  {
+   "ts": 1789803018826,
+   "label": "S3-TERM-done n1 exit=0"
+  },
+  {
+   "ts": 1789803041214,
+   "label": "S3-restart n1"
+  },
+  {
+   "ts": 1789803084205,
+   "label": "S3-rejoined n1 state=normal leader=3 view=146"
+  },
+  {
+   "ts": 1789803094243,
+   "label": "S4-begin target=n2"
+  },
+  {
+   "ts": 1789803094244,
+   "label": "S4-SIGKILL-done n2"
+  },
+  {
+   "ts": 1789803096264,
+   "label": "S4-restart n2"
+  },
+  {
+   "ts": 1789803246956,
+   "label": "S4-rejoin-BLOCKED n2 states=n1:normal:v147:l1 n2:restarting:v0:l1 n3:normal:v147:l1"
+  },
+  {
+   "ts": 1789803252162,
+   "label": "S4-begin target=n3"
+  },
+  {
+   "ts": 1789803252166,
+   "label": "S4-SIGKILL-done n3"
+  },
+  {
+   "ts": 1789803294788,
+   "label": "S4-restart n3"
+  },
+  {
+   "ts": 1789803445181,
+   "label": "S4-rejoin-BLOCKED n3 states=n1:view_change:v1381:l2 n2:down n3:view_change:v1383:l1"
+  },
+  {
+   "ts": 1789803450282,
+   "label": "S4-begin target=n1"
+  },
+  {
+   "ts": 1789803450284,
+   "label": "S4-SIGKILL-done n1"
+  },
+  {
+   "ts": 1789803482422,
+   "label": "S4-restart n1"
+  },
+  {
+   "ts": 1789803632777,
+   "label": "S4-rejoin-BLOCKED n1 states=n1:restarting:v0:l1 n2:down n3:down"
+  },
+  {
+   "ts": 1789803637888,
+   "label": "S5-begin pass=1 gap_s=10"
+  },
+  {
+   "ts": 1789803637888,
+   "label": "S5-TERM-begin pass=1 n1"
+  },
+  {
+   "ts": 1789803637889,
+   "label": "S5-TERM-done pass=1 n1"
+  },
+  {
+   "ts": 1789803637889,
+   "label": "S5-TERM-begin pass=1 n2"
+  },
+  {
+   "ts": 1789803637889,
+   "label": "S5-TERM-done pass=1 n2"
+  },
+  {
+   "ts": 1789803637889,
+   "label": "S5-TERM-begin pass=1 n3"
+  },
+  {
+   "ts": 1789803637889,
+   "label": "S5-TERM-done pass=1 n3"
+  },
+  {
+   "ts": 1789803637889,
+   "label": "S5-all-down pass=1"
+  },
+  {
+   "ts": 1789803647890,
+   "label": "S5-restart-all pass=1"
+  },
+  {
+   "ts": 1789803768740,
+   "label": "S5-converge-BLOCKED pass=1 states=n1:restarting:v0:l1 n2:restarting:v0:l1 n3:restarting:v0:l1"
+  },
+  {
+   "ts": 1789803777795,
+   "label": "S5-begin pass=2 gap_s=30"
+  },
+  {
+   "ts": 1789803777795,
+   "label": "S5-TERM-begin pass=2 n1"
+  },
+  {
+   "ts": 1789803777796,
+   "label": "S5-TERM-done pass=2 n1"
+  },
+  {
+   "ts": 1789803777796,
+   "label": "S5-TERM-begin pass=2 n2"
+  },
+  {
+   "ts": 1789803777796,
+   "label": "S5-TERM-done pass=2 n2"
+  },
+  {
+   "ts": 1789803777796,
+   "label": "S5-TERM-begin pass=2 n3"
+  },
+  {
+   "ts": 1789803777796,
+   "label": "S5-TERM-done pass=2 n3"
+  },
+  {
+   "ts": 1789803777796,
+   "label": "S5-all-down pass=2"
+  },
+  {
+   "ts": 1789803807797,
+   "label": "S5-restart-all pass=2"
+  },
+  {
+   "ts": 1789803810375,
+   "label": "S5-converged pass=2 leader=n1"
+  },
+  {
+   "ts": 1789803820761,
+   "label": "S6-begin departing=n3 replacement=n4 leader=n1"
+  },
+  {
+   "ts": 1789803820789,
+   "label": "S6-decrement reply={\"action\":\"decrement\",\"id\":3,\"accepted\":true}"
+  },
+  {
+   "ts": 1789803830868,
+   "label": "S6-leave reply={\"action\":\"leave\",\"id\":3,\"accepted\":true}"
+  },
+  {
+   "ts": 1789803830868,
+   "label": "S6-departed n3"
+  },
+  {
+   "ts": 1789803830918,
+   "label": "S6-n3-stopped"
+  },
+  {
+   "ts": 1789803832920,
+   "label": "S6-restart n4"
+  },
+  {
+   "ts": 1789803838953,
+   "label": "S6-join reply={\"action\":\"join\",\"id\":4,\"accepted\":true}"
+  },
+  {
+   "ts": 1789803844301,
+   "label": "S6-increment reply={\"action\":\"increment\",\"id\":4,\"accepted\":true}"
+  },
+  {
+   "ts": 1789803844303,
+   "label": "S6-swap-complete state=normal leader=1 view=6"
+  },
+  {
+   "ts": 1789803854747,
+   "label": "ladder-complete states=n1:normal:v7:l2 n2:normal:v7:l2 n3:down"
+  },
+  {
+   "ts": 1789803854747,
+   "label": "teardown-begin"
+  },
+  {
+   "ts": 1789803855909,
+   "label": "T-TERM-begin n1"
+  },
+  {
+   "ts": 1789803855959,
+   "label": "T-TERM-done n1 exit=0"
+  },
+  {
+   "ts": 1789803855959,
+   "label": "T-TERM-begin n2"
+  },
+  {
+   "ts": 1789803856009,
+   "label": "T-TERM-done n2 exit=0"
+  },
+  {
+   "ts": 1789803856064,
+   "label": "teardown-complete total_client_errors=0"
+  }
+ ],
+ "measures": [
+  {
+   "scenario": "S0",
+   "steady_s": "240",
+   "client_errors": "0",
+   "states": "n1:normal:v1:l2",
+   "raw": "scenario=S0 steady_s=240 client_errors=0 states=n1:normal:v1:l2 n2:normal:v1:l2 n3:normal:v1:l2"
+  },
+  {
+   "scenario": "S1",
+   "node": "n1",
+   "stop_ms": "50",
+   "rejoin_ms": "15618",
+   "serving_continued": "1",
+   "first_ok_gap_ms": "69",
+   "raw": "scenario=S1 node=n1 stop_ms=50 rejoin_ms=15618 serving_continued=1 first_ok_gap_ms=69"
+  },
+  {
+   "scenario": "S1",
+   "node": "n3",
+   "stop_ms": "50",
+   "rejoin_ms": "21017",
+   "serving_continued": "0",
+   "first_ok_gap_ms": "-1",
+   "raw": "scenario=S1 node=n3 stop_ms=50 rejoin_ms=21017 serving_continued=0 first_ok_gap_ms=-1"
+  },
+  {
+   "scenario": "S2",
+   "cycle": "1",
+   "abdication_leader": "n1",
+   "drive_ms": "8",
+   "failover_ms": "30",
+   "settle_ms": "145",
+   "raw": "scenario=S2 cycle=1 abdication_leader=n1 drive_ms=8 failover_ms=30 settle_ms=145"
+  },
+  {
+   "scenario": "S2",
+   "cycle": "2",
+   "abdication_leader": "n2",
+   "drive_ms": "8",
+   "failover_ms": "27",
+   "settle_ms": "153",
+   "raw": "scenario=S2 cycle=2 abdication_leader=n2 drive_ms=8 failover_ms=27 settle_ms=153"
+  },
+  {
+   "scenario": "S2",
+   "cycle": "3",
+   "abdication_leader": "n3",
+   "drive_ms": "7",
+   "failover_ms": "26",
+   "settle_ms": "156",
+   "raw": "scenario=S2 cycle=3 abdication_leader=n3 drive_ms=7 failover_ms=26 settle_ms=156"
+  },
+  {
+   "scenario": "S3",
+   "node": "n1",
+   "stop_ms": "50",
+   "takeover_ms": "20370",
+   "new_leader": "n2",
+   "rejoin_ms": "42991",
+   "raw": "scenario=S3 node=n1 stop_ms=50 takeover_ms=20370 new_leader=n2 rejoin_ms=42991"
+  },
+  {
+   "scenario": "S4",
+   "node": "n2",
+   "crash_restart_to_serving_ms": "BLOCKED",
+   "rejoin_ms": "BLOCKED",
+   "incarnation": "1",
+   "own": "16777218",
+   "remap_notices": "0",
+   "stuck_status": "latest",
+   "status": "restarting",
+   "voting": "0",
+   "diagnostic": "GapDetected",
+   "states": "n1:normal:v147:l1",
+   "raw": "scenario=S4 node=n2 crash_restart_to_serving_ms=BLOCKED rejoin_ms=BLOCKED incarnation=1 own=16777218 remap_notices=0 stuck_status=latest status=restarting voting=0 diagnostic=GapDetected states=n1:normal:v147:l1 n2:restarting:v0:l1 n3:normal:v147:l1"
+  },
+  {
+   "scenario": "S4",
+   "node": "n3",
+   "crash_restart_to_serving_ms": "BLOCKED",
+   "rejoin_ms": "BLOCKED",
+   "incarnation": "1",
+   "own": "16777219",
+   "remap_notices": "0",
+   "stuck_status": "latest",
+   "status": "view_change",
+   "voting": "0",
+   "diagnostic": "GapDetected",
+   "states": "n1:view_change:v1381:l2",
+   "raw": "scenario=S4 node=n3 crash_restart_to_serving_ms=BLOCKED rejoin_ms=BLOCKED incarnation=1 own=16777219 remap_notices=0 stuck_status=latest status=view_change voting=0 diagnostic=GapDetected states=n1:view_change:v1381:l2 n2:down n3:view_change:v1383:l1"
+  },
+  {
+   "scenario": "S4",
+   "node": "n1",
+   "crash_restart_to_serving_ms": "BLOCKED",
+   "rejoin_ms": "BLOCKED",
+   "incarnation": "1",
+   "own": "16777217",
+   "remap_notices": "0",
+   "stuck_status": "latest",
+   "status": "restarting",
+   "voting": "0",
+   "diagnostic": "GapDetected",
+   "states": "n1:restarting:v0:l1",
+   "raw": "scenario=S4 node=n1 crash_restart_to_serving_ms=BLOCKED rejoin_ms=BLOCKED incarnation=1 own=16777217 remap_notices=0 stuck_status=latest status=restarting voting=0 diagnostic=GapDetected states=n1:restarting:v0:l1 n2:down n3:down"
+  },
+  {
+   "scenario": "S5",
+   "pass": "1",
+   "converge": "BLOCKED",
+   "down_ms": "10001",
+   "stuck_report": "normal",
+   "states": "n1:restarting:v0:l1",
+   "raw": "scenario=S5 pass=1 converge=BLOCKED down_ms=10001 stuck_report=normal voters: 0/3 states=n1:restarting:v0:l1 n2:restarting:v0:l1 n3:restarting:v0:l1"
+  },
+  {
+   "scenario": "S5",
+   "pass": "2",
+   "down_ms": "30001",
+   "first_op_ms": "2596",
+   "converge_ms": "2578",
+   "states": "n1:normal:v0:l1",
+   "raw": "scenario=S5 pass=2 down_ms=30001 first_op_ms=2596 converge_ms=2578 states=n1:normal:v0:l1 n2:normal:v0:l1 n3:normal:v0:l1"
+  },
+  {
+   "scenario": "S6",
+   "departing": "n3",
+   "replacement": "n4",
+   "decrement_ms": "28",
+   "leave_ms": "5022",
+   "join_ms": "5017",
+   "increment_ms": "5026",
+   "total_ms": "23542",
+   "rejoin_ms": "11383",
+   "states": "n1:normal:v6:l1",
+   "raw": "scenario=S6 departing=n3 replacement=n4 decrement_ms=28 leave_ms=5022 join_ms=5017 increment_ms=5026 total_ms=23542 rejoin_ms=11383 states=n1:normal:v6:l1 n2:normal:v6:l1 n3:down"
+  }
+ ]
+}

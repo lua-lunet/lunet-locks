@@ -1,0 +1,40 @@
+5: INFO leader leader=1 era=1 view=0 ts=1789802661590
+11: INFO leader leader=2 era=1 view=1 ts=1789802662397
+4339: INFO leader leader=1 era=1 view=0 ts=1789802906955
+4347: INFO leader leader=2 era=1 view=1 ts=1789802906961
+4349: INFO timedout=true ts=1789802906961 last_toggle=none why=view-change ts=1789802906961
+4350: INFO timeout toggle node=1 timedout=true ts=1789802906961 last_toggle=1789802906961 previous_known=false
+4354: INFO timedout=false ts=1789802906973 last_toggle=1789802906961 why=fresh-commit ts=1789802906973
+4355: INFO timeout toggle node=1 timedout=false ts=1789802906973 last_toggle=1789802906961 previous_known=true
+4358: INFO timedout=true ts=1789802906973 last_toggle=1789802906973 why=view-change ts=1789802906973
+4359: INFO timeout toggle node=1 timedout=true ts=1789802906973 last_toggle=1789802906973 previous_known=true
+4363: INFO timedout=false ts=1789802906986 last_toggle=1789802906973 why=fresh-commit ts=1789802906987
+4364: INFO timeout toggle node=1 timedout=false ts=1789802906986 last_toggle=1789802906973 previous_known=true
+4367: INFO timedout=true ts=1789802906986 last_toggle=1789802906986 why=view-change ts=1789802906987
+4368: INFO timeout toggle node=1 timedout=true ts=1789802906986 last_toggle=1789802906986 previous_known=true
+4372: INFO timedout=false ts=1789802907000 last_toggle=1789802906986 why=fresh-commit ts=1789802907000
+4373: INFO timeout toggle node=1 timedout=false ts=1789802907000 last_toggle=1789802906986 previous_known=true
+4378: INFO timedout=true ts=1789802907000 last_toggle=1789802907000 why=view-change ts=1789802907001
+4379: INFO timeout toggle node=1 timedout=true ts=1789802907000 last_toggle=1789802907000 previous_known=true
+4382: INFO timedout=false ts=1789802907013 last_toggle=1789802907000 why=fresh-commit ts=1789802907013
+4383: INFO timeout toggle node=1 timedout=false ts=1789802907013 last_toggle=1789802907000 previous_known=true
+4388: INFO timedout=true ts=1789802907013 last_toggle=1789802907013 why=view-change ts=1789802907013
+4389: INFO timeout toggle node=1 timedout=true ts=1789802907013 last_toggle=1789802907013 previous_known=true
+4390: INFO timedout=false ts=1789802907018 last_toggle=1789802907013 why=fresh-commit ts=1789802907018
+4391: INFO timeout toggle node=1 timedout=false ts=1789802907018 last_toggle=1789802907013 previous_known=true
+4395: INFO timedout=true ts=1789802907018 last_toggle=1789802907018 why=view-change ts=1789802907019
+4396: INFO timeout toggle node=1 timedout=true ts=1789802907018 last_toggle=1789802907018 previous_known=true
+4399: INFO timedout=false ts=1789802907032 last_toggle=1789802907018 why=fresh-commit ts=1789802907032
+4400: INFO timeout toggle node=1 timedout=false ts=1789802907032 last_toggle=1789802907018 previous_known=true
+4404: INFO timedout=true ts=1789802907032 last_toggle=1789802907032 why=view-change ts=1789802907032
+4405: INFO timeout toggle node=1 timedout=true ts=1789802907032 last_toggle=1789802907032 previous_known=true
+4409: INFO timedout=false ts=1789802907044 last_toggle=1789802907032 why=fresh-commit ts=1789802907045
+4410: INFO timeout toggle node=1 timedout=false ts=1789802907044 last_toggle=1789802907032 previous_known=true
+4413: INFO timedout=true ts=1789802907044 last_toggle=1789802907044 why=view-change ts=1789802907045
+4414: INFO timeout toggle node=1 timedout=true ts=1789802907044 last_toggle=1789802907044 previous_known=true
+4418: INFO timedout=false ts=1789802907058 last_toggle=1789802907044 why=fresh-commit ts=1789802907058
+4419: INFO timeout toggle node=1 timedout=false ts=1789802907058 last_toggle=1789802907044 previous_known=true
+4422: INFO timedout=true ts=1789802907058 last_toggle=1789802907058 why=view-change ts=1789802907058
+4423: INFO timeout toggle node=1 timedout=true ts=1789802907058 last_toggle=1789802907058 previous_known=true
+4427: INFO timedout=false ts=1789802907071 last_toggle=1789802907058 why=fresh-commit ts=1789802907071
+4428: INFO timeout toggle node=1 timedout=false ts=1789802907071 last_toggle=1789802907058 previous_known=true

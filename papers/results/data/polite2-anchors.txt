@@ -1,0 +1,102 @@
+# local-polite2-2026-09-19 — the calm maintenance ladder (item25.29)
+# knobs: heartbeat 5ms, election 3000ms (sloppy detector 3000-5000ms), recovery 3000ms
+# binary: flight-recorder build (dirty disclosed); load: 3x lease-load polite (persistent conns) + shipped lease-client serving probes
+anchor=1789802661571 run-begin polite2 calm maintenance ladder
+anchor=1789802661571 boot n1
+anchor=1789802661573 boot n2
+anchor=1789802661589 boot n3
+anchor=1789802664117 converged leader=n2 states=n1:normal:v1:l2 n2:normal:v1:l2 n3:normal:v1:l2
+anchor=1789802664117 USR2 start all clients
+anchor=1789802664470 steady-serving-begin
+measure scenario=S0 steady_s=240 client_errors=0 states=n1:normal:v1:l2 n2:normal:v1:l2 n3:normal:v1:l2
+anchor=1789802904552 S1-begin target=n1 leader=n2
+anchor=1789802904552 S1-TERM-begin n1
+anchor=1789802904602 S1-TERM-done n1 exit=0
+anchor=1789802906941 S1-restart n1
+anchor=1789802922559 S1-rejoined n1 state=normal leader=3 view=35
+measure scenario=S1 node=n1 stop_ms=50 rejoin_ms=15618 serving_continued=1 first_ok_gap_ms=69
+anchor=1789802930570 S1-begin target=n3 leader=n2
+anchor=1789802930573 S1-TERM-begin n3
+anchor=1789802930623 S1-TERM-done n3 exit=0
+anchor=1789802952940 S1-restart n3
+anchor=1789802973957 S1-rejoined n3 state=normal leader=1 view=84
+measure scenario=S1 node=n3 stop_ms=50 rejoin_ms=21017 serving_continued=0 first_ok_gap_ms=-1
+anchor=1789802982055 S2-begin cycle=1 leader=n1 states=n1:normal:v84:l1 n2:normal:v84:l1 n3:normal:v84:l1
+anchor=1789802982066 S2-abdicate-drive cycle=1 reply={"action":"abdicate","accepted":true}
+
+anchor=1789802982200 S2-settled cycle=1 states=n1:normal:v84:l1 n2:normal:v84:l1 n3:normal:v84:l1
+measure scenario=S2 cycle=1 abdication_leader=n1 drive_ms=8 failover_ms=30 settle_ms=145
+anchor=1789802994314 S2-begin cycle=2 leader=n2 states=n1:normal:v85:l2 n2:normal:v85:l2 n3:normal:v85:l2
+anchor=1789802994322 S2-abdicate-drive cycle=2 reply={"action":"abdicate","accepted":true}
+
+anchor=1789802994467 S2-settled cycle=2 states=n1:normal:v86:l3 n2:normal:v85:l2 n3:normal:v85:l2
+measure scenario=S2 cycle=2 abdication_leader=n2 drive_ms=8 failover_ms=27 settle_ms=153
+anchor=1789803006601 S2-begin cycle=3 leader=n3 states=n1:normal:v86:l3 n2:normal:v86:l3 n3:normal:v86:l3
+anchor=1789803006608 S2-abdicate-drive cycle=3 reply={"action":"abdicate","accepted":true}
+
+anchor=1789803006757 S2-settled cycle=3 states=n1:normal:v86:l3 n2:normal:v86:l3 n3:normal:v86:l3
+measure scenario=S2 cycle=3 abdication_leader=n3 drive_ms=7 failover_ms=26 settle_ms=156
+anchor=1789803018776 S3-begin target=n1 (the leader)
+anchor=1789803018776 S3-TERM-begin n1
+anchor=1789803018826 S3-TERM-done n1 exit=0
+anchor=1789803041214 S3-restart n1
+anchor=1789803084205 S3-rejoined n1 state=normal leader=3 view=146
+measure scenario=S3 node=n1 stop_ms=50 takeover_ms=20370 new_leader=n2 rejoin_ms=42991
+anchor=1789803094243 S4-begin target=n2
+anchor=1789803094244 S4-SIGKILL-done n2
+anchor=1789803096264 S4-restart n2
+anchor=1789803246956 S4-rejoin-BLOCKED n2 states=n1:normal:v147:l1 n2:restarting:v0:l1 n3:normal:v147:l1
+measure scenario=S4 node=n2 crash_restart_to_serving_ms=BLOCKED rejoin_ms=BLOCKED incarnation=1 own=16777218 remap_notices=0 stuck_status=latest status=restarting voting=0 diagnostic=GapDetected states=n1:normal:v147:l1 n2:restarting:v0:l1 n3:normal:v147:l1
+anchor=1789803252162 S4-begin target=n3
+anchor=1789803252166 S4-SIGKILL-done n3
+anchor=1789803294788 S4-restart n3
+anchor=1789803445181 S4-rejoin-BLOCKED n3 states=n1:view_change:v1381:l2 n2:down n3:view_change:v1383:l1
+measure scenario=S4 node=n3 crash_restart_to_serving_ms=BLOCKED rejoin_ms=BLOCKED incarnation=1 own=16777219 remap_notices=0 stuck_status=latest status=view_change voting=0 diagnostic=GapDetected states=n1:view_change:v1381:l2 n2:down n3:view_change:v1383:l1
+anchor=1789803450282 S4-begin target=n1
+anchor=1789803450284 S4-SIGKILL-done n1
+anchor=1789803482422 S4-restart n1
+anchor=1789803632777 S4-rejoin-BLOCKED n1 states=n1:restarting:v0:l1 n2:down n3:down
+measure scenario=S4 node=n1 crash_restart_to_serving_ms=BLOCKED rejoin_ms=BLOCKED incarnation=1 own=16777217 remap_notices=0 stuck_status=latest status=restarting voting=0 diagnostic=GapDetected states=n1:restarting:v0:l1 n2:down n3:down
+anchor=1789803637888 S5-begin pass=1 gap_s=10
+anchor=1789803637888 S5-TERM-begin pass=1 n1
+anchor=1789803637889 S5-TERM-done pass=1 n1
+anchor=1789803637889 S5-TERM-begin pass=1 n2
+anchor=1789803637889 S5-TERM-done pass=1 n2
+anchor=1789803637889 S5-TERM-begin pass=1 n3
+anchor=1789803637889 S5-TERM-done pass=1 n3
+anchor=1789803637889 S5-all-down pass=1
+anchor=1789803647890 S5-restart-all pass=1
+anchor=1789803768740 S5-converge-BLOCKED pass=1 states=n1:restarting:v0:l1 n2:restarting:v0:l1 n3:restarting:v0:l1
+measure scenario=S5 pass=1 converge=BLOCKED down_ms=10001 stuck_report=normal voters: 0/3 states=n1:restarting:v0:l1 n2:restarting:v0:l1 n3:restarting:v0:l1
+anchor=1789803777795 S5-begin pass=2 gap_s=30
+anchor=1789803777795 S5-TERM-begin pass=2 n1
+anchor=1789803777796 S5-TERM-done pass=2 n1
+anchor=1789803777796 S5-TERM-begin pass=2 n2
+anchor=1789803777796 S5-TERM-done pass=2 n2
+anchor=1789803777796 S5-TERM-begin pass=2 n3
+anchor=1789803777796 S5-TERM-done pass=2 n3
+anchor=1789803777796 S5-all-down pass=2
+anchor=1789803807797 S5-restart-all pass=2
+anchor=1789803810375 S5-converged pass=2 leader=n1
+measure scenario=S5 pass=2 down_ms=30001 first_op_ms=2596 converge_ms=2578 states=n1:normal:v0:l1 n2:normal:v0:l1 n3:normal:v0:l1
+anchor=1789803820761 S6-begin departing=n3 replacement=n4 leader=n1
+anchor=1789803820789 S6-decrement reply={"action":"decrement","id":3,"accepted":true}
+ drive_ms=28
+anchor=1789803830868 S6-leave reply={"action":"leave","id":3,"accepted":true}
+ drive_ms=5022
+anchor=1789803830868 S6-departed n3
+anchor=1789803830918 S6-n3-stopped
+anchor=1789803832920 S6-restart n4
+anchor=1789803838953 S6-join reply={"action":"join","id":4,"accepted":true}
+ drive_ms=5017
+anchor=1789803844301 S6-increment reply={"action":"increment","id":4,"accepted":true}
+ drive_ms=5026
+anchor=1789803844303 S6-swap-complete state=normal leader=1 view=6
+measure scenario=S6 departing=n3 replacement=n4 decrement_ms=28 leave_ms=5022 join_ms=5017 increment_ms=5026 total_ms=23542 rejoin_ms=11383 states=n1:normal:v6:l1 n2:normal:v6:l1 n3:down
+anchor=1789803854747 ladder-complete states=n1:normal:v7:l2 n2:normal:v7:l2 n3:down
+anchor=1789803854747 teardown-begin
+anchor=1789803855909 T-TERM-begin n1
+anchor=1789803855959 T-TERM-done n1 exit=0
+anchor=1789803855959 T-TERM-begin n2
+anchor=1789803856009 T-TERM-done n2 exit=0
+anchor=1789803856064 teardown-complete total_client_errors=0

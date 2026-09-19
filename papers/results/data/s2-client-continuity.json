@@ -1,0 +1,22 @@
+{
+ "n1": {
+  "s2_window_ops": 414,
+  "s2_window_max_gap_ms": 166,
+  "total_ops_in_log": 9440
+ },
+ "n2": {
+  "s2_window_ops": 440,
+  "s2_window_max_gap_ms": 170,
+  "total_ops_in_log": 8154
+ },
+ "n3": {
+  "s2_window_ops": 438,
+  "s2_window_max_gap_ms": 171,
+  "total_ops_in_log": 9666
+ },
+ "n4": {
+  "s2_window_ops": 0,
+  "s2_window_max_gap_ms": 0,
+  "total_ops_in_log": 202
+ }
+}

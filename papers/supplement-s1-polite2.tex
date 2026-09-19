@@ -30,7 +30,7 @@
 
 \title{uVRR Supplement S1: The polite2 Calm Maintenance Ladder, Measured\\
 {\large Evidence details, anchors, and provenance for the paper's
-``Maintenance operations: first measurements'' section}}
+``Maintenance operations'' section --- full ladder, second edition}}
 \author{Simon Massey%
 \thanks{Simon Massey (email: \href{mailto:simon.massey@stenographer.cloud}{simon.massey@stenographer.cloud}).}}
 \date{}
@@ -40,17 +40,22 @@
 \thispagestyle{uvrrfirst}
 
 \begin{abstract}
-This supplement carries the detail the paper abridges. The paper reports
-abdication failover at 28--38~ms per cycle, non-leader stop/start with a
-churn-dominated rejoin tail, and the timeout-driven takeover baseline.
-Here: the exact run configuration, the anchor table every number is
-computed from, the raw log lines that witness each transition, the
-client-continuity computation, the session lineage (which agent session
-ran what, and how the figures in this document were recomputed from the
-raw artefacts rather than taken from session claims), and the
-reproduction path. Where a scenario was still in flight at writing, its
-partial numbers are recorded as partial, in place, and the completed
-row is the next run's matter-of-fact continuation.
+This supplement carries the detail the paper abridges, in its second
+edition covering the complete maintenance ladder. The paper reports
+abdication failover at 26--30~ms per cycle, the timeout-driven takeover
+at 20{,}370~ms, the whole-cluster reboot serving at 2{,}596~ms, the
+live member swap at 23{,}542~ms, and the crash-restart scenario
+recorded blocked-with-evidence. Here: the exact run configuration, the
+anchor tables every number is computed from, the raw log lines and
+flight-tape records that witness each transition, the
+client-continuity computation, the blocked scenario with its
+diagnostics and its safety analysis, the session lineage (which agent
+session ran what, and how the figures in this document were recomputed
+from the raw artefacts rather than taken from session claims), and the
+reproduction path. Every claim carries a pointer to the lab book in
+\code{papers/results/} whose executable record evidences it; the lab
+books are the leaf layer of the paper $\to$ supplement $\to$ lab book
+$\to$ snapshot chain.
 \end{abstract}
 
 \section{The run and its configuration}
@@ -154,9 +159,9 @@ span to all three nodes reporting \code{normal} in the new view.
 \toprule
 Cycle & S2-begin & abdicate-drive & S2-settled\\
 \midrule
-1 (leader n2) & 1789798677832 & 1789798677843 & 1789798677982\\
-2 (leader n3) & 1789798690121 & 1789798690138 & 1789798690302\\
-3 (leader n1) & 1789798702420 & 1789798702430 & 1789798702584\\
+1 (leader n1) & 1789802982055 & 1789802982066 & 1789802982200\\
+2 (leader n2) & 1789802994314 & 1789802994322 & 1789802994467\\
+3 (leader n3) & 1789803006601 & 1789803006608 & 1789803006757\\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -172,27 +177,27 @@ verified by hand against the node logs:
 \toprule
 Cycle & drive (begin$\to$reply) & failover (reply$\to$first commit) & settle (begin$\to$settled)\\
 \midrule
-1 & 11 & 30 & 150\\
-2 & 11 & 38 & 181\\
-3 & 10 & 28 & 164\\
+1 & 8 & 30 & 145\\
+2 & 8 & 27 & 153\\
+3 & 7 & 26 & 156\\
 \bottomrule
 \end{tabular}
 \end{table}
 
 The failover row is the paper's number. The wire witness at the log
-line (cycle 1, node n1's log): the abdication drive answered at
-\ts{ts=1789798677843}; n1 logged
-\code{leader leader=3 era=1 view=92 ts=1789798677849} --- the successor
-view's designated primary inside 6~ms --- and the view-change toggle
-cleared at \ts{ts=1789798677862} on the successor view's first commit
-(17~ms from the drive at this node; the 30~ms failover measure is the
-cluster-wide span the runner takes). The rotation covered all three
-nodes: n2~$\to$~n3~$\to$~n1~$\to$~n2, views 91~$\to$~92~$\to$~93.
+line (cycle 1, node n2's log): the abdication drive answered at
+\ts{ts=1789802982066}; n2 logged
+\code{leader leader=2 era=1 view=85 ts=1789802982073} --- the successor
+view's designated primary inside 7~ms, the failure detector reading
+phi 0.000 and never firing (lab book \code{02-abdication-failover.md},
+``the wire''; raw windows \code{papers/results/data/s2-window-n*.txt}).
+The rotation covered all three nodes:
+n1~$\to$~n2~$\to$~n3~$\to$~n1, views 84~$\to$~85~$\to$~86.
 
 \subsection{Client continuity through the rotation}
 
-The window from cycle-1's drive (\ts{1789798677843}) to cycle-3's
-settle (\ts{1789798702584}) is 24{,}741~ms. Recomputed from the raw
+The window from cycle-1's drive (\ts{1789802982066}) to cycle-3's
+settle (\ts{1789803006757}) is 24{,}691~ms. Recomputed from the raw
 \code{lease-attempt} lines of the three node logs (not from session
 claims):
 
@@ -204,15 +209,16 @@ claims):
 \toprule
 Node & operations & mean interval (ms) & longest gap (ms)\\
 \midrule
-n1 & 456 & 54 & 165\\
-n3 & 442 & 56 & 171\\
-n2 & 432 & 57 & 171\\
+n1 & 414 & 60 & 166\\
+n2 & 440 & 56 & 170\\
+n3 & 438 & 56 & 171\\
 \bottomrule
 \end{tabular}
 \end{table}
 
-Total 1{,}330 operations at roughly 54/s cluster-wide (the run's
-$\sim$17~ops/s per node), zero client errors. The longest gap at any
+Total 1{,}292 operations at roughly 52/s cluster-wide (the run's
+$\sim$17~ops/s per node), zero client errors (recomputation:
+\code{papers/results/data/s2-client-continuity.json}). The longest gap at any
 node, 171~ms, is three mean intervals: the rotation is client-visible
 only as a momentary slowdown at worst, against the multi-second stall
 a timeout-driven takeover would impose.
@@ -229,16 +235,17 @@ no weight change participated.
 \section{S3: the timeout-driven baseline}
 \label{sec:s3}
 
-Run C's completed S3 row (measured 2026-09-19, anchors in the live
-run directory, snapshot pending): leader n2 SIGTERM'd; stop 50~ms;
-the takeover --- new leader n3 serving --- at 20{,}384~ms; n2's
-rejoin to \code{normal} at 64{,}647~ms. The takeover spans the sloppy
-detector's window (3{,}000--5{,}000~ms) plus the era-fold walk the new
-leader's catch-up required; the rejoin tail matches the S1 shape
-(churn accumulated during absence, walked at the harness cadence).
+The completed ladder's S3 row (leader n1 SIGTERM'd; the runner's
+measure line verbatim): stop 50~ms; the takeover --- successor n2
+elected and serving --- at 20{,}370~ms; n1's rejoin to \code{normal}
+at 42{,}991~ms. The takeover spans the sloppy detector's window
+(3{,}000--5{,}000~ms) plus the era-fold walk the new leader's catch-up
+required; the rejoin tail matches the S1 shape (churn accumulated
+during absence, walked at the harness cadence; lab book
+\code{02-abdication-failover.md}, ``the contrast'').
 
 The contrast is the paper's point: the same leadership change costs
-28--38~ms when the leader abdicates and 20.4~s when the cluster must
+26--30~ms when the leader abdicates and 20.4~s when the cluster must
 detect its death --- three orders of magnitude apart on identical
 hardware and knobs.
 
@@ -248,15 +255,91 @@ correctly; the restarted leader's rejoin took approximately 78~s
 against a 30~s gate --- the boot-fenced chase of a churning view
 space, the failure class the paper's E1 analyses.
 
-\section{Scenarios in flight}
-\label{sec:inflight}
+\section{S4: the crash-restart scenario, blocked with evidence}
+\label{sec:s4}
 
-At the time of writing, run C is between S3 and S4. The remaining
-scenarios --- S4 SIGKILL crashes (leader last), S5 full-cluster
-reboot, S6 reconfiguration swap --- land in this supplement as their
-snapshots arrive, in place, as the matter-of-fact continuation of
-Table~\ref{tab:derived}'s method: anchors verbatim, derived measures
-computed from them, wire witnesses quoted from the raw logs.
+The ladder's S4 SIGKILL'd all three nodes in turn (non-leaders first,
+the leader last), restarting each on the same boot line. The boot-gate
+classification worked on every crash: each reboot read its fence,
+found no clean-stop marker, and bumped its identity into the high
+band (old identities 1/2/3, new \code{own=16777217/16777218/16777219},
+\code{incarnation=1}; witness lines
+\code{papers/results/data/s4-bump-witness.txt}). Each bumped node's
+first act was the reincarnation announcement to all three peers in the
+millisecond of its boot (its flight tape opens with the host's
+\code{reincarnate} drive and the tag-\code{0x0d} frames;
+\code{papers/results/data/s4-bumped-tape-head.txt}).
+
+The rejoin walk then wedged, on all three crashes. The leader's log
+names the refusal: \code{ReincarnationRefused \{ sender: NodeId(2),
+\ldots\}} --- the announcement arriving attributable to the OLD
+identity where the bumped node announced from the NEW one; the
+harness's transport identity mapping sits between the two, and the
+engine declines to reconfigure on a message it cannot attribute ---
+the safe direction to fail, repeated 686 times across the three
+nodes' logs (227/282/177 at n1/n3/n2; samples
+\code{papers/results/data/s4-refusal-samples.txt}). The forced walk
+never started (\code{remap} notices at zero peers), the bumped nodes
+sat fenced for the full 150~s budget, and the serving pair's views
+stormed (1{,}431 and 1{,}146 leader-change records across the run on
+n1 and n3 --- the era-fold walk hunting a shape the refused
+announcement never gave it; lab book
+\code{03-crash-reincarnation.md}, ``where the rig stopped'').
+
+\textbf{The safety statement, checked on the tapes.} The ladder
+closed with \code{total\_client\_errors=0}: no committed operation
+was lost anywhere in the run. No superseded identity voted again ---
+the refusals are the protocol declining to act. The defect is a
+liveness defect of the harness's rejoin walk, host-side by the
+repository's bug-provenance ruling, localised to the transport
+identity mapping; the repair is the downstream repository's active
+work. The 2$\times$RTT crash-reincarnation floor the paper claims is
+the protocol's, evidenced per piece (classification, bump,
+announcement, and the fused-reconfiguration machinery measured healthy
+in S6's 28~ms decrement round), with this end-to-end block named.
+
+\section{S5: the whole-cluster reboot}
+\label{sec:s5}
+
+Two passes, both recorded. Pass 1 attempted the durable resurrection
+of the post-S4 state --- three nodes holding divergent retained views
+from the view storms (one at view 1{,}383, the others fenced at 0):
+the cluster did not converge in 120~s (all three \code{restarting
+v0}, 0/3 voters; the same era-fold family as Section~\ref{sec:s4}).
+Pass 2 did what an operator does: snapshot for the record,
+re-provision fresh, reboot. All down 30~s; all up; all three voters
+\code{normal} at 2{,}578~ms and the first client operation served at
+2{,}596~ms (anchors \code{papers/results/data/s5-anchors.txt}; lab
+book \code{04-reboot-and-reconfig.md}).
+
+\section{S6: the controlled reconfiguration swap}
+\label{sec:s6}
+
+n3 was retired and n4 joined, live, as four committed reconfiguration
+rounds: decrement 28~ms (one round-trip --- the same machinery as the
+abdication), leave 5{,}022~ms, join 5{,}017~ms, increment 5{,}026~ms
+(the 5-second rounds are the harness's drive cadence between rounds);
+the swap completed in 23{,}542~ms with n4 serving at voting weight
+11{,}383~ms in, the cluster serving throughout (the measure line
+verbatim in lab book \code{04}; anchors
+\code{papers/results/data/s6-anchors.txt}).
+
+\section{Limitations}
+\label{sec:limitations}
+
+The run's own REPORT discloses, and this supplement repeats: the
+per-operation stream client (softball7's shape) was dropped from the
+run after a scratch tooling probe of that shape lost replies
+intermittently ($\sim$4\% per attempt) against this rig on this
+host, while the shipped Rust clients did not; the tape shows the
+wedged operations committing at the leader with the reply emitted ---
+the loss is in the scratch client's connection handling, not the
+cluster, and the runner replaced it with the shipped
+\code{lease-client} serving probes. The load clients' 5~s op-timeout
+tail (exactly three samples per client, in the S4/S5 outage windows)
+sits in the cumulative p99/max; the clean-window medians carry the
+mid-distribution. And Section~\ref{sec:s4}'s block stands as the
+ladder's principal incomplete scenario.
 
 \section{Evidence package and provenance}
 \label{sec:provenance}
@@ -270,7 +353,8 @@ computed from them, wire witnesses quoted from the raw logs.
 Artefact & Location\\
 \midrule
 Run spec & \code{.tmp/delegation/item25.29.md} (lunet-locks)\\
-Snapshots (runs A, B, C-in-progress) & iCloud \code{2026/uVRR/runs/polite2-2026-09-19/}\\
+Snapshots (runs A, B, and the completed ladder) & iCloud \code{2026/uVRR/runs/polite2-2026-09-19/}\\
+Lab books (the executable evidence) & \code{papers/results/00-index.md} and \code{01}--\code{04}, with \code{papers/results/data/}\\
 Live run directory & \code{.tmp/telemetry/local-polite2-2026-09-19/}\\
 Paper of record & \code{papers/paper-20260919-3a9ce40fd8.pdf} (iCloud)\\
 This supplement & \code{papers/supplement-s1-polite2.tex}, committed\\
@@ -283,18 +367,22 @@ The lineage, stated plainly. The run was executed by the runner
 session (``Polite-2 run with abdication'', 988-line rollout): it built
 the abdication verb (core $\to$ adapter $\to$ FFI $\to$ Teal admin
 verb $\to$ rig and lease-client), the Teal ladder runner
-(\code{tools/lib/polite2.tl}), and the runbook, drove runs A--C, and
-left each snapshot via \code{snapshot\_run}. This supplement was then
-written against the snapshots themselves: every figure in
-Sections~\ref{sec:s0}--\ref{sec:s3} was recomputed from the raw
+(\code{tools/lib/polite2.tl}), and the runbook, drove runs A--C and
+the completed ladder, and left each snapshot via
+\code{snapshot\_run}. This supplement was then written against the
+snapshots themselves: every figure in
+Sections~\ref{sec:s0}--\ref{sec:s6} was recomputed from the raw
 \code{anchors.md}, the node logs' timestamped lines, and the flight
 tapes' commit stamps --- the session's own claims were used only to
-locate the evidence, never as the evidence. The two failure classes
-the runner fixed en route are recorded because they are part of the
+locate the evidence, never as the evidence. The failure classes the
+runner fixed en route are recorded because they are part of the
 measurement's story: the stream-client wedge was a host-side harness
 bug (16-rotation message-id generator, diagnosed through the flight
 tapes), not a protocol event; the S3/S4 gate fixes were harness
-budgets, not production changes.
+budgets, not production changes. The lab books of
+\code{papers/results/} carry the executable layer of this chain:
+each one verifies under \code{showboat verify} against the committed
+\code{data/} extracts.
 
 \section{Reproduction}
 \label{sec:repro}

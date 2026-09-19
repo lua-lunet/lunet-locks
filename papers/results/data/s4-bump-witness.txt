@@ -1,0 +1,8 @@
+logs/n1.2026-09-19.log:27485: INFO restart: the identity is a later life in the high band old=1 new=16777217 incarnation=1
+logs/n1.2026-09-19.log:27486: INFO node provisioned own=16777217 incarnation=1 boot="genesis"
+logs/n1.2026-09-19.log:27488: INFO boot name=n1 descriptor-id=1 own=16777217 incarnation=1 detector=sloppy-timeout ts=1789803482427
+logs/n1.2026-09-19.log:51935: INFO restart: the identity is a later life in the high band old=1 new=16777217 incarnation=1
+logs/n1.2026-09-19.log:51936: INFO node provisioned own=16777217 incarnation=1 boot="genesis"
+logs/n1.2026-09-19.log:51938: INFO boot name=n1 descriptor-id=1 own=16777217 incarnation=1 detector=sloppy-timeout ts=1789803647897
+logs/n3.2026-09-19.log:16342: INFO restart: the identity is a later life in the high band old=3 new=16777219 incarnation=1
+logs/n3.2026-09-19.log:16343: INFO node provisioned own=16777219 incarnation=1 boot="genesis"
