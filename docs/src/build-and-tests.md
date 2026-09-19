@@ -8,11 +8,10 @@ make hooks      # enable the formatting pre-commit hook once after clone
 ```
 
 The native adapter requires Rust 1.85 or newer. Its ordering core is the
-vendored `ext/uvrr-core` git submodule, branch `lunet-locks/learner-era-fold`:
-upstream commit `0fc6380` plus the learner-acquisition and
-fence-under-load patch commits. The adapter manifest pins the upstream
-revision and its `[patch]` section builds the dependency from the
-submodule, so `cargo` fetches no git dependencies: local builds, the
+vendored `ext/uvrr-core` git submodule, checked out on upstream main at
+tag `v0.7.4` (commit `e5b0a79`, released 2026-09-19). The adapter manifest
+pins the upstream tag and its `[patch]` section builds the dependency from
+the submodule, so `cargo` fetches no git dependencies: local builds, the
 vendored Docker context, and CI all compile the submodule source directly.
 
 ## Teal tooling

@@ -281,9 +281,9 @@ as this repo does:
 - `lunet-advisory-lock` has no release tag: pin the `lua-lunet/lunet-locks`
   commit the integration was validated against (`f5f8373` and later).
 - The core comes in through the advisory-lock crate's dependency:
-  `uvrr-core` upstream commit `0fc6380` plus the `lunet-locks/learner-era-fold`
-  patch branch (submodule head `aacecda`), which carries the learner
-  acquisition rule and the stop-the-world-under-stream completion. The
+  `uvrr-core` upstream tag `v0.7.4` (submodule head `e5b0a79`), which
+  carries the lifecycle boot gate, the learner acquisition rule, and the
+  stop-the-world-under-stream completion. The
   `[patch]` section in `ext/advisory_lock/Cargo.toml` builds it from the
   vendored submodule; downstream mirrors that section with its own pin.
 - The embedded surface is `Node::open` / `request` / `receive` / `idle` /

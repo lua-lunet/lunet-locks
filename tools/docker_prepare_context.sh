@@ -23,8 +23,8 @@ sed "s|directory = \".*\"|directory = \"/app/vendor\"|" "$context/.cargo/config.
 
 cp "$root/ext/advisory_lock/Cargo.toml" "$root/ext/advisory_lock/Cargo.lock" "$context/ext/advisory_lock/"
 cp -R "$root/ext/advisory_lock/src" "$context/ext/advisory_lock/src"
-# The learner-era-fold patch branch: the [patch] section of the manifest
-# resolves vrr-core to the uvrr-core submodule, so the vendored context
+# The vendored uvrr-core submodule: the [patch] section of the manifest
+# resolves vrr-core to it, so the vendored context
 # carries its source at the same relative position the manifest names.
 test -d "$root/ext/uvrr-core/src" || {
     echo "missing the uvrr-core submodule source; run git submodule update --init" >&2

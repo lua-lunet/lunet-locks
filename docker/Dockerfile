@@ -1,9 +1,9 @@
 # Plain multi-stage Docker build, intentionally compatible with Colima's legacy
 # builder: it uses no BuildKit-only mounts, secrets, or cache directives.
 # `tools/docker_prepare_context.sh` vendors the transitive dependency sources
-# and the uvrr-core submodule source (the lunet-locks/learner-era-fold patch
-# branch the manifest's [patch] section names), so no git fetch happens inside
-# Docker. The runtime stage carries the diagnosis kit: the NTP/capture/RTT
+# and the uvrr-core submodule source (the upstream tag v0.7.4 the manifest's
+# dependency names), so no git fetch happens inside Docker. The runtime stage
+# carries the diagnosis kit: the NTP/capture/RTT
 # tooling packages and the demo crate's binaries from the kit stage.
 ARG AOF_IMAGE=ghcr.io/lua-lunet/lunet-locks/tbio-core:v0.17.9-lunet.2-arm64
 ARG LUNET_LOCKS_HEAD=unknown
