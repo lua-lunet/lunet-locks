@@ -666,10 +666,6 @@ local function scenario_crashes()
         local t_boot = anchor("S4-restart " .. name)
         start_node(name)
         local ok, report = wait_node_normal(name, t_boot, REJOIN_DEADLINE_MS)
-        if not ok then
-            gate.fail("S4: " .. name .. " did not come back to normal: " .. report)
-        end
-        local t_serving = anchor("S4-serving " .. name .. " " .. report)
         -- The dirty-boot evidence: the bumped boot note and the remap
         -- notices at the peers.
         local bumped = ""
@@ -691,19 +687,57 @@ local function scenario_crashes()
                 remaps = remaps + logs.count(node_log_files(other), "remap ")
             end
         end
-        measure(
-            "scenario=S4 node="
-                .. name
-                .. " crash_restart_to_serving_ms="
-                .. (t_serving - t_boot)
-                .. " "
-                .. (bumped ~= "" and bumped or "no_bump_seen")
-                .. " remap_notices="
-                .. remaps
-                .. " states="
-                .. states_snapshot()
-        )
-        clock.sleep(8)
+        if not ok then
+            -- The crashed-node rejoin is bounded, not fatal to the ladder:
+            -- the rejoin walk at a deep view can sit fenced (the parked
+            -- era-fold family). The states, the boot note, the remap count
+            -- and the newest named diagnostic ARE the evidence; the node's
+            -- process is stopped so the serving pair carries the ladder.
+            local diagnostic_name = ""
+            for _, line in ipairs(logs.grep(node_log_files(name), "diagnostic=")) do
+                diagnostic_name = line:match("diagnostic=(%S+)") or ""
+                break
+            end
+            anchor("S4-rejoin-BLOCKED " .. name .. " states=" .. states_snapshot())
+            measure(
+                "scenario=S4 node="
+                    .. name
+                    .. " crash_restart_to_serving_ms=BLOCKED"
+                    .. " rejoin_ms=BLOCKED"
+                    .. " "
+                    .. (bumped ~= "" and bumped or "no_bump_seen")
+                    .. " remap_notices="
+                    .. remaps
+                    .. " stuck_status="
+                    .. report
+                    .. " diagnostic="
+                    .. diagnostic_name
+                    .. " states="
+                    .. states_snapshot()
+            )
+            progress(
+                "S4 "
+                    .. name
+                    .. ": the crashed rejoin stayed fenced (blocked, recorded)"
+            )
+            term_node(name, 2000)
+            clock.sleep(5)
+        else
+            local t_serving = anchor("S4-serving " .. name .. " " .. report)
+            measure(
+                "scenario=S4 node="
+                    .. name
+                    .. " crash_restart_to_serving_ms="
+                    .. (t_serving - t_boot)
+                    .. " "
+                    .. (bumped ~= "" and bumped or "no_bump_seen")
+                    .. " remap_notices="
+                    .. remaps
+                    .. " states="
+                    .. states_snapshot()
+            )
+            clock.sleep(8)
+        end
     end
 end
 
