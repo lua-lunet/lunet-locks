@@ -220,6 +220,7 @@ mod tests {
         };
         let mut frame = vec![0u8; message.packed_len()];
         let written = message.pack_into(&mut frame).expect("the core packs its own body");
+        eprintln!("frame[0..45]: {:02x?}", &frame[..written]);
         assert_eq!(written, REINCARNATION_BYTES, "the constant tracks the core's frame");
         assert_eq!(
             reincarnation_pair(&frame),
@@ -236,7 +237,7 @@ mod tests {
                 view: ViewId { era: Era(1), view: View(0) },
                 slot: Slot(0),
             },
-            body: Body::Commit { through: Slot(0) },
+            body: Body::Commit { committed: Slot(0) },
         };
         let mut frame = vec![0u8; message.packed_len()];
         let written = message.pack_into(&mut frame).expect("the core packs its own body");

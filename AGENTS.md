@@ -48,17 +48,6 @@ No instruction conflicts with Andon; if one appears to, Andon wins.
   immediately, without a todo list, or name a specific order — then do what
   they said.
 
-## Architecture note: phi vs timeouts
-
-- Phi failure detection, leader-election (leader) timeouts, and the
-  cluster viewchange timeout are DISTINCT concepts with DISTINCT
-  mechanisms. Phi is a steady-state leader-failure detector; while a
-  node is timed out (`timedout` toggle) phi is neither updated nor
-  checked, and the randomized cluster viewchange timeout polls instead.
-  See `docs/src/phi-and-timeouts.md`. Every unit test, feature, and
-  config must reflect this distinction — a test, feature, or config key
-  that conflates them is wrong.
-
 ## Fast line: pure Rust, then wrappers
 
 - Debugging is ad-hoc Rust first: small throwaway CLI bins named
@@ -117,12 +106,6 @@ No instruction conflicts with Andon; if one appears to, Andon wins.
   the workspace. If a tool defaults to an external temp, redirect it into
   the repo root pinned `.tmp/` or run without it.
 
-## Scope
-
-- `src/` is the shipped Teal source tree.
-- `build/` is Cyan output. Never hand-edit it.
-- `tests/` holds the forward-pass tests and the learning tests.
-
 ## Toolchain
 
 - Build with [Cyan](https://github.com/teal-language/cyan), not ad-hoc `tl gen` loops.
@@ -142,21 +125,6 @@ No instruction conflicts with Andon; if one appears to, Andon wins.
   for data mining only.
 - `make init` also installs `tl` into `.rocks/` for the LuaJIT 5.1 ABI,
   idempotently; `make check` runs `tl check` over `tools/lib`.
-
-## Runtime and upstream boundaries
-
-- The only service/smoke runtime is the project-local official Lunet `v0.10.0`
-  release. Run `make lunet-runtime` or `make smoke`; do not use a `lunet-run`
-  from `PATH`. Its authoritative shipped LuaCATS/Teal docs are under
-  `.lunet/v0.10.0/types/`.
-- The authoritative uvrr-core source is the vendored submodule
-  `ext/uvrr-core`, branch `lunet-locks/learner-era-fold`: upstream commit
-  `0fc6380` plus the learner-acquisition and fence-under-load patch
-  commits. The adapter manifest's `[patch]` section builds the dependency
-  from the submodule, so this tree always builds against that branch. Do
-  not revalidate or change the submodule unless a concrete adapter API need
-  requires it. A serious correctness, safety, or replication bug is a
-  stop-and-report issue; report upstream engagement to the coordinator.
 
 ## Teal no-surprises recap
 
@@ -211,3 +179,7 @@ leaving a livelock, and uVRR is suspect only when evidence shows
 reasonable timeouts producing unnecessary messages. Agents assume every
 bug is their own and must find the defect in the uVRR spec or protocol
 before raising anything upstream.
+
+## RELEASE GATE 
+
+This repo cannot be tagged and released unless the checkout is clean, every submodule is a clean checkout on a commit that is on the main branch of its repo, with a local tag in this repo naming exactly the release and a corresponding local tag in each submodule checkout making the connection; no testing while any submodule holds commits not pushed upstream as a draft PR + explanatory issue (Andon) — and any such test-PR todo cannot complete until the upstream PR+issue are accepted, merged to main, pulled and built here
