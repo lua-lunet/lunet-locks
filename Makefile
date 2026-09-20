@@ -123,7 +123,7 @@ simulation: lunet-runtime build $(SIM_BIN)
 # over the network inside Docker and no BuildKit mounts are needed.
 DOCKER_IMAGE ?= lunet-advisory-lock
 DOCKER_PLATFORM ?= native
-AOF_IMAGE ?= ghcr.io/lua-lunet/lunet-locks/tbio-core:v0.17.9-lunet.2-arm64
+AOF_IMAGE ?= ghcr.io/lua-lunet/lunet-locks/tbio-core:v0.17.9-lunet.3-arm64
 docker-build: build lunet-runtime
 	@context=$$(mktemp -d "$(CURDIR)/.tmp/docker-context.XXXXXX"); \
 	tools/docker_prepare_context.sh "$$context" || exit 1; \
@@ -208,7 +208,17 @@ ext-check:
 ext-test: ext-check
 	cargo test --manifest-path ext/advisory_lock/Cargo.toml
 	cargo test --manifest-path ext/lunet-locks-aof/Cargo.toml
-	cd ext/lunet-locks-aof/zig && mise exec -- zig build test
+	cd ext/lunet-locks-aof/zig && mise exec -- zig build test $(ZIG_TEST_FLAGS)
+
+# The vendored checksum asserts AES hardware at comptime (vsr/checksum.zig);
+# Linux arm64 CI resolves a generic CPU baseline that lacks the feature, so
+# the arm64 build carries the flag explicitly — every deployment target
+# carries ARMv8 AES (the runners are Ampere Altra, the cloud VMs Graviton).
+ifeq ($(shell uname -m),aarch64)
+ZIG_TEST_FLAGS := -Dcpu=baseline+aes
+else
+ZIG_TEST_FLAGS :=
+endif
 
 # Release packaging (tagged CI builds). Target keys match the CI matrix;
 # the archive layout is documented in tests/package_release.sh.
