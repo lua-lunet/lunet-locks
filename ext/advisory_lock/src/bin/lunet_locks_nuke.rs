@@ -331,7 +331,12 @@ fn verdict(copies: &[CopyInfo]) -> String {
 fn zone_head_hex(bytes: &[u8], slot: usize, geometry: marker::Geometry) -> Option<String> {
     let start = geometry.copy_size.checked_mul(slot)?;
     let head = bytes.get(start..)?.iter().take(16);
-    Some(head.map(|byte| format!("{byte:02x}")).collect())
+    let mut hex = String::with_capacity(16 * 2);
+    for byte in head {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{byte:02x}");
+    }
+    Some(hex)
 }
 
 /// The on-block state string (the fixed-width, space-padded name at the
@@ -403,4 +408,27 @@ fn write_projection(state: &Path, incarnation: u64, word: &str) -> Result<(), St
         let _ = fs::File::open(dir).and_then(|file| file.sync_all());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod zone_head_hex_test {
+    use super::*;
+
+    /// The defensive test for the CI clippy fix: the rendered head is
+    /// the plain two-hex-digit-per-byte form, unchanged by the rewrite.
+    #[test]
+    fn renders_two_hex_digits_per_byte() {
+        let geometry = marker::Geometry {
+            copies: 4,
+            copy_size: 256,
+        };
+        let mut bytes = vec![0u8; 256];
+        bytes[..3].copy_from_slice(&[0x00, 0x0a, 0xff]);
+        assert_eq!(
+            zone_head_hex(&bytes, 0, geometry).as_deref(),
+            Some("000aff00000000000000000000000000")
+        );
+        // An empty slice renders an empty head: the tool's dump shape.
+        assert_eq!(zone_head_hex(&[], 0, geometry), Some(String::new()));
+    }
 }
