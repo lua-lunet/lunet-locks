@@ -74,7 +74,10 @@ while true do
             os.exit(1)
         end
         local lat = now_ms() - t0
-        print(t0, lat, reply)
+        -- The reply line is `t0 lat reply` with single spaces: the
+        -- smoke's window_stats parses exactly this shape to measure the
+        -- per-reconfig-window request count and worst-case latency.
+        io.write(string.format("%d %d %s\n", t0, lat, reply))
         io.stdout:flush()
         if not reply:find(marker, 1, true) then
             io.stderr:write(

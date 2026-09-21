@@ -13,7 +13,7 @@ permissions:
   packages: write
 
 env:
-  AOF_TAG: v0.17.9-lunet.3
+  AOF_TAG: v0.17.9-lunet.4
   IMAGE: ghcr.io/lua-lunet/lunet-locks/tbio-core
 
 jobs:

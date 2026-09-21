@@ -138,10 +138,13 @@ jobs:
           retention-days: 5
       # Windows lane, tagged builds only: reduced scope. The Teal/Cyan
       # toolchain, the shell smoke harness, and the Docker simulation are
-      # POSIX-only today; validate the Rust extension crate natively.
+      # POSIX-only today; validate the Rust extension crate natively. The
+      # `--lib` scope matches the dependency graph: the bins import the
+      # AOF engine, declared non-Windows at Cargo.toml, so they are
+      # POSIX-only by construction and the POSIX lanes own their tests.
       - name: Rust extension tests (Windows)
         if: runner.os == 'Windows'
-        run: cargo test --manifest-path ext/advisory_lock/Cargo.toml
+        run: cargo test --manifest-path ext/advisory_lock/Cargo.toml --lib
 
   # Tagged builds only: the docker/* simulation against a release build of
   # the native adapter, on both Linux architectures.

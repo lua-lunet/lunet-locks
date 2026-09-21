@@ -1399,6 +1399,14 @@ local function main(options: Options)
             local client = socket.accept(listener)
             if client ~= nil then
                 lunet.spawn(function() serve_client(client) end)
+            else
+                -- A nil accept is the runtime's unwake of this parked
+                -- coroutine at the deliberate-stop teardown (or a transient
+                -- accept refusal). Re-accepting immediately without a yield
+                -- re-parks the coroutine inside the teardown's handle walk
+                -- and the shutdown never finishes; the back-off sleep is
+                -- what lets the event loop unwind through the drain point.
+                lunet.sleep(50)
             end
         end
     end

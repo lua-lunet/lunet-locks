@@ -6,6 +6,12 @@
 -- works under `env -u LUA_PATH -u LUA_CPATH` from any directory.
 
 local entry_dir = arg[0]:match("^(.*)/[^/]*$") or "."
+-- A relative entry (make recipes run `tools/smoke.lua` from the repo
+-- root) has no leading slash for the root-walk to climb; absolutize it
+-- first or the walk reaches "/" and every repo-local resolution dies.
+if entry_dir:sub(1, 1) ~= "/" then
+    entry_dir = (os.getenv("PWD") or ".") .. "/" .. entry_dir
+end
 
 local function exists(path)
     local f = io.open(path, "rb")

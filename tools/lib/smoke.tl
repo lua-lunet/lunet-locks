@@ -156,8 +156,9 @@ local function window_stats(path: string, t_a: integer, t_b: integer): integer, 
     for line in (data .. "\n"):gmatch("(.-)\n") do
         local t0, lat_s = line:match("^(%d+) (%d+) ")
         if t0 and lat_s then
-            local lat = lat_s as integer
-            if (t0 as integer) >= t_a and (t0 as integer) < t_b then
+            local lat = (tonumber(lat_s) or 0) as integer
+            local t0_ms = (tonumber(t0) or 0) as integer
+            if t0_ms >= t_a and t0_ms < t_b then
                 n = n + 1
                 if lat > max_latency then
                     max_latency = lat
