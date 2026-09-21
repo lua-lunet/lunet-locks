@@ -5,7 +5,7 @@
 # dependency names), so no git fetch happens inside Docker. The runtime stage
 # carries the diagnosis kit: the NTP/capture/RTT
 # tooling packages and the demo crate's binaries from the kit stage.
-ARG AOF_IMAGE=ghcr.io/lua-lunet/lunet-locks/tbio-core:v0.17.9-lunet.4-arm64
+ARG AOF_IMAGE=ghcr.io/lua-lunet/lunet-locks/tbio-core:v0.17.9-lunet.5-arm64
 ARG LUNET_LOCKS_HEAD=unknown
 FROM ${AOF_IMAGE} AS aof
 

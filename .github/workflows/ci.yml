@@ -33,8 +33,8 @@ jobs:
         run: |
           # Regular lane: Linux amd64 + arm64 only (the fast stuff).
           LINUX='{"include":[{"os":"ubuntu-24.04","arch":"amd64","platform":"linux","target_key":"linux-amd64"},{"os":"blacksmith-4vcpu-ubuntu-2404-arm","arch":"arm64","platform":"linux","target_key":"linux-arm64"}]}'
-          # Tagged lane: everything, adding macOS and Windows.
-          ALL='{"include":[{"os":"ubuntu-24.04","arch":"amd64","platform":"linux","target_key":"linux-amd64"},{"os":"blacksmith-4vcpu-ubuntu-2404-arm","arch":"arm64","platform":"linux","target_key":"linux-arm64"},{"os":"macos-latest","arch":"arm64","platform":"macos","target_key":"macos"},{"os":"blacksmith-4vcpu-windows-2025","arch":"amd64","platform":"windows","target_key":"windows"}]}'
+          # Tagged lane: everything, adding macOS.
+          ALL='{"include":[{"os":"ubuntu-24.04","arch":"amd64","platform":"linux","target_key":"linux-amd64"},{"os":"blacksmith-4vcpu-ubuntu-2404-arm","arch":"arm64","platform":"linux","target_key":"linux-arm64"},{"os":"macos-latest","arch":"arm64","platform":"macos","target_key":"macos"}]}'
           if [ "${{ github.ref_type }}" = "tag" ]; then
             echo "matrix=$ALL" >> "$GITHUB_OUTPUT"
           else
@@ -79,14 +79,12 @@ jobs:
         # formula installed by default.
         run: brew install luajit luarocks zlib
       - uses: jdx/mise-action@v2
-        if: runner.os != 'Windows'
       # rustfmt + clippy are required by make ext-check (cargo fmt --check,
       # cargo clippy); the default rust-toolchain profile omits them.
       - uses: dtolnay/rust-toolchain@1.85
         with:
           components: rustfmt, clippy
       - name: Install project Lua tools
-        if: runner.os != 'Windows'
         shell: bash
         run: |
           if [ "${{ runner.os }}" = "Linux" ]; then
@@ -95,10 +93,8 @@ jobs:
             make deps
           fi
       - name: Format and lint
-        if: runner.os != 'Windows'
         run: make fmt && git diff --exit-code && make lint
       - name: Rust, Cyan, and advisory tests
-        if: runner.os != 'Windows'
         shell: bash
         run: |
           if [ "${{ runner.os }}" = "Linux" ]; then
@@ -107,7 +103,6 @@ jobs:
             make test
           fi
       - name: Three-replica Lunet smoke test
-        if: runner.os != 'Windows'
         shell: bash
         run: |
           if [ "${{ runner.os }}" = "Linux" ]; then
@@ -122,30 +117,21 @@ jobs:
       # tree that just passed test + smoke, for publish-release to attach.
       # The archive carries BOTH cdylib shapes (the package script builds the
       # flight-recorder variant itself — a clean tagged checkout satisfies
-      # its clean-commit guard). Windows is excluded: the Lua loader has no
-      # .dll suffix handling, so there is no loadable Windows artifact to
-      # ship (see the reduced-scope Windows step below).
+      # its clean-commit guard). Windows is excluded from the matrix: the
+      # lock crate's FFI imports the AOF engine (declared non-Windows at
+      # Cargo.toml) and the engine has no Windows artifact, so the crate
+      # cannot build there and no loadable artifact exists to ship.
       - name: Package release archive
-        if: github.ref_type == 'tag' && matrix.platform != 'windows'
+        if: github.ref_type == 'tag'
         shell: bash
         run: tests/package_release.sh ${{ matrix.target_key }} lunet-locks-${{ matrix.target_key }}.tar.gz
       - name: Upload release archive
-        if: github.ref_type == 'tag' && matrix.platform != 'windows'
+        if: github.ref_type == 'tag'
         uses: actions/upload-artifact@v4
         with:
           name: release-${{ matrix.target_key }}
           path: lunet-locks-${{ matrix.target_key }}.tar.gz
           retention-days: 5
-      # Windows lane, tagged builds only: reduced scope. The Teal/Cyan
-      # toolchain, the shell smoke harness, and the Docker simulation are
-      # POSIX-only today; validate the Rust extension crate natively. The
-      # `--lib` scope matches the dependency graph: the bins import the
-      # AOF engine, declared non-Windows at Cargo.toml, so they are
-      # POSIX-only by construction and the POSIX lanes own their tests.
-      - name: Rust extension tests (Windows)
-        if: runner.os == 'Windows'
-        run: cargo test --manifest-path ext/advisory_lock/Cargo.toml --lib
-
   # Tagged builds only: the docker/* simulation against a release build of
   # the native adapter, on both Linux architectures.
   docker-simulation:

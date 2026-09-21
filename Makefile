@@ -123,7 +123,7 @@ simulation: lunet-runtime build $(SIM_BIN)
 # over the network inside Docker and no BuildKit mounts are needed.
 DOCKER_IMAGE ?= lunet-advisory-lock
 DOCKER_PLATFORM ?= native
-AOF_IMAGE ?= ghcr.io/lua-lunet/lunet-locks/tbio-core:v0.17.9-lunet.4-arm64
+AOF_IMAGE ?= ghcr.io/lua-lunet/lunet-locks/tbio-core:v0.17.9-lunet.5-arm64
 docker-build: build lunet-runtime
 	@context=$$(mktemp -d "$(CURDIR)/.tmp/docker-context.XXXXXX"); \
 	tools/docker_prepare_context.sh "$$context" || exit 1; \
