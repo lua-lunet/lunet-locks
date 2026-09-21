@@ -57,6 +57,10 @@ deps:
 	# `tl check` gate over tools/lib. A 5.5-tree tl is invisible under
 	# LuaJIT, so the Lua version is pinned here like everywhere else.
 	@$(LUAROCKS) list tl 2>/dev/null | grep -q "^tl$$" || $(LUAROCKS) install tl
+	# luasocket: the tooling's TCP client. The Debian luarocks package
+	# happens to pull lua-socket system-wide; brew's does not, so the
+	# project tree owns the rock and every runner resolves it locally.
+	$(LUAROCKS) install luasocket
 
 fmt:
 	$(CERU) src tests

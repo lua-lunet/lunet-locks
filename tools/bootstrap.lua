@@ -39,6 +39,10 @@ if not pcall(require, "tl") then
         return out
     end
     package.path = root .. "/.rocks/share/lua/5.1/?.lua;" .. package.path
+    -- The project tree owns its C rocks too (luasocket): without the
+    -- cpath entry they resolve only when a system tree happens to carry
+    -- them (Debian's luarocks does, brew's does not).
+    package.cpath = root .. "/.rocks/lib/lua/5.1/?.so;" .. package.cpath
     local p, c = lr("path"), lr("cpath")
     if p and #p > 0 then
         package.path = p .. ";" .. package.path
