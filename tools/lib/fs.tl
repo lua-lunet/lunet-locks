@@ -47,6 +47,12 @@ if ffi.os == "OSX" then
    ]]
     )
 else
+    -- Linux's struct stat differs per CPU: the x86_64 ABI puts nlink
+    -- before mode, the generic ABI (aarch64) puts mode before nlink. A
+    -- truncated or misordered declaration makes lstat write real data
+    -- into wrong offsets and every is_dir() reads garbage — the smoke's
+    -- work-dir mkdir_p fails on the arm64 runners while amd64 sails.
+    if ffi.arch == "x64" then
     ffi.cdef(
         [[
       struct stat {
@@ -78,6 +84,39 @@ else
       };
    ]]
     )
+    else
+    ffi.cdef(
+        [[
+      struct stat {
+         unsigned long st_dev;
+         unsigned long st_ino;
+         unsigned int st_mode;
+         unsigned int st_nlink;
+         unsigned int st_uid;
+         unsigned int st_gid;
+         int __pad0;
+         unsigned long st_rdev;
+         long st_size;
+         long st_blksize;
+         long st_blocks;
+         long st_atime;
+         long st_atime_nsec;
+         long st_mtime;
+         long st_mtime_nsec;
+         long st_ctime;
+         long st_ctime_nsec;
+         long __unused[3];
+      };
+      struct dirent {
+         unsigned long d_ino;
+         long d_off;
+         unsigned short d_reclen;
+         unsigned char d_type;
+         char d_name[256];
+      };
+   ]]
+    )
+    end
 end
 
 ffi.cdef(
