@@ -34,7 +34,10 @@ jobs:
           # Regular lane: Linux amd64 + arm64 only (the fast stuff).
           LINUX='{"include":[{"os":"ubuntu-24.04","arch":"amd64","platform":"linux","target_key":"linux-amd64"},{"os":"blacksmith-4vcpu-ubuntu-2404-arm","arch":"arm64","platform":"linux","target_key":"linux-arm64"}]}'
           # Tagged lane: everything, adding macOS.
-          ALL='{"include":[{"os":"ubuntu-24.04","arch":"amd64","platform":"linux","target_key":"linux-amd64"},{"os":"blacksmith-4vcpu-ubuntu-2404-arm","arch":"arm64","platform":"linux","target_key":"linux-arm64"},{"os":"macos-latest","arch":"arm64","platform":"macos","target_key":"macos"}]}'
+          # macOS pinned to the macos-14 image: Zig 0.14.1 cannot link the
+          # build runner against the macOS 26 SDK the macos-latest image
+          # ships (upstream ziglang/zig#31658, fixed at 0.16).
+          ALL='{"include":[{"os":"ubuntu-24.04","arch":"amd64","platform":"linux","target_key":"linux-amd64"},{"os":"blacksmith-4vcpu-ubuntu-2404-arm","arch":"arm64","platform":"linux","target_key":"linux-arm64"},{"os":"macos-14","arch":"arm64","platform":"macos","target_key":"macos"}]}'
           if [ "${{ github.ref_type }}" = "tag" ]; then
             echo "matrix=$ALL" >> "$GITHUB_OUTPUT"
           else
