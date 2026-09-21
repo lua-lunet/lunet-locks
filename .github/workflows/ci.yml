@@ -177,8 +177,18 @@ jobs:
           components: rustfmt, clippy
       - name: Install project Lua tools
         run: make deps LUAJIT_DIR=/opt/luajit-shim
+      - name: Log into ghcr for the pinned AOF artifact
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
       - name: Docker build and three-container simulation
-        run: make docker-simulation LUAJIT_DIR=/opt/luajit-shim
+        # The pinned AOF artifact ships per architecture; the matrix arch
+        # names the tag the runner's native docker build pulls.
+        run: |
+          make docker-simulation LUAJIT_DIR=/opt/luajit-shim \
+            AOF_IMAGE=ghcr.io/lua-lunet/lunet-locks/tbio-core:v0.17.9-lunet.5-${{ matrix.arch }}
 
   # Tagged builds only, modeled on upstream lua-lunet/lunet's publish-release:
   # runs after every verification lane passed, downloads the packaged
