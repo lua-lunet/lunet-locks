@@ -11,8 +11,11 @@
 #
 # Stages:
 #   toolchain  rust + the x86 cross-linker kit + the AOF zig toolchain
+#              + static libsodium (the paxe-core build script's link input)
 #   deps       manifests-first stub build: all dependencies, both triples
 #   check      the sanity payload `make sanity` runs (--target check)
+#              every ext crate, both triples, prod + flight-recorder/kat
+#              shapes
 #   release    optimised libs + binaries, prod and flight shapes
 #   artifacts  /out/: the release payload laid out for extraction
 #   rootfs     the amd64 runtime rootfs, pre-assembled for the x86 image
@@ -33,10 +36,32 @@ FROM rust:1-slim AS toolchain
 # aarch64, emits and links x86 through its own sysroot — the crt objects
 # and target libgcc included). Nothing emulates. The aarch64 triple
 # links natively in-image.
+#
+# paxe-core requires a static libsodium with the ARM64 AES-256-GCM
+# hardware path (>= 1.0.20 on ARM64 Linux; see PAXE.md "Requirements").
+# Debian's libsodium-dev (1.0.18) lacks it, so the image builds 1.0.22
+# from source into /usr/local: static-only, no Debian package. pkg-config
+# resolves the archive from there; one aarch64 archive serves both
+# triples inside this image: `cargo check` never links, and the native
+# cargo test run links only the aarch64 triple (the x86 paxe payload is
+# checked, never emulated).
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates curl xz-utils file crossbuild-essential-amd64 \
-    && rm -rf /var/lib/apt/lists/*
+        pkg-config build-essential \
+    && rm -rf /var/lib/apt/lists/* \
+    && curl --fail --location --retry 3 \
+        "https://github.com/jedisct1/libsodium/releases/download/1.0.22-RELEASE/libsodium-1.0.22.tar.gz" \
+        --output /tmp/libsodium.tar.gz \
+    && echo "adbdd8f16149e81ac6078a03aca6fc03b592b89ef7b5ed83841c086191be3349  /tmp/libsodium.tar.gz" | sha256sum -c - \
+    && tar -xzf /tmp/libsodium.tar.gz -C /tmp \
+    && cd /tmp/libsodium-1.0.22 \
+    && ./configure --disable-shared --enable-static --prefix=/usr/local \
+    && make -j"$(nproc)" \
+    && make install \
+    && test -f /usr/local/lib/libsodium.a \
+    && ldconfig \
+    && rm -rf /tmp/libsodium-1.0.22 /tmp/libsodium.tar.gz
 
 RUN rustup target add aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu
 
@@ -140,6 +165,14 @@ RUN cargo check --manifest-path ext/advisory_lock/Cargo.toml \
     && LUNET_LOCKS_AOF_TARGET=x86_64-linux-gnu \
         cargo check --locked --manifest-path examples/lease-sequencer/Cargo.toml \
         --features flight-recorder \
+        --target x86_64-unknown-linux-gnu \
+    && cargo check --manifest-path ext/paxe-core/Cargo.toml \
+        --target aarch64-unknown-linux-gnu \
+    && cargo check --manifest-path ext/paxe-core/Cargo.toml --features kat \
+        --target aarch64-unknown-linux-gnu \
+    && cargo check --manifest-path ext/paxe-core/Cargo.toml \
+        --target x86_64-unknown-linux-gnu \
+    && cargo check --manifest-path ext/paxe-core/Cargo.toml --features kat \
         --target x86_64-unknown-linux-gnu
 
 # The release payload: the flight-recorder shape first (its artifacts

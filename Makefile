@@ -39,7 +39,7 @@ TOOL_SOURCES = $(wildcard tools/lib/*.tl)
 # plus the client-signal behavioural smoke.
 SIGNAL_BIN := examples/lease-sequencer/bin
 
-.PHONY: init deps build check test smoke simulation simulation-test lunet-runtime docs clean ext ext-check ext-test fmt lint hooks sh-check sh-smoke docker-build docker-simulation sanity release-images build-proof package package-verify
+.PHONY: init deps build check test smoke simulation simulation-test lunet-runtime docs clean ext ext-check ext-test fmt lint hooks sh-check sh-smoke docker-build docker-simulation sanity release-images build-proof package package-verify bench
 
 init:
 	@command -v mise >/dev/null 2>&1 || { echo "ERROR: mise is not on PATH. Install it from https://mise.jdx.dev and try again."; exit 1; }
@@ -121,6 +121,23 @@ simulation-test: tools/lease_failover_sim.rs
 simulation: lunet-runtime build $(SIM_BIN)
 	SIM_ROOT=$(CURDIR) LUNET_RUN=$(abspath $(LUNET_RUN)) $(SIM_BIN) --duration $(SIM_DURATION)
 
+# The on-the-bench harness (docs/src/bench-harness.md): the phi +
+# flight-recorder rig, three forked nodes on real UDP, the force-fed
+# store, and the CAS-chain oracle. The flight build wants a clean tree;
+# the bench's tapes are development artefacts, not release evidence, so
+# the target carries the override (the tapes stamp dirty and every
+# reader annotates it). Release evidence stays the clean-commit
+# softball run.
+BENCH_DIR := examples/lease-sequencer
+BENCH_FEATURES := experimental-phi flight-recorder
+bench:
+	cd $(BENCH_DIR) && FLIGHT_RECORDER_ALLOW_DIRTY=1 cargo build \
+		--features "$(BENCH_FEATURES)" \
+		--bin lease-sequencer --bin skaffold_bench_driver
+	$(BENCH_DIR)/target/debug/skaffold_bench_driver \
+		--node-bin $(abspath $(BENCH_DIR)/target/debug/lease-sequencer) \
+		--run-dir $(CURDIR)/.tmp/bench-run
+
 # Plain multi-stage `docker build`. The prepared context carries the vendored
 # dependency sources and the ext/uvrr-core submodule source (the manifest's
 # [patch] section resolves vrr-core to the submodule), so nothing is fetched
@@ -174,7 +191,7 @@ sanity:
 		--build-arg LUNET_LOCKS_HEAD=$$(git rev-parse HEAD) \
 		--target check -t lunet-locks:sanity \
 		-f docker/Dockerfile.fastbuild .; \
-	echo "SANITY: cargo check green on colima for aarch64-unknown-linux-gnu + x86_64-unknown-linux-gnu (cdylib + rig crates, prod and flight-recorder shapes) at commit $$(git rev-parse --short=12 HEAD). Nothing deployed, nothing run from the image — the build is the proof."
+	echo "SANITY: cargo check green on colima for aarch64-unknown-linux-gnu + x86_64-unknown-linux-gnu (cdylib + rig crates, prod and flight-recorder shapes; paxe-core prod and kat shapes) at commit $$(git rev-parse --short=12 HEAD). Nothing deployed, nothing run from the image — the build is the proof."
 
 # The RELEASE dual-arch image gate (docs/src/build-and-release.md):
 # both linux architecture images built from the committed tree, each
@@ -201,6 +218,7 @@ release-images:
 ext: ext-test
 	cargo build --release --manifest-path ext/advisory_lock/Cargo.toml
 	cargo build --release --manifest-path ext/lunet-locks-aof/Cargo.toml
+	cargo build --release --manifest-path ext/paxe-core/Cargo.toml
 
 ext-check:
 	cargo fmt --manifest-path ext/advisory_lock/Cargo.toml -- --check
@@ -208,11 +226,14 @@ ext-check:
 	cargo fmt --manifest-path ext/lunet-locks-aof/Cargo.toml -- --check
 	cargo clippy --manifest-path ext/lunet-locks-aof/Cargo.toml --all-targets -- -D warnings
 	mise exec -- zig fmt --check ext/lunet-locks-aof/zig/src
+	cargo fmt --manifest-path ext/paxe-core/Cargo.toml -- --check
+	cargo clippy --manifest-path ext/paxe-core/Cargo.toml --all-targets -- -D warnings
 
 ext-test: ext-check
 	cargo test --manifest-path ext/advisory_lock/Cargo.toml
 	cargo test --manifest-path ext/lunet-locks-aof/Cargo.toml
 	cd ext/lunet-locks-aof/zig && mise exec -- zig build test $(ZIG_TEST_FLAGS)
+	cargo test --manifest-path ext/paxe-core/Cargo.toml
 
 # The vendored checksum asserts AES hardware at comptime (vsr/checksum.zig);
 # Linux arm64 CI resolves a generic CPU baseline that lacks the feature, so

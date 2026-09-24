@@ -4,3 +4,6 @@
 [submodule "ext/lunet-locks-aof"]
 	path = ext/lunet-locks-aof
 	url = git@github.com:lua-lunet/tbio-core.git
+[submodule "ext/paxe-core"]
+	path = ext/paxe-core
+	url = https://github.com/lua-lunet/paxe-core.git

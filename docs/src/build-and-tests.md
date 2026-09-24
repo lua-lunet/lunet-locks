@@ -82,8 +82,9 @@ The target, in order:
    `cargo check` for BOTH linux triples (`aarch64-unknown-linux-gnu`
    natively, `x86_64-unknown-linux-gnu` cross-built natively by rustc —
    never an emulated build target, never a qemu `--platform`), the
-   adapter cdylib and the rig crate, the prod and flight-recorder
-   shapes, against the classic manifests-first deps layer cache;
+   adapter cdylib and the rig crate (the prod and flight-recorder
+   shapes) and paxe-core (the prod and kat shapes), against the classic
+   manifests-first deps layer cache;
 4. prints the verdict with the HEAD commit hash. There is no binfmt
    registration anywhere in this flow, and no BuildKit
    (`DOCKER_BUILDKIT=0` throughout). The mechanics — the
@@ -122,6 +123,7 @@ make lunet-runtime   # fetch and verify Lunet v0.10.0 locally
 make smoke           # build and run the three-process service smoke test
 make simulation      # 30s TCP-NDJSON three-datacenter lease failover demo
 make simulation-test # focused std-Rust simulator unit tests
+make bench           # the on-the-bench harness (see bench-harness.md)
 make docker-build    # plain Docker image, including Linux Lunet v0.10.0
 make docker-simulation # the same 30s simulation against a stable Docker cluster
 make sanity          # the build-confirmation gate: clean commit + colima cross-check both triples
