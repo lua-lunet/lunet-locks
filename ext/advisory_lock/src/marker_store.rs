@@ -57,6 +57,10 @@
 //! Windows keeps the item08 single-file discipline: the vendored AOF
 //! build is unix-only, and no Windows asset is packaged.
 use std::io;
+#[cfg(unix)]
+use std::io::{BufRead, BufReader, Write};
+#[cfg(unix)]
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -157,66 +161,236 @@ pub(crate) fn superblock_path(state: &Path) -> PathBuf {
     PathBuf::from(os)
 }
 
+/// The engine marker's word on the bench store RPC (the engine's own
+/// vocabulary — `joining`/`restarting` are the running sentinels).
+#[cfg(unix)]
+fn marker_word(marker: Marker) -> &'static str {
+    match marker {
+        Marker::Stopping => "stopping",
+        Marker::Stopped => "stopped",
+        Marker::Restarting => "restarting",
+        Marker::Joining => "joining",
+    }
+}
+
+/// The engine marker a bench read reply names: the driver's answer is
+/// already in the collapsed engine vocabulary — the sentinels read as
+/// `Joining`, exactly as the disk path's `engine_marker` collapses them.
+#[cfg(unix)]
+fn word_marker(word: &str) -> Option<Marker> {
+    match word {
+        "joining" | "restarting" => Some(Marker::Joining),
+        "stopping" => Some(Marker::Stopping),
+        "stopped" => Some(Marker::Stopped),
+        _ => None,
+    }
+}
+
+/// The bench backend's end of the store RPC: synchronous NDJSON over the
+/// harness driver's unix socket, one request one reply.
+#[cfg(unix)]
+struct MemBackend {
+    writer: UnixStream,
+    reader: BufReader<UnixStream>,
+}
+
+#[cfg(unix)]
+impl MemBackend {
+    fn connect(path: &Path) -> io::Result<MemBackend> {
+        let writer = UnixStream::connect(path)?;
+        let reader = BufReader::new(writer.try_clone()?);
+        Ok(MemBackend { writer, reader })
+    }
+
+    fn rpc(&mut self, request: &serde_json::Value) -> io::Result<serde_json::Value> {
+        let mut line = request.to_string();
+        line.push('\n');
+        self.writer.write_all(line.as_bytes())?;
+        self.writer.flush()?;
+        let mut reply = String::new();
+        let read = self.reader.read_line(&mut reply)?;
+        if read == 0 {
+            return Err(io::Error::other(
+                "the bench store driver closed the control socket",
+            ));
+        }
+        serde_json::from_str(reply.trim_end()).map_err(|error| {
+            io::Error::other(format!("the bench store reply did not parse: {error}"))
+        })
+    }
+
+    /// The reply's `ok` flag, or the driver's refusal as the store error.
+    fn ack(reply: &serde_json::Value) -> io::Result<()> {
+        if reply.get("ok").and_then(|ok| ok.as_bool()) == Some(true) {
+            return Ok(());
+        }
+        let reason = reply
+            .get("error")
+            .and_then(|error| error.as_str())
+            .unwrap_or("no reason given");
+        Err(io::Error::other(format!(
+            "the bench store driver refused: {reason}"
+        )))
+    }
+}
+
+/// The store backend: the real application's durable mechanics (`Disk` —
+/// the quorum plus the projection), or the bench harness's force-feed
+/// (`Mem` — every engine call rides the driver's socket and the driver
+/// answers from memory, enforcing the signalled discipline; unix-only,
+/// like the bench).
+#[cfg(unix)]
+enum Backend {
+    Disk { state: PathBuf },
+    Mem(MemBackend),
+}
+
+/// The durable-only backend: non-unix builds carry no bench.
+#[cfg(not(unix))]
+enum Backend {
+    Disk { state: PathBuf },
+}
+
 /// The host's durable mechanics for the boot gate: the superblock quorum
 /// store plus the single-file projection, wired to the committed-
 /// transition sink for the halt's drain.
 pub(crate) struct GateStore {
-    state: PathBuf,
+    backend: Backend,
     sink: SinkDoor,
 }
 
 impl GateStore {
     pub(crate) fn new(state: &Path, sink: SinkDoor) -> GateStore {
         GateStore {
-            state: state.to_path_buf(),
+            backend: Backend::Disk {
+                state: state.to_path_buf(),
+            },
             sink,
         }
     }
+
+    /// The bench-harness store: no durable marker I/O at all — every
+    /// engine call (`read_copies`, `commit`, `drain`) is an RPC to the
+    /// harness driver, which holds the identity's state in memory and
+    /// fails the run on an unsignalled or out-of-order call
+    /// (`docs/src/bench-harness.md`). The connect failure refuses the
+    /// boot exactly as a durable read failure does.
+    #[cfg(unix)]
+    pub(crate) fn mem(ctl: &Path, sink: SinkDoor) -> io::Result<GateStore> {
+        Ok(GateStore {
+            backend: Backend::Mem(MemBackend::connect(ctl)?),
+            sink,
+        })
+    }
+}
+
+/// The durable read: the working quorum's verdict, or the compatibility
+/// projection's while the copies predate this routing.
+#[cfg(not(target_os = "windows"))]
+fn read_copies_disk(state: &Path) -> io::Result<Option<SuperblockCopies>> {
+    let superblock = superblock_path(state);
+    if !superblock.exists() {
+        // The copies never existed: the single file is the boot input
+        // (the legacy migration — the first routed write seeds the
+        // copies from the file's own state). Neither storage present
+        // is the first life, which has no durable identity yet.
+        if !state.exists() {
+            return Ok(None);
+        }
+        let (incarnation, marker) = read_marker(state)?;
+        return Ok(Some(uniform(Incarnation(incarnation), marker)));
+    }
+    // The copies exist: they are the authoritative read. THE
+    // BOOT-READ SAFETY LAW: a bad checksum on ANY copy is a loud log
+    // and a PANIC (the adapter panics on the Zig store's distinct
+    // refusal code) — never cleared, never repaired, never fallen
+    // back, never "unclear". Any other unreadable shape (no quorum, a
+    // fork, any refusal) is an error — the boot refuses rather than
+    // guessing an identity or falling back to the projection.
+    let classified = lunet_locks_aof::marker::classify(&superblock).map_err(|code| {
+        if code == lunet_locks_aof::marker::CORRUPT {
+            boot_read_checksum_panic(&superblock, "the quorum read");
+        }
+        io::Error::other(format!("the marker quorum read failed (FFI code {code})"))
+    })?;
+    Ok(Some(uniform(
+        Incarnation(classified.incarnation),
+        engine_marker(classified.state),
+    )))
+}
+
+/// The durable read: Windows keeps the item08 single-file discipline.
+#[cfg(target_os = "windows")]
+fn read_copies_disk(state: &Path) -> io::Result<Option<SuperblockCopies>> {
+    if !state.exists() {
+        return Ok(None);
+    }
+    let (incarnation, marker) = read_marker(state)?;
+    Ok(Some(uniform(Incarnation(incarnation), marker)))
+}
+
+/// The durable write: the quorum write, then the projection mirror.
+#[cfg(not(target_os = "windows"))]
+fn commit_disk(state: &Path, copy: CopyState) -> io::Result<()> {
+    let identity = copy.identity.0;
+    lunet_locks_aof::marker::write(&superblock_path(state), identity, zig_state(copy.marker))
+        .map_err(|code| {
+            if code == lunet_locks_aof::marker::CORRUPT {
+                boot_read_checksum_panic(&superblock_path(state), "the write's read");
+            }
+            io::Error::other(format!("the marker quorum write failed (FFI code {code})"))
+        })?;
+    // The compatibility projection: the item08 single-file write,
+    // exactly as before, only AFTER the quorum write succeeded.
+    write_marker(state, identity, copy.marker)
+}
+
+/// The durable write: Windows keeps the item08 single-file discipline.
+#[cfg(target_os = "windows")]
+fn commit_disk(state: &Path, copy: CopyState) -> io::Result<()> {
+    write_marker(state, copy.identity.0, copy.marker)
 }
 
 impl LifecycleStore for GateStore {
     type Error = io::Error;
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(unix)]
     fn read_copies(&mut self) -> Result<Option<SuperblockCopies>, Self::Error> {
-        let superblock = superblock_path(&self.state);
-        if !superblock.exists() {
-            // The copies never existed: the single file is the boot input
-            // (the legacy migration — the first routed write seeds the
-            // copies from the file's own state). Neither storage present
-            // is the first life, which has no durable identity yet.
-            if !self.state.exists() {
-                return Ok(None);
+        match &mut self.backend {
+            Backend::Disk { state } => read_copies_disk(state),
+            Backend::Mem(mem) => {
+                let reply = mem.rpc(&serde_json::json!({"op": "read"}))?;
+                match reply.get("verdict").and_then(|v| v.as_str()) {
+                    Some("none") => Ok(None),
+                    Some(word) => {
+                        let marker = word_marker(word).ok_or_else(|| {
+                            io::Error::other(format!(
+                                "the bench store read named an unknown verdict '{word}'"
+                            ))
+                        })?;
+                        let incarnation = reply
+                            .get("incarnation")
+                            .and_then(|i| i.as_u64())
+                            .ok_or_else(|| {
+                                io::Error::other(
+                                    "the bench store read reply carried no incarnation",
+                                )
+                            })?;
+                        Ok(Some(uniform(Incarnation(incarnation), marker)))
+                    }
+                    None => Err(io::Error::other(
+                        "the bench store read reply carried no verdict",
+                    )),
+                }
             }
-            let (incarnation, marker) = read_marker(&self.state)?;
-            return Ok(Some(uniform(Incarnation(incarnation), marker)));
         }
-        // The copies exist: they are the authoritative read. THE
-        // BOOT-READ SAFETY LAW: a bad checksum on ANY copy is a loud log
-        // and a PANIC (the adapter panics on the Zig store's distinct
-        // refusal code) — never cleared, never repaired, never fallen
-        // back, never "unclear". Any other unreadable shape (no quorum, a
-        // fork, any refusal) is an error — the boot refuses rather than
-        // guessing an identity or falling back to the projection.
-        let classified = lunet_locks_aof::marker::classify(&superblock).map_err(|code| {
-            if code == lunet_locks_aof::marker::CORRUPT {
-                boot_read_checksum_panic(&superblock, "the quorum read");
-            }
-            io::Error::other(format!("the marker quorum read failed (FFI code {code})"))
-        })?;
-        Ok(Some(uniform(
-            Incarnation(classified.incarnation),
-            engine_marker(classified.state),
-        )))
     }
 
-    #[cfg(target_os = "windows")]
+    #[cfg(not(unix))]
     fn read_copies(&mut self) -> Result<Option<SuperblockCopies>, Self::Error> {
-        if !self.state.exists() {
-            return Ok(None);
+        match &self.backend {
+            Backend::Disk { state } => read_copies_disk(state),
         }
-        let (incarnation, marker) = read_marker(&self.state)?;
-        Ok(Some(uniform(Incarnation(incarnation), marker)))
     }
 
     fn commit(&mut self, copies: &SuperblockCopies) -> Result<(), Self::Error> {
@@ -227,25 +401,27 @@ impl LifecycleStore for GateStore {
             copies.copies.iter().all(|one| *one == copy),
             "the boot gate's rewrites are uniform 4x"
         );
-        let identity = copy.identity.0;
-        #[cfg(not(target_os = "windows"))]
-        lunet_locks_aof::marker::write(
-            &superblock_path(&self.state),
-            identity,
-            zig_state(copy.marker),
-        )
-        .map_err(|code| {
-            if code == lunet_locks_aof::marker::CORRUPT {
-                boot_read_checksum_panic(&superblock_path(&self.state), "the write's read");
+        match &mut self.backend {
+            Backend::Disk { state } => commit_disk(state, copy),
+            #[cfg(unix)]
+            Backend::Mem(mem) => {
+                let reply = mem.rpc(&serde_json::json!({
+                    "op": "commit",
+                    "incarnation": copy.identity.0,
+                    "marker": marker_word(copy.marker),
+                }))?;
+                MemBackend::ack(&reply)
             }
-            io::Error::other(format!("the marker quorum write failed (FFI code {code})"))
-        })?;
-        // The compatibility projection: the item08 single-file write,
-        // exactly as before, only AFTER the quorum write succeeded.
-        write_marker(&self.state, identity, copy.marker)
+        }
     }
 
     fn drain(&mut self) -> Result<(), Self::Error> {
-        drain_sink(&mut sink_guard(&self.sink))
+        drain_sink(&mut sink_guard(&self.sink))?;
+        #[cfg(unix)]
+        if let Backend::Mem(mem) = &mut self.backend {
+            let reply = mem.rpc(&serde_json::json!({"op": "drain"}))?;
+            return MemBackend::ack(&reply);
+        }
+        Ok(())
     }
 }

@@ -212,10 +212,7 @@ impl Fabric {
                 };
                 eprintln!(
                     "DBG pump t={} to=n{} from=n{} tag={}",
-                    self.now,
-                    to,
-                    from,
-                    tag
+                    self.now, to, from, tag
                 );
             }
             // The fresh-commit arrival re-arms the watch: a received
@@ -302,7 +299,8 @@ fn step(fabric: &mut Fabric, dt: u64, serving: bool) {
         // own reliability mechanism — and the heal window counts the
         // post-heal resends.
         if fabric.hosts[index].state() == STATE_JOINING
-            && fabric.now.saturating_sub(fabric.hosts[index].last_gossip) >= rejoin::GOSSIP_RESEND_MS
+            && fabric.now.saturating_sub(fabric.hosts[index].last_gossip)
+                >= rejoin::GOSSIP_RESEND_MS
         {
             fabric.hosts[index].last_gossip = fabric.now;
             let status = fabric.hosts[index].node.status();
@@ -491,9 +489,7 @@ fn a_boot_fenced_voter_must_adopt_or_emit_actionable_evidence() {
         let cluster_view = settled_view
             .max(fabric.hosts[0].view())
             .max(fabric.hosts[1].view());
-        if fenced.state() == STATE_NORMAL && fenced.view() >= cluster_view
-            || fabric.gossips > 0
-        {
+        if fenced.state() == STATE_NORMAL && fenced.view() >= cluster_view || fabric.gossips > 0 {
             saved = true;
             break;
         }

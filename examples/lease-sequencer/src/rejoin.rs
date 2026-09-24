@@ -73,7 +73,11 @@ mod tests {
     #[test]
     fn gossip_datagram_round_trips_through_the_cores_own_codec() {
         let frame = gossip_datagram(4, 13);
-        assert_eq!(frame.len(), 20 + 1 + 8 + 8, "header + discriminant + two slots");
+        assert_eq!(
+            frame.len(),
+            20 + 1 + 8 + 8,
+            "header + discriminant + two slots"
+        );
         assert_eq!(
             u32::from_be_bytes(frame[0..4].try_into().expect("4 bytes")),
             17,
@@ -102,7 +106,10 @@ mod tests {
         );
         let message = Message::unpack_from(&frame).expect("the core reads its own frame");
         assert_eq!(message.header.tag, Tag::GossipRequest);
-        assert_eq!((message.header.view.era.0, message.header.view.view.0), (4, 13));
+        assert_eq!(
+            (message.header.view.era.0, message.header.view.view.0),
+            (4, 13)
+        );
         assert_eq!(message.header.slot, Slot::NONE);
         assert_eq!(
             message.body,

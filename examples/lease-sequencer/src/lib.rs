@@ -3,6 +3,8 @@
 //! tree; this facade re-exports only what tests and external embedders
 //! need.
 
+pub mod bench_oracle;
+pub mod bench_store;
 pub mod bridge;
 pub mod client_gate;
 pub mod embedded_client;

@@ -125,9 +125,7 @@ fn main() {
             options.verb,
             options.id.unwrap_or_else(|| die("--id required"))
         ),
-        "abdicate" => format!(
-            "{{\"action\":\"abdicate\",\"message_id\":\"{message_id}\"}}"
-        ),
+        "abdicate" => format!("{{\"action\":\"abdicate\",\"message_id\":\"{message_id}\"}}"),
         other => {
             eprintln!("lease-client: unknown verb {other}");
             std::process::exit(2);

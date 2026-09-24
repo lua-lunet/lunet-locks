@@ -1145,24 +1145,45 @@ impl Node {
         scratch_dir: &str,
     ) -> Result<Node, i32> {
         catch_unwind(AssertUnwindSafe(|| {
-            let journal = journal_dir.filter(|dir| !dir.is_empty()).and_then(|dir| {
-                match LockJournal::open(Path::new(dir), roll_bytes as u64) {
-                    Ok(j) => Some(JournalSink::Blocking(j)),
-                    Err(e) => {
-                        eprintln!(
-                            "lunet-advisory-lock: journal open failed ({e}); \
-                         journaling disabled for this process"
-                        );
-                        None
-                    }
-                }
-            });
+            let journal = open_journal(journal_dir.filter(|dir| !dir.is_empty()), roll_bytes);
             node_from_sink(
                 members.as_bytes(),
                 own.as_bytes(),
                 state.as_bytes(),
                 journal,
                 Some((variant, PathBuf::from(scratch_dir))),
+                None,
+            )
+        }))
+        .unwrap_or(Err(PANIC))
+    }
+
+    /// The bench-harness variant (`docs/src/bench-harness.md`, unix
+    /// only): the lifecycle marker store rides the harness driver's
+    /// control socket — every boot-read, commit, and drain is an RPC the
+    /// driver answers from memory under the scenario's signalled
+    /// discipline — while the blocking journal stays real (it is the
+    /// run's CAS-chain evidence). The C ABI never takes this path.
+    #[cfg(unix)]
+    pub fn open_bench(
+        members: &str,
+        own: &str,
+        journal_dir: Option<&str>,
+        roll_bytes: u32,
+        store_ctl: &str,
+    ) -> Result<Node, i32> {
+        catch_unwind(AssertUnwindSafe(|| {
+            let journal = open_journal(journal_dir, roll_bytes);
+            node_from_sink(
+                members.as_bytes(),
+                own.as_bytes(),
+                // The marker store is the driver's; the state path is
+                // never touched on this path. The grammar still wants a
+                // non-empty value.
+                b"bench",
+                journal,
+                None,
+                Some(store_ctl),
             )
         }))
         .unwrap_or(Err(PANIC))
@@ -2021,8 +2042,7 @@ struct BootDecision {
 /// so the boot refuses there exactly as the old ladder refused at
 /// exhaustion.
 fn boot_gate(
-    path: &Path,
-    sink: SinkDoor,
+    store: GateStore,
     recovery: Option<(&RecoveryFlush, &Path)>,
 ) -> Result<BootDecision, i32> {
     let refuse = |what: String| -> i32 {
@@ -2032,7 +2052,7 @@ fn boot_gate(
         );
         CONFIG
     };
-    match lifecycle::boot(GateStore::new(path, sink)) {
+    match lifecycle::boot(store) {
         Err((_, BootError::QuorumLost)) => Err(refuse(
             "the marker set is torn beyond the quorum read".to_string(),
         )),
@@ -2142,6 +2162,24 @@ fn guarded(run: impl FnOnce() -> i32) -> i32 {
 /// margin over the payload so admission can refuse before proposing.
 const PREPARE_OVERHEAD: usize = 20 + 1 + 8 + 4 + 1 + 16 + 4 + 8;
 
+/// The blocking journal's open, shared by every node-construction path
+/// that takes one: a failure logs and disables journaling for the
+/// process; the replication path is never poisoned by observability.
+fn open_journal(journal_dir: Option<&str>, roll_bytes: u32) -> Option<JournalSink> {
+    journal_dir.and_then(
+        |dir| match LockJournal::open(Path::new(dir), roll_bytes as u64) {
+            Ok(j) => Some(JournalSink::Blocking(j)),
+            Err(e) => {
+                eprintln!(
+                    "lunet-advisory-lock: journal open failed ({e}); \
+                 journaling disabled for this process"
+                );
+                None
+            }
+        },
+    )
+}
+
 /// The construction body shared by the C ABI's `lunet_lock_node_new` and
 /// the embedded host's `Node::open`: parse the member buffer, classify the
 /// boot from the durable incarnation marker, and build the replica. Each
@@ -2153,20 +2191,8 @@ fn node_from_parts(
     journal_dir: Option<&str>,
     roll_bytes: u32,
 ) -> Result<Node, i32> {
-    let journal =
-        journal_dir.and_then(
-            |dir| match LockJournal::open(Path::new(dir), roll_bytes as u64) {
-                Ok(j) => Some(JournalSink::Blocking(j)),
-                Err(e) => {
-                    eprintln!(
-                        "lunet-advisory-lock: journal open failed ({e}); \
-                 journaling disabled for this process"
-                    );
-                    None
-                }
-            },
-        );
-    node_from_sink(members_data, own_data, state_data, journal, None)
+    let journal = open_journal(journal_dir, roll_bytes);
+    node_from_sink(members_data, own_data, state_data, journal, None, None)
 }
 
 /// The AOF-backed variant: the committed-transition hook enqueues to the
@@ -2193,7 +2219,7 @@ fn node_from_aof(
             None
         }
     };
-    node_from_sink(members_data, own_data, state_data, sink, None)
+    node_from_sink(members_data, own_data, state_data, sink, None, None)
 }
 
 fn node_from_sink(
@@ -2202,6 +2228,7 @@ fn node_from_sink(
     state_data: &[u8],
     journal: Option<JournalSink>,
     recovery: Option<(RecoveryFlush, PathBuf)>,
+    store_ctl: Option<&str>,
 ) -> Result<Node, i32> {
     // Member entries are "<u32-id>:<name>"; a post-genesis (joined)
     // entry is "<u32-id>:<name>:j". The plain-entry order is the
@@ -2263,12 +2290,33 @@ fn node_from_sink(
     // schedule (see the module's Incarnation note and `boot_gate`). The
     // crashed classification is the recovery boundary: a configured E2
     // variant's forced flush executes there, against the caller-provided
-    // scratch directory.
+    // scratch directory. The bench harness substitutes the store itself:
+    // `store_ctl` names the driver's control socket and every marker
+    // call rides it (`docs/src/bench-harness.md`); the durable path is
+    // unchanged when no control socket is given.
     let state_path = PathBuf::from(state);
     let sink: SinkDoor = Arc::new(Mutex::new(journal));
+    #[cfg(unix)]
+    let store = match store_ctl {
+        Some(ctl) => match GateStore::mem(Path::new(ctl), Arc::clone(&sink)) {
+            Ok(store) => store,
+            Err(error) => {
+                eprintln!(
+                    "lunet-advisory-lock: the bench store control socket is not \
+                     reachable ({error}); the boot refuses"
+                );
+                return Err(CONFIG);
+            }
+        },
+        None => GateStore::new(&state_path, Arc::clone(&sink)),
+    };
+    #[cfg(not(unix))]
+    let store = {
+        let _ = store_ctl;
+        GateStore::new(&state_path, Arc::clone(&sink))
+    };
     let decision = boot_gate(
-        &state_path,
-        Arc::clone(&sink),
+        store,
         recovery
             .as_ref()
             .map(|(variant, dir)| (variant, dir.as_path())),
@@ -2852,7 +2900,7 @@ mod tests {
         let path = state_path("marker");
         // The first life: one anchor round — `(0, Joining)` 4x, the
         // projection's running sentinel.
-        let decision = boot_gate(&path, test_sink(), None).expect("first boot");
+        let decision = boot_gate(GateStore::new(&path, test_sink()), None).expect("first boot");
         assert_eq!(decision.incarnation, 0);
         assert!(decision.session.is_some() && decision.deferred.is_none());
         drop(decision);
@@ -2860,7 +2908,7 @@ mod tests {
         // A restart over the anchor classifies crashed: the replacement
         // pair is decided (0 -> 1) and NOTHING is written — the durable
         // bump defers to the seated witness.
-        let decision = boot_gate(&path, test_sink(), None).expect("crashed boot");
+        let decision = boot_gate(GateStore::new(&path, test_sink()), None).expect("crashed boot");
         assert_eq!(decision.incarnation, 1);
         let pair = decision.pair.expect("the replacement pair");
         assert_eq!((pair.old.0, pair.new.0), (0, 1));
@@ -2873,7 +2921,7 @@ mod tests {
         );
         // The re-crash replay: the same markers re-decide the SAME pair —
         // the bump is a pure function of the quorum-resolved identity.
-        let decision = boot_gate(&path, test_sink(), None).expect("replay");
+        let decision = boot_gate(GateStore::new(&path, test_sink()), None).expect("replay");
         assert_eq!(decision.pair.expect("the replayed pair").new.0, 1);
         drop(decision);
         // A clean checkpoint (flushed) continues under the same identity:
@@ -2883,7 +2931,7 @@ mod tests {
         // migration path the copy-free rig states boot through.
         fs::remove_file(superblock_path(&path)).unwrap();
         write_marker(&path, 7, Marker::Stopped).unwrap();
-        let decision = boot_gate(&path, test_sink(), None).expect("clean continue");
+        let decision = boot_gate(GateStore::new(&path, test_sink()), None).expect("clean continue");
         assert_eq!(decision.incarnation, 7);
         assert!(decision.session.is_some() && decision.pair.is_none());
         drop(decision);
@@ -2903,20 +2951,32 @@ mod tests {
     fn the_boot_gate_refuses_malformed_and_exhausted_identities() {
         let path = state_path("marker-bad");
         fs::write(&path, "not a marker\n").unwrap();
-        assert_eq!(boot_gate(&path, test_sink(), None).unwrap_err(), CONFIG);
+        assert_eq!(
+            boot_gate(GateStore::new(&path, test_sink()), None).unwrap_err(),
+            CONFIG
+        );
         fs::write(&path, "999 unflushed\n").unwrap();
-        assert_eq!(boot_gate(&path, test_sink(), None).unwrap_err(), CONFIG);
+        assert_eq!(
+            boot_gate(GateStore::new(&path, test_sink()), None).unwrap_err(),
+            CONFIG
+        );
         fs::write(&path, "3 stale\n").unwrap();
-        assert_eq!(boot_gate(&path, test_sink(), None).unwrap_err(), CONFIG);
+        assert_eq!(
+            boot_gate(GateStore::new(&path, test_sink()), None).unwrap_err(),
+            CONFIG
+        );
         // The bump refuses past the band instead of wrapping a superseded
         // identity into circulation (the high-band law: past incarnation
         // 255 a bumped id would collide with the reserved LEADER_UNKNOWN
         // value).
         fs::write(&path, format!("{} unflushed\n", INCARNATION_MAX)).unwrap();
-        assert_eq!(boot_gate(&path, test_sink(), None).unwrap_err(), CONFIG);
+        assert_eq!(
+            boot_gate(GateStore::new(&path, test_sink()), None).unwrap_err(),
+            CONFIG
+        );
         fs::write(&path, format!("{} flushed\n", INCARNATION_MAX)).unwrap();
         assert_eq!(
-            boot_gate(&path, test_sink(), None)
+            boot_gate(GateStore::new(&path, test_sink()), None)
                 .expect("the exhausted identity still continues")
                 .incarnation,
             255
@@ -2935,14 +2995,13 @@ mod tests {
         let path = state_path("marker-flush");
         let scratch = state_path("marker-flush-scratch");
         fs::remove_dir_all(&scratch).ok();
-        boot_gate(&path, test_sink(), None).expect("first boot");
+        boot_gate(GateStore::new(&path, test_sink()), None).expect("first boot");
         assert!(
             !scratch.exists(),
             "boot_gate with no variant writes nothing"
         );
         let decision = boot_gate(
-            &path,
-            test_sink(),
+            GateStore::new(&path, test_sink()),
             Some((&RecoveryFlush::SingleBlock, &scratch)),
         )
         .expect("crashed boot with the flush variant");
@@ -2957,8 +3016,7 @@ mod tests {
             "the marker discipline is unchanged by the flush: the durable bump defers"
         );
         let decision = boot_gate(
-            &path,
-            test_sink(),
+            GateStore::new(&path, test_sink()),
             Some((&RecoveryFlush::Diskless, &scratch)),
         )
         .expect("variant 0");
@@ -2979,7 +3037,8 @@ mod tests {
     fn existing_unflushed_files_boot_unchanged() {
         let path = state_path("marker-compat");
         fs::write(&path, "0 unflushed\n").unwrap();
-        let decision = boot_gate(&path, test_sink(), None).expect("unchanged classification");
+        let decision =
+            boot_gate(GateStore::new(&path, test_sink()), None).expect("unchanged classification");
         assert_eq!(
             decision.incarnation, 1,
             "the running sentinel still classifies crashed"
@@ -3006,7 +3065,8 @@ mod tests {
     fn legacy_flushed_file_migrates_and_continues_clean() {
         let path = state_path("marker-compat-clean");
         fs::write(&path, "4 flushed\n").unwrap();
-        let decision = boot_gate(&path, test_sink(), None).expect("migrated classification");
+        let decision =
+            boot_gate(GateStore::new(&path, test_sink()), None).expect("migrated classification");
         assert_eq!(
             decision.incarnation, 4,
             "the flush from the pre-routing era continues clean"
@@ -3034,8 +3094,8 @@ mod tests {
     #[test]
     fn an_unreadable_marker_quorum_refuses_the_boot() {
         let path = state_path("marker-lost");
-        boot_gate(&path, test_sink(), None).expect("first boot");
-        drop(boot_gate(&path, test_sink(), None).expect("crashed boot"));
+        boot_gate(GateStore::new(&path, test_sink()), None).expect("first boot");
+        drop(boot_gate(GateStore::new(&path, test_sink()), None).expect("crashed boot"));
         let superblock = superblock_path(&path);
         let geometry = lunet_locks_aof::marker::geometry().expect("geometry");
         {
@@ -3047,7 +3107,7 @@ mod tests {
                 .expect("tear the copies file down to one zone");
         }
         assert_eq!(
-            boot_gate(&path, test_sink(), None).unwrap_err(),
+            boot_gate(GateStore::new(&path, test_sink()), None).unwrap_err(),
             CONFIG,
             "the unreadable quorum refuses the boot"
         );

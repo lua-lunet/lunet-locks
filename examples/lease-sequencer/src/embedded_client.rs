@@ -420,6 +420,17 @@ impl Signals {
         self.on.load(Ordering::Relaxed)
     }
 
+    /// The ungated mode (the bench harness,
+    /// `docs/src/bench-harness.md`): no OS signal registration — the
+    /// latch starts ON and the clients run for the process lifetime.
+    /// There the SIGUSR1/SIGUSR2 pair carries the node's lifecycle, so
+    /// the client gate must never listen for it.
+    pub fn always_on() -> Signals {
+        Signals {
+            on: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
     /// The per-worker form the lease-load binary uses: move this
     /// worker's gate to the latched process mode. Idempotent — a gate
     /// already in the process mode is untouched, so repeated signals in

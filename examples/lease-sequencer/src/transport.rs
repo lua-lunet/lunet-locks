@@ -213,7 +213,10 @@ mod tests {
         let message = Message {
             header: Header {
                 tag: Tag::Reincarnation,
-                view: ViewId { era: Era(1), view: View(0) },
+                view: ViewId {
+                    era: Era(1),
+                    view: View(0),
+                },
                 slot: Slot(0),
             },
             body: Body::Reincarnation {
@@ -224,8 +227,13 @@ mod tests {
             },
         };
         let mut frame = vec![0u8; message.packed_len()];
-        let written = message.pack_into(&mut frame).expect("the core packs its own body");
-        assert_eq!(written, REINCARNATION_BYTES, "the constant tracks the core's frame");
+        let written = message
+            .pack_into(&mut frame)
+            .expect("the core packs its own body");
+        assert_eq!(
+            written, REINCARNATION_BYTES,
+            "the constant tracks the core's frame"
+        );
         assert_eq!(
             frame[20], 13,
             "the body discriminant mirrors the header tag at offset 20"
@@ -252,7 +260,10 @@ mod tests {
         let message = Message {
             header: Header {
                 tag: Tag::Reincarnation,
-                view: ViewId { era: Era(1), view: View(0) },
+                view: ViewId {
+                    era: Era(1),
+                    view: View(0),
+                },
                 slot: Slot(0),
             },
             body: Body::Reincarnation {
@@ -263,7 +274,9 @@ mod tests {
             },
         };
         let mut frame = vec![0u8; message.packed_len()];
-        let written = message.pack_into(&mut frame).expect("the core packs its own body");
+        let written = message
+            .pack_into(&mut frame)
+            .expect("the core packs its own body");
         assert_eq!(written, frame.len());
         let wrong_discriminant = {
             let mut patched = frame.clone();
@@ -292,7 +305,11 @@ mod tests {
             None,
             "a frame with trailing bytes never arms the remap"
         );
-        assert_eq!(reincarnation_pair(&[]), None, "an empty payload never arms the remap");
+        assert_eq!(
+            reincarnation_pair(&[]),
+            None,
+            "an empty payload never arms the remap"
+        );
         assert_eq!(
             reincarnation_pair(&[0u8; REINCARNATION_BYTES]),
             None,
@@ -301,13 +318,18 @@ mod tests {
         let commit = Message {
             header: Header {
                 tag: Tag::Commit,
-                view: ViewId { era: Era(1), view: View(0) },
+                view: ViewId {
+                    era: Era(1),
+                    view: View(0),
+                },
                 slot: Slot(0),
             },
             body: Body::Commit { committed: Slot(0) },
         };
         let mut commit_frame = vec![0u8; commit.packed_len()];
-        let commit_written = commit.pack_into(&mut commit_frame).expect("the core packs its own body");
+        let commit_written = commit
+            .pack_into(&mut commit_frame)
+            .expect("the core packs its own body");
         assert_eq!(commit_written, commit_frame.len());
         assert_eq!(
             reincarnation_pair(&commit_frame),

@@ -12,6 +12,7 @@ nav = [
   { "Standby telemetry" = "telemetry-aof.md" },
   { "External client protocol" = "client-protocol.md" },
   { "Build and tests" = "build-and-tests.md" },
+  { "Bench harness" = "bench-harness.md" },
   { "Contributing" = "contributing.md" },
 ]
 

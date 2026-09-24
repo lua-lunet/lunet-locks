@@ -69,6 +69,10 @@ const OP_DEADLINE_MS: u64 = 1000;
 /// The client-verb era-advance deadline (the admin ack discipline).
 const ADMIN_DEADLINE_MS: u64 = 10000;
 const TICK_MS: u64 = 5;
+/// The lock-event journal's roll threshold: a run never rolls (the CAS
+/// chain stays one file per node per process lifetime; a bench cycle
+/// resumes the same open file).
+const JOURNAL_ROLL_BYTES: u32 = 64 * 1024 * 1024;
 const LEADER_UNKNOWN: u32 = u32::MAX;
 const MAX_CLIENT_LINE: usize = 65000;
 
@@ -523,6 +527,19 @@ struct Options {
     join_id: u32,
     /// The joining member's endpoint (`[host]:port`), the UDP bind.
     join_endpoint: String,
+    /// The bench harness's store control socket
+    /// (`docs/src/bench-harness.md`). Non-empty puts the node on the
+    /// bench: the lifecycle marker store rides the driver's socket, the
+    /// SIGUSR1/SIGUSR2 pair carries the clean/dirty in-process cycles
+    /// (the client gate never registers), the build must be the
+    /// `experimental-phi` shape (the sloppy timeout is not compiled
+    /// in), and the AOF/telemetry options are refused — the journal
+    /// (`--journal-dir`), the logs, and the flight tape are the
+    /// evidence.
+    bench_store: String,
+    /// The blocking lock-event journal's directory (the committed-
+    /// transition CAS chain). Empty = journaling off, as before.
+    journal_dir: String,
 }
 
 fn parse_options() -> Options {
@@ -556,6 +573,8 @@ fn parse_options() -> Options {
         embedded_renew_fraction: 0.5,
         join_id: 0,
         join_endpoint: String::new(),
+        bench_store: String::new(),
+        journal_dir: String::new(),
     };
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut index = 0;
@@ -609,6 +628,8 @@ fn parse_options() -> Options {
             "--renew-fraction" => options.embedded_renew_fraction = value.parse().unwrap_or(0.5),
             "--join-id" => options.join_id = value.parse().unwrap_or(0),
             "--join-endpoint" => options.join_endpoint = value.clone(),
+            "--bench-store" => options.bench_store = value.clone(),
+            "--journal-dir" => options.journal_dir = value.clone(),
             other => {
                 eprintln!("lease-sequencer: unknown option {other}");
                 exit(2);
@@ -647,9 +668,43 @@ fn parse_options() -> Options {
          [--heartbeat-ms N] [--election-ms N] [--recovery-ms N] \
 {USAGE_PHI}\
          [--embedded-client N] [--lock N] [--client-ttl-ms N] [--renew-fraction F] \
-         [--join-id N --join-endpoint HOST:PORT]"
+         [--join-id N --join-endpoint HOST:PORT] \
+         [--bench-store PATH --journal-dir PATH]"
         );
         exit(2);
+    }
+    if !options.bench_store.is_empty() {
+        #[cfg(not(feature = "experimental-phi"))]
+        {
+            eprintln!(
+                "lease-sequencer: --bench-store requires the experimental-phi build \
+                 (the bench compiles the sloppy timeout out): \
+                 cargo build --features experimental-phi"
+            );
+            exit(2);
+        }
+        if !options.aof_dir.is_empty() || !options.telemetry_aof_dir.is_empty() {
+            eprintln!(
+                "lease-sequencer: --bench-store excludes --aof-dir and \
+                 --telemetry-aof-dir (the journal, the logs, and the flight \
+                 tape are the bench's evidence)"
+            );
+            exit(2);
+        }
+        if options.recovery_flush != RecoveryFlush::Diskless {
+            eprintln!(
+                "lease-sequencer: --bench-store excludes --recovery-flush \
+                 (the bench store is the force-feed)"
+            );
+            exit(2);
+        }
+        if options.journal_dir.is_empty() {
+            eprintln!(
+                "lease-sequencer: --bench-store requires --journal-dir \
+                 (the journal is the bench's CAS chain)"
+            );
+            exit(2);
+        }
     }
     options
 }
@@ -1741,12 +1796,83 @@ impl Host {
     }
 }
 
+/// The process's signal flags, registered once and shared across the
+/// bench's in-process cycles: SIGTERM/SIGINT request the clean stop and
+/// process exit; on the bench (`--bench-store`) SIGUSR1 requests the
+/// clean shutdown+startup cycle and SIGUSR2 the dirty restart cycle
+/// (`docs/src/bench-harness.md`). Off the bench the cycle flags are
+/// never registered and the embedded clients' gate owns SIGUSR1/SIGUSR2.
+struct Lifecycle {
+    stopped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    clean_cycle: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    dirty_cycle: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Lifecycle {
+    fn register(bench: bool) -> Lifecycle {
+        let stopped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        for signal in [signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT] {
+            signal_hook::flag::register(signal, stopped.clone()).expect("signal flag registration");
+        }
+        let clean_cycle = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let dirty_cycle = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        if bench {
+            signal_hook::flag::register(signal_hook::consts::SIGUSR1, clean_cycle.clone())
+                .expect("SIGUSR1 flag registration");
+            signal_hook::flag::register(signal_hook::consts::SIGUSR2, dirty_cycle.clone())
+                .expect("SIGUSR2 flag registration");
+        }
+        Lifecycle {
+            stopped,
+            clean_cycle,
+            dirty_cycle,
+        }
+    }
+}
+
+/// One `serve` run's ending: the process exits (the SIGTERM/SIGINT clean
+/// stop), or the bench re-boots in-process — clean (the stop path ran,
+/// the store shows the drain-proven marker) or dirty (no stop path, the
+/// running sentinel stands).
+enum Serve {
+    Exit(i32),
+    CleanCycle,
+    DirtyCycle,
+}
+
 fn main() {
     let options = parse_options();
     let nodes = boot_nodes(parse_config(&options.config), &options).unwrap_or_else(|message| {
         eprintln!("{message}");
         exit(2);
     });
+
+    // The subscriber stack (the binary owns it; the library stays
+    // subscriber-free): `RUST_LOG` env-filter, ANSI off, no line timestamp
+    // (events carry their own `ts=` fields), through `NonBlocking` over a
+    // per-node daily rolling file. The guard is held for the process
+    // lifetime and flushes on an orderly shutdown.
+    let _worker_guard = init_tracing(&options.log);
+    let lifecycle = Lifecycle::register(!options.bench_store.is_empty());
+    // The bench cycle loop: a SIGUSR1/SIGUSR2 cycle returns from `serve`
+    // and the node re-boots in-process — the adapter, its session, and
+    // every volatile host state are rebuilt exactly as a process restart
+    // rebuilds them; the tracing stack and the signal registrations are
+    // the process's and survive. Off the bench `serve` runs once.
+    loop {
+        match serve(&options, &nodes, &lifecycle) {
+            Serve::Exit(code) => exit(code),
+            Serve::CleanCycle => eprintln!(
+                "lease-sequencer: bench clean cycle: the stop path ran; re-booting in-process"
+            ),
+            Serve::DirtyCycle => eprintln!(
+                "lease-sequencer: bench dirty cycle: no stop path ran; re-booting in-process"
+            ),
+        }
+    }
+}
+
+fn serve(options: &Options, nodes: &[ClusterNode], lifecycle: &Lifecycle) -> Serve {
     let Some(own) = nodes.iter().find(|node| node.name == options.name) else {
         unreachable!("boot_nodes guarantees the own row");
     };
@@ -1776,12 +1902,6 @@ fn main() {
         .collect();
     let fingerprint = transport::genesis_fingerprint(&genesis);
 
-    // The subscriber stack (the binary owns it; the library stays
-    // subscriber-free): `RUST_LOG` env-filter, ANSI off, no line timestamp
-    // (events carry their own `ts=` fields), through `NonBlocking` over a
-    // per-node daily rolling file. The guard is held for the process
-    // lifetime and flushes on an orderly shutdown.
-    let _worker_guard = init_tracing(&options.log);
     let standby = !options.aof_dir.is_empty();
     // The telemetry AOF (item22): the envelope record layer over the
     // vendored TigerBeetle AOF, gated by the node's voting weight. The
@@ -1822,7 +1942,22 @@ fn main() {
             }
         }
     };
-    let node = if standby {
+    let journal_dir = (!options.journal_dir.is_empty()).then_some(options.journal_dir.as_str());
+    let node = if !options.bench_store.is_empty() {
+        // The bench boot: the lifecycle marker store rides the driver's
+        // control socket; the journal is real (the run's CAS chain).
+        Node::open_bench(
+            &members,
+            &options.name,
+            journal_dir,
+            JOURNAL_ROLL_BYTES,
+            &options.bench_store,
+        )
+        .unwrap_or_else(|code| {
+            eprintln!("lease-sequencer: bench node boot failed with code {code}");
+            exit(2);
+        })
+    } else if standby {
         // The standby telemetry host: the committed-transition hook feeds
         // the async AOF writer (the LKE1 journal producer path, deferred
         // durability target) and the lease driver stays idle.
@@ -1838,7 +1973,14 @@ fn main() {
             exit(2);
         })
     } else if options.recovery_flush == RecoveryFlush::Diskless {
-        Node::open(&members, &options.name, &options.state, None, 0).unwrap_or_else(|code| {
+        Node::open(
+            &members,
+            &options.name,
+            &options.state,
+            journal_dir,
+            JOURNAL_ROLL_BYTES,
+        )
+        .unwrap_or_else(|code| {
             eprintln!("lease-sequencer: node boot failed with code {code}");
             exit(2);
         })
@@ -1883,7 +2025,7 @@ fn main() {
 
     let mut peers: HashMap<u32, SocketAddr> = HashMap::new();
     let mut addr_to_id: HashMap<SocketAddr, u32> = HashMap::new();
-    for descriptor in &nodes {
+    for descriptor in nodes {
         if let Ok(mut addrs) = descriptor.endpoint.to_socket_addrs()
             && let Some(addr) = addrs.next()
         {
@@ -1934,11 +2076,17 @@ fn main() {
         pending: None,
     };
     // The embedded lock client (item04): N contender loops against this
-    // node's own service, behind the host's client gate. The SIGUSR1 /
-    // SIGUSR2 flags are registered only when clients run — a gateless
-    // host ignores them.
+    // node's own service. Off the bench they run behind the host's client
+    // gate and the SIGUSR1/SIGUSR2 flags register only when clients run —
+    // a gateless host ignores them. On the bench the SIGUSR pair carries
+    // the node's lifecycle, so the clients run ungated (`always_on`) and
+    // never listen for it.
     let embedded = (options.embedded_clients > 0).then(|| {
-        let signals = embedded_client::Signals::register();
+        let signals = if options.bench_store.is_empty() {
+            embedded_client::Signals::register()
+        } else {
+            embedded_client::Signals::always_on()
+        };
         Runner::new(
             options.embedded_clients,
             embedded_client::Config {
@@ -2070,16 +2218,37 @@ fn main() {
     // SIGTERM/SIGINT (the clean-stop path): the flag flips, the loop
     // exits through the teardown discipline — the boot-marker/teardown
     // record LAST, then the unconditional flush. SIGKILL skips all of it
-    // and loses the last unflushed window (documented).
-    let stopped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    for signal in [signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT] {
-        signal_hook::flag::register(signal, stopped.clone()).expect("signal flag registration");
-    }
-
+    // and loses the last unflushed window (documented). The bench's
+    // SIGUSR1/SIGUSR2 cycle flags ride the same loop top.
     loop {
-        if stopped.load(std::sync::atomic::Ordering::Relaxed) {
+        if lifecycle.stopped.load(std::sync::atomic::Ordering::Relaxed) {
             host.note("sigterm: clean stop");
             break;
+        }
+        if lifecycle
+            .clean_cycle
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            // The bench clean cycle: the loop return IS the drain point,
+            // exactly as the SIGTERM break — the stop path runs below and
+            // the process re-boots in-process from the flushed marker.
+            host.note("sigusr1: bench clean cycle");
+            let code = host.node.stop();
+            if code != OK {
+                eprintln!("lease-sequencer: bench clean cycle stop failed with code {code}");
+            }
+            return Serve::CleanCycle;
+        }
+        if lifecycle
+            .dirty_cycle
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            // The bench dirty cycle: NO stop path — the adapter is
+            // dropped with the running sentinel standing, and the
+            // in-process re-boot reincarnates off it (the crash shape,
+            // without the process death).
+            host.note("sigusr2: bench dirty cycle");
+            return Serve::DirtyCycle;
         }
         let now = millis();
         pump_udp(&mut host, now, &mut rng);
@@ -2115,6 +2284,7 @@ fn main() {
     {
         eprintln!("lease-sequencer: telemetry aof teardown failed ({error})");
     }
+    Serve::Exit(0)
 }
 
 fn timers(host: &mut Host, now: u64, rng: &mut Rng) {
@@ -2258,7 +2428,8 @@ fn timers(host: &mut Host, now: u64, rng: &mut Rng) {
     // gossips the entry ticket to every peer; the leader's answering push
     // is the evidence the boot fence qualifies, so the node catches up
     // and stays a streamed witness until a view change seats it.
-    if status.state == STATE_JOINING && now.saturating_sub(host.last_gossip) >= rejoin::GOSSIP_RESEND_MS
+    if status.state == STATE_JOINING
+        && now.saturating_sub(host.last_gossip) >= rejoin::GOSSIP_RESEND_MS
     {
         host.last_gossip = now;
         host.join_gossip();
@@ -3418,6 +3589,8 @@ mod boot_hint_tests {
             embedded_renew_fraction: 0.5,
             join_id,
             join_endpoint: join_endpoint.to_string(),
+            bench_store: String::new(),
+            journal_dir: String::new(),
         }
     }
 
@@ -3534,13 +3707,25 @@ mod reincarnation_remap_tests {
 
     fn boot_host(name: &str, root: &PathBuf) -> NodeHost {
         let state = root.join(format!("{name}.state"));
-        let node = match Node::open("1:a\x002:b\x003:c", name, state.to_str().expect("path"), None, 0) {
+        let node = match Node::open(
+            "1:a\x002:b\x003:c",
+            name,
+            state.to_str().expect("path"),
+            None,
+            0,
+        ) {
             Ok(node) => node,
             Err(_) => {
                 let root = temp_root();
                 let state = root.join(format!("{name}.state"));
-                Node::open("1:a\x002:b\x003:c", name, state.to_str().expect("path"), None, 0)
-                    .expect("node boots")
+                Node::open(
+                    "1:a\x002:b\x003:c",
+                    name,
+                    state.to_str().expect("path"),
+                    None,
+                    0,
+                )
+                .expect("node boots")
             }
         };
         let own_id = node.own_id();
@@ -3613,6 +3798,7 @@ mod reincarnation_remap_tests {
             phi_monitor: None,
             #[cfg(feature = "experimental-phi")]
             phi_cfg: phi::PhiConfig {
+                phi_threshold: 1.0,
                 heartbeat_ms: 100,
                 safety_multiple: 2.0,
                 window: 100,
@@ -3643,7 +3829,10 @@ mod reincarnation_remap_tests {
             telemetry: None,
             embedded: None,
         };
-        NodeHost { host, udp: udp_addr }
+        NodeHost {
+            host,
+            udp: udp_addr,
+        }
     }
 
     /// Three hosts — the three-voter genesis the forced weight sequence
@@ -3722,7 +3911,9 @@ mod reincarnation_remap_tests {
             },
         };
         let mut frame = vec![0u8; message.packed_len()];
-        let written = message.pack_into(&mut frame).expect("the core packs its own body");
+        let written = message
+            .pack_into(&mut frame)
+            .expect("the core packs its own body");
         assert_eq!(written, frame.len());
         frame
     }
@@ -3755,7 +3946,14 @@ mod reincarnation_remap_tests {
         let (mut a, b, _c, mut rng) = wire();
         let fingerprint = a.host.fingerprint.clone();
         let new = 2 + (1 << 24);
-        let frame = announcement(ViewId { era: Era(1), view: View(0) }, 2, new);
+        let frame = announcement(
+            ViewId {
+                era: Era(1),
+                view: View(0),
+            },
+            2,
+            new,
+        );
         deliver(&b, &mut a, &fingerprint, &frame, &mut rng);
         assert_eq!(
             a.host.peers.get(&new),
@@ -3791,7 +3989,14 @@ mod reincarnation_remap_tests {
         let (mut a, b, _c, mut rng) = wire();
         // A low-band `new` is not a bumped identity: no row, no rebind.
         let fingerprint = a.host.fingerprint.clone();
-        let low_band = announcement(ViewId { era: Era(1), view: View(0) }, 2, 5);
+        let low_band = announcement(
+            ViewId {
+                era: Era(1),
+                view: View(0),
+            },
+            2,
+            5,
+        );
         deliver(&b, &mut a, &fingerprint, &low_band, &mut rng);
         assert_eq!(a.host.peers.get(&5), None, "a low-band id gains no row");
         assert_eq!(
@@ -3801,7 +4006,14 @@ mod reincarnation_remap_tests {
         );
         // A degenerate pair (`old == new`) is not an announcement of a
         // bumped identity: no row, no rebind.
-        let degenerate = announcement(ViewId { era: Era(1), view: View(0) }, 2, 2);
+        let degenerate = announcement(
+            ViewId {
+                era: Era(1),
+                view: View(0),
+            },
+            2,
+            2,
+        );
         deliver(&b, &mut a, &fingerprint, &degenerate, &mut rng);
         assert_eq!(
             a.host.addr_to_id.get(&b.udp),
