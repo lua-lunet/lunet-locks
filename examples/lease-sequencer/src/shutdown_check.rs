@@ -54,6 +54,8 @@ const STOP_BEGIN_SPELLINGS: &[&str] = &[
     "stop: usr1 received",
     "stop: usr2 received",
     "sigterm: clean stop",
+    "sigint: clean stop",
+    "sigquit: clean stop",
 ];
 
 const DRAIN_SPELLINGS: &[&str] = &[

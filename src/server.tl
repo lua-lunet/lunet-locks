@@ -41,8 +41,9 @@
 -- redirect or a silent-leader window just advances the rotation.
 
 -- The deliberate-stop exit code the runtime reports at shutdown: 1 is the
--- "no clean stop ran" default; only the TERM bridge (below) records 0 at
--- the moment it hands the process to the v0.10.0 stop contract.
+-- "no clean stop ran" default; only the signal bridge (below — TERM, INT,
+-- and QUIT) records 0 at the moment it hands the process to the v0.10.0
+-- stop contract.
 global __lunet_exit_code: integer = 1
 
 local record DebugInfo
@@ -1368,28 +1369,57 @@ local function main(options: Options)
     lunet.spawn(discovery_loop)
     lunet.spawn(write_behind_loop)
     -- The supported v0.10.0 signal bridge (the runtime's own mechanics,
-    -- not a private handler): arming the one-shot watcher overrides the
-    -- default SIGTERM disposition, the first TERM resumes this coroutine,
-    -- and the process hands itself to the stop contract — the deliberate
-    -- stop passes through the drain point above and exits with the
-    -- recorded clean-stop code. Without this bridge lunet-run kills the
-    -- process at the default disposition and no hook ever runs.
+    -- not a private handler): arming a one-shot watcher overrides the
+    -- default signal disposition, the first matching signal resumes that
+    -- coroutine, and the process hands itself to the stop contract — the
+    -- deliberate stop passes through the drain point above and exits
+    -- with the recorded clean-stop code. TERM, INT, and QUIT are the
+    -- catchable termination signals here: each carries its own one-shot
+    -- waiter, whichever fires first logs the signal name and stops.
+    -- Without this bridge lunet-run kills the process at the default
+    -- disposition and no hook ever runs.
+    for _, caught in ipairs({"TERM", "INT", "QUIT"}) do
+        lunet.spawn(
+            function()
+                local signal_name, signal_error = signal.wait(caught)
+                assert(
+                    signal_error == nil,
+                    "server: signal watch failed: " .. (signal_error or "unknown")
+                )
+                log_membership(
+                    "advisory-lock "
+                        .. options.node
+                        .. " stop: "
+                        .. signal_name
+                        .. " received"
+                )
+                __lunet_exit_code = 0
+                lunet.stop()
+            end
+        )
+    end
+    -- SIGHUP is a logged no-op: the re-arming loop waits again after
+    -- each HUP so every one is logged and the process never dies on it.
+    -- It will reload the runtime config — the passive witness list
+    -- (never-voting, out-of-region, loaded at startup, outside the
+    -- cluster config) and the cluster jsonl — but that wiring is a
+    -- scheduled item; until it lands every HUP is the logged no-op.
     lunet.spawn(
         function()
-            local signal_name, signal_error = signal.wait("TERM")
-            assert(
-                signal_error == nil,
-                "server: signal watch failed: " .. (signal_error or "unknown")
-            )
-            log_membership(
-                "advisory-lock "
-                    .. options.node
-                    .. " stop: "
-                    .. signal_name
-                    .. " received"
-            )
-            __lunet_exit_code = 0
-            lunet.stop()
+            while true do
+                local signal_name, signal_error = signal.wait("HUP")
+                assert(
+                    signal_error == nil,
+                    "server: signal watch failed: " .. (signal_error or "unknown")
+                )
+                log_membership(
+                    "advisory-lock "
+                        .. options.node
+                        .. " sighup: config reload not wired; noop ("
+                        .. signal_name
+                        .. ")"
+                )
+            end
         end
     )
     while true do

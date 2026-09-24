@@ -1797,13 +1797,26 @@ impl Host {
 }
 
 /// The process's signal flags, registered once and shared across the
-/// bench's in-process cycles: SIGTERM/SIGINT request the clean stop and
-/// process exit; on the bench (`--bench-store`) SIGUSR1 requests the
-/// clean shutdown+startup cycle and SIGUSR2 the dirty restart cycle
+/// bench's in-process cycles: SIGTERM/SIGINT/SIGQUIT form the clean-stop
+/// catch set — all three flip the one `stopped` flag and process exit
+/// through the same drain point — and the per-signal latches record
+/// WHICH member fired so the stop-begin record names it. SIGHUP latches
+/// its own flag: the serve loop logs it as a no-op and never stops on
+/// it. On the bench (`--bench-store`) SIGUSR1 requests the clean
+/// shutdown+startup cycle and SIGUSR2 the dirty restart cycle
 /// (`docs/src/bench-harness.md`). Off the bench the cycle flags are
 /// never registered and the embedded clients' gate owns SIGUSR1/SIGUSR2.
 struct Lifecycle {
     stopped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    caught_term: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    caught_int: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    caught_quit: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// SIGHUP: the serve loop consumes this flag and carries on. It will
+    /// reload the runtime config — the passive witness list (never-voting,
+    /// out-of-region, loaded at startup, outside the cluster config) and
+    /// the cluster jsonl — but that wiring is a scheduled item; until it
+    /// lands every HUP is the logged no-op.
+    hup: std::sync::Arc<std::sync::atomic::AtomicBool>,
     clean_cycle: std::sync::Arc<std::sync::atomic::AtomicBool>,
     dirty_cycle: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
@@ -1811,9 +1824,29 @@ struct Lifecycle {
 impl Lifecycle {
     fn register(bench: bool) -> Lifecycle {
         let stopped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        for signal in [signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT] {
+        let caught_term = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let caught_int = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let caught_quit = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        for (signal, caught) in [
+            (
+                signal_hook::consts::SIGTERM,
+                std::sync::Arc::clone(&caught_term),
+            ),
+            (
+                signal_hook::consts::SIGINT,
+                std::sync::Arc::clone(&caught_int),
+            ),
+            (
+                signal_hook::consts::SIGQUIT,
+                std::sync::Arc::clone(&caught_quit),
+            ),
+        ] {
             signal_hook::flag::register(signal, stopped.clone()).expect("signal flag registration");
+            signal_hook::flag::register(signal, caught).expect("signal name registration");
         }
+        let hup = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        signal_hook::flag::register(signal_hook::consts::SIGHUP, hup.clone())
+            .expect("SIGHUP flag registration");
         let clean_cycle = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let dirty_cycle = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         if bench {
@@ -1824,16 +1857,20 @@ impl Lifecycle {
         }
         Lifecycle {
             stopped,
+            caught_term,
+            caught_int,
+            caught_quit,
+            hup,
             clean_cycle,
             dirty_cycle,
         }
     }
 }
 
-/// One `serve` run's ending: the process exits (the SIGTERM/SIGINT clean
-/// stop), or the bench re-boots in-process — clean (the stop path ran,
-/// the store shows the drain-proven marker) or dirty (no stop path, the
-/// running sentinel stands).
+/// One `serve` run's ending: the process exits (the SIGTERM/SIGINT/SIGQUIT
+/// clean stop), or the bench re-boots in-process — clean (the stop path
+/// ran, the store shows the drain-proven marker) or dirty (no stop path,
+/// the running sentinel stands).
 enum Serve {
     Exit(i32),
     CleanCycle,
@@ -1851,8 +1888,10 @@ fn main() {
     // subscriber-free): `RUST_LOG` env-filter, ANSI off, no line timestamp
     // (events carry their own `ts=` fields), through `NonBlocking` over a
     // per-node daily rolling file. The guard is held for the process
-    // lifetime and flushes on an orderly shutdown.
-    let _worker_guard = init_tracing(&options.log);
+    // lifetime and flushes on an orderly shutdown — the Exit arm drops it
+    // explicitly, because `exit()` skips the drop and would lose the
+    // stop path's final records still sitting in the writer's buffer.
+    let mut worker_guard = Some(init_tracing(&options.log));
     let lifecycle = Lifecycle::register(!options.bench_store.is_empty());
     // The bench cycle loop: a SIGUSR1/SIGUSR2 cycle returns from `serve`
     // and the node re-boots in-process — the adapter, its session, and
@@ -1861,7 +1900,10 @@ fn main() {
     // the process's and survive. Off the bench `serve` runs once.
     loop {
         match serve(&options, &nodes, &lifecycle) {
-            Serve::Exit(code) => exit(code),
+            Serve::Exit(code) => {
+                drop(worker_guard.take());
+                exit(code);
+            }
             Serve::CleanCycle => eprintln!(
                 "lease-sequencer: bench clean cycle: the stop path ran; re-booting in-process"
             ),
@@ -2215,14 +2257,30 @@ fn serve(options: &Options, nodes: &[ClusterNode], lifecycle: &Lifecycle) -> Ser
     let mut rng = Rng::new(millis() ^ (own_desc_id as u64) ^ (std::process::id() as u64));
     host.flush_outputs(now, &mut rng);
 
-    // SIGTERM/SIGINT (the clean-stop path): the flag flips, the loop
-    // exits through the teardown discipline — the boot-marker/teardown
-    // record LAST, then the unconditional flush. SIGKILL skips all of it
-    // and loses the last unflushed window (documented). The bench's
-    // SIGUSR1/SIGUSR2 cycle flags ride the same loop top.
+    // SIGTERM/SIGINT/SIGQUIT (the clean-stop catch set): the flag flips,
+    // the loop exits through the teardown discipline — the
+    // boot-marker/teardown record LAST, then the unconditional flush.
+    // SIGHUP is a consumed no-op: the flag is read and cleared, the loop
+    // carries on. SIGKILL skips all of it and loses the last unflushed
+    // window (documented). The bench's SIGUSR1/SIGUSR2 cycle flags ride
+    // the same loop top.
     loop {
+        if lifecycle.hup.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            host.note("sighup: config reload not wired; noop");
+        }
         if lifecycle.stopped.load(std::sync::atomic::Ordering::Relaxed) {
-            host.note("sigterm: clean stop");
+            let name = if lifecycle.caught_term.swap(false, std::sync::atomic::Ordering::Relaxed)
+            {
+                "sigterm"
+            } else if lifecycle.caught_int.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                "sigint"
+            } else if lifecycle.caught_quit.swap(false, std::sync::atomic::Ordering::Relaxed)
+            {
+                "sigquit"
+            } else {
+                "sigterm"
+            };
+            host.note(&format!("{name}: clean stop"));
             break;
         }
         if lifecycle
