@@ -13,6 +13,7 @@ nav = [
   { "External client protocol" = "client-protocol.md" },
   { "Build and tests" = "build-and-tests.md" },
   { "Bench harness" = "bench-harness.md" },
+  { "The fenced crash restart" = "fenced-crash-restart.md" },
   { "Contributing" = "contributing.md" },
 ]
 

@@ -1,0 +1,71 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="980" height="560" viewBox="0 0 980 560" font-family="monospace" font-size="12">
+  <defs>
+    <marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+      <path d="M0,0 L8,4 L0,8 z" fill="#222"/>
+    </marker>
+    <marker id="arrowdash" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+      <path d="M0,0 L8,4 L0,8 z" fill="#a00"/>
+    </marker>
+  </defs>
+
+  <text x="490" y="28" text-anchor="middle" font-size="15" font-weight="bold">The fenced crash restart: the shallow case (the view-churn fence)</text>
+  <text x="490" y="46" text-anchor="middle" font-size="11" fill="#444">local-softball9-2026-09-25, the n3 crash at view-depth 1234; every frame below is in messages.jsonl with its recorder source</text>
+
+  <!-- lifelines -->
+  <line x1="180" y1="92" x2="180" y2="478" stroke="#222" stroke-width="2"/>
+  <line x1="490" y1="92" x2="490" y2="478" stroke="#222" stroke-width="2"/>
+  <line x1="800" y1="92" x2="800" y2="478" stroke="#222" stroke-width="2"/>
+  <text x="180" y="82" text-anchor="middle" font-weight="bold">the fenced node</text>
+  <text x="180" y="98" text-anchor="middle" font-size="11" fill="#444">n3, restarted as 16777219</text>
+  <text x="490" y="82" text-anchor="middle" font-weight="bold">the leader</text>
+  <text x="490" y="98" text-anchor="middle" font-size="11" fill="#444">n1, running as 16777217</text>
+  <text x="800" y="82" text-anchor="middle" font-weight="bold">the other peer</text>
+  <text x="800" y="98" text-anchor="middle" font-size="11" fill="#444">n2, running as 16777218</text>
+
+  <!-- boot state box -->
+  <rect x="20" y="108" width="320" height="52" fill="#f4f4f4" stroke="#666"/>
+  <text x="30" y="124">boot reads the marker: 0 unflushed (the running</text>
+  <text x="30" y="138">sentinel; no stopped quorum) - crashed - bump to</text>
+  <text x="30" y="152">incarnation 1: era 1, view 0, restarting, voting 0</text>
+
+  <!-- 1: announcement to the leader -->
+  <circle cx="196" cy="192" r="9" fill="#222"/>
+  <text x="196" y="196" fill="#fff" text-anchor="middle">1</text>
+  <line x1="210" y1="192" x2="482" y2="192" stroke="#222" stroke-width="2" marker-end="url(#arrow)"/>
+  <text x="212" y="182">Reincarnation old=3 new=16777219, era 1 view 0 (every 1 s)</text>
+  <text x="300" y="208" fill="#a00">refused: ReincarnationRefused - never a normal primary at receipt</text>
+
+  <!-- 2: announcement to the other peer -->
+  <circle cx="196" cy="248" r="9" fill="#222"/>
+  <text x="196" y="252" fill="#fff" text-anchor="middle">2</text>
+  <line x1="210" y1="248" x2="792" y2="248" stroke="#222" stroke-width="2" marker-end="url(#arrow)"/>
+  <text x="212" y="238">the same announcement to every member it can name</text>
+  <text x="520" y="264" fill="#a00">refused the same way</text>
+
+  <!-- 3: the self loop -->
+  <circle cx="196" cy="304" r="9" fill="#222"/>
+  <text x="196" y="308" fill="#fff" text-anchor="middle">3</text>
+  <path d="M210,304 C260,286 260,322 210,322" stroke="#222" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+  <text x="268" y="300">the past-life id 3 stays in the descriptor: the send loops</text>
+  <text x="268" y="314">back onto its own socket (152 refused drops logged)</text>
+
+  <!-- 4: the churn from the leader -->
+  <circle cx="474" cy="368" r="9" fill="#a00"/>
+  <text x="474" y="372" fill="#fff" text-anchor="middle">4</text>
+  <line x1="458" y1="368" x2="188" y2="368" stroke="#a00" stroke-width="2" stroke-dasharray="6 4" marker-end="url(#arrowdash)"/>
+  <text x="196" y="356" fill="#a00">StartViewChange era 5, views 256..1238, addressed to the past-life id 3</text>
+  <text x="196" y="384" fill="#a00">dropped UnevaluableEra: the era-1 table cannot evaluate era 5</text>
+
+  <!-- 5: the churn from the other peer -->
+  <circle cx="784" cy="420" r="9" fill="#a00"/>
+  <text x="784" y="424" fill="#fff" text-anchor="middle">5</text>
+  <line x1="768" y1="420" x2="188" y2="420" stroke="#a00" stroke-width="2" stroke-dasharray="6 4" marker-end="url(#arrowdash)"/>
+  <text x="196" y="410" fill="#a00">StartViewChange era 5, views 235..1230, addressed to id 3</text>
+  <text x="196" y="436" fill="#a00">dropped UnevaluableEra; nothing is ever addressed to 16777219</text>
+
+  <!-- the fence -->
+  <rect x="20" y="478" width="940" height="52" fill="#fdecec" stroke="#a00"/>
+  <text x="30" y="496" font-weight="bold">the fence: 151 s of this exchange, the node never leaves state=restarting era=1 view=0 voting=0;</text>
+  <text x="30" y="510">304 announcements out, 1979 fence votes in, zero answers - then the harness parks it and the run moves on</text>
+  <text x="30" y="524" fill="#666">the cluster itself never settles the window: view_change at every status sample on both peers, no start_view emitted</text>
+</svg>
