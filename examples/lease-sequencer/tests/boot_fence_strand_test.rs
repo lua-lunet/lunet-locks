@@ -5,7 +5,12 @@
 //! `state=4 (Joining) view=0` forever while the other two voters walk the
 //! genesis views past it and serve as a 2-of-3 quorum. The stranded node
 //! drops every inbound message as `ViewMismatch { got: N, current: 0 }`,
-//! never adopts, never panics, and sends nothing the cluster can act on.
+//! never adopts, never panics, and sends nothing the cluster can act on —
+//! the recorded runs predate the join-gossip drive. On the current tree
+//! the host loop's resend timer emits the entry ticket
+//! (`rejoin::gossip_datagram`, the joiner half of
+//! `lease_sequencer::rejoin`) at the node's current view, and this test
+//! pins that emission.
 //!
 //! The recorded race, from the run logs: the stranded node's FIRST-EVER
 //! inbound datagram was already at the walk's final view (run 5:
@@ -339,11 +344,16 @@ fn walkers(fabric: &Fabric) -> Vec<(u32, u32, u32)> {
 
 /// The boot-fence strand: a provisioned voter whose first-ever inbound
 /// datagram arrives at the settled cluster's view must still reach the
-/// cluster — adopt, or emit outbound evidence the cluster can act on. On
-/// the current tree it wedges at the fence: every inbound datagram drops
-/// as `ViewMismatch { got: N, current: 0 }`, its own timeout machinery
-/// produces nothing, and the cluster serves past it as a 2-of-3 quorum —
-/// exactly the live-recorded lockup.
+/// cluster — adopt, or emit outbound evidence the cluster can act on.
+/// Every inbound datagram at the fence drops as
+/// `ViewMismatch { got: N, current: 0 }` and the node's own timeout
+/// machinery produces nothing (the drop rules above), so the pinned
+/// evidence is the join gossip: the host loop's resend timer
+/// (`main.rs::timers`) emits `rejoin::gossip_datagram` at the node's
+/// CURRENT view every `rejoin::GOSSIP_RESEND_MS`, and the heal window
+/// counts those resends. The node stays fenced at `Joining` view 0 in
+/// this fabric — adoption is the cluster's answering half, exercised by
+/// the live crash-family re-run lane.
 #[test]
 fn a_boot_fenced_voter_must_adopt_or_emit_actionable_evidence() {
     let _ = std::fs::remove_dir_all(ROOT);
@@ -499,7 +509,8 @@ fn a_boot_fenced_voter_must_adopt_or_emit_actionable_evidence() {
     let walker_rows = walkers(&fabric);
     assert!(
         saved,
-        "THE BOOT-FENCE STRAND (local-softball5/6-2026-09-18 defect): the \
+        "THE BOOT-FENCE STRAND REGRESSED (the local-softball5/6-2026-09-18 \
+         defect shape returned): the \
          provisioned voter n3 sat boot-fenced at state={} view={} for the \
          whole bounded drive while the settled cluster served at view {} \
          (walkers {walker_rows:?}) as a 2-of-3 quorum.\n\
@@ -522,7 +533,7 @@ fn a_boot_fenced_voter_must_adopt_or_emit_actionable_evidence() {
          (`lease_sequencer::rejoin`: the resend-timer drive the host loop \
          runs for a fenced Joining boot).\n\
          The fenced node sent nothing the cluster can act on and never \
-         adopted. n3 final status: {:?}",
+         adopted — the join-gossip resend drive regressed. n3 final status: {:?}",
         fenced.state(),
         fenced.view(),
         settled_view,

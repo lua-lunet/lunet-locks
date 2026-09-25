@@ -1,42 +1,160 @@
-//! The tape acceptance (item03 3d): run-4's corpus streamed, filtered,
-//! fed to one node — the Red/Green story pinned as the defensive test.
+//! The tape acceptance: the corpus is RECORDED IN-TEST (record-once-
+//! then-replay) — the former gitignored run pulls were dead for any
+//! fresh clone — so the test records its own era-4 view-13 leader-66
+//! telemetry AOF into the repository's `.tmp/` scratch through the
+//! vendored record layer, streams it as the tape, and replays it in the
+//! same run.
 //!
-//! Red (kept): a fresh genesis node force-fed the era-4 tape digests
-//! every datagram with an `OK` return code yet never replays a committed
-//! transition — the core drops datagrams naming an era outside its
-//! configuration table's retention window (`uvrr-core`
+//! Red (kept): a fresh genesis node force-fed the higher-era tape
+//! digests every datagram with an `OK` return code yet never replays a
+//! committed transition — the core drops datagrams naming an era outside
+//! its configuration table's retention window (`uvrr-core`
 //! `src/replica/normal.rs`, the `EraUnevaluable` gate), and a mid-stream
 //! window carries no slots for a fresh node's commit fold to walk. This
 //! pins WHY the replay layer for a mid-stream window is the lock
 //! Service — the node's committed state machine — fed the verbs
 //! extracted byte-exactly from the tape's `frame_hex` payloads.
 //!
-//! Green: the scenario + the trimmed leader-66 window replay the
-//! recorded committed transitions byte-exactly — the renewal chain holds
-//! once and renews the same holder on every later regrant, at the
+//! Green: the scenario + the leader-66 window replay the recorded
+//! committed transitions byte-exactly — the renewal chain holds once per
+//! holder run and renews the same holder on every later regrant, at the
 //! recorded execution clocks, from the recorded wire bytes.
+
+#[path = "recorder/mod.rs"]
+mod recorder;
 
 #[path = "scenario/mod.rs"]
 mod scenario;
 
+use lease_sequencer::phi::Trailer;
 use lease_sequencer::tape::{TapeOptions, stream_dir};
+use lunet_advisory_lock::locks::{LeaseCandidate, Request};
+use recorder::{commit_frame, prepare_frame, write_aof};
 use scenario::{Scenario, TapeFrame, committed_verbs, feed_tape, replay_verbs, tape_frame};
 use std::collections::BTreeMap;
+use std::path::Path;
+use uuid::Uuid;
 
-/// The run-4 dc3 corpus: the recording standby's AOF directory.
-fn corpus_dir() -> std::path::PathBuf {
-    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.tmp/telemetry/run4/dc3")
+const RECORDER: u32 = 99;
+const ERA: u32 = 4;
+const VIEW: u32 = 13;
+const LEADER: u32 = 66;
+/// The window's committed frontier at its start; the recorded verbs'
+/// slots begin one past it.
+const COMMITTED_SLOT: u64 = 41_001;
+/// The polite lock's recorded holder runs: three SETs, then two, then
+/// seven — three holder runs, the middle one a holder change.
+const RUN_LENGTHS: [usize; 3] = [3, 2, 7];
+const TOTAL_FRAMES: usize = {
+    let mut total = 0;
+    let mut index = 0;
+    while index < RUN_LENGTHS.len() {
+        total += 2 * RUN_LENGTHS[index];
+        index += 1;
+    }
+    total
+};
+/// A fixed recording clock (ms `BASE_NS / 1_000_000`): the replay's
+/// execution ticks are the recorded clocks.
+const BASE_NS: u64 = 1_793_000_000_000_000_000;
+const NS_STEP: u64 = 1_000_000;
+
+/// The recorded holders, in run order: two distinct holders, the third
+/// run a return to the first.
+fn holders() -> [Uuid; 3] {
+    [
+        Uuid::from_u128(0x0DDB_A11_01),
+        Uuid::from_u128(0x0DDB_A11_02),
+        Uuid::from_u128(0x0DDB_A11_01),
+    ]
 }
 
-/// Streams the corpus as the tape (all kinds), in file order.
-fn stream_tape() -> Vec<String> {
+/// Records the leader-66 window into a fresh telemetry AOF under `root`:
+/// for each committed verb one untrailed Prepare (the wire header names
+/// no sender) followed by one trailed Commit naming leader 66 — the
+/// tape's own from-derivation shape. The window opens on the untrailed
+/// Prepare, as the recorded corpora opened.
+fn record_corpus(root: &Path) -> std::path::PathBuf {
+    let dir = root.join("telemetry");
+    let mut records = Vec::new();
+    let holders = holders();
+    let mut slot = COMMITTED_SLOT;
+    let mut ns = BASE_NS;
+    for (run_index, length) in RUN_LENGTHS.iter().enumerate() {
+        // A holder change lands after the prior holder's lease window
+        // (250 ms) has expired at the recorded clocks, so the new
+        // holder's SET is grantable.
+        if run_index > 0 {
+            ns += 500 * NS_STEP;
+        }
+        for _ in 0..*length {
+            slot += 1;
+            ns += NS_STEP;
+            let holder = holders[run_index];
+            let message_id = Uuid::from_u128(slot as u128 | 0xDDBA_1200_0000_0000);
+            let request = Request::Set {
+                message_id,
+                client_id: 7,
+                request_num: slot,
+                lock_id: 145_310_90,
+                lease: LeaseCandidate {
+                    lease_id: slot,
+                    holder,
+                    lease_ms: 250,
+                },
+                name: None,
+                labels: None,
+                sent_at_ms: None,
+            };
+            let payload = serde_json::to_vec(&request).expect("the verb serializes");
+            records.push(lunet_locks_aof::envelope::Record::wire(
+                ns,
+                &prepare_frame(ERA, VIEW, slot, message_id, &payload, slot - 1),
+            ));
+            ns += NS_STEP;
+            let trailer = Trailer {
+                era: ERA,
+                leader: LEADER,
+                seq: (slot - COMMITTED_SLOT) as u32,
+                sent_at_ms: ns / 1_000_000,
+            };
+            records.push(lunet_locks_aof::envelope::Record::wire(
+                ns,
+                &commit_frame(ERA, VIEW, slot, slot, &trailer),
+            ));
+        }
+    }
+    write_aof(&dir, 1_793_000_000, &records);
+    dir
+}
+
+/// Streams the recorded corpus as the tape (all kinds), in file order.
+fn stream_tape(dir: &Path) -> Vec<String> {
     let mut options = TapeOptions::default();
-    options.recorder = Some(99);
+    options.recorder = Some(RECORDER);
     let mut capture: Vec<u8> = Vec::new();
-    stream_dir(&corpus_dir(), &options, &mut capture).expect("the corpus streams");
+    stream_dir(dir, &options, &mut capture).expect("the corpus streams");
     String::from_utf8_lossy(&capture)
         .lines()
         .map(|line| line.to_string())
+        .collect()
+}
+
+/// The frames to the recorder: every wire record (all of them name the
+/// recorder as their `to`).
+fn frames_to_recorder(dir: &Path) -> Vec<TapeFrame> {
+    stream_tape(dir)
+        .iter()
+        .filter_map(|line| {
+            let (from, to, json) = scenario::parse_tape_line(line)?;
+            if to != "99" {
+                return None;
+            }
+            if json.get("kind").and_then(|v| v.as_str()) != Some("wire") {
+                return None;
+            }
+            tape_frame(from, json)
+        })
         .collect()
 }
 
@@ -62,30 +180,19 @@ const SCENARIO_99: &str = r#"{
 }"#;
 
 /// RED, kept: the fresh node digests the whole tape with `OK` codes and
-/// replays nothing — the era-table wall, pinned.
+/// replays nothing — the era wall, pinned.
 #[test]
-fn given_a_fresh_genesis_node_the_run4_era4_tape_never_replays() {
+fn given_a_fresh_genesis_node_the_higher_era_tape_never_replays() {
     let scenario = Scenario::parse(SCENARIO_99).expect("the scenario parses");
-    let root = std::env::temp_dir().join(format!("item03-red-{}", std::process::id()));
+    let root = recorder::temp_root("tape-playback-red");
+    let dir = record_corpus(&root);
     let mut node = scenario.open_node(&root).expect("the scenario node boots");
 
-    let frames: Vec<TapeFrame> = stream_tape()
-        .iter()
-        .filter_map(|line| {
-            let (from, to, json) = scenario::parse_tape_line(line)?;
-            if to != "99" {
-                return None;
-            }
-            if json.get("kind").and_then(|v| v.as_str()) != Some("wire") {
-                return None;
-            }
-            tape_frame(from, json)
-        })
-        .collect();
-    assert!(
-        frames.len() > 10_000,
-        "the tape to node 99 is unexpectedly thin: {}",
-        frames.len()
+    let frames = frames_to_recorder(&dir);
+    assert_eq!(
+        frames.len(),
+        TOTAL_FRAMES,
+        "the tape to the recorder is the recorded stream, byte-count exact"
     );
 
     let result = feed_tape(&mut node, &frames);
@@ -134,52 +241,46 @@ fn given_a_fresh_genesis_node_the_run4_era4_tape_never_replays() {
     );
 }
 
-/// GREEN: the scenario + the trimmed era-4 view-13 leader-66 window: the
+/// GREEN: the scenario + the era-4 view-13 leader-66 window: the
 /// committed verbs extracted from the tape's own bytes replay the
-/// recorded committed transitions byte-exactly — the renewal chain holds
-/// once and renews the same holder thereafter, at the recorded clocks.
+/// recorded committed transitions byte-exactly — each holder run opens
+/// with a Hold and renews the same holder thereafter, at the recorded
+/// clocks.
 #[test]
 fn given_the_scenario_and_tape_the_committed_verbs_replay_the_recorded_transitions() {
     let scenario = Scenario::parse(SCENARIO_99).expect("the scenario parses");
     // The scenario's frontier must agree with the tape it replays.
-    assert_eq!(scenario.era, 4);
-    assert_eq!(scenario.view, 13);
-    assert_eq!(scenario.committed_slot, 41_001);
+    assert_eq!(scenario.era, ERA);
+    assert_eq!(scenario.view, VIEW);
+    assert_eq!(scenario.committed_slot, COMMITTED_SLOT);
 
-    // The trimmed window: the leader-66 stream into node 99 — its
-    // trailed Commits (the ^66,99, filter shape) and the untrailed
-    // Preparers whose committed slots those Commits cover. The tape's
-    // `from` derivation names the trailed Commits 66 and leaves the
-    // Preparers `?`; both belong to the same leader-66 era-4 view-13
-    // section, so the trim keys on the recorded header fields.
-    let frames: Vec<TapeFrame> = stream_tape()
-        .iter()
-        .filter_map(|line| {
-            let (from, to, json) = scenario::parse_tape_line(line)?;
-            if to != "99" {
-                return None;
-            }
-            if json.get("kind").and_then(|v| v.as_str()) != Some("wire") {
-                return None;
-            }
-            if json.get("era").and_then(|v| v.as_u64()) != Some(4) {
-                return None;
-            }
-            if json.get("view").and_then(|v| v.as_u64()) != Some(13) {
-                return None;
-            }
-            tape_frame(from, json)
+    let root = recorder::temp_root("tape-playback-green");
+    let dir = record_corpus(&root);
+    // The trimmed window: the leader-66 stream into the recorder — its
+    // trailed Commits (the tape's `from` derivation names them 66) and
+    // the untrailed Preparers whose committed slots those Commits cover.
+    let frames: Vec<TapeFrame> = frames_to_recorder(&dir)
+        .into_iter()
+        .filter(|frame| {
+            frame.json.get("era").and_then(|v| v.as_u64()) == Some(ERA as u64)
+                && frame.json.get("view").and_then(|v| v.as_u64()) == Some(VIEW as u64)
         })
         .collect();
-    assert!(
-        frames.len() > 1_000,
-        "the leader-66 window is unexpectedly thin: {}",
-        frames.len()
+    let _ = std::fs::remove_dir_all(&root);
+    assert_eq!(
+        frames.len(),
+        TOTAL_FRAMES,
+        "the leader-66 window is the recorded stream, byte-count exact"
     );
 
     // The verbs and the transitions: the deterministic committed-state
     // replay of the window's own bytes.
     let verbs = committed_verbs(&frames);
+    assert_eq!(
+        verbs.len(),
+        RUN_LENGTHS.iter().sum::<usize>(),
+        "every recorded Prepare carries a decodable committed verb"
+    );
     let replayed = replay_verbs(&verbs);
     let sets: Vec<&scenario::ReplayedVerb> =
         replayed.iter().filter(|verb| verb.op == "set").collect();
@@ -189,11 +290,10 @@ fn given_the_scenario_and_tape_the_committed_verbs_replay_the_recorded_transitio
         sets.len()
     );
 
-    // The known committed transition, per lock, as holder runs: the
+    // The recorded transition discipline, per lock, as holder runs: the
     // first SET of a run holds with the offered holder granted, every
     // later same-holder regrant on that run renews; a holder change
-    // starts the next run. The window's committed chain on the polite
-    // lock (14531090) is exactly three runs — the recorded facts.
+    // starts the next run.
     let mut by_lock: BTreeMap<u64, Vec<&scenario::ReplayedVerb>> = BTreeMap::new();
     for verb in &sets {
         by_lock.entry(verb.lock_id).or_default().push(verb);
@@ -245,7 +345,8 @@ fn given_the_scenario_and_tape_the_committed_verbs_replay_the_recorded_transitio
         );
     }
     // The window's recorded facts, pinned: the polite lock's chain is
-    // three holder runs of 87, 87, and 7 committed SETs.
+    // three holder runs of the recorded lengths, the middle one a holder
+    // change.
     let polite: Vec<&scenario::ReplayedVerb> = sets
         .iter()
         .copied()
@@ -255,7 +356,7 @@ fn given_the_scenario_and_tape_the_committed_verbs_replay_the_recorded_transitio
     let run_lengths: Vec<usize> = polite_runs.map(<[&scenario::ReplayedVerb]>::len).collect();
     assert_eq!(
         run_lengths,
-        vec![87, 87, 7],
+        RUN_LENGTHS,
         "the polite lock's holder runs are the recorded facts"
     );
 

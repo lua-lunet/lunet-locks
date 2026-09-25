@@ -3117,13 +3117,24 @@ mod forward_tests {
 
     use super::*;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     const LOCK_ID: u64 = 0x0DDBA12;
 
+    static FORWARD_SCRATCH_SEQ: AtomicU64 = AtomicU64::new(0);
+
     fn temp_root() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "lease-sequencer-forward-{}-{}",
+        // Test scratch stays inside the repository's `.tmp/` directory;
+        // this crate sits two levels below the repository root, and the
+        // crate directory is baked in at compile time.
+        let repo_tmp = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join(".tmp");
+        let seq = FORWARD_SCRATCH_SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = repo_tmp.join(format!(
+            "lease-sequencer-forward-{}-{}-{seq}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -3265,10 +3276,21 @@ mod forward_tests {
         }
     }
 
+    /// The harness's scratch root: removed when the guard drops, so a
+    /// test's scratch never outlives the test (panic paths included).
+    struct ScratchRoot(PathBuf);
+
+    impl Drop for ScratchRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     /// A settled two-node localhost harness: `a` leads genesis's primary,
     /// `b` follows; both peer rows know each other's real sockets.
-    fn harness() -> (NodeHost, NodeHost, Rng) {
+    fn harness() -> (NodeHost, NodeHost, Rng, ScratchRoot) {
         let root = temp_root();
+        let scratch = ScratchRoot(root.clone());
         let mut a = boot_host("a", &root);
         let mut b = boot_host("b", &root);
         a.host.peers.insert(2, b.udp);
@@ -3290,7 +3312,7 @@ mod forward_tests {
             );
             tick(&mut a, &mut b, &mut rng);
         }
-        (a, b, rng)
+        (a, b, rng, scratch)
     }
 
     fn tick(a: &mut NodeHost, b: &mut NodeHost, rng: &mut Rng) {
@@ -3399,7 +3421,7 @@ mod forward_tests {
     }
 
     fn one_follower_get_scenario() {
-        let (mut a, mut b, mut rng) = harness();
+        let (mut a, mut b, mut rng, _scratch) = harness();
         let follower_to_b = b.host.node.status().leader != b.host.own_id;
         assert!(
             follower_to_b,
@@ -3415,7 +3437,7 @@ mod forward_tests {
     }
 
     fn one_follower_set_scenario() {
-        let (mut a, mut b, mut rng) = harness();
+        let (mut a, mut b, mut rng, _scratch) = harness();
         let line = round_trip(&mut a, &mut b, &mut rng, true, &set_request(800_006, 1));
         let reply = ok_reply(&line);
         assert_eq!(reply["granted"], true, "the forwarded set grants: {line}");
@@ -3426,7 +3448,7 @@ mod forward_tests {
     }
 
     fn one_leader_local_scenario() {
-        let (mut a, mut b, mut rng) = harness();
+        let (mut a, mut b, mut rng, _scratch) = harness();
         let line = round_trip(&mut a, &mut b, &mut rng, false, &get_request(800_002, 1));
         ok_reply(&line);
     }
@@ -3438,7 +3460,7 @@ mod forward_tests {
     /// arrives afterwards. The late ack must not abort the node: two
     /// dead voters kill the cluster.
     fn one_churn_late_ack_scenario() {
-        let (mut a, mut b, mut rng) = harness();
+        let (mut a, mut b, mut rng, _scratch) = harness();
         assert!(
             b.host.node.status().leader != b.host.own_id,
             "harness shape: b follows"
@@ -3522,7 +3544,7 @@ mod forward_tests {
     }
 
     fn one_refusal_scenario() {
-        let (mut a, mut b, mut rng) = harness();
+        let (mut a, mut b, mut rng, _scratch) = harness();
         // A conn with a pending forward: a real socket pair installed
         // straight into the host (the accept path is covered above), with
         // one op in flight whose leader-side refusal is what we feed next.
