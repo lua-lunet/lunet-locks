@@ -1,12 +1,20 @@
 //! The routed lifecycle marker: the engine's `LifecycleStore` over the
 //! superblock copies.
 //!
-//! The engine (`vrr::lifecycle`, uvrr-core tag v0.7.4 @ e5b0a79) owns the marker
+//! The engine (`vrr::lifecycle`, uvrr-core tag v0.8.0 @ 450dcab) owns the marker
 //! machine — which marker, which copies, when, and in what order
 //! (`docs/uvrr-boot-gate.md` §3). This module is the host's durable
 //! mechanics: the vendored Zig store's quorum-of-copies construction,
 //! reached through the AOF C ABI's marker exports (`ext/lunet-locks-aof`),
-//! plus the item08 single-file compatibility projection.
+//! plus the single-file compatibility projection.
+//!
+//! The bridge to the engine's internal machine: the durable marker is the
+//! `NodeIdentity` pair (system identifier, crash counter) — it vouches for
+//! the life — and the engine's `Incarnation` input is the marker pair's
+//! crash counter (the life's number) read at this boot-gate boundary. The
+//! packed u32 is what goes on the wire; this module derives the engine's
+//! number from the pair on every read and spells the pair back on every
+//! write.
 //!
 //! - **Read** (`read_copies`) — the working quorum's verdict: the
 //!   highest-sequence valid copies at the `.open` threshold (2/4). THE
@@ -49,10 +57,10 @@
 //! # On-disk layout
 //!
 //! The superblock copies live in a sibling file, `<state>.superblock`.
-//! The single `<incarnation> <flushed|unflushed|stopped>` text file stays
-//! exactly as item08 wrote it — it is the projection legacy rigs and
-//! operators read, and the boot input only while the copies predate this
-//! routing.
+//! The single `<system> <crash> <unflushed|stopped|flushed>` text file
+//! (the identity pair spelled as its halves, then the state word) is the
+//! projection legacy rigs and operators read, and the boot input only
+//! while the copies predate this routing.
 //!
 //! Windows keeps the item08 single-file discipline: the vendored AOF
 //! build is unix-only, and no Windows asset is packaged.
@@ -67,6 +75,9 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use vrr::lifecycle::{CopyState, Incarnation, LifecycleStore, Marker, SuperblockCopies};
 
 use crate::ffi::{JournalSink, read_marker, write_marker};
+
+#[cfg(not(target_os = "windows"))]
+use lunet_locks_aof::marker;
 
 /// The shared door to the committed-transition sink: the Node appends
 /// through it during operation, and the halt's `drain` forces it.
@@ -190,8 +201,10 @@ fn word_marker(word: &str) -> Option<Marker> {
 /// harness driver's unix socket, one request one reply.
 #[cfg(unix)]
 struct MemBackend {
-    writer: UnixStream,
-    reader: BufReader<UnixStream>,
+    /// The driver's socket: the write half and the read half behind one
+    /// lock, so the store's RPCs (the engine's scheduled calls and the
+    /// emission gate's round) share the one wire discipline.
+    socket: std::sync::Mutex<(UnixStream, BufReader<UnixStream>)>,
 }
 
 #[cfg(unix)]
@@ -199,16 +212,22 @@ impl MemBackend {
     fn connect(path: &Path) -> io::Result<MemBackend> {
         let writer = UnixStream::connect(path)?;
         let reader = BufReader::new(writer.try_clone()?);
-        Ok(MemBackend { writer, reader })
+        Ok(MemBackend {
+            socket: std::sync::Mutex::new((writer, reader)),
+        })
     }
 
-    fn rpc(&mut self, request: &serde_json::Value) -> io::Result<serde_json::Value> {
+    fn rpc(&self, request: &serde_json::Value) -> io::Result<serde_json::Value> {
         let mut line = request.to_string();
         line.push('\n');
-        self.writer.write_all(line.as_bytes())?;
-        self.writer.flush()?;
+        let mut socket = self
+            .socket
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        socket.0.write_all(line.as_bytes())?;
+        socket.0.flush()?;
         let mut reply = String::new();
-        let read = self.reader.read_line(&mut reply)?;
+        let read = socket.1.read_line(&mut reply)?;
         if read == 0 {
             return Err(io::Error::other(
                 "the bench store driver closed the control socket",
@@ -253,19 +272,23 @@ enum Backend {
 
 /// The host's durable mechanics for the boot gate: the superblock quorum
 /// store plus the single-file projection, wired to the committed-
-/// transition sink for the halt's drain.
+/// transition sink for the halt's drain. The system identifier is the
+/// descriptor's own member's system half — every marker round this store
+/// spells carries it.
 pub(crate) struct GateStore {
     backend: Backend,
     sink: SinkDoor,
+    system: u16,
 }
 
 impl GateStore {
-    pub(crate) fn new(state: &Path, sink: SinkDoor) -> GateStore {
+    pub(crate) fn new(state: &Path, sink: SinkDoor, system: u16) -> GateStore {
         GateStore {
             backend: Backend::Disk {
                 state: state.to_path_buf(),
             },
             sink,
+            system,
         }
     }
 
@@ -280,14 +303,58 @@ impl GateStore {
         Ok(GateStore {
             backend: Backend::Mem(MemBackend::connect(ctl)?),
             sink,
+            system: 0,
         })
+    }
+
+    /// The emission gate's one durable round: the crash bump's marker
+    /// write — the next life at the running sentinel — fsync-complete
+    /// before the driver releases the first announcement. Unconditional:
+    /// the round lands seated or not. A life the packing cannot spell
+    /// (past the crash counter's sixteen bits) refuses here.
+    pub(crate) fn emission_gate(&self, life: u64) -> io::Result<()> {
+        let counter = u16::try_from(life).map_err(|_| {
+            io::Error::other(format!(
+                "the next life {life} is not spellable as a crash counter"
+            ))
+        })?;
+        match &self.backend {
+            Backend::Disk { state } => {
+                #[cfg(not(target_os = "windows"))]
+                {
+                    let identity = marker::NodeIdentity::new(self.system, counter).ok_or_else(
+                        || {
+                            io::Error::other(format!(
+                                "the identity pair ({}, {counter}) is not spellable: \
+                                 a zero half is no identity",
+                                self.system
+                            ))
+                        },
+                    )?;
+                    write_round(state, identity, marker::MarkerState::Unflushed)
+                }
+                #[cfg(target_os = "windows")]
+                write_marker(state, self.system, counter, Marker::Joining)
+            }
+            #[cfg(unix)]
+            Backend::Mem(mem) => {
+                let reply = mem.rpc(&serde_json::json!({
+                    "op": "commit",
+                    "incarnation": life,
+                    "marker": "joining",
+                }))?;
+                MemBackend::ack(&reply)
+            }
+        }
     }
 }
 
 /// The durable read: the working quorum's verdict, or the compatibility
-/// projection's while the copies predate this routing.
+/// projection's while the copies predate this routing. The marker's
+/// `NodeIdentity` pair vouches for the life; the engine's incarnation
+/// input is the pair's crash counter (the life's number).
 #[cfg(not(target_os = "windows"))]
-fn read_copies_disk(state: &Path) -> io::Result<Option<SuperblockCopies>> {
+fn read_copies_disk(state: &Path, system: u16) -> io::Result<Option<SuperblockCopies>> {
     let superblock = superblock_path(state);
     if !superblock.exists() {
         // The copies never existed: the single file is the boot input
@@ -297,58 +364,98 @@ fn read_copies_disk(state: &Path) -> io::Result<Option<SuperblockCopies>> {
         if !state.exists() {
             return Ok(None);
         }
-        let (incarnation, marker) = read_marker(state)?;
-        return Ok(Some(uniform(Incarnation(incarnation), marker)));
+        let (file_system, crash, marker) = read_marker(state)?;
+        if file_system != system {
+            return Err(io::Error::other(format!(
+                "the projection names system {file_system} but the descriptor names system {system}"
+            )));
+        }
+        return Ok(Some(uniform(Incarnation(u64::from(crash)), marker)));
     }
     // The copies exist: they are the authoritative read. THE
     // BOOT-READ SAFETY LAW: a bad checksum on ANY copy is a loud log
     // and a PANIC (the adapter panics on the Zig store's distinct
     // refusal code) — never cleared, never repaired, never fallen
-    // back, never "unclear". Any other unreadable shape (no quorum, a
-    // fork, any refusal) is an error — the boot refuses rather than
+    // back, never "unclear". An old-format marker (INCOMPATIBLE) is
+    // invalid, never converted. Any other unreadable shape (no quorum,
+    // a fork, any refusal) is an error — the boot refuses rather than
     // guessing an identity or falling back to the projection.
-    let classified = lunet_locks_aof::marker::classify(&superblock).map_err(|code| {
-        if code == lunet_locks_aof::marker::CORRUPT {
+    let classified = marker::classify(&superblock).map_err(|code| {
+        if code == marker::CORRUPT {
             boot_read_checksum_panic(&superblock, "the quorum read");
+        }
+        if code == marker::INCOMPATIBLE {
+            return io::Error::other(format!(
+                "the marker is an old-format file (FFI code {code}): invalid, never converted"
+            ));
         }
         io::Error::other(format!("the marker quorum read failed (FFI code {code})"))
     })?;
     Ok(Some(uniform(
-        Incarnation(classified.incarnation),
+        Incarnation(u64::from(classified.identity.crash_counter())),
         engine_marker(classified.state),
     )))
 }
 
-/// The durable read: Windows keeps the item08 single-file discipline.
+/// The durable read: Windows keeps the single-file discipline.
 #[cfg(target_os = "windows")]
-fn read_copies_disk(state: &Path) -> io::Result<Option<SuperblockCopies>> {
+fn read_copies_disk(state: &Path, system: u16) -> io::Result<Option<SuperblockCopies>> {
     if !state.exists() {
         return Ok(None);
     }
-    let (incarnation, marker) = read_marker(state)?;
-    Ok(Some(uniform(Incarnation(incarnation), marker)))
+    let (file_system, crash, marker) = read_marker(state)?;
+    if file_system != system {
+        return Err(io::Error::other(format!(
+            "the projection names system {file_system} but the descriptor names system {system}"
+        )));
+    }
+    Ok(Some(uniform(Incarnation(u64::from(crash)), marker)))
 }
 
 /// The durable write: the quorum write, then the projection mirror.
 #[cfg(not(target_os = "windows"))]
-fn commit_disk(state: &Path, copy: CopyState) -> io::Result<()> {
-    let identity = copy.identity.0;
-    lunet_locks_aof::marker::write(&superblock_path(state), identity, zig_state(copy.marker))
-        .map_err(|code| {
-            if code == lunet_locks_aof::marker::CORRUPT {
-                boot_read_checksum_panic(&superblock_path(state), "the write's read");
-            }
-            io::Error::other(format!("the marker quorum write failed (FFI code {code})"))
-        })?;
-    // The compatibility projection: the item08 single-file write,
-    // exactly as before, only AFTER the quorum write succeeded.
-    write_marker(state, identity, copy.marker)
+fn commit_disk(state: &Path, system: u16, copy: CopyState) -> io::Result<()> {
+    let counter = u16::try_from(copy.identity.0)
+        .map_err(|_| io::Error::other(format!("the life {} is not spellable as a crash counter", copy.identity.0)))?;
+    let identity = marker::NodeIdentity::new(system, counter).ok_or_else(|| {
+        io::Error::other(format!(
+            "the identity pair ({system}, {counter}) is not spellable: a zero half is no identity"
+        ))
+    })?;
+    marker::write(&superblock_path(state), identity, zig_state(copy.marker)).map_err(|code| {
+        if code == marker::CORRUPT {
+            boot_read_checksum_panic(&superblock_path(state), "the write's read");
+        }
+        io::Error::other(format!("the marker quorum write failed (FFI code {code})"))
+    })?;
+    // The compatibility projection: the single-file write, only AFTER
+    // the quorum write succeeded.
+    write_marker(state, system, counter, copy.marker)
 }
 
-/// The durable write: Windows keeps the item08 single-file discipline.
+/// The durable write: Windows keeps the single-file discipline.
 #[cfg(target_os = "windows")]
-fn commit_disk(state: &Path, copy: CopyState) -> io::Result<()> {
-    write_marker(state, copy.identity.0, copy.marker)
+fn commit_disk(state: &Path, system: u16, copy: CopyState) -> io::Result<()> {
+    let counter = u16::try_from(copy.identity.0)
+        .map_err(|_| io::Error::other(format!("the life {} is not spellable as a crash counter", copy.identity.0)))?;
+    write_marker(state, system, counter, copy.marker)
+}
+
+/// The one durable marker round: the quorum write of `(identity,
+/// state)` with forced I/O, then the projection mirror.
+#[cfg(not(target_os = "windows"))]
+fn write_round(
+    state: &Path,
+    identity: marker::NodeIdentity,
+    round: marker::MarkerState,
+) -> io::Result<()> {
+    marker::write(&superblock_path(state), identity, round).map_err(|code| {
+        if code == marker::CORRUPT {
+            boot_read_checksum_panic(&superblock_path(state), "the write's read");
+        }
+        io::Error::other(format!("the marker quorum write failed (FFI code {code})"))
+    })?;
+    write_marker(state, identity.system_identifier(), identity.crash_counter(), engine_marker(round))
 }
 
 impl LifecycleStore for GateStore {
@@ -356,8 +463,8 @@ impl LifecycleStore for GateStore {
 
     #[cfg(unix)]
     fn read_copies(&mut self) -> Result<Option<SuperblockCopies>, Self::Error> {
-        match &mut self.backend {
-            Backend::Disk { state } => read_copies_disk(state),
+        match &self.backend {
+            Backend::Disk { state } => read_copies_disk(state, self.system),
             Backend::Mem(mem) => {
                 let reply = mem.rpc(&serde_json::json!({"op": "read"}))?;
                 match reply.get("verdict").and_then(|v| v.as_str()) {
@@ -389,7 +496,7 @@ impl LifecycleStore for GateStore {
     #[cfg(not(unix))]
     fn read_copies(&mut self) -> Result<Option<SuperblockCopies>, Self::Error> {
         match &self.backend {
-            Backend::Disk { state } => read_copies_disk(state),
+            Backend::Disk { state } => read_copies_disk(state, self.system),
         }
     }
 
@@ -401,8 +508,8 @@ impl LifecycleStore for GateStore {
             copies.copies.iter().all(|one| *one == copy),
             "the boot gate's rewrites are uniform 4x"
         );
-        match &mut self.backend {
-            Backend::Disk { state } => commit_disk(state, copy),
+        match &self.backend {
+            Backend::Disk { state } => commit_disk(state, self.system, copy),
             #[cfg(unix)]
             Backend::Mem(mem) => {
                 let reply = mem.rpc(&serde_json::json!({
@@ -418,7 +525,7 @@ impl LifecycleStore for GateStore {
     fn drain(&mut self) -> Result<(), Self::Error> {
         drain_sink(&mut sink_guard(&self.sink))?;
         #[cfg(unix)]
-        if let Backend::Mem(mem) = &mut self.backend {
+        if let Backend::Mem(mem) = &self.backend {
             let reply = mem.rpc(&serde_json::json!({"op": "drain"}))?;
             return MemBackend::ack(&reply);
         }

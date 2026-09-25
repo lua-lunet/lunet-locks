@@ -3,7 +3,7 @@
 //! instrument — NOT part of the shipped surface, NOT referenced from any
 //! documentation.
 //!
-//! THE OPERATOR'S LAW (plan item25.24, confirmed):
+//! THE OPERATOR'S LAW (confirmed):
 //!
 //! - The tool is EXPLICIT operator intent, outside the never-self-heal
 //!   rule: a commanded write over a corrupt block is the operator's own
@@ -64,11 +64,19 @@ struct Args {
     #[arg(long)]
     set_state: Option<String>,
 
-    /// Reset target incarnation. Defaults to the working quorum's
-    /// current incarnation when the store resolves one; required when
-    /// it does not.
+    /// Reset target system identifier (the identity pair's high half).
+    /// Defaults to the working quorum's resolved identity when the store
+    /// resolves one; required together with `--set-crash` when it does
+    /// not.
     #[arg(long)]
-    set_incarnation: Option<u64>,
+    set_system: Option<u16>,
+
+    /// Reset target crash counter (the identity pair's low half — the
+    /// life's number, one-indexed). Defaults to the working quorum's
+    /// resolved identity when the store resolves one; required together
+    /// with `--set-system` when it does not.
+    #[arg(long)]
+    set_crash: Option<u16>,
 
     /// Skip the interactive y/n review (the ONLY override; the flag IS
     /// the consent).
@@ -88,7 +96,7 @@ fn main() -> std::process::ExitCode {
 }
 
 fn run(args: &Args) -> i32 {
-    let writing = args.set_state.is_some() || args.set_incarnation.is_some();
+    let writing = args.set_state.is_some() || args.set_system.is_some() || args.set_crash.is_some();
     let superblock = superblock_path(&args.state);
 
     // Not-found (print-only): neither the projection nor the superblock
@@ -121,28 +129,42 @@ fn run(args: &Args) -> i32 {
 
     let copies = marker::inspect(&superblock).unwrap_or_default();
 
-    // The reset target: an explicit incarnation, else the working
-    // quorum's — the highest-sequence checksum-valid copy's identity.
-    // Nothing is guessed beyond that: with no valid copy, the operator
-    // names the incarnation.
-    let incarnation = match args.set_incarnation {
-        Some(incarnation) => incarnation,
-        None => {
-            let working = copies
-                .iter()
-                .filter(|copy| copy.readable == 1 && copy.valid_checksum == 1)
-                .max_by_key(|copy| copy.sequence)
-                .map(|copy| copy.incarnation);
-            match working {
-                Some(incarnation) => incarnation,
-                None => {
-                    eprintln!(
-                        "{PREFIX}: no --set-incarnation given and no valid copy resolves one; \
-                         the operator names the identity"
-                    );
-                    return EXIT_USAGE;
-                }
+    // The reset target: the explicitly named identity pair, else the
+    // working quorum's resolved one — the highest-sequence checksum-valid
+    // copy's pair. Nothing is guessed beyond that: with no valid copy,
+    // the operator names both halves.
+    let resolved = copies
+        .iter()
+        .filter(|copy| copy.readable == 1 && copy.valid_checksum == 1)
+        .max_by_key(|copy| copy.sequence)
+        .and_then(|copy| copy.identity());
+    let (system, crash) = match (args.set_system, args.set_crash) {
+        (Some(system), Some(crash)) => (system, crash),
+        (None, None) => match resolved {
+            Some(identity) => (identity.system_identifier(), identity.crash_counter()),
+            None => {
+                eprintln!(
+                    "{PREFIX}: no --set-system/--set-crash given and no valid copy resolves \
+                     an identity; the operator names the pair"
+                );
+                return EXIT_USAGE;
             }
+        },
+        _ => {
+            eprintln!(
+                "{PREFIX}: --set-system and --set-crash name the identity pair together"
+            );
+            return EXIT_USAGE;
+        }
+    };
+    let identity = match marker::NodeIdentity::new(system, crash) {
+        Some(identity) => identity,
+        None => {
+            eprintln!(
+                "{PREFIX}: the identity pair ({system}, {crash}) is not spellable: \
+                 a zero half is no identity"
+            );
+            return EXIT_USAGE;
         }
     };
 
@@ -177,10 +199,10 @@ fn run(args: &Args) -> i32 {
     if !args.quiet {
         println!("reset plan:");
         println!(
-            "  superblock copies <- fresh format: incarnation={incarnation} state={word} \
-             (4x, forced I/O, verified)"
+            "  superblock copies <- fresh format: identity=(system {system}, crash {crash}) \
+             state={word} (4x, forced I/O, verified)"
         );
-        println!("  projection        <- \"{incarnation} {word}\\n\"");
+        println!("  projection        <- \"{system} {crash} {word}\\n\"");
         println!();
     }
 
@@ -202,15 +224,14 @@ fn run(args: &Args) -> i32 {
     // (the fresh format reads nothing first; the boot-path read/write
     // refusals are untouched). Every failure is a one-line stderr
     // message + exit 1; NO reprint of what it wrote.
-    if let Err(code) = marker::format(&superblock, incarnation, state) {
+    if let Err(code) = marker::format(&superblock, identity, state) {
         eprintln!(
-            "{PREFIX}: the reset failed (FFI code {code}; -1 = the named incarnation \
-             would regress the marker or the state is outside the lifecycle, \
-             -7 = storage)"
+            "{PREFIX}: the reset failed (FFI code {code}; -1 = the named pair is unspellable \
+             or the state is outside the lifecycle, -7 = storage)"
         );
         return EXIT_FAILURE;
     }
-    if let Err(message) = write_projection(&args.state, incarnation, word) {
+    if let Err(message) = write_projection(&args.state, system, crash, word) {
         eprintln!("{PREFIX}: the projection write failed: {message}");
         return EXIT_FAILURE;
     }
@@ -282,10 +303,18 @@ fn print_copies(superblock: &Path, copies: &[CopyInfo], geometry: marker::Geomet
             .as_deref()
             .map(|bytes| on_block_state_string(bytes, slot, geometry))
             .unwrap_or_else(|| "<unreadable>".to_owned());
+        let identity = match copy.identity() {
+            Some(identity) => format!(
+                "system={} crash={}",
+                identity.system_identifier(),
+                identity.crash_counter()
+            ),
+            None => format!("INVALID (packed 0x{:08x})", copy.node),
+        };
         println!(
             "copy {slot}: checksum=valid sequence={} state={state} state_string=\"{state_string}\" \
-             incarnation={} checksum=0x{:016x}{:016x}",
-            copy.sequence, copy.incarnation, copy.checksum_hi, copy.checksum_lo,
+             identity={identity} checksum=0x{:016x}{:016x}",
+            copy.sequence, copy.checksum_hi, copy.checksum_lo,
         );
     }
 }
@@ -316,7 +345,7 @@ fn verdict(copies: &[CopyInfo]) -> String {
         && readable.windows(2).all(|pair| {
             pair[0].sequence == pair[1].sequence
                 && pair[0].state == pair[1].state
-                && pair[0].incarnation == pair[1].incarnation
+                && pair[0].node == pair[1].node
         });
     if unanimous {
         "verdict: OK".to_owned()
@@ -370,9 +399,9 @@ fn read_projection(state: &Path) -> Option<String> {
 }
 
 /// The projection write with the adapter's durability discipline:
-/// fsync, rename, dir-sync (the item08 single-file pattern). Every
-/// failure surfaces as an error — no panic, no expect.
-fn write_projection(state: &Path, incarnation: u64, word: &str) -> Result<(), String> {
+/// fsync, rename, dir-sync (the single-file pattern). Every failure
+/// surfaces as an error — no panic, no expect.
+fn write_projection(state: &Path, system: u16, crash: u16, word: &str) -> Result<(), String> {
     let parent = state.parent().unwrap_or_else(|| Path::new("."));
     let base = state.file_name().unwrap_or_default();
     let unique = std::time::SystemTime::now()
@@ -383,7 +412,7 @@ fn write_projection(state: &Path, incarnation: u64, word: &str) -> Result<(), St
         base.to_string_lossy(),
         std::process::id()
     ));
-    let line = format!("{incarnation} {word}\n");
+    let line = format!("{system} {crash} {word}\n");
     if let Err(err) = (|| -> std::io::Result<()> {
         let mut file = fs::OpenOptions::new()
             .write(true)

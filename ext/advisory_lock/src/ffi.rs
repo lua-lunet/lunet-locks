@@ -200,7 +200,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, trace, warn};
 use vrr::configuration::{EraTable, INIT_SLOT, MAX_MEMBERS, SystemOperation, VOID_SLOT};
 use vrr::effects::{Effect, Stability};
-use vrr::ids::{Era, NodeId, Operation, OperationId, Slot, Tick, View, ViewId};
+use vrr::ids::{CrashCounter, Era, NodeId, Operation, OperationId, Slot, SystemId, Tick, View, ViewId};
 use vrr::journal::{Journal, LogEntry, Payload, SegmentedLog};
 use vrr::lifecycle::{
     self, BootError, BootOutcome, Bumped, Crashed, Incarnation, Marker, Running, Vouched,
@@ -324,23 +324,9 @@ const EVIDENCE_BUDGET: usize = 8192;
 /// leader-for-view report in that case.
 const LEADER_UNKNOWN: u32 = u32::MAX;
 
-/// The descriptor id band's top: incarnation-0 ids live in
-/// `[0, INCARNATION_LOW_MAX]`; the value `INCARNATION_LOW_MAX + 1` is
-/// forbidden because at incarnation 255 it would derive the reserved
-/// `LEADER_UNKNOWN` value (see the module's Incarnation note).
-const INCARNATION_LOW_MAX: u64 = (1u64 << 24) - 2; // 16777214
-
-/// The bump base: the k-th incarnation's identity is
-/// `low + k * INCARNATION_BASE`, placing every bumped identity in the
-/// high band `[2^24, u32::MAX - 1]`, disjoint from the whole descriptor
-/// space by construction.
-const INCARNATION_BASE: u64 = 1u64 << 24;
-
-/// The highest incarnation a bump may produce. The next one would overflow
-/// the band arithmetic; the bump refuses instead of wrapping a superseded
-/// identity into circulation (upstream `Incarnation::bump`,
-/// `src/replica/reincarnation.rs:413-417`).
-const INCARNATION_MAX: u64 = 255;
+/// The lawful packing's halves: the system identifier is the high
+/// sixteen bits of a packed `NodeId`, the crash counter the low sixteen.
+const SYSTEM_HALF_SHIFT: u32 = 16;
 
 struct Queued {
     kind: u32,
@@ -1254,12 +1240,20 @@ impl Node {
         if data.len() > MAX_DATAGRAM {
             return TOO_LARGE;
         }
-        // A message attributed to a low-band id outside the descriptor's
-        // address space is a maybe: unexpected, not provably impossible (a
-        // misconfigured or hostile sender), and survivable — the core drops
-        // it by name (Diagnostic::UnknownSender). Bumped (high-band) ids are
-        // the reincarnation story's legitimate callers and exempt.
-        if !self.known_ids.contains(&from) && from < (1u32 << 24) {
+        // A message attributed to an id outside the descriptor's
+        // address space whose system half names no descriptor member is
+        // a maybe: unexpected, not provably impossible (a misconfigured
+        // or hostile sender), and survivable — the core drops it by
+        // name (Diagnostic::UnknownSender). A later life of a member
+        // (the crash counter advanced under the same system half — the
+        // identity law's packing) is the reincarnation story's
+        // legitimate caller and exempt.
+        if !self.known_ids.contains(&from)
+            && !self
+                .known_ids
+                .iter()
+                .any(|known| (known >> SYSTEM_HALF_SHIFT) == (from >> SYSTEM_HALF_SHIFT))
+        {
             #[cfg(feature = "flight-recorder")]
             self.flight_log(
                 "maybe",
@@ -1801,6 +1795,15 @@ struct MemberEntry {
     joined: bool,
 }
 
+/// The descriptor's provisioned-identity law: the id is the packed pair
+/// (system, crash counter 1) — a lawful identity whose system half is
+/// the sysadmin-assigned system identifier and whose crash half names
+/// the genesis life. The marker's crash counter carries the life from
+/// there.
+fn provisioned_identity(id: u32) -> bool {
+    NodeId::from(id).system_id().is_some() && (id & 0xffff) == 1
+}
+
 /// Reconfiguration operation codes for `lunet_lock_node_reconfigure`.
 /// The departure route is `Decrement` to weight 0, then `Leave` (the core's
 /// one departure route); a weight-0 member cannot be decremented further.
@@ -1905,27 +1908,31 @@ fn unix_millis() -> Result<u64, i32> {
         .and_then(|duration| u64::try_from(duration.as_millis()).map_err(|_| SERVICE))
 }
 
-/// The marker file's on-disk line: `<incarnation>
-/// <unflushed|stopped|flushed>` — the projection's spelling of the
-/// engine marker (`marker_store::projection_word`).
-fn marker_line(incarnation: u64, marker: Marker) -> String {
+/// The marker file's on-disk line: `<system> <crash>
+/// <unflushed|stopped|flushed>` — the identity pair spelled as its halves
+/// (the projection's spelling of the engine marker,
+/// `marker_store::projection_word`).
+fn marker_line(system: u16, crash: u16, marker: Marker) -> String {
     format!(
-        "{incarnation} {}\n",
+        "{system} {crash} {}\n",
         crate::marker_store::projection_word(marker)
     )
 }
 
 /// Parses the marker line. Anything else is an unreadable marker: the boot
-/// refuses rather than guessing an identity. The file's words map onto the
+/// refuses rather than guessing an identity. The file's words are the
+/// identity pair's halves (a zero half is refused — no identity) and the
 /// engine's markers: `unflushed` is the running sentinel (`Joining` — an
 /// operating or freshly-latched process), `stopped` is the halt's first
 /// round (`Stopping` — it vouches for nothing), `flushed` is the
 /// drain-proven second round (`Stopped`).
-pub(crate) fn parse_marker(text: &str) -> Option<(u64, Marker)> {
+pub(crate) fn parse_marker(text: &str) -> Option<(u16, u16, Marker)> {
     let line = text.trim();
-    let (incarnation_text, marker_text) = line.split_once(' ')?;
-    let incarnation = incarnation_text.parse::<u64>().ok()?;
-    if incarnation > INCARNATION_MAX {
+    let (system_text, rest) = line.split_once(' ')?;
+    let (crash_text, marker_text) = rest.split_once(' ')?;
+    let system = system_text.parse::<u16>().ok()?;
+    let crash = crash_text.parse::<u16>().ok()?;
+    if system == 0 || crash == 0 {
         return None;
     }
     let marker = match marker_text {
@@ -1934,10 +1941,10 @@ pub(crate) fn parse_marker(text: &str) -> Option<(u64, Marker)> {
         "unflushed" => Marker::Joining,
         _ => return None,
     };
-    Some((incarnation, marker))
+    Some((system, crash, marker))
 }
 
-pub(crate) fn read_marker(path: &Path) -> std::io::Result<(u64, Marker)> {
+pub(crate) fn read_marker(path: &Path) -> std::io::Result<(u16, u16, Marker)> {
     parse_marker(&fs::read_to_string(path)?)
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid marker"))
 }
@@ -1946,13 +1953,15 @@ pub(crate) fn read_marker(path: &Path) -> std::io::Result<(u64, Marker)> {
 /// consistency — persist the new directory entry, not just the file's
 /// data; Windows no-ops the directory sync, see `sync_dir`).
 ///
-/// The item08 single-file write, retained verbatim: since the lifecycle
-/// marker routed through the quorum-of-copies superblock copies, this is
-/// the COMPATIBILITY PROJECTION — written only after the authoritative
-/// quorum write succeeded (see `marker_store`), and the conservative
-/// fallback at boot when the copies predate the routing or lose their
-/// quorum.
-pub(crate) fn write_marker(path: &Path, incarnation: u64, marker: Marker) -> std::io::Result<()> {
+/// The single-file write is the COMPATIBILITY PROJECTION — written only
+/// after the authoritative quorum write succeeded (see `marker_store`),
+/// never a classification input once the copies exist.
+pub(crate) fn write_marker(
+    path: &Path,
+    system: u16,
+    crash: u16,
+    marker: Marker,
+) -> std::io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let base = path.file_name().unwrap_or_default();
     let unique = SystemTime::now()
@@ -1967,7 +1976,7 @@ pub(crate) fn write_marker(path: &Path, incarnation: u64, marker: Marker) -> std
         .create_new(true)
         .open(&temporary)?;
     let result = (|| {
-        file.write_all(marker_line(incarnation, marker).as_bytes())?;
+        file.write_all(marker_line(system, crash, marker).as_bytes())?;
         file.sync_all()?;
         fs::rename(&temporary, path)?;
         sync_parent(path)
@@ -1985,15 +1994,18 @@ pub(crate) fn write_marker(path: &Path, incarnation: u64, marker: Marker) -> std
 struct BootDecision {
     /// The latched session (a First or Clean classification): the
     /// Running typestate the stop path drives. `None` on the crashed
-    /// path, whose durable latch defers.
+    /// path, whose engine session is held for the seated witness's
+    /// latch.
     session: Option<Running<GateStore>>,
-    /// The crashed classification's deferred session: held until the
-    /// engine's seated observation mints the witness. `None` on the
-    /// latched paths.
+    /// The crashed classification's engine session: the engine's
+    /// typestate latches it only once the seated observation mints the
+    /// witness (landing the same marker round the emission gate already
+    /// made durable at boot). `None` on the latched paths.
     deferred: Option<Crashed<GateStore>>,
-    /// The identity the boot decided: 0 for a first boot, the
-    /// quorum-resolved identity for a clean continue, the bumped
-    /// identity for a crashed boot.
+    /// The life the boot decided — the crash counter of the marker pair
+    /// (the engine's incarnation input): 1 for a first boot, the
+    /// quorum-resolved counter for a clean continue, the next life's
+    /// counter for a crashed boot.
     incarnation: u64,
     /// The clean start's proof token (`Replica::resume` requires it).
     vouched: Option<Vouched>,
@@ -2012,19 +2024,24 @@ struct BootDecision {
 /// fixes the write schedule. The verdicts:
 ///
 /// * No marker ever written — the FIRST life: the first latch anchors
-///   identity 0 (the projection's running sentinel), so a later crash
-///   reads as a crash.
+///   the genesis life (crash counter 1), so a later crash reads as a
+///   crash.
 /// * A stopped quorum — the CLEAN start: the drain was proven. One
-///   latch round (`Restarting`, the running sentinel) and the
-///   same-identity resume behind the `Vouched` token.
+///   latch round (the running sentinel) and the same-identity resume
+///   behind the `Vouched` token.
 /// * No stopped quorum — a CRASH: the identity is dead. The replacement
-///   pair is decided here and the durable bump DEFERS to the seated
-///   witness — no marker round is paid at the boundary of an
-///   uninitialised start; a re-crash re-decides the same pair.
-/// * An unreadable marker shape (rotted beyond the read quorum, a fork,
-///   any store refusal) — the boot REFUSES. A host that cannot classify
-///   from durable state is unsafe and must not start; there is no
-///   projection fallback and no guessed identity.
+///   pair is decided here and THE EMISSION GATE lands the bump's one
+///   durable marker round — the next life at the running sentinel —
+///   before the driver releases the first announcement, unconditional,
+///   seated or not. The engine's session is held so its typestate can
+///   latch the same round again once the seated observation mints the
+///   witness (the same identity and state: idempotent on the marker).
+/// * An old-format marker (INCOMPATIBLE) or any other unreadable
+///   marker shape (rotted beyond the read quorum, a fork, any store
+///   refusal) — the boot REFUSES. A host that cannot classify from
+///   durable state is unsafe and must not start; old-format markers
+///   are never converted; there is no projection fallback and no
+///   guessed identity.
 ///
 /// The crashed classification is the recovery boundary (the experiment
 /// design's §4): when a variant is configured, its forced flush executes
@@ -2036,11 +2053,10 @@ struct BootDecision {
 /// load-bearing for the measurement, so a failure here means the disk is
 /// not usable.
 ///
-/// The adapter's high-band identity law rides the engine's bump: the
-/// pair's replacement identity may not pass incarnation 255 (past it a
-/// bumped id would collide with the reserved `LEADER_UNKNOWN` value),
-/// so the boot refuses there exactly as the old ladder refused at
-/// exhaustion.
+/// The adapter's identity law rides the marker pair: the crash counter's
+/// next life must stay spellable through the packing's sixteen-bit
+/// counter half, so the boot refuses there exactly as the engine's
+/// checked bump refuses at exhaustion.
 fn boot_gate(
     store: GateStore,
     recovery: Option<(&RecoveryFlush, &Path)>,
@@ -2063,7 +2079,7 @@ fn boot_gate(
             "the marker store refused the boot read: {error}"
         ))),
         Ok(BootOutcome::First(first)) => {
-            let session = match first.latch(Incarnation(0)) {
+            let session = match first.latch(Incarnation(1)) {
                 Ok(session) => session,
                 Err((_, error)) => {
                     return Err(refuse(format!("the first latch write failed: {error}")));
@@ -2072,7 +2088,7 @@ fn boot_gate(
             Ok(BootDecision {
                 session: Some(session),
                 deferred: None,
-                incarnation: 0,
+                incarnation: 1,
                 vouched: None,
                 pair: None,
                 flush: None,
@@ -2102,13 +2118,15 @@ fn boot_gate(
                     return Err(refuse(format!("the replacement pair refused: {refusal:?}")));
                 }
             };
-            if pair.new.0 > INCARNATION_MAX {
-                return Err(refuse(format!(
-                    "the bumped identity {} would leave the band (the high-band law refuses \
-                     past incarnation {})",
-                    pair.new.0, INCARNATION_MAX
-                )));
-            }
+            // THE EMISSION GATE: the crash bump's one durable marker
+            // round — the next life at the running sentinel — completes
+            // here, before the driver releases the first announcement,
+            // unconditionally (seated or not). A failed round refuses
+            // the boot: the node is never half-announced.
+            crashed
+                .store()
+                .emission_gate(pair.new.0)
+                .map_err(|error| refuse(format!("the crash bump's marker write failed: {error}")))?;
             let flush = match recovery {
                 None | Some((RecoveryFlush::Diskless, _)) => None,
                 Some((variant, scratch)) => Some(
@@ -2252,7 +2270,7 @@ fn node_from_sink(
         || members.len() > MAX_MEMBERS as usize
         || members
             .iter()
-            .any(|member| member.name.is_empty() || member.id as u64 > INCARNATION_LOW_MAX)
+            .any(|member| member.name.is_empty() || !provisioned_identity(member.id))
     {
         return Err(CONFIG);
     }
@@ -2268,19 +2286,24 @@ fn node_from_sink(
     if unique_ids.len() != members.len() || unique_names.len() != members.len() {
         return Err(CONFIG);
     }
-    let Some(own_member) = members.iter().find(|member| member.name == own) else {
-        return Err(CONFIG);
-    };
-    // Explicit admin-assigned identity: the descriptor's genesis (plain)
+    // The admin-assigned identity law: the descriptor's genesis (plain)
     // ids in buffer order are both the live NodeIds of the founding
-    // membership and the genesis succession sequence. Every buffer id
-    // is an incarnation-0 id (the low band, validated above), which is
-    // what keeps a bumped identity's high band disjoint from it.
+    // membership and the genesis succession sequence. Every id is the
+    // member's PROVISIONED identity — the packed pair (system, crash
+    // counter 1) — so the system half is what the descriptor assigns and
+    // the marker's crash counter carries the life.
     let genesis_order: Vec<NodeId> = members
         .iter()
         .filter(|member| !member.joined)
         .map(|member| NodeId(member.id))
         .collect();
+    let Some(own_member) = members.iter().find(|member| member.name == own) else {
+        return Err(CONFIG);
+    };
+    let system = match SystemId::new((own_member.id >> SYSTEM_HALF_SHIFT) as u16) {
+        Some(system) => system,
+        None => return Err(CONFIG),
+    };
     let knobs = ViewChangeKnobs {
         primary_timeout: PRIMARY_TIMEOUT_MS,
         view_change_budget: EVIDENCE_BUDGET,
@@ -2308,12 +2331,12 @@ fn node_from_sink(
                 return Err(CONFIG);
             }
         },
-        None => GateStore::new(&state_path, Arc::clone(&sink)),
+        None => GateStore::new(&state_path, Arc::clone(&sink), system.get()),
     };
     #[cfg(not(unix))]
     let store = {
         let _ = store_ctl;
-        GateStore::new(&state_path, Arc::clone(&sink))
+        GateStore::new(&state_path, Arc::clone(&sink), system.get())
     };
     let decision = boot_gate(
         store,
@@ -2331,33 +2354,62 @@ fn node_from_sink(
             "recovery-boundary flush executed"
         );
     }
-    let own_id = if incarnation == 0 {
-        NodeId(own_member.id)
-    } else {
-        let bumped = match (own_member.id as u64)
-            .checked_add(incarnation * INCARNATION_BASE)
-            .and_then(|value| u32::try_from(value).ok())
-        {
-            Some(value) => value,
-            None => return Err(CONFIG),
-        };
-        NodeId(bumped)
+    // The live identity: the packed pair (descriptor system half, marker
+    // crash counter — the life's number, the engine's incarnation input).
+    // The first life carries counter 1; a crashed boot's emission gate
+    // already landed the next life's round before this point.
+    let counter = match u16::try_from(incarnation) {
+        Ok(counter) if counter > 0 => counter,
+        _ => return Err(CONFIG),
     };
-    // Invariant (asserted, always): a reincarnated identity never reuses
-    // the old id — the bump moves the identity into the high band, disjoint
-    // from the whole descriptor space by construction.
+    let own_id = match CrashCounter::new(counter) {
+        Some(counter) => NodeId::new(system, counter),
+        None => return Err(CONFIG),
+    };
+    // The superseded identity on the CRASHED path: the bumped node
+    // re-announces `Reincarnation(old, new)` on every fenced-boot drive
+    // and, while it is below voting weight, on the host's §8 re-announce
+    // cadence. The old identity is the one the node LAST OPERATED AS —
+    // the marker pair the boot classified (the replacement pair's old
+    // life), not the descriptor id: from the second bump on, the
+    // descriptor id was already evicted by the previous life's forced
+    // walk, so announcing it would name a non-member, the transport's
+    // remap could never chain (the previous life's id is the row the
+    // peers still attribute the socket to), and the leader-side
+    // `from == new` gate would refuse the announcement forever. A clean
+    // resume or a first life carries no pair and announces nothing: the
+    // pair is the crashed path's commitment.
+    let reincarnate_from = match decision.pair.as_ref() {
+        Some(pair) => {
+            let old_counter = match u16::try_from(pair.old.0) {
+                Ok(counter) => counter,
+                Err(_) => return Err(CONFIG),
+            };
+            match CrashCounter::new(old_counter) {
+                Some(counter) => Some(NodeId::new(system, counter)),
+                None => return Err(CONFIG),
+            }
+        }
+        None => None,
+    };
+    // Invariant (asserted, always): the announced identity is lawful and
+    // names the descriptor's system half; on the crashed path it is the
+    // replacement pair's new identity — the strict next life of the
+    // superseded one.
     assert!(
-        incarnation == 0 || own_id.0 != own_member.id && own_id.0 >= (1u32 << 24),
-        "reincarnated identity reuses the old id (old={}, new={})",
-        own_member.id,
-        own_id.0
+        own_id.is_lawful()
+            && own_id.system_id() == Some(system)
+            && reincarnate_from.map_or(own_id.0 == own_member.id, |old| own_id
+                == old.next_life().expect("a lawful life has a next")),
+        "the announced identity does not follow the marker pair (system={}, life={counter})",
+        system.get(),
     );
-    if incarnation > 0 {
+    if incarnation > 1 {
         info!(
-            old = own_member.id,
+            old = reincarnate_from.map_or(0, |old| old.0),
             new = own_id.0,
             incarnation,
-            "restart: the identity is a later life in the high band"
+            "restart: the identity is a later life of the same system"
         );
     }
     info!(
@@ -2374,45 +2426,6 @@ fn node_from_sink(
         .iter()
         .map(|member| member.id)
         .collect::<HashSet<_>>();
-    // The superseded identity on the CRASHED path: the bumped node
-    // re-announces `Reincarnation(old, new)` on every fenced-boot drive
-    // and, while it is below voting weight, on the host's §8 re-announce
-    // cadence. The old identity is the one the node LAST OPERATED AS —
-    // `low + old * INCARNATION_BASE` for the pair's superseded band — not
-    // the descriptor id: from the second bump on, the descriptor id was
-    // already evicted by the previous life's forced walk, so announcing it
-    // would name a non-member, the transport's remap could never chain
-    // (the previous bumped id is the row the peers still attribute the
-    // socket to), and the leader-side `from == new` gate would refuse the
-    // announcement forever. A clean resume or a first life carries no
-    // pair and announces nothing: the pair is the crashed path's
-    // commitment.
-    let reincarnate_from = match decision.pair.as_ref() {
-        Some(pair) => {
-            let previous = match (own_member.id as u64)
-                .checked_add(pair.old.0 * INCARNATION_BASE)
-                .and_then(|value| u32::try_from(value).ok())
-            {
-                Some(value) => value,
-                None => return Err(CONFIG),
-            };
-            Some(NodeId(previous))
-        }
-        None => None,
-    };
-    // Invariant (asserted, always): a reincarnated identity never reuses
-    // the old id — the bump moves the identity one band step past the
-    // previous life, disjoint from the whole descriptor space by
-    // construction.
-    assert!(
-        incarnation == 0
-            || (own_id.0 != own_member.id
-                && own_id.0 >= (1u32 << 24)
-                && Some(own_id.0) != reincarnate_from.map(|old| old.0)),
-        "reincarnated identity reuses the old id (old={:?}, new={})",
-        reincarnate_from.map(|old| old.0),
-        own_id.0
-    );
     // The constructor the classification chose. Every later life reopens
     // over the deployment's genesis — the honest Volatile shape (there
     // is no durable journal to carry forward) — fenced until the stream
@@ -2896,51 +2909,56 @@ mod tests {
     }
 
     #[test]
-    fn first_boot_anchors_identity_zero_and_the_dirty_boot_defers_its_latch() {
+    fn first_boot_anchors_the_genesis_life_and_the_crash_bump_is_durable_at_boot() {
         let path = state_path("marker");
-        // The first life: one anchor round — `(0, Joining)` 4x, the
-        // projection's running sentinel.
-        let decision = boot_gate(GateStore::new(&path, test_sink()), None).expect("first boot");
-        assert_eq!(decision.incarnation, 0);
+        // The first life: one anchor round — `(system 1, counter 1,
+        // Joining)` 4x, the projection's running sentinel.
+        let decision = boot_gate(GateStore::new(&path, test_sink(), 1), None).expect("first boot");
+        assert_eq!(decision.incarnation, 1);
         assert!(decision.session.is_some() && decision.deferred.is_none());
         drop(decision);
-        assert_eq!(fs::read_to_string(&path).unwrap(), "0 unflushed\n");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "1 1 unflushed\n");
         // A restart over the anchor classifies crashed: the replacement
-        // pair is decided (0 -> 1) and NOTHING is written — the durable
-        // bump defers to the seated witness.
-        let decision = boot_gate(GateStore::new(&path, test_sink()), None).expect("crashed boot");
-        assert_eq!(decision.incarnation, 1);
+        // pair is decided (counter 1 -> 2) and THE EMISSION GATE lands
+        // the bump's one durable round at boot — before the driver
+        // releases the first announcement, seated or not.
+        let decision =
+            boot_gate(GateStore::new(&path, test_sink(), 1), None).expect("crashed boot");
+        assert_eq!(decision.incarnation, 2);
         let pair = decision.pair.expect("the replacement pair");
-        assert_eq!((pair.old.0, pair.new.0), (0, 1));
+        assert_eq!((pair.old.0, pair.new.0), (1, 2));
         assert!(decision.deferred.is_some() && decision.session.is_none());
         drop(decision);
         assert_eq!(
             fs::read_to_string(&path).unwrap(),
-            "0 unflushed\n",
-            "no marker round before the seated witness"
+            "1 2 unflushed\n",
+            "the bump round is durable before the first announcement"
         );
-        // The re-crash replay: the same markers re-decide the SAME pair —
-        // the bump is a pure function of the quorum-resolved identity.
-        let decision = boot_gate(GateStore::new(&path, test_sink()), None).expect("replay");
-        assert_eq!(decision.pair.expect("the replayed pair").new.0, 1);
+        // A re-boot over the landed round derives the strictly next
+        // life: the identity law's counter never re-derives the same
+        // identity.
+        let decision = boot_gate(GateStore::new(&path, test_sink(), 1), None).expect("replay");
+        assert_eq!(decision.pair.expect("the replayed pair").new.0, 3);
         drop(decision);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "1 3 unflushed\n");
         // A clean checkpoint (flushed) continues under the same identity:
         // the running sentinel replaces it, the identity never regresses.
         // Hand-writing the single file here simulates the pre-routing
         // projection, so the copies are dropped: this is the legacy
         // migration path the copy-free rig states boot through.
         fs::remove_file(superblock_path(&path)).unwrap();
-        write_marker(&path, 7, Marker::Stopped).unwrap();
-        let decision = boot_gate(GateStore::new(&path, test_sink()), None).expect("clean continue");
+        write_marker(&path, 1, 7, Marker::Stopped).unwrap();
+        let decision =
+            boot_gate(GateStore::new(&path, test_sink(), 1), None).expect("clean continue");
         assert_eq!(decision.incarnation, 7);
         assert!(decision.session.is_some() && decision.pair.is_none());
         drop(decision);
-        assert_eq!(fs::read_to_string(&path).unwrap(), "7 unflushed\n");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "1 7 unflushed\n");
         // The migration seeded the copies from the single file: the next
         // classification reads them, not the projection.
         assert_eq!(
             marker_class(&path).expect("seeded"),
-            (7, Marker::Joining),
+            (1, 7, Marker::Joining),
             "the copies carry the running sentinel"
         );
         fs::remove_file(&path).unwrap();
@@ -2948,38 +2966,52 @@ mod tests {
     }
 
     #[test]
-    fn the_boot_gate_refuses_malformed_and_exhausted_identities() {
+    fn the_boot_gate_refuses_malformed_identities_and_exhausted_counters() {
         let path = state_path("marker-bad");
         fs::write(&path, "not a marker\n").unwrap();
         assert_eq!(
-            boot_gate(GateStore::new(&path, test_sink()), None).unwrap_err(),
+            boot_gate(GateStore::new(&path, test_sink(), 1), None).unwrap_err(),
             CONFIG
         );
+        // The projection's three-word spelling: two halves and a state.
+        // A two-word line is an old-format marker: unreadable, refused.
         fs::write(&path, "999 unflushed\n").unwrap();
         assert_eq!(
-            boot_gate(GateStore::new(&path, test_sink()), None).unwrap_err(),
+            boot_gate(GateStore::new(&path, test_sink(), 1), None).unwrap_err(),
             CONFIG
         );
         fs::write(&path, "3 stale\n").unwrap();
         assert_eq!(
-            boot_gate(GateStore::new(&path, test_sink()), None).unwrap_err(),
+            boot_gate(GateStore::new(&path, test_sink(), 1), None).unwrap_err(),
             CONFIG
         );
-        // The bump refuses past the band instead of wrapping a superseded
-        // identity into circulation (the high-band law: past incarnation
-        // 255 a bumped id would collide with the reserved LEADER_UNKNOWN
-        // value).
-        fs::write(&path, format!("{} unflushed\n", INCARNATION_MAX)).unwrap();
+        // A zero half is no identity: refused at the projection's edge.
+        fs::write(&path, "0 1 unflushed\n").unwrap();
         assert_eq!(
-            boot_gate(GateStore::new(&path, test_sink()), None).unwrap_err(),
+            boot_gate(GateStore::new(&path, test_sink(), 1), None).unwrap_err(),
             CONFIG
         );
-        fs::write(&path, format!("{} flushed\n", INCARNATION_MAX)).unwrap();
+        fs::write(&path, "1 0 unflushed\n").unwrap();
         assert_eq!(
-            boot_gate(GateStore::new(&path, test_sink()), None)
+            boot_gate(GateStore::new(&path, test_sink(), 1), None).unwrap_err(),
+            CONFIG
+        );
+        // The bump refuses when the next life would not fit the packing's
+        // sixteen-bit counter half instead of wrapping a superseded
+        // identity into circulation (the engine's checked bump, refused
+        // at the emission gate's spelling).
+        fs::write(&path, "1 65535 unflushed\n").unwrap();
+        assert_eq!(
+            boot_gate(GateStore::new(&path, test_sink(), 1), None).unwrap_err(),
+            CONFIG
+        );
+        // The last spellable life still continues clean.
+        fs::write(&path, "1 65535 flushed\n").unwrap();
+        assert_eq!(
+            boot_gate(GateStore::new(&path, test_sink(), 1), None)
                 .expect("the exhausted identity still continues")
                 .incarnation,
-            255
+            65535
         );
         fs::remove_file(&path).unwrap();
         fs::remove_file(superblock_path(&path)).unwrap();
@@ -2987,42 +3019,42 @@ mod tests {
 
     /// The recovery boundary executes the configured variant's flush exactly
     /// at the crashed classification: its latency is reported, a re-crash
-    /// replay reports it again (the pair is re-decided), and a clean
-    /// continue never flushes.
+    /// replay reports it again (the pair is re-decided from the landed
+    /// round), and a clean continue never flushes.
     #[test]
     fn dirty_boot_executes_the_recovery_flush_clean_continue_does_not() {
         use crate::recovery_flush::RecoveryFlush;
         let path = state_path("marker-flush");
         let scratch = state_path("marker-flush-scratch");
         fs::remove_dir_all(&scratch).ok();
-        boot_gate(GateStore::new(&path, test_sink()), None).expect("first boot");
+        boot_gate(GateStore::new(&path, test_sink(), 1), None).expect("first boot");
         assert!(
             !scratch.exists(),
             "boot_gate with no variant writes nothing"
         );
         let decision = boot_gate(
-            GateStore::new(&path, test_sink()),
+            GateStore::new(&path, test_sink(), 1),
             Some((&RecoveryFlush::SingleBlock, &scratch)),
         )
         .expect("crashed boot with the flush variant");
-        assert_eq!(decision.incarnation, 1);
+        assert_eq!(decision.incarnation, 2);
         let outcome = decision.flush.expect("the crashed boot reports the flush");
         assert_eq!(outcome.variant, "single");
         assert_eq!(outcome.bytes_written, 4096);
         assert!(outcome.latency.as_nanos() > 0);
         assert_eq!(
             fs::read_to_string(&path).unwrap(),
-            "0 unflushed\n",
-            "the marker discipline is unchanged by the flush: the durable bump defers"
+            "1 2 unflushed\n",
+            "the marker discipline is unchanged by the flush: the emission gate's round stands"
         );
         let decision = boot_gate(
-            GateStore::new(&path, test_sink()),
+            GateStore::new(&path, test_sink(), 1),
             Some((&RecoveryFlush::Diskless, &scratch)),
         )
         .expect("variant 0");
         assert_eq!(
-            decision.incarnation, 1,
-            "the replay re-decides the same pair"
+            decision.incarnation, 3,
+            "the replay re-decides from the landed round"
         );
         assert_eq!(decision.flush, None, "variant 0 writes nothing");
         fs::remove_file(&path).unwrap();
@@ -3030,33 +3062,36 @@ mod tests {
         fs::remove_dir_all(&scratch).unwrap();
     }
 
-    /// On-disk compatibility: a marker file in the pre-lifecycle spelling
-    /// (`<incarnation> unflushed`) boots exactly as before — the crashed
-    /// classification and the deferred bump — with no interpretation change.
+    /// The crash bump's marker round lands at the crashed classification
+    /// (the emission gate), copy-free rig state included: a single-file
+    /// projection in the running sentinel's spelling classifies crashed,
+    /// the bump round writes the quorum copies and the projection.
     #[test]
-    fn existing_unflushed_files_boot_unchanged() {
+    fn existing_unflushed_files_boot_the_emission_gate_round() {
         let path = state_path("marker-compat");
-        fs::write(&path, "0 unflushed\n").unwrap();
+        fs::write(&path, "1 7 unflushed\n").unwrap();
         let decision =
-            boot_gate(GateStore::new(&path, test_sink()), None).expect("unchanged classification");
+            boot_gate(GateStore::new(&path, test_sink(), 1), None).expect("crashed classification");
         assert_eq!(
-            decision.incarnation, 1,
+            decision.incarnation, 8,
             "the running sentinel still classifies crashed"
         );
-        assert_eq!(decision.pair.expect("the pair").new.0, 1);
+        assert_eq!(decision.pair.expect("the pair").new.0, 8);
+        drop(decision);
         assert_eq!(
             fs::read_to_string(&path).unwrap(),
-            "0 unflushed\n",
-            "the durable bump defers to the seated witness"
+            "1 8 unflushed\n",
+            "the emission gate's round mirrors the quorum write"
         );
         assert!(
-            !superblock_path(&path).exists(),
-            "the crashed classification wrote nothing"
+            superblock_path(&path).exists(),
+            "the crash bump's round wrote the quorum copies"
         );
         fs::remove_file(&path).unwrap();
+        fs::remove_file(superblock_path(&path)).unwrap();
     }
 
-    /// On-disk compatibility, the clean-stop spelling: a copy-free rig
+    /// The migration path, the clean-stop spelling: a copy-free rig
     /// state whose single file reads `flushed` (the pre-routing boot's
     /// end state) migrates at boot — the classification reads the file,
     /// the first routed write seeds the copies, and the boot continues
@@ -3064,21 +3099,21 @@ mod tests {
     #[test]
     fn legacy_flushed_file_migrates_and_continues_clean() {
         let path = state_path("marker-compat-clean");
-        fs::write(&path, "4 flushed\n").unwrap();
+        fs::write(&path, "1 4 flushed\n").unwrap();
         let decision =
-            boot_gate(GateStore::new(&path, test_sink()), None).expect("migrated classification");
+            boot_gate(GateStore::new(&path, test_sink(), 1), None).expect("migrated classification");
         assert_eq!(
             decision.incarnation, 4,
             "the flush from the pre-routing era continues clean"
         );
         assert!(decision.session.is_some() && decision.pair.is_none());
         drop(decision);
-        assert_eq!(fs::read_to_string(&path).unwrap(), "4 unflushed\n");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "1 4 unflushed\n");
         // The migration seeded the copies: they now carry the running
         // sentinel, and the projection was rewritten alongside them.
         assert_eq!(
             marker_class(&path).expect("seeded"),
-            (4, Marker::Joining),
+            (1, 4, Marker::Joining),
             "the copies carry the running sentinel"
         );
         fs::remove_file(&path).unwrap();
@@ -3094,8 +3129,8 @@ mod tests {
     #[test]
     fn an_unreadable_marker_quorum_refuses_the_boot() {
         let path = state_path("marker-lost");
-        boot_gate(GateStore::new(&path, test_sink()), None).expect("first boot");
-        drop(boot_gate(GateStore::new(&path, test_sink()), None).expect("crashed boot"));
+        boot_gate(GateStore::new(&path, test_sink(), 1), None).expect("first boot");
+        drop(boot_gate(GateStore::new(&path, test_sink(), 1), None).expect("crashed boot"));
         let superblock = superblock_path(&path);
         let geometry = lunet_locks_aof::marker::geometry().expect("geometry");
         {
@@ -3107,7 +3142,7 @@ mod tests {
                 .expect("tear the copies file down to one zone");
         }
         assert_eq!(
-            boot_gate(GateStore::new(&path, test_sink()), None).unwrap_err(),
+            boot_gate(GateStore::new(&path, test_sink(), 1), None).unwrap_err(),
             CONFIG,
             "the unreadable quorum refuses the boot"
         );
@@ -3119,8 +3154,9 @@ mod tests {
         fs::remove_file(&superblock).unwrap();
     }
 
-    /// The projection word the engine marker spells on disk.
-    fn marker_class(path: &Path) -> std::io::Result<(u64, Marker)> {
+    /// The projection line the engine marker spells on disk: the
+    /// identity pair's halves, then the state word.
+    fn marker_class(path: &Path) -> std::io::Result<(u16, u16, Marker)> {
         read_marker(path)
     }
 
@@ -3143,13 +3179,13 @@ mod tests {
         let path = state_path("marker-rot");
         let state = path.to_str().expect("state path");
         let superblock = superblock_path(&path);
-        let members = "10:a\x000:b\x0030:c";
-        let mut node = Node::open(members, "a", state, None, 0).expect("first boot");
+        let members = test_members(&TEST_IDS, None);
+        let mut node = Node::open(&members, "member655361", state, None, 0).expect("first boot");
         assert_eq!(node.stop(), OK, "the stop leaves the copies at flushed");
         drop(node);
         assert_eq!(
             marker_class(&path).expect("routed"),
-            (0, Marker::Stopped),
+            (TEST_SYSTEM, 1, Marker::Stopped),
             "the drained stop's copies prove the clean stop"
         );
 
@@ -3167,7 +3203,7 @@ mod tests {
         }
         let before = fs::read(&superblock).expect("the copies file");
 
-        let boot = Node::open(members, "a", state, None, 0);
+        let boot = Node::open(&members, "member655361", state, None, 0);
         assert!(
             matches!(boot, Err(PANIC)),
             "the bad checksum panics the boot (the boundary reports PANIC), never a hang"
@@ -3182,26 +3218,24 @@ mod tests {
     }
 
     /// The clean-stop lifecycle end to end through `Node::open` and
-    /// `Node::stop` (RED before the lifecycle landed: nothing wrote the
-    /// stop markers, so every restart was DIRTY): the stopped node's
-    /// marker reads clean on the next boot — same incarnation, no bump,
-    /// no reincarnation announcement, the running sentinel rewritten as
-    /// operating begins.
+    /// `Node::stop`: the stopped node's marker reads clean on the next
+    /// boot — same identity, no bump, no reincarnation announcement, the
+    /// running sentinel rewritten as operating begins.
     #[test]
     fn clean_stop_boot_continues_the_same_incarnation_no_bump() {
         let path = state_path("clean-stop");
         let state = path.to_str().expect("state path");
-        let members = "10:a\x000:b\x0030:c";
-        let mut node = Node::open(members, "a", state, None, 0).expect("first boot");
+        let members = test_members(&TEST_IDS, None);
+        let mut node = Node::open(&members, "member655361", state, None, 0).expect("first boot");
         let own_before = node.own_id();
         // The running sentinel the operating process leaves behind.
-        assert_eq!(fs::read_to_string(&path).unwrap(), "0 unflushed\n");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "10 1 unflushed\n");
         assert_eq!(node.stop(), OK);
         // The stop's end state: `flushed` (the intermediate `stopped`
         // write was atomically replaced at the drain point).
-        assert_eq!(fs::read_to_string(&path).unwrap(), "0 flushed\n");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "10 1 flushed\n");
         drop(node);
-        let node = Node::open(members, "a", state, None, 0).expect("clean continue");
+        let node = Node::open(&members, "member655361", state, None, 0).expect("clean continue");
         assert_eq!(
             node.own_id(),
             own_before,
@@ -3209,7 +3243,7 @@ mod tests {
         );
         assert_eq!(
             fs::read_to_string(&path).unwrap(),
-            "0 unflushed\n",
+            "10 1 unflushed\n",
             "the running sentinel is rewritten before operating begins"
         );
         fs::remove_file(&path).unwrap();
@@ -3334,7 +3368,7 @@ mod tests {
         assert_eq!(nodes[0].stop(), OK);
         assert_eq!(
             fs::read_to_string(&nodes[0].state_path).unwrap(),
-            "0 flushed\n",
+            "10 1 flushed\n",
             "the marker lands only after the drain"
         );
         // Every file in the AOF series parses; the committed Hold is
@@ -3356,8 +3390,16 @@ mod tests {
     }
 
     /// The sparse admin-assigned member ids every test cluster uses, in
-    /// deployment-descriptor (genesis succession) order.
-    const TEST_IDS: [u32; 3] = [10, 20, 30];
+    /// deployment-descriptor (genesis succession) order: the provisioned
+    /// identities (system half << 16) | 1.
+    const TEST_IDS: [u32; 3] = [(10 << 16) | 1, (20 << 16) | 1, (30 << 16) | 1];
+
+    /// The own member's system half the marker-level tests read back.
+    const TEST_SYSTEM: u16 = 10;
+
+    /// The four-node tests' joiner member: id 40's provisioned identity
+    /// (the packed pair, crash counter 1).
+    const JOINER_ID: u32 = (40 << 16) | 1;
 
     /// The member descriptor the test clusters boot through the real
     /// construction path (`node_from_parts` — the same body the C ABI
@@ -3438,7 +3480,7 @@ mod tests {
 
     /// A fresh three-node cluster brought to Normal: every node provisions
     /// fenced `Recovering` (the boot rule); the genesis primary (member id
-    /// 10, first in the descriptor order) self-promotes on a tick and
+    /// 655361, first in the descriptor order) self-promotes on a tick and
     /// broadcasts Commit; the Recovering backups adopt the view under the
     /// §4 bootstrap rule when the primary's messages reach them.
     fn boot_cluster() -> [Node; 3] {
@@ -3786,14 +3828,14 @@ mod tests {
         assert_eq!(receive(&mut nodes[1], TEST_IDS[0], &[0u8; 16]), STOPPED);
         assert_eq!(
             fs::read_to_string(&nodes[1].state_path).unwrap(),
-            "0 flushed\n",
+            "20 1 flushed\n",
             "the drain point's flushed marker"
         );
 
         // The next boot is a clean continue under the same incarnation:
         // no bump, no reincarnation, and no window to resume.
         let path = nodes[1].state_path.clone();
-        let members = "10:a\x0020:b\x0030:c";
+        let members = "655361:a\x001310721:b\x001966081:c";
         drop(nodes);
         let node =
             Node::open(members, "b", path.to_str().unwrap(), None, 0).expect("clean continue");
@@ -3837,17 +3879,17 @@ mod tests {
     /// module's Identity note).
     fn boot_four_and_join() -> ([Node; 4], [u32; 4]) {
         let [one, two, three] = boot_cluster();
-        let joiner = provision_joiner("cluster-joiner", 40, &TEST_IDS);
+        let joiner = provision_joiner("cluster-joiner", JOINER_ID, &TEST_IDS);
         assert_eq!(joiner.replica.progress().status(), Status::Restarting);
         let mut nodes = [one, two, three, joiner];
-        let ids = [TEST_IDS[0], TEST_IDS[1], TEST_IDS[2], 40];
+        let ids = [TEST_IDS[0], TEST_IDS[1], TEST_IDS[2], JOINER_ID];
 
         // The join: `construct_pivot` cannot place a non-member in either
         // vote set (the cardinality rule's union coverage), so the adapter
         // drives the stop-the-world fallback: the establishing Prepare goes
         // to every backup, and the era awaits the ordinary view change.
         assert_eq!(
-            reconfigure(&mut nodes[0], RECONFIGURE_JOIN, 40, POSITION_APPEND),
+            reconfigure(&mut nodes[0], RECONFIGURE_JOIN, JOINER_ID, POSITION_APPEND),
             OK
         );
         let prepare = pop_send(&mut nodes[0], TEST_IDS[1], vrr::wire::Tag::Prepare)
@@ -3855,7 +3897,7 @@ mod tests {
         let prepare_two = pop_send(&mut nodes[0], TEST_IDS[2], vrr::wire::Tag::Prepare)
             .expect("the establishing Prepare reaches every backup");
         assert!(
-            pop_send(&mut nodes[0], 40, vrr::wire::Tag::Prepare).is_none(),
+            pop_send(&mut nodes[0], JOINER_ID, vrr::wire::Tag::Prepare).is_none(),
             "a non-member is never in the establishing fan-out"
         );
         assert_eq!(nodes[0].replica.progress().config().current().era, Era(1));
@@ -4186,7 +4228,7 @@ mod tests {
             request(&mut nodes[1], &request_json(Uuid::from_bytes([31; 16]))),
             OK
         );
-        let to_learner = pop_send(&mut nodes[1], 40, vrr::wire::Tag::Prepare)
+        let to_learner = pop_send(&mut nodes[1], JOINER_ID, vrr::wire::Tag::Prepare)
             .expect("the learner is in the view configuration's fan-out");
         deliver_hop(&mut nodes, &ids, 1, to_learner);
         let ok_learner = pop_send(&mut nodes[3], TEST_IDS[1], vrr::wire::Tag::PrepareOk)
@@ -4224,12 +4266,12 @@ mod tests {
         // solicitation never re-fires). The establishing Prepare reaches
         // every backup, and the commit advances the era to 3: the
         // departed identity is gone from the folded configuration.
-        assert_eq!(reconfigure(&mut nodes[1], RECONFIGURE_LEAVE, 40, 0), OK);
+        assert_eq!(reconfigure(&mut nodes[1], RECONFIGURE_LEAVE, JOINER_ID, 0), OK);
         let prepare = pop_send(&mut nodes[1], TEST_IDS[0], vrr::wire::Tag::Prepare)
             .expect("the stop-the-world fallback reaches every backup");
         let prepare_three = pop_send(&mut nodes[1], TEST_IDS[2], vrr::wire::Tag::Prepare)
             .expect("the stop-the-world fallback reaches every backup");
-        let prepare_learner = pop_send(&mut nodes[1], 40, vrr::wire::Tag::Prepare)
+        let prepare_learner = pop_send(&mut nodes[1], JOINER_ID, vrr::wire::Tag::Prepare)
             .expect("the stop-the-world fallback reaches every backup");
         assert!(
             pop_send(
@@ -4268,7 +4310,7 @@ mod tests {
                 .config()
                 .current()
                 .config
-                .weight_of(NodeId(40))
+                .weight_of(NodeId(JOINER_ID))
                 .is_none(),
             "the departed identity is out of the configuration"
         );
@@ -4309,10 +4351,10 @@ mod tests {
 
         // The promotion on the era-2 primary: the establishing Prepare goes
         // only to `qII - {L}` = {id 10, id 40}.
-        assert_eq!(reconfigure(&mut nodes[1], RECONFIGURE_INCREMENT, 40, 0), OK);
+        assert_eq!(reconfigure(&mut nodes[1], RECONFIGURE_INCREMENT, JOINER_ID, 0), OK);
         let to_voter = pop_send(&mut nodes[1], TEST_IDS[0], vrr::wire::Tag::Prepare)
             .expect("the pivot routes the establishing Prepare");
-        let to_learner = pop_send(&mut nodes[1], 40, vrr::wire::Tag::Prepare)
+        let to_learner = pop_send(&mut nodes[1], JOINER_ID, vrr::wire::Tag::Prepare)
             .expect("the learner is inside qII: it receives the copy, weight or no weight");
         assert!(
             pop_send(&mut nodes[1], TEST_IDS[2], vrr::wire::Tag::Prepare).is_none(),
@@ -4370,7 +4412,7 @@ mod tests {
             .expect("StartView to every member of config(e+1)");
         let start_two = pop_send(&mut nodes[1], TEST_IDS[2], vrr::wire::Tag::StartView)
             .expect("StartView to every member of config(e+1)");
-        let start_three = pop_send(&mut nodes[1], 40, vrr::wire::Tag::StartView)
+        let start_three = pop_send(&mut nodes[1], JOINER_ID, vrr::wire::Tag::StartView)
             .expect("StartView to every member of config(e+1)");
         assert_eq!((start_one.era, start_one.view), (3, 5));
         deliver_hop(&mut nodes, &ids, 1, start_one);
@@ -4406,7 +4448,7 @@ mod tests {
             .expect("the voter's copy");
         let p_two = pop_send(&mut nodes[1], TEST_IDS[2], vrr::wire::Tag::Prepare)
             .expect("the voter's copy");
-        let p_three = pop_send(&mut nodes[1], 40, vrr::wire::Tag::Prepare)
+        let p_three = pop_send(&mut nodes[1], JOINER_ID, vrr::wire::Tag::Prepare)
             .expect("the promoted member is in the fan-out");
         assert_eq!((p_one.era, p_one.view), (3, 5), "the header names v'");
         deliver_hop(&mut nodes, &ids, 1, p_one);
@@ -4469,10 +4511,10 @@ mod tests {
         // inside qII, the commit folds era 3, the planned quorum over
         // qI = {L, id 30} completes, and the ONE switch installs v' =
         // (3, 5) with StartView to every member of config(e+1).
-        assert_eq!(reconfigure(&mut nodes[1], RECONFIGURE_INCREMENT, 40, 0), OK);
+        assert_eq!(reconfigure(&mut nodes[1], RECONFIGURE_INCREMENT, JOINER_ID, 0), OK);
         let to_voter = pop_send(&mut nodes[1], TEST_IDS[0], vrr::wire::Tag::Prepare)
             .expect("the pivot routes the establishing Prepare");
-        let to_learner = pop_send(&mut nodes[1], 40, vrr::wire::Tag::Prepare)
+        let to_learner = pop_send(&mut nodes[1], JOINER_ID, vrr::wire::Tag::Prepare)
             .expect("the learner is inside qII: it receives the copy");
         assert!(
             pop_send(&mut nodes[1], TEST_IDS[2], vrr::wire::Tag::Prepare).is_none(),
@@ -4530,7 +4572,7 @@ mod tests {
             request(&mut nodes[1], &request_json(Uuid::from_bytes([42; 16]))),
             OK
         );
-        let p_learner = pop_send(&mut nodes[1], 40, vrr::wire::Tag::Prepare)
+        let p_learner = pop_send(&mut nodes[1], JOINER_ID, vrr::wire::Tag::Prepare)
             .expect("the promoted member is in the fan-out");
         deliver_hop(&mut nodes, &ids, 1, p_learner);
         let ok_learner = pop_send(&mut nodes[3], TEST_IDS[1], vrr::wire::Tag::PrepareOk)
@@ -4560,7 +4602,7 @@ mod tests {
                 .config()
                 .current()
                 .config
-                .weight_of(NodeId(40))
+                .weight_of(NodeId(JOINER_ID))
                 == Some(vrr::configuration::Weight(1)),
             "the promoted member is a full voter in the era it joined"
         );
@@ -4586,8 +4628,8 @@ mod tests {
         // The promotion through the non-stop overlap: the pivot places the
         // weight-0 learner inside qII, the commit folds era 3, the planned
         // quorum over qI completes, and the ONE switch installs v' = (3, 5).
-        assert_eq!(reconfigure(&mut nodes[1], RECONFIGURE_INCREMENT, 40, 0), OK);
-        let to_learner = pop_send(&mut nodes[1], 40, vrr::wire::Tag::Prepare)
+        assert_eq!(reconfigure(&mut nodes[1], RECONFIGURE_INCREMENT, JOINER_ID, 0), OK);
+        let to_learner = pop_send(&mut nodes[1], JOINER_ID, vrr::wire::Tag::Prepare)
             .expect("the learner is inside qII: it receives the copy");
         let to_voter = pop_send(&mut nodes[1], TEST_IDS[0], vrr::wire::Tag::Prepare)
             .expect("the pivot routes the establishing Prepare");
@@ -4657,12 +4699,12 @@ mod tests {
         // adapter drives the stop-the-world fallback: the establishing
         // Prepare reaches every backup, and the era awaits the ordinary
         // fence. A latency outcome, never an error.
-        assert_eq!(reconfigure(&mut nodes[1], RECONFIGURE_DECREMENT, 40, 0), OK);
+        assert_eq!(reconfigure(&mut nodes[1], RECONFIGURE_DECREMENT, JOINER_ID, 0), OK);
         let to_one = pop_send(&mut nodes[1], TEST_IDS[0], vrr::wire::Tag::Prepare)
             .expect("the stop-the-world fallback reaches every backup");
         let to_three = pop_send(&mut nodes[1], TEST_IDS[2], vrr::wire::Tag::Prepare)
             .expect("the stop-the-world fallback reaches every backup");
-        let to_learner = pop_send(&mut nodes[1], 40, vrr::wire::Tag::Prepare)
+        let to_learner = pop_send(&mut nodes[1], JOINER_ID, vrr::wire::Tag::Prepare)
             .expect("the stop-the-world fallback reaches every backup");
         assert!(
             pop_send(
@@ -4695,7 +4737,7 @@ mod tests {
                 .config()
                 .current()
                 .config
-                .weight_of(NodeId(40)),
+                .weight_of(NodeId(JOINER_ID)),
             Some(vrr::configuration::Weight(0)),
             "the voter is a learner again in the era the decrement established"
         );
@@ -4734,12 +4776,12 @@ mod tests {
         // pivot policy drives membership changes stop-the-world
         // (`pivot: None`): the establishing Prepare reaches every backup
         // and the commit folds era 5.
-        assert_eq!(reconfigure(&mut nodes[0], RECONFIGURE_LEAVE, 40, 0), OK);
+        assert_eq!(reconfigure(&mut nodes[0], RECONFIGURE_LEAVE, JOINER_ID, 0), OK);
         let prepare_one = pop_send(&mut nodes[0], TEST_IDS[1], vrr::wire::Tag::Prepare)
             .expect("the stop-the-world fallback reaches every backup");
         let prepare_three = pop_send(&mut nodes[0], TEST_IDS[2], vrr::wire::Tag::Prepare)
             .expect("the stop-the-world fallback reaches every backup");
-        let prepare_learner = pop_send(&mut nodes[0], 40, vrr::wire::Tag::Prepare)
+        let prepare_learner = pop_send(&mut nodes[0], JOINER_ID, vrr::wire::Tag::Prepare)
             .expect("the stop-the-world fallback reaches every backup");
         assert!(
             pop_send(
@@ -4773,7 +4815,7 @@ mod tests {
                 .config()
                 .current()
                 .config
-                .weight_of(NodeId(40))
+                .weight_of(NodeId(JOINER_ID))
                 .is_none(),
             "the departed identity is out of the configuration"
         );
@@ -4833,7 +4875,7 @@ mod tests {
         // Non-primary: the actionable refusal, with nothing proposed.
         let frontier = nodes[1].replica.observer().read().accepted;
         assert_eq!(
-            reconfigure(&mut nodes[1], RECONFIGURE_INCREMENT, 40, 0),
+            reconfigure(&mut nodes[1], RECONFIGURE_INCREMENT, JOINER_ID, 0),
             NOT_LEADER
         );
         assert!(nodes[1].outputs.is_empty());
@@ -4851,7 +4893,7 @@ mod tests {
         assert!(nodes[0].outputs.is_empty());
         assert_eq!(nodes[0].replica.observer().read().accepted, frontier);
         assert_eq!(
-            reconfigure(&mut nodes[0], RECONFIGURE_DECREMENT, 40, 0),
+            reconfigure(&mut nodes[0], RECONFIGURE_DECREMENT, JOINER_ID, 0),
             SERVICE,
             "a decrement while a transition is outstanding is internal"
         );
@@ -4895,7 +4937,7 @@ mod tests {
         assert!(primary.outputs.is_empty());
         assert_eq!(primary.replica.observer().read().accepted, frontier);
         assert_eq!(
-            reconfigure(primary, RECONFIGURE_DECREMENT, 40, 0),
+            reconfigure(primary, RECONFIGURE_DECREMENT, JOINER_ID, 0),
             SERVICE,
             "a decrement of a weight-0 member is fold-refused: a learner has no weight to give"
         );
@@ -4903,9 +4945,9 @@ mod tests {
         assert_eq!(primary.replica.observer().read().accepted, frontier);
 
         // Bad op codes are invalid arguments. (4 is Decrement now.)
-        assert_eq!(reconfigure(&mut nodes[0], 0, 40, 0), INVALID);
-        assert_eq!(reconfigure(&mut nodes[0], 5, 40, 0), INVALID);
-        assert_eq!(reconfigure(&mut nodes[0], 99, 40, 0), INVALID);
+        assert_eq!(reconfigure(&mut nodes[0], 0, JOINER_ID, 0), INVALID);
+        assert_eq!(reconfigure(&mut nodes[0], 5, JOINER_ID, 0), INVALID);
+        assert_eq!(reconfigure(&mut nodes[0], 99, JOINER_ID, 0), INVALID);
     }
 
     #[test]
@@ -5095,7 +5137,7 @@ mod tests {
         // The full C surface: members are NUL-separated "<id>:<name>"
         // entries in descriptor (genesis succession) order with sparse
         // admin-assigned ids, state is the nonce file path.
-        let members = b"10:n1\x0020:n2\x0030:n3";
+        let members = b"655361:n1\x001310721:n2\x001966081:n3";
         let own = b"n1";
         let state = state_path("abi-node");
         let state_bytes = state.as_os_str().as_encoded_bytes();
@@ -5156,7 +5198,7 @@ mod tests {
         );
         assert_eq!(status, 4, "joining");
         assert_eq!((era, view), (1, 0));
-        assert_eq!(leader, 10);
+        assert_eq!(leader, TEST_IDS[0]);
 
         // The fenced-boot drive is a tick: the genesis primary self-promotes
         // and announces its committed frontier to every backup, drained
@@ -5199,7 +5241,7 @@ mod tests {
         }
         assert_eq!(
             destinations,
-            vec![20, 30],
+            vec![TEST_IDS[1], TEST_IDS[2]],
             "the promotion fans out to the backups, by member id"
         );
 
@@ -5212,7 +5254,7 @@ mod tests {
         );
         assert_eq!(status, 0, "normal after the bootstrap tick");
         assert_eq!((era, view), (1, 0));
-        assert_eq!(leader, 10);
+        assert_eq!(leader, TEST_IDS[0]);
 
         unsafe { lunet_lock_node_free(handle) };
         fs::remove_file(state).unwrap();
@@ -5227,8 +5269,8 @@ mod tests {
         assert_eq!(
             unsafe {
                 lunet_lock_node_new(
-                    b"10:n1\x0020:n2".len(),
-                    b"10:n1\x0020:n2".as_ptr(),
+                    b"655361:n1\x001310721:n2".len(),
+                    b"655361:n1\x001310721:n2".as_ptr(),
                     b"n9".len(),
                     b"n9".as_ptr(),
                     state_bytes.len(),
@@ -5245,8 +5287,8 @@ mod tests {
         assert_eq!(
             unsafe {
                 lunet_lock_node_new(
-                    b"10:n1\x0010:n2".len(),
-                    b"10:n1\x0010:n2".as_ptr(),
+                    b"655361:n1\x00655361:n2".len(),
+                    b"655361:n1\x00655361:n2".as_ptr(),
                     b"n1".len(),
                     b"n1".as_ptr(),
                     state_bytes.len(),
@@ -5263,8 +5305,8 @@ mod tests {
         assert_eq!(
             unsafe {
                 lunet_lock_node_new(
-                    b"10:n1\x0020:n1".len(),
-                    b"10:n1\x0020:n1".as_ptr(),
+                    b"655361:n1\x001310721:n1".len(),
+                    b"655361:n1\x001310721:n1".as_ptr(),
                     b"n1".len(),
                     b"n1".as_ptr(),
                     state_bytes.len(),
@@ -5281,8 +5323,8 @@ mod tests {
         assert_eq!(
             unsafe {
                 lunet_lock_node_new(
-                    b"10:n1\x0020n2\x0030:n3".len(),
-                    b"10:n1\x0020n2\x0030:n3".as_ptr(),
+                    b"655361:n1\x001310721n2\x001966081:n3".len(),
+                    b"655361:n1\x001310721n2\x001966081:n3".as_ptr(),
                     b"n1".len(),
                     b"n1".as_ptr(),
                     state_bytes.len(),
@@ -5316,10 +5358,11 @@ mod tests {
         assert!(handle.is_null());
     }
 
-    /// The bumped node of the reincarnation test: member id 30 restarted
-    /// dirty, its incarnation bumped to 1, identity derived into the high
-    /// band (`30 + 2^24`).
-    const BUMPED_ID: u32 = 30 + (1 << 24);
+    /// The bumped node of the reincarnation test: member id 1966081
+    /// (system 30) restarted dirty, its life bumped past the genesis
+    /// counter — the identity is the marker pair's next life
+    /// (`(30 << 16) | 2`).
+    const BUMPED_ID: u32 = (30 << 16) | 2;
 
     /// Routes like `route_until_quiet` but drops sends addressed to `dead`
     /// — the dead old-identity socket, undeliverable exactly as the live
@@ -5418,9 +5461,9 @@ mod tests {
         drop(crashed);
 
         // The dirty restart runs through the real ABI: the marker bumps
-        // (0 -> 1) and the identity is derived into the high band.
+        // (counter 1 -> 2) and the identity is the pair's next life.
         let state_bytes = third_path.as_os_str().as_encoded_bytes();
-        let members = b"10:n1\x0020:n2\x0030:n3";
+        let members = b"655361:n1\x001310721:n2\x001966081:n3";
         let mut handle: *mut c_void = ptr::null_mut();
         assert_eq!(
             unsafe {
@@ -5540,7 +5583,7 @@ mod tests {
                 .iter()
                 .map(|member| member.node.0)
                 .collect::<Vec<_>>(),
-            vec![10, 20, BUMPED_ID, 30],
+            vec![TEST_IDS[0], TEST_IDS[1], BUMPED_ID, TEST_IDS[2]],
             "era 2: the learner joined at weight 0 in the old succession position"
         );
         assert_eq!(
@@ -5626,7 +5669,7 @@ mod tests {
                 .iter()
                 .map(|member| member.node.0)
                 .collect::<Vec<_>>(),
-            vec![10, 20, BUMPED_ID],
+            vec![TEST_IDS[0], TEST_IDS[1], BUMPED_ID],
             "the rejoin: the old identity gone, the new identity at weight 1"
         );
         assert_eq!(
@@ -5736,43 +5779,50 @@ mod tests {
             "the rejoining member's vote counts under the era-3 arithmetic"
         );
 
-        // The deferred latch's durable bump: once the engine seated the
-        // node (Normal at voting weight), the marker machine latched the
-        // bumped identity — the projection reads the new life's running
-        // sentinel, and the next boot continues under it.
+        // The emission gate's durable bump: the round landed at the boot
+        // gate (before the announcement), and the engine's seated latch
+        // landed the same round again — the projection reads the new
+        // life's running sentinel, and the next boot continues under it.
         assert_eq!(
             fs::read_to_string(&third_path).unwrap(),
-            "1 unflushed\n",
-            "the deferred latch landed at the seat: the bumped identity is durable"
+            "30 2 unflushed\n",
+            "the bumped identity is durable: the next life's running sentinel"
         );
     }
 
     #[test]
-    fn abi_refuses_high_band_descriptor_ids() {
-        let state = state_path("abi-high-band");
+    fn abi_refuses_unlawful_descriptor_ids() {
+        let state = state_path("abi-unlawful-ids");
         let state_bytes = state.as_os_str().as_encoded_bytes();
         let mut handle: *mut c_void = ptr::null_mut();
-        // A member id outside the incarnation-0 low band would collide with
-        // the bump arithmetic's derived identities; the descriptor parser
-        // rejects it and so does the ABI.
-        assert_eq!(
-            unsafe {
-                lunet_lock_node_new(
-                    b"10:n1\x0016777215:n2".len(),
-                    b"10:n1\x0016777215:n2".as_ptr(),
-                    b"n1".len(),
-                    b"n1".as_ptr(),
-                    state_bytes.len(),
-                    state_bytes.as_ptr(),
-                    0,
-                    ptr::null(),
-                    0,
-                    &mut handle,
-                )
-            },
-            CONFIG
-        );
-        assert!(handle.is_null());
+        // The descriptor's ids are the provisioned identities: the packed
+        // pair (system, crash counter 1). A zero system half is no
+        // identity; a crash half other than the genesis life 1 is not a
+        // provisioned form. The descriptor parser rejects both and so
+        // does the ABI.
+        for members in [
+            b"0:n1\x00655361:n2".as_slice(),
+            b"655361:n1\x00131072:n2".as_slice(),
+        ] {
+            assert_eq!(
+                unsafe {
+                    lunet_lock_node_new(
+                        members.len(),
+                        members.as_ptr(),
+                        b"n1".len(),
+                        b"n1".as_ptr(),
+                        state_bytes.len(),
+                        state_bytes.as_ptr(),
+                        0,
+                        ptr::null(),
+                        0,
+                        &mut handle,
+                    )
+                },
+                CONFIG
+            );
+            assert!(handle.is_null());
+        }
     }
 
     #[test]
@@ -5782,7 +5832,7 @@ mod tests {
 
         let journal_dir = state_path("journal-integration");
         let _ = fs::remove_dir_all(&journal_dir);
-        let members = b"10:n1\x0020:n2\x0030:n3";
+        let members = b"655361:n1\x001310721:n2\x001966081:n3";
         let own = b"n1";
         let state = state_path("journal-node");
         let state_bytes = state.as_os_str().as_encoded_bytes();
@@ -6043,7 +6093,7 @@ mod tests {
         }
     }
 
-    /// The dirty restart bumps the identity into the high band: the
+    /// The dirty restart announces the marker pair's next life: the
     /// reincarnated identity never reuses the old id (the asserted boot
     /// invariant, exercised through `Node::open`).
     #[test]
@@ -6054,16 +6104,22 @@ mod tests {
             .map(|id| format!("{id}:member{id}"))
             .collect::<Vec<_>>()
             .join("\0");
-        let first =
-            Node::open(&members, "member10", path.to_str().unwrap(), None, 0).expect("first boot");
+        let first = Node::open(&members, "member655361", path.to_str().unwrap(), None, 0)
+            .expect("first boot");
         assert_eq!(first.own_id(), TEST_IDS[0]);
         drop(first);
-        let second = Node::open(&members, "member10", path.to_str().unwrap(), None, 0)
+        let second = Node::open(&members, "member655361", path.to_str().unwrap(), None, 0)
             .expect("dirty boot bumps");
         let bumped = second.own_id();
         assert_ne!(bumped, TEST_IDS[0], "the old id is never reused");
-        assert!(bumped >= (1u32 << 24), "the bumped id is high band");
-        assert_eq!(bumped, TEST_IDS[0] + (1u32 << 24));
+        assert_eq!(
+            bumped,
+            NodeId::from(TEST_IDS[0])
+                .next_life()
+                .expect("the genesis life has a next")
+                .0,
+            "the bumped id is the marker pair's next life"
+        );
     }
 
     /// Ticks are nondecreasing: the clamp holds a wall-clock regression

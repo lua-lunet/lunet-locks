@@ -28,14 +28,18 @@ fn temp_dir(name: &str) -> PathBuf {
     dir
 }
 
-fn write_state(base: &Path, incarnation: u64, word: &str) {
-    fs::write(base, format!("{incarnation} {word}\n")).unwrap();
+fn write_state(base: &Path, system: u16, crash: u16, word: &str) {
+    fs::write(base, format!("{system} {crash} {word}\n")).unwrap();
 }
 
-fn write_superblock(base: &Path, incarnation: u64, state: MarkerState) {
+fn write_superblock(base: &Path, system: u16, crash: u16, state: MarkerState) {
     let superblock = PathBuf::from(format!("{}.superblock", base.display()));
-    marker::write(&superblock, incarnation, state)
-        .expect("the vendored store writes the marker copy");
+    marker::write(
+        &superblock,
+        marker::NodeIdentity::new(system, crash).expect("lawful pair"),
+        state,
+    )
+    .expect("the vendored store writes the marker copy");
 }
 
 fn write_log(path: &Path, lines: &[impl AsRef<str>]) {
@@ -71,8 +75,8 @@ fn a_clean_stop_cross_checks_consistent() {
     write_log(&log, &clean_cycle(begin_ts, "1"));
     let base = dir.join("state").join("n1.state");
     fs::create_dir_all(dir.join("state")).unwrap();
-    write_state(&base, 3, "flushed");
-    write_superblock(&base, 3, MarkerState::Flushed);
+    write_state(&base, 1, 3, "flushed");
+    write_superblock(&base, 1, 3, MarkerState::Flushed);
 
     let report = check_shutdown(&dir).expect("the check runs");
     assert_eq!(report.verdict, Verdict::Consistent, "{}", report.text);
@@ -97,8 +101,8 @@ fn the_planted_flush_claim_against_an_unflushed_marker_is_reported() {
     write_log(&log, &clean_cycle(begin_ts, "1"));
     let base = dir.join("state").join("n1.state");
     fs::create_dir_all(dir.join("state")).unwrap();
-    write_state(&base, 3, "unflushed");
-    write_superblock(&base, 3, MarkerState::Unflushed);
+    write_state(&base, 1, 3, "unflushed");
+    write_superblock(&base, 1, 3, MarkerState::Unflushed);
 
     let report = check_shutdown(&dir).expect("the check runs");
     assert_eq!(report.verdict, Verdict::Inconsistent, "{}", report.text);
@@ -115,7 +119,7 @@ fn the_planted_flush_claim_against_an_unflushed_marker_is_reported() {
         report.text
     );
     assert!(
-        report.text.contains("unflushed at incarnation 3"),
+        report.text.contains("unflushed at identity system=1 crash=3"),
         "the superblock copy state is named: {}",
         report.text
     );
@@ -133,8 +137,8 @@ fn the_projection_ahead_of_the_quorum_is_reported() {
     write_log(&log, &clean_cycle(begin_ts, "1"));
     let base = dir.join("state").join("n1.state");
     fs::create_dir_all(dir.join("state")).unwrap();
-    write_state(&base, 3, "flushed");
-    write_superblock(&base, 3, MarkerState::Unflushed);
+    write_state(&base, 1, 3, "flushed");
+    write_superblock(&base, 1, 3, MarkerState::Unflushed);
 
     let report = check_shutdown(&dir).expect("the check runs");
     assert_eq!(report.verdict, Verdict::Inconsistent, "{}", report.text);
@@ -158,7 +162,7 @@ fn the_flush_claim_without_a_superblock_is_reported() {
     write_log(&log, &clean_cycle(begin_ts, "1"));
     let base = dir.join("state").join("n1.state");
     fs::create_dir_all(dir.join("state")).unwrap();
-    write_state(&base, 3, "unflushed");
+    write_state(&base, 1, 3, "unflushed");
 
     let report = check_shutdown(&dir).expect("the check runs");
     assert_eq!(report.verdict, Verdict::Inconsistent, "{}", report.text);
@@ -187,8 +191,8 @@ fn the_flushed_marker_without_a_stop_record_is_reported() {
     );
     let base = dir.join("state").join("n1.state");
     fs::create_dir_all(dir.join("state")).unwrap();
-    write_state(&base, 3, "flushed");
-    write_superblock(&base, 3, MarkerState::Flushed);
+    write_state(&base, 1, 3, "flushed");
+    write_superblock(&base, 1, 3, MarkerState::Flushed);
 
     let report = check_shutdown(&dir).expect("the check runs");
     assert_eq!(report.verdict, Verdict::Inconsistent, "{}", report.text);
@@ -219,8 +223,8 @@ fn the_stop_path_out_of_order_is_flagged() {
     );
     let base = dir.join("state").join("n1.state");
     fs::create_dir_all(dir.join("state")).unwrap();
-    write_state(&base, 3, "flushed");
-    write_superblock(&base, 3, MarkerState::Flushed);
+    write_state(&base, 1, 3, "flushed");
+    write_superblock(&base, 1, 3, MarkerState::Flushed);
 
     let report = check_shutdown(&dir).expect("the check runs");
     assert_eq!(report.verdict, Verdict::Inconsistent, "{}", report.text);
@@ -249,8 +253,8 @@ fn the_work_after_the_persist_order_is_flagged() {
     write_log(&log, &lines);
     let base = dir.join("state").join("n1.state");
     fs::create_dir_all(dir.join("state")).unwrap();
-    write_state(&base, 3, "flushed");
-    write_superblock(&base, 3, MarkerState::Flushed);
+    write_state(&base, 1, 3, "flushed");
+    write_superblock(&base, 1, 3, MarkerState::Flushed);
 
     let report = check_shutdown(&dir).expect("the check runs");
     assert_eq!(report.verdict, Verdict::Inconsistent, "{}", report.text);
@@ -282,8 +286,8 @@ fn a_later_life_supersedes_the_earlier_stop_cycle() {
     write_log(&log, &lines);
     let base = dir.join("state").join("n1.state");
     fs::create_dir_all(dir.join("state")).unwrap();
-    write_state(&base, 4, "unflushed");
-    write_superblock(&base, 4, MarkerState::Unflushed);
+    write_state(&base, 1, 4, "unflushed");
+    write_superblock(&base, 1, 4, MarkerState::Unflushed);
 
     let report = check_shutdown(&dir).expect("the check runs");
     assert_eq!(report.verdict, Verdict::Consistent, "{}", report.text);
@@ -300,8 +304,8 @@ fn the_identity_mismatch_between_marker_copies_is_reported() {
     write_log(&log, &clean_cycle(begin_ts, "1"));
     let base = dir.join("state").join("n1.state");
     fs::create_dir_all(dir.join("state")).unwrap();
-    write_state(&base, 4, "flushed");
-    write_superblock(&base, 3, MarkerState::Flushed);
+    write_state(&base, 1, 4, "flushed");
+    write_superblock(&base, 1, 3, MarkerState::Flushed);
 
     let report = check_shutdown(&dir).expect("the check runs");
     assert_eq!(report.verdict, Verdict::Inconsistent, "{}", report.text);
@@ -322,7 +326,7 @@ fn the_unreadable_superblock_is_reported() {
     write_log(&log, &clean_cycle(begin_ts, "1"));
     let base = dir.join("state").join("n1.state");
     fs::create_dir_all(dir.join("state")).unwrap();
-    write_state(&base, 3, "unflushed");
+    write_state(&base, 1, 3, "unflushed");
     fs::write(
         PathBuf::from(format!("{}.superblock", base.display())),
         vec![0u8; 4096],
@@ -351,8 +355,8 @@ fn the_archive_read_equals_the_raw_read() {
     write_log(&log, &clean_cycle(begin_ts, "1"));
     let base = dir.join("state").join("n1.state");
     fs::create_dir_all(dir.join("state")).unwrap();
-    write_state(&base, 3, "flushed");
-    write_superblock(&base, 3, MarkerState::Flushed);
+    write_state(&base, 1, 3, "flushed");
+    write_superblock(&base, 1, 3, MarkerState::Flushed);
     fs::write(
         dir.join("anchors.md"),
         "## teardown ts=2026-09-18T10:00:06Z\n",
@@ -388,8 +392,8 @@ fn the_snapshot_tool_archive_reads_like_the_raw_dir() {
     write_log(&log, &clean_cycle(begin_ts, "1"));
     let base = dir.join("state").join("n1.state");
     fs::create_dir_all(dir.join("state")).unwrap();
-    write_state(&base, 3, "flushed");
-    write_superblock(&base, 3, MarkerState::Flushed);
+    write_state(&base, 1, 3, "flushed");
+    write_superblock(&base, 1, 3, MarkerState::Flushed);
 
     let raw = check_shutdown(&dir).expect("the raw read runs");
 

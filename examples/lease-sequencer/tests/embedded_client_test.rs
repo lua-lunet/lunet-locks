@@ -73,7 +73,7 @@ struct Harness {
 
 impl Harness {
     fn boot(root: &Path) -> Harness {
-        let members = "1:a\02:b";
+        let members = "65537:a\0131073:b";
         let node_a = Node::open(
             members,
             "a",
@@ -122,8 +122,8 @@ impl Harness {
         for _ in 0..1000 {
             // a first, then b: the fixed order keeps the leader's queue
             // order (the SET race's determinism rides it).
-            let moved_a = Harness::drain_one(1, &mut self.node_a, &mut self.node_b, &mut replies);
-            let moved_b = Harness::drain_one(2, &mut self.node_b, &mut self.node_a, &mut replies);
+            let moved_a = Harness::drain_one(65537, &mut self.node_a, &mut self.node_b, &mut replies);
+            let moved_b = Harness::drain_one(131073, &mut self.node_b, &mut self.node_a, &mut replies);
             if !moved_a && !moved_b {
                 return replies;
             }
@@ -174,7 +174,7 @@ fn submit_via(harness: &mut Harness, host_index: usize, action: &Action) -> bool
     if leader == LEADER_UNKNOWN {
         return false;
     }
-    let rc = if leader == 1 {
+    let rc = if leader == 65537 {
         harness.node_a.request(action.request.as_bytes())
     } else {
         harness.node_b.request(action.request.as_bytes())
@@ -202,7 +202,7 @@ fn drive_round(
             continue;
         }
         if runner_b.absorb(now, &message_id, &bytes, &mut |action| {
-            submit_via(harness, 1, action)
+            submit_via(harness, 65537, action)
         }) {
             continue;
         }

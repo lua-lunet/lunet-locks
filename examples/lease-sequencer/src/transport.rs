@@ -208,6 +208,11 @@ mod tests {
     /// constants. A body-layout change upstream fails here before it can
     /// silently disarm the remap that attributes a reincarnation
     /// announcement to its bumped identity.
+    /// The lawful identity pair the fixture announces: node 2's provisioned
+    /// id (system 2, crash counter 1) and its next life.
+    const OLD_ID: u32 = (2 << 16) | 1;
+    const NEW_ID: u32 = (2 << 16) | 2;
+
     #[test]
     fn reincarnation_pair_reads_the_cores_packed_frame() {
         let message = Message {
@@ -220,8 +225,8 @@ mod tests {
                 slot: Slot(0),
             },
             body: Body::Reincarnation {
-                old: NodeId(2),
-                new: NodeId(2 + (1 << 24) + 1),
+                old: NodeId(OLD_ID),
+                new: NodeId(NEW_ID),
                 committed: Slot(2),
                 prepared: Slot(2),
             },
@@ -250,7 +255,7 @@ mod tests {
         );
         assert_eq!(
             reincarnation_pair(&frame),
-            Some((2, 2 + (1 << 24) + 1)),
+            Some((OLD_ID, NEW_ID)),
             "the remap's parser decodes the real announcement frame"
         );
     }
@@ -267,8 +272,8 @@ mod tests {
                 slot: Slot(0),
             },
             body: Body::Reincarnation {
-                old: NodeId(2),
-                new: NodeId(2 + (1 << 24) + 1),
+                old: NodeId(OLD_ID),
+                new: NodeId(NEW_ID),
                 committed: Slot(2),
                 prepared: Slot(2),
             },
@@ -294,8 +299,8 @@ mod tests {
             "a truncated frame never arms the remap"
         );
         assert_eq!(
-            reincarnation_pair(frame[..45].to_vec().as_slice()),
-            Some((2, 2 + (1 << 24) + 1)),
+            reincarnation_pair(&frame[..45]),
+            Some((OLD_ID, NEW_ID)),
             "the exact-length frame decodes"
         );
         let mut over_length = frame.clone();

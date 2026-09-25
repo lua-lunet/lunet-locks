@@ -17,7 +17,7 @@ impl TestNode {
     fn open(id: u32, name: &str, root: &std::path::Path) -> TestNode {
         let dir = root.join(format!("node{id}"));
         std::fs::create_dir_all(&dir).expect("state dir");
-        let members = "1:a\0 2:b\0 3:c".replace("\0 ", "\0");
+        let members = "65537:a\0 131073:b\0 196609:c".replace("\0 ", "\0");
         let node = Node::open(
             &members,
             name,
@@ -60,18 +60,18 @@ fn a_gap_served_chunk_applies_its_whole_committed_range() {
     ));
     std::fs::create_dir_all(&root).expect("scratch root");
 
-    let mut n1 = TestNode::open(1, "a", &root);
-    let mut n2 = TestNode::open(2, "b", &root);
-    let mut n3 = TestNode::open(3, "c", &root);
+    let mut n1 = TestNode::open(65537, "a", &root);
+    let mut n2 = TestNode::open(131073, "b", &root);
+    let mut n3 = TestNode::open(196609, "c", &root);
 
     // Genesis: the primary self-promotes on the first tick.
     assert_eq!(n1.node.idle(), OK);
     let announces: Vec<(u32, Vec<u8>)> = drain_sends(&mut n1);
     assert!(!announces.is_empty(), "the primary announces itself");
     for (_, bytes) in &announces {
-        assert_eq!(n3.node.receive(1, bytes), OK, "n3 adopts the view");
+        assert_eq!(n3.node.receive(65537, bytes), OK, "n3 adopts the view");
         for (_, bytes) in drain_sends(&mut n3) {
-            assert_eq!(n1.node.receive(3, &bytes), OK);
+            assert_eq!(n1.node.receive(196609, &bytes), OK);
             drain_sends(&mut n1);
         }
     }
@@ -83,15 +83,15 @@ fn a_gap_served_chunk_applies_its_whole_committed_range() {
         let json = request_json(op, 1, u64::from(op), lease_ms);
         assert_eq!(n1.node.request(json.as_bytes()), OK, "op {op} proposed");
         for (to, bytes) in drain_sends(&mut n1) {
-            if to == 2 {
+            if to == 131073 {
                 // The partition: n2 receives nothing yet — the newest
                 // Prepare is kept for the gap trigger below.
                 held_prepare = Some(bytes);
                 continue;
             }
-            assert_eq!(n3.node.receive(1, &bytes), OK);
+            assert_eq!(n3.node.receive(65537, &bytes), OK);
             for (_, ack) in drain_sends(&mut n3) {
-                assert_eq!(n1.node.receive(3, &ack), OK, "the vote is counted");
+                assert_eq!(n1.node.receive(196609, &ack), OK, "the vote is counted");
                 drain_sends(&mut n1);
             }
         }
@@ -100,12 +100,12 @@ fn a_gap_served_chunk_applies_its_whole_committed_range() {
 
     // The gap ruling at n2: the Prepare past the accepted frontier's
     // successor opens the fetch.
-    assert_eq!(n2.node.receive(1, &held_prepare), OK, "the gap is named");
+    assert_eq!(n2.node.receive(65537, &held_prepare), OK, "the gap is named");
     let fetch: Vec<(u32, Vec<u8>)> = drain_sends(&mut n2);
     assert!(!fetch.is_empty(), "the fetch rides the ruling");
     for (to, bytes) in &fetch {
-        assert_eq!(*to, 1, "the fetch asks the primary");
-        assert_eq!(n1.node.receive(2, bytes), OK, "the primary serves");
+        assert_eq!(*to, 65537, "the fetch asks the primary");
+        assert_eq!(n1.node.receive(131073, bytes), OK, "the primary serves");
     }
     let answers: Vec<(u32, Vec<u8>)> = drain_sends(&mut n1);
     assert!(!answers.is_empty(), "the chunk is queued");
@@ -113,9 +113,9 @@ fn a_gap_served_chunk_applies_its_whole_committed_range() {
     // The chunk answers: it carries every committed operation slot, and
     // the install applies them in slot order in one drive.
     for (to, bytes) in &answers {
-        assert_eq!(*to, 2, "the answer routes to the requester");
+        assert_eq!(*to, 131073, "the answer routes to the requester");
         assert_eq!(
-            n2.node.receive(1, bytes),
+            n2.node.receive(65537, bytes),
             OK,
             "the multi-operation chunk applies without refusing its own acknowledgements"
         );
@@ -128,18 +128,18 @@ fn a_gap_served_chunk_applies_its_whole_committed_range() {
     assert_eq!(n1.node.request(json.as_bytes()), OK);
     let mut next_prepare = None;
     for (to, bytes) in drain_sends(&mut n1) {
-        if to == 2 {
+        if to == 131073 {
             next_prepare = Some(bytes);
             continue;
         }
-        assert_eq!(n3.node.receive(1, &bytes), OK);
+        assert_eq!(n3.node.receive(65537, &bytes), OK);
         for (_, ack) in drain_sends(&mut n3) {
-            assert_eq!(n1.node.receive(3, &ack), OK);
+            assert_eq!(n1.node.receive(196609, &ack), OK);
             drain_sends(&mut n1);
         }
     }
     let next_prepare = next_prepare.expect("the rejoined member's Prepare");
-    assert_eq!(n2.node.receive(1, &next_prepare), OK, "n2 accepts the tail");
+    assert_eq!(n2.node.receive(65537, &next_prepare), OK, "n2 accepts the tail");
     let acks = drain_sends(&mut n2);
     assert!(!acks.is_empty(), "n2 acknowledges again");
 

@@ -20,10 +20,6 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-/// The bumped-identity band: a reincarnated id is `descriptor_id +
-/// incarnation * 2^24`, disjoint from the whole descriptor space.
-const BUMPED_BAND: u64 = 1 << 24;
-
 /// The stop-path log records each clean stop must leave behind (the
 /// stop-begin record names the caught signal; the drain and the
 /// drain-proven records come from the adapter's stop contract).
@@ -297,7 +293,7 @@ fn log_contains(path: &Path, needle: &str) -> bool {
 /// `flushed` quorum across the four superblock copies (every copy
 /// readable at the final state, the hash chain two or more rounds deep),
 /// and the single-file projection agreeing.
-fn assert_flushed_marker(state_path: &Path, incarnation: u64) {
+fn assert_flushed_marker(state_path: &Path) {
     let superblock = superblock_path(state_path);
     let classified = marker::classify(&superblock)
         .unwrap_or_else(|code| panic!("marker classify failed with code {code}"));
@@ -306,10 +302,7 @@ fn assert_flushed_marker(state_path: &Path, incarnation: u64) {
         MarkerState::Flushed,
         "the final marker state must be flushed"
     );
-    assert_eq!(
-        classified.incarnation, incarnation,
-        "the final marker must hold the same incarnation"
-    );
+    let identity = classified.identity;
     let copies = marker::inspect(&superblock).expect("marker inspect");
     assert_eq!(copies.len(), 4, "the marker zone holds four copies");
     for (index, copy) in copies.iter().enumerate() {
@@ -321,8 +314,9 @@ fn assert_flushed_marker(state_path: &Path, incarnation: u64) {
             "copy {index} must sit at flushed"
         );
         assert_eq!(
-            copy.incarnation, incarnation,
-            "copy {index} must hold the same incarnation"
+            copy.node,
+            identity.packed(),
+            "copy {index} must hold the marker's identity pair"
         );
         assert!(
             copy.sequence >= 2,
@@ -333,17 +327,19 @@ fn assert_flushed_marker(state_path: &Path, incarnation: u64) {
     }
     let projection = fs::read_to_string(state_path).expect("single-file projection");
     assert!(
-        projection
-            .trim()
-            .starts_with(&format!("{incarnation} flushed")),
-        "the single-file projection must read `{incarnation} flushed`, got \
-         {projection:?}"
+        projection.trim().starts_with(&format!(
+            "{} {} flushed",
+            identity.system_identifier(),
+            identity.crash_counter()
+        )),
+        "the single-file projection must read the identity pair and \
+         `flushed`, got {projection:?}"
     );
 }
 
-/// The running sentinel: the marker stands at `unflushed` at the given
-/// incarnation (the crash shape — the stop path never ran).
-fn assert_unflushed_marker(state_path: &Path, incarnation: u64) {
+/// The running sentinel: the marker stands at `unflushed` (the crash
+/// shape — the stop path never ran).
+fn assert_unflushed_marker(state_path: &Path) {
     let superblock = superblock_path(state_path);
     let classified = marker::classify(&superblock)
         .unwrap_or_else(|code| panic!("marker classify failed with code {code}"));
@@ -352,13 +348,10 @@ fn assert_unflushed_marker(state_path: &Path, incarnation: u64) {
         MarkerState::Unflushed,
         "the running sentinel must stand"
     );
-    assert_eq!(classified.incarnation, incarnation);
     let projection = fs::read_to_string(state_path).expect("single-file projection");
     assert!(
-        projection
-            .trim()
-            .starts_with(&format!("{incarnation} unflushed")),
-        "the single-file projection must read `{incarnation} unflushed`, got \
+        projection.trim().ends_with("unflushed"),
+        "the single-file projection must read the running sentinel, got \
          {projection:?}"
     );
 }
@@ -370,21 +363,24 @@ fn superblock_path(state_path: &Path) -> PathBuf {
 }
 
 /// The restart record's bumped identity: parse `new=` from the later-life
-/// record and demand the high band.
-fn assert_bumped_identity(log: &Path) -> u64 {
+/// record and demand the marker pair's next life.
+fn assert_bumped_identity(log: &Path) -> u32 {
     let text = fs::read_to_string(log).expect("boot log");
     for line in text.lines() {
         if let Some(new_text) = line
             .split_whitespace()
             .find_map(|field| field.strip_prefix("new="))
-            .filter(|_| line.contains("later life in the high band"))
+            .filter(|_| line.contains("later life of the same system"))
         {
-            let bumped: u64 = new_text
+            let bumped: u32 = new_text
                 .parse()
                 .unwrap_or_else(|_| panic!("later-life record's new={new_text}"));
+            // The announced identity is the marker pair's next life: a
+            // lawful packed id whose crash counter is a life past the
+            // genesis one.
             assert!(
-                bumped >= BUMPED_BAND,
-                "the bumped id {bumped} must sit in the >= {BUMPED_BAND} band"
+                (bumped >> 16) != 0 && (bumped & 0xffff) >= 2,
+                "the later life {bumped} is a lawful identity past the genesis counter"
             );
             return bumped;
         }
@@ -439,7 +435,7 @@ fn clean_stop_case(signal_name: &str, stop_record: &str) {
     wait_log_contains(&log, stop_record, Duration::from_secs(10));
     wait_log_contains(&log, DRAIN_RECORD, Duration::from_secs(10));
     wait_log_contains(&log, FLUSHED_RECORD, Duration::from_secs(10));
-    assert_flushed_marker(&state_path, 0);
+    assert_flushed_marker(&state_path);
 
     // The re-boot: same incarnation, no identity bump, no resurrection —
     // the durable state continues and the node serves again.
@@ -484,7 +480,7 @@ fn clean_stop_case(signal_name: &str, stop_record: &str) {
     send_signal(&rebooted, "TERM");
     let status = rebooted.wait_exit("re-boot teardown", Duration::from_secs(60));
     assert_eq!(status.code(), Some(0), "the re-boot must stop cleanly");
-    assert_flushed_marker(&state_path, 0);
+    assert_flushed_marker(&state_path);
 }
 
 #[test]
@@ -521,7 +517,7 @@ fn sigkill_leaves_the_running_sentinel_and_next_boot_bumps() {
         status.code().is_none(),
         "SIGKILL must not exit through the stop path"
     );
-    assert_unflushed_marker(&state_path, 0);
+    assert_unflushed_marker(&state_path);
 
     // The peers do not carry evidence this case needs; stop them so the
     // re-boot runs alone.
@@ -601,6 +597,6 @@ fn sighup_is_a_logged_noop_and_the_node_keeps_serving() {
     send_signal(&node, "TERM");
     let status = node.wait_exit("sighup teardown", Duration::from_secs(60));
     assert_eq!(status.code(), Some(0), "the post-HUP stop must be clean");
-    assert_flushed_marker(&state_path, 0);
+    assert_flushed_marker(&state_path);
     stop_cluster(peers);
 }

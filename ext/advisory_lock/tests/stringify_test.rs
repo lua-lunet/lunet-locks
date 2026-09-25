@@ -57,7 +57,7 @@ fn the_booted_status_spells_its_state_name() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let mut node = Node::open(
-        &["10:n1", "11:n2", "12:n3"].join("\0"),
+        &["655361:n1", "720897:n2", "786433:n3"].join("\0"),
         "n1",
         dir.join("state").to_str().unwrap(),
         None,

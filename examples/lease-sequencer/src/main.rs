@@ -48,6 +48,7 @@ use std::process::exit;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::info;
 use tracing_appender::non_blocking::WorkerGuard;
+use vrr::ids::NodeId;
 
 /// The sequencer lease's sentinel lock id.
 const LOCK_ID: u64 = 0x0DDBA11;
@@ -2051,7 +2052,15 @@ fn serve(options: &Options, nodes: &[ClusterNode], lifecycle: &Lifecycle) -> Ser
         })
     };
     let own_id = node.own_id();
-    let incarnation = own_id.saturating_sub(own_desc_id) / (1 << 24);
+    // The marker pair vouches for the life: the announced id is the
+    // packed identity (MSB system, LSB crash counter), the marker's next
+    // life when the boot bumped. The crash counter is the life's number.
+    let incarnation = u64::from(
+        NodeId::from(own_id)
+            .crash_counter()
+            .expect("the announced identity is lawful")
+            .get(),
+    );
 
     let udp_endpoint = own.endpoint.clone();
     let sock = UdpSocket::bind(udp_endpoint.as_str()).unwrap_or_else(|e| {
@@ -2161,7 +2170,7 @@ fn serve(options: &Options, nodes: &[ClusterNode], lifecycle: &Lifecycle) -> Ser
         last_gossip: 0,
         last_status_note: 0,
         last_seen_leader: LEADER_UNKNOWN,
-        reincarnated: incarnation > 0,
+        reincarnated: incarnation > 1,
         driver,
         forwarded_from: HashMap::new(),
         late_acks: 0,
@@ -2235,7 +2244,7 @@ fn serve(options: &Options, nodes: &[ClusterNode], lifecycle: &Lifecycle) -> Ser
     // weight.
     {
         let status = host.node.status();
-        let decision = if incarnation > 0 {
+        let decision = if incarnation > 1 {
             "restarting"
         } else if status.state == STATE_RECOVERING {
             "recovering"
@@ -2610,8 +2619,8 @@ fn handle_packet(
         // steps evict the old identity.
         if let Some((old, new)) = transport::reincarnation_pair(payload)
             && old == replica
-            && old != new
-            && new >= (1 << 24)
+            && NodeId::from(old).is_lawful()
+            && NodeId::from(old).next_life() == Some(NodeId::from(new))
             && !host.peers.contains_key(&new)
         {
             host.peers.insert(new, addr);
@@ -3156,12 +3165,12 @@ mod forward_tests {
         let state = root.join(format!("{name}.state"));
         // A parallel-test boot race (same-process marker churn) is
         // tolerated by one fresh-root retry; the boot CONFIG error otherwise.
-        let node = match Node::open("1:a\x002:b", name, state.to_str().expect("path"), None, 0) {
+        let node = match Node::open("65537:a\x00131073:b", name, state.to_str().expect("path"), None, 0) {
             Ok(node) => node,
             Err(_) => {
                 let root = temp_root();
                 let state = root.join(format!("{name}.state"));
-                Node::open("1:a\x002:b", name, state.to_str().expect("path"), None, 0)
+                Node::open("65537:a\x00131073:b", name, state.to_str().expect("path"), None, 0)
                     .expect("node boots")
             }
         };
@@ -3173,9 +3182,9 @@ mod forward_tests {
         let client_port = listener.local_addr().expect("local").port();
         let udp_addr = sock.local_addr().expect("udp local");
         let rows = vec![
-            (1u32, "127.0.0.1".to_string(), 42901u16, true),
-            (2u32, "127.0.0.1".to_string(), 42902u16, true),
-            (3u32, "127.0.0.1".to_string(), 42903u16, true),
+            (65537u32, "127.0.0.1".to_string(), 42901u16, true),
+            (131073u32, "127.0.0.1".to_string(), 42902u16, true),
+            (196609u32, "127.0.0.1".to_string(), 42903u16, true),
         ];
         let model = membership::Model {
             era: 1,
@@ -3788,7 +3797,7 @@ mod reincarnation_remap_tests {
     fn boot_host(name: &str, root: &PathBuf) -> NodeHost {
         let state = root.join(format!("{name}.state"));
         let node = match Node::open(
-            "1:a\x002:b\x003:c",
+            "65537:a\x00131073:b\x00196609:c",
             name,
             state.to_str().expect("path"),
             None,
@@ -3799,7 +3808,7 @@ mod reincarnation_remap_tests {
                 let root = temp_root();
                 let state = root.join(format!("{name}.state"));
                 Node::open(
-                    "1:a\x002:b\x003:c",
+                    "65537:a\x00131073:b\x00196609:c",
                     name,
                     state.to_str().expect("path"),
                     None,
@@ -3928,9 +3937,9 @@ mod reincarnation_remap_tests {
         let b_udp = b.udp;
         let c_udp = c.udp;
         for (host, others) in [
-            (&mut a, [(2u32, b_udp), (3u32, c_udp)]),
-            (&mut b, [(1u32, a_udp), (3u32, c_udp)]),
-            (&mut c, [(1u32, a_udp), (2u32, b_udp)]),
+            (&mut a, [(131073u32, b_udp), (196609u32, c_udp)]),
+            (&mut b, [(65537u32, a_udp), (196609u32, c_udp)]),
+            (&mut c, [(65537u32, a_udp), (131073u32, b_udp)]),
         ] {
             for (id, addr) in others {
                 host.host.peers.insert(id, addr);
@@ -4025,13 +4034,13 @@ mod reincarnation_remap_tests {
     fn the_remap_rebinds_the_source_socket_and_keeps_the_old_row() {
         let (mut a, b, _c, mut rng) = wire();
         let fingerprint = a.host.fingerprint.clone();
-        let new = 2 + (1 << 24);
+        let new = (2 << 16) | 2;
         let frame = announcement(
             ViewId {
                 era: Era(1),
                 view: View(0),
             },
-            2,
+            (2 << 16) | 1,
             new,
         );
         deliver(&b, &mut a, &fingerprint, &frame, &mut rng);
@@ -4046,7 +4055,7 @@ mod reincarnation_remap_tests {
             "the source socket is re-attributed to the bumped id"
         );
         assert_eq!(
-            a.host.peers.get(&2),
+            a.host.peers.get(&((2 << 16) | 1)),
             Some(&b.udp),
             "the old id's row stays: the serving configuration still names it"
         );
@@ -4065,25 +4074,42 @@ mod reincarnation_remap_tests {
     }
 
     #[test]
-    fn the_remap_arms_only_on_the_bumped_identity_band_and_a_real_pair() {
+    fn the_remap_arms_only_on_a_lawful_next_life_pair() {
         let (mut a, b, _c, mut rng) = wire();
-        // A low-band `new` is not a bumped identity: no row, no rebind.
+        // A `new` that is not `old`'s next life (a skipped counter) arms
+        // nothing: no row, no rebind.
         let fingerprint = a.host.fingerprint.clone();
-        let low_band = announcement(
+        let skipped_life = announcement(
             ViewId {
                 era: Era(1),
                 view: View(0),
             },
-            2,
-            5,
+            (2 << 16) | 1,
+            (2 << 16) | 3,
         );
-        deliver(&b, &mut a, &fingerprint, &low_band, &mut rng);
-        assert_eq!(a.host.peers.get(&5), None, "a low-band id gains no row");
+        deliver(&b, &mut a, &fingerprint, &skipped_life, &mut rng);
+        assert_eq!(
+            a.host.peers.get(&((2 << 16) | 3)),
+            None,
+            "a skipped life's id gains no row"
+        );
         assert_eq!(
             a.host.addr_to_id.get(&b.udp),
-            Some(&2),
-            "a low-band pair does not re-attribute the socket"
+            Some(&((2 << 16) | 1)),
+            "a skipped life's pair does not re-attribute the socket"
         );
+        // An unlawful `new` (a zero system half) is no identity: no row,
+        // no rebind.
+        let unlawful = announcement(
+            ViewId {
+                era: Era(1),
+                view: View(0),
+            },
+            (2 << 16) | 1,
+            5,
+        );
+        deliver(&b, &mut a, &fingerprint, &unlawful, &mut rng);
+        assert_eq!(a.host.peers.get(&5), None, "an unlawful id gains no row");
         // A degenerate pair (`old == new`) is not an announcement of a
         // bumped identity: no row, no rebind.
         let degenerate = announcement(
@@ -4091,17 +4117,17 @@ mod reincarnation_remap_tests {
                 era: Era(1),
                 view: View(0),
             },
-            2,
-            2,
+            (2 << 16) | 1,
+            (2 << 16) | 1,
         );
         deliver(&b, &mut a, &fingerprint, &degenerate, &mut rng);
         assert_eq!(
             a.host.addr_to_id.get(&b.udp),
-            Some(&2),
+            Some(&((2 << 16) | 1)),
             "a degenerate pair does not re-attribute the socket"
         );
         // No row was learned: the map still carries exactly the two rows
-        // the three-voter wiring gave this host (ids 2 and 3).
+        // the three-voter wiring gave this host (ids 131073 and 196609).
         assert_eq!(a.host.peers.len(), 2, "no row was learned");
     }
 
@@ -4109,13 +4135,17 @@ mod reincarnation_remap_tests {
     fn correct_attribution_drives_the_one_pass_fused_batch() {
         let (mut a, mut b, mut c, mut rng) = settled();
         let status = a.host.node.status();
-        assert_eq!(status.leader, 1, "the genesis primary leads the harness");
+        assert_eq!(
+            status.leader,
+            65537,
+            "the genesis primary leads the harness"
+        );
         let view = ViewId {
             era: Era(status.era),
             view: View(status.view),
         };
-        let new = 2 + (1 << 24);
-        let frame = announcement(view, 2, new);
+        let new = (2 << 16) | 2;
+        let frame = announcement(view, (2 << 16) | 1, new);
         let fingerprint = a.host.fingerprint.clone();
         deliver(&b, &mut a, &fingerprint, &frame, &mut rng);
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -4145,8 +4175,8 @@ mod reincarnation_remap_tests {
         // current attribution: the remap lawfully refuses, the datagram is
         // delivered under the current attribution, and the core's
         // anti-spoof guard refuses it by name — no reconfiguration.
-        let forged_old = 999;
-        let new = forged_old + (1 << 24);
+        let forged_old = 999u32 << 16 | 1;
+        let new = forged_old + 1;
         let frame = announcement(view, forged_old, new);
         let fingerprint = a.host.fingerprint.clone();
         deliver(&b, &mut a, &fingerprint, &frame, &mut rng);
@@ -4166,7 +4196,7 @@ mod reincarnation_remap_tests {
         );
         assert_eq!(
             a.host.addr_to_id.get(&b.udp),
-            Some(&2),
+            Some(&131073),
             "the source socket keeps its current attribution"
         );
     }

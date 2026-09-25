@@ -65,13 +65,19 @@ fn stderr(out: &Output) -> String {
 }
 
 /// A real store via the vendored Zig FFI: the four-copy superblock plus
-/// the single-file projection.
-fn seed_store(dir: &Path, incarnation: u64, state: marker_ffi::MarkerState) -> PathBuf {
+/// the single-file projection. The identity is the pair (system 1, the
+/// named crash counter).
+fn seed_store(dir: &Path, crash: u16, state: marker_ffi::MarkerState) -> PathBuf {
     let superblock = dir.join("state.superblock");
-    marker_ffi::write(&superblock, incarnation, state).expect("the store's first write");
+    marker_ffi::write(
+        &superblock,
+        marker_ffi::NodeIdentity::new(1, crash).expect("lawful pair"),
+        state,
+    )
+    .expect("the store's first write");
     fs::write(
         dir.join("state"),
-        format!("{} {}\n", incarnation, state.name()),
+        format!("1 {crash} {}\n", state.name()),
     )
     .expect("the projection");
     dir.join("state")
@@ -208,7 +214,9 @@ fn the_write_prompt_defaults_to_no() {
             state.to_str().expect("path"),
             "--set-state",
             "flushed",
-            "--set-incarnation",
+            "--set-system",
+            "1",
+            "--set-crash",
             "9",
         ],
         None,
@@ -259,7 +267,9 @@ fn skip_review_with_quiet_is_fully_non_interactive() {
             state.to_str().expect("path"),
             "--set-state",
             "stopped",
-            "--set-incarnation",
+            "--set-system",
+            "1",
+            "--set-crash",
             "4",
             "--dangerously-skip-review",
             "-q",
@@ -283,7 +293,7 @@ fn skip_review_with_quiet_is_fully_non_interactive() {
         classified,
         marker_ffi::Classified {
             state: marker_ffi::MarkerState::Stopped,
-            incarnation: 4,
+            identity: marker_ffi::NodeIdentity::new(1, 4).expect("lawful pair"),
         },
         "the write landed"
     );
@@ -362,7 +372,7 @@ fn the_write_argument_takes_names_not_numbers() {
         classified,
         marker_ffi::Classified {
             state: marker_ffi::MarkerState::Unflushed,
-            incarnation: 3,
+            identity: marker_ffi::NodeIdentity::new(1, 3).expect("lawful pair"),
         },
         "running maps to the on-disk running sentinel"
     );
@@ -387,7 +397,9 @@ fn a_write_reprints_nothing() {
             state.to_str().expect("path"),
             "--set-state",
             "flushed",
-            "--set-incarnation",
+            "--set-system",
+            "1",
+            "--set-crash",
             "9",
         ],
         Some(b"y\n"),
@@ -447,8 +459,12 @@ fn a_torn_spread_prints_the_torn_verdict() {
     let older: Vec<Vec<u8>> = (1..geometry.copies)
         .map(|slot| read_zone(&superblock, slot, geometry))
         .collect();
-    marker_ffi::write(&superblock, 3, marker_ffi::MarkerState::Unflushed)
-        .expect("the next transition's write");
+    marker_ffi::write(
+        &superblock,
+        marker_ffi::NodeIdentity::new(1, 3).expect("lawful pair"),
+        marker_ffi::MarkerState::Unflushed,
+    )
+    .expect("the next transition's write");
     for (index, snapshot) in older.iter().enumerate() {
         write_zone(&superblock, index + 1, snapshot, geometry);
     }
@@ -465,7 +481,7 @@ fn a_torn_spread_prints_the_torn_verdict() {
     let _ = fs::remove_dir_all(&root);
 }
 
-/// The overturned item25.20 call: a commanded write over a corrupt store
+/// The operator's law: a commanded write over a corrupt store
 /// PROCEEDS (the tool is explicit operator intent, outside the
 /// never-self-heal rule), and the re-run shows the fresh store — the
 /// padded `flushed` string on the blocks, sequence 1, verdict OK.
@@ -483,7 +499,9 @@ fn an_operator_write_proceeds_over_a_corrupt_store() {
             state.to_str().expect("path"),
             "--set-state",
             "flushed",
-            "--set-incarnation",
+            "--set-system",
+            "1",
+            "--set-crash",
             "9",
             "--dangerously-skip-review",
         ],
@@ -518,7 +536,7 @@ fn an_operator_write_proceeds_over_a_corrupt_store() {
     );
     assert_eq!(
         fs::read_to_string(&state).expect("the projection"),
-        "9 flushed\n",
+        "1 9 flushed\n",
         "the projection reset to the same identity"
     );
 
@@ -540,7 +558,9 @@ fn a_storage_failure_is_a_one_liner_never_a_panic() {
             state.to_str().expect("path"),
             "--set-state",
             "flushed",
-            "--set-incarnation",
+            "--set-system",
+            "1",
+            "--set-crash",
             "1",
             "--dangerously-skip-review",
             "-q",

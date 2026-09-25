@@ -170,11 +170,11 @@ fn drive(fabric: &mut Fabric, ms: u64) {
 fn clean_restart_while_the_cluster_advances_converges() {
     let _ = std::fs::remove_dir_all(ROOT);
     std::fs::create_dir_all(ROOT).expect("scratch root");
-    let members = ["1:n1", "2:n2", "3:n3"].join("\0");
+    let members = ["65537:n1", "131073:n2", "196609:n3"].join("\0");
     let mut fabric = Fabric {
         now: 0,
-        live: vec![1, 2, 3],
-        hosts: [1usize, 2, 3]
+        live: vec![65537, 131073, 196609],
+        hosts: [65537u32, 131073, 196609]
             .iter()
             .map(|id| Host {
                 node: Node::open(
@@ -208,7 +208,7 @@ fn clean_restart_while_the_cluster_advances_converges() {
 
     // The clean stop: the wire closes, the drain runs, the Stopped quorum
     // lands — the boot gate's clean classification is earned.
-    let leader_id = leader as u32 + 1;
+    let leader_id = fabric.hosts[leader].own();
     let leader_view = fabric.hosts[leader].view();
     assert_eq!(fabric.hosts[leader].node.stop(), 0, "the clean stop");
 

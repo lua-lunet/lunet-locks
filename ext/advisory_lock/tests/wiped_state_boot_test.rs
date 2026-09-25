@@ -18,7 +18,7 @@ impl TestNode {
         // The host's dir creation: the wiped state tree is recreated here,
         // before the marker write touches it.
         std::fs::create_dir_all(&dir).expect("state dir");
-        let members = ["1:a", "2:b", "3:c"].join("\0");
+        let members = ["65537:a", "131073:b", "196609:c"].join("\0");
         let node = Node::open(
             &members,
             name,
@@ -80,17 +80,17 @@ fn a_first_boot_over_a_wiped_state_dir_boots_serves_and_a_crash_bumps() {
     ));
     std::fs::create_dir_all(&root).expect("scratch root");
 
-    let mut n1 = TestNode::open(1, "a", &root);
-    let mut n3 = TestNode::open(3, "c", &root);
+    let mut n1 = TestNode::open(65537, "a", &root);
+    let mut n3 = TestNode::open(196609, "c", &root);
 
     // Genesis: the primary self-promotes on the first tick.
     assert_eq!(n1.node.idle(), OK);
     let announces: Vec<(u32, Vec<u8>)> = drain_sends(&mut n1);
     assert!(!announces.is_empty(), "the primary announces itself");
     for (_, bytes) in &announces {
-        assert_eq!(n3.node.receive(1, bytes), OK, "n3 adopts the view");
+        assert_eq!(n3.node.receive(65537, bytes), OK, "n3 adopts the view");
         for (_, bytes) in drain_sends(&mut n3) {
-            assert_eq!(n1.node.receive(3, &bytes), OK);
+            assert_eq!(n1.node.receive(196609, &bytes), OK);
             drain_sends(&mut n1);
         }
     }
@@ -99,10 +99,10 @@ fn a_first_boot_over_a_wiped_state_dir_boots_serves_and_a_crash_bumps() {
     let json = request_json(7, 1, 1, 60_000);
     assert_eq!(n1.node.request(json.as_bytes()), OK, "the op proposed");
     for (to, bytes) in drain_sends(&mut n1) {
-        if to == 2 {
+        if to == 131073 {
             continue;
         }
-        assert_eq!(n3.node.receive(1, &bytes), OK);
+        assert_eq!(n3.node.receive(65537, &bytes), OK);
     }
     // Route until quiet: the PrepareOks, the Commit, and the apply's
     // publish ride back and forth until the cluster is still.
@@ -112,16 +112,16 @@ fn a_first_boot_over_a_wiped_state_dir_boots_serves_and_a_crash_bumps() {
         let (sends, mut round_replies) = drain(&mut n1);
         replies.append(&mut round_replies);
         for (to, bytes) in sends {
-            if to == 3 {
-                assert_eq!(n3.node.receive(1, &bytes), OK);
+            if to == 196609 {
+                assert_eq!(n3.node.receive(65537, &bytes), OK);
                 moved = true;
             }
         }
         let (sends, mut round_replies) = drain(&mut n3);
         replies.append(&mut round_replies);
         for (to, bytes) in sends {
-            if to == 1 {
-                assert_eq!(n1.node.receive(3, &bytes), OK);
+            if to == 65537 {
+                assert_eq!(n1.node.receive(196609, &bytes), OK);
                 moved = true;
             }
         }
@@ -136,34 +136,32 @@ fn a_first_boot_over_a_wiped_state_dir_boots_serves_and_a_crash_bumps() {
     );
 
     // The first boot seeded the quorum copies next to the marker file.
-    let superblock = root.join("node1/state.superblock");
+    let superblock = root.join("node65537/state.superblock");
     assert!(superblock.exists(), "the marker copies exist");
     assert_eq!(
-        std::fs::read_to_string(root.join("node1/state")).unwrap(),
-        "0 unflushed\n",
+        std::fs::read_to_string(root.join("node65537/state")).unwrap(),
+        "1 1 unflushed\n",
         "the projection records the first boot's identity"
     );
 
     // A crash (no stop): the reopen classifies the running sentinel as a
-    // crash and the replacement pair is decided — the identity bumps into
-    // the high band, while the durable bump DEFERS to the seated witness:
-    // the markers hold the crash's evidence, and a re-crash re-decides
-    // the same pair.
+    // crash and the replacement pair is decided — the emission gate
+    // lands the bump's one durable round (the next life at the running
+    // sentinel) at boot, before the announcement queues.
     drop(n1);
     drop(n3);
-    let mut n1 = TestNode::open(1, "a", &root);
+    let mut n1 = TestNode::open(65537, "a", &root);
     assert_eq!(n1.node.idle(), OK);
     drain_sends(&mut n1);
     assert_eq!(
         n1.node.own_id(),
-        1 + (1 << 24),
-        "the crashed-state boot derives the bumped identity"
+        65538,
+        "the crashed-state boot announces the marker's next life"
     );
     assert_eq!(
-        std::fs::read_to_string(root.join("node1/state")).unwrap(),
-        "0 unflushed\n",
-        "the crashed-state boot writes nothing: the durable bump defers to the \
-         seated witness"
+        std::fs::read_to_string(root.join("node65537/state")).unwrap(),
+        "1 2 unflushed\n",
+        "the emission gate's round is durable at boot"
     );
 
     let _ = std::fs::remove_dir_all(&root);

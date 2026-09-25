@@ -19,7 +19,7 @@ lunet-advisory-lock = { path = "../../ext/advisory_lock" }
 lunet-locks-aof = { path = "../../ext/lunet-locks-aof" }
 # The bridge (item23) decodes Wire records through the core's own
 # `Message::unpack_from`; the [patch] below resolves it to the submodule.
-vrr = { package = "vrr-core", git = "https://github.com/lua-lunet/uvrr-core.git", tag = "v0.7.4" }
+vrr = { package = "vrr-core", git = "https://github.com/lua-lunet/uvrr-core.git", tag = "v0.8.0" }
 serde_json = "1"
 # The run-state snapshot archives (the snapshot rule): the check tool
 # reads `snapshot_run.lua`'s gzip tars transparently next to raw run dirs.
@@ -50,7 +50,7 @@ flight-recorder = ["lunet-advisory-lock/flight-recorder"]
 # The [patch] section is honored only in a workspace root's manifest — a
 # dependency's own [patch] is ignored — so the consumer restates it here.
 # It resolves the tagged dependency to the vendored submodule copy
-# (ext/uvrr-core, checked out at e5b0a79 = upstream tag v0.7.4), so every
+# (ext/uvrr-core, checked out at 450dcab = upstream tag v0.8.0), so every
 # build lane — including Docker with no network fetch — builds against
 # content byte-identical to the released tag.
 [patch."https://github.com/lua-lunet/uvrr-core.git"]

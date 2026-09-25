@@ -163,19 +163,22 @@ fn marker_word(state: MarkerState) -> &'static str {
     }
 }
 
-/// The single-file projection line: `<incarnation>
-/// <unflushed|stopped|flushed>`.
-fn parse_single_file(text: &str) -> Option<(u64, &'static str)> {
+/// The single-file projection line: `<system> <crash>
+/// <unflushed|stopped|flushed>` — the identity pair's halves, then the
+/// state word.
+fn parse_single_file(text: &str) -> Option<(u16, u16, &'static str)> {
     let line = text.trim().lines().next()?;
-    let (incarnation_text, word) = line.split_once(' ')?;
-    let incarnation = incarnation_text.parse::<u64>().ok()?;
+    let (system_text, rest) = line.split_once(' ')?;
+    let (crash_text, word) = rest.split_once(' ')?;
+    let system = system_text.parse::<u16>().ok()?;
+    let crash = crash_text.parse::<u16>().ok()?;
     let word = match word {
         "flushed" => "flushed",
         "stopped" => "stopped",
         "unflushed" => "unflushed",
         _ => return None,
     };
-    Some((incarnation, word))
+    Some((system, crash, word))
 }
 
 /// The node identity a file name carries: the leading token before the
@@ -240,7 +243,7 @@ struct MarkerCopy {
     superblock: Option<PathBuf>,
     classified: Option<Classified>,
     classify_error: Option<i32>,
-    single_file: Option<(u64, &'static str)>,
+    single_file: Option<(u16, u16, &'static str)>,
     mtime_ms: Option<u64>,
 }
 
@@ -249,7 +252,7 @@ impl MarkerCopy {
         let mut render = format!(
             "single-file {}",
             match self.single_file {
-                Some((incarnation, word)) => format!("\"{incarnation} {word}\""),
+                Some((system, crash, word)) => format!("\"{system} {crash} {word}\""),
                 None => "absent".to_string(),
             }
         );
@@ -260,9 +263,10 @@ impl MarkerCopy {
         }
         if let Some(classified) = self.classified {
             render.push_str(&format!(
-                " classifies {} at incarnation {}",
+                " classifies {} at identity system={} crash={}",
                 marker_word(classified.state),
-                classified.incarnation,
+                classified.identity.system_identifier(),
+                classified.identity.crash_counter(),
             ));
         }
         render
@@ -547,7 +551,7 @@ fn check_node(token: &str, evidence: &NodeEvidence, root: &Path) -> Vec<String> 
         // authoritative quorum write succeeded: a flushed/stopped
         // projection above an unflushed quorum is an inconsistency, and
         // the two copies must name the same identity.
-        if let (Some((single_incarnation, single_word)), Some(classified)) =
+        if let (Some((single_system, single_crash, single_word)), Some(classified)) =
             (copy.single_file, copy.classified)
         {
             if (single_word == "flushed" || single_word == "stopped")
@@ -555,20 +559,22 @@ fn check_node(token: &str, evidence: &NodeEvidence, root: &Path) -> Vec<String> 
             {
                 findings.push(format!(
                     "INCONSISTENCY [{token}] projection-ahead-of-quorum: \
-the single-file marker \"{} {}\" at {} stands over a superblock that \
-classifies unflushed at incarnation {}",
-                    single_incarnation,
-                    single_word,
+the single-file marker \"{single_system} {single_crash} {single_word}\" at {} stands \
+over a superblock that classifies unflushed at identity system={} crash={}",
                     display_rel(&copy.base, root),
-                    classified.incarnation,
+                    classified.identity.system_identifier(),
+                    classified.identity.crash_counter(),
                 ));
             }
-            if single_incarnation != classified.incarnation {
+            if single_system != classified.identity.system_identifier()
+                || single_crash != classified.identity.crash_counter()
+            {
                 findings.push(format!(
                     "INCONSISTENCY [{token}] identity-mismatch: the single-file \
-marker names incarnation {single_incarnation} but the superblock names {} \
-for {}",
-                    classified.incarnation,
+marker names identity system={single_system} crash={single_crash} but the superblock \
+names system={} crash={} for {}",
+                    classified.identity.system_identifier(),
+                    classified.identity.crash_counter(),
                     display_rel(&copy.base, root),
                 ));
             }
@@ -595,10 +601,11 @@ classification (code {code})",
                 if !has_flushed {
                     findings.push(format!(
                         "INCONSISTENCY [{token}] marker-without-stop-record: the \
-superblock classifies {} at incarnation {} for {} but no log carries a \
+superblock classifies {} at identity system={} crash={} for {} but no log carries a \
 drained-and-flushed stop record for this node",
                         marker_word(classified.state),
-                        classified.incarnation,
+                        classified.identity.system_identifier(),
+                        classified.identity.crash_counter(),
                         display_rel(&copy.base, root),
                     ));
                 }
@@ -640,8 +647,9 @@ for {}{copies}{}",
                     findings.push(format!(
                         "INCONSISTENCY [{token}] log-claims-flush-marker-not-flushed: \
 the stop record below claims a clean flush but the superblock classifies \
-unflushed at incarnation {} for {}{copies}{}",
-                        classified.incarnation,
+unflushed at identity system={} crash={} for {}{copies}{}",
+                        classified.identity.system_identifier(),
+                        classified.identity.crash_counter(),
                         display_rel(&copy.base, root),
                         log_record.as_deref().unwrap_or(""),
                     ));

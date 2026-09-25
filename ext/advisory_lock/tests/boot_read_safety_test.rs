@@ -46,7 +46,7 @@ impl TestNode {
     fn open(id: u32, name: &str, root: &Path) -> TestNode {
         let dir = root.join(format!("node{id}"));
         fs::create_dir_all(&dir).expect("state dir");
-        let members = ["1:a", "2:b", "3:c"].join("\0");
+        let members = ["65537:a", "131073:b", "196609:c"].join("\0");
         let node = Node::open(
             &members,
             name,
@@ -83,9 +83,9 @@ fn serve_one_operation(n1: &mut TestNode, n3: &mut TestNode) {
     let announces = drain_sends(n1);
     assert!(!announces.is_empty());
     for (_, bytes) in &announces {
-        assert_eq!(n3.node.receive(1, bytes), OK, "n3 adopts the view");
+        assert_eq!(n3.node.receive(65537, bytes), OK, "n3 adopts the view");
         for (_, bytes) in drain_sends(n3) {
-            assert_eq!(n1.node.receive(3, &bytes), OK);
+            assert_eq!(n1.node.receive(196609, &bytes), OK);
             drain_sends(n1);
         }
     }
@@ -98,16 +98,16 @@ fn serve_one_operation(n1: &mut TestNode, n3: &mut TestNode) {
         let (sends, round_replies) = drain(n1);
         replies.extend(round_replies);
         for (to, bytes) in sends {
-            if to == 3 {
-                assert_eq!(n3.node.receive(1, &bytes), OK);
+            if to == 196609 {
+                assert_eq!(n3.node.receive(65537, &bytes), OK);
                 moved = true;
             }
         }
         let (sends, round_replies) = drain(n3);
         replies.extend(round_replies);
         for (to, bytes) in sends {
-            if to == 1 {
-                assert_eq!(n1.node.receive(3, &bytes), OK);
+            if to == 65537 {
+                assert_eq!(n1.node.receive(196609, &bytes), OK);
                 moved = true;
             }
         }
@@ -166,12 +166,12 @@ fn write_zone(superblock: &Path, slot: usize, bytes: &[u8], geometry: marker_ffi
 fn the_full_cycle_halts_starts_and_crash_restarts_without_lockup() {
     let root = workdir("full-cycle");
 
-    let mut n1 = TestNode::open(1, "a", &root);
-    let mut n3 = TestNode::open(3, "c", &root);
+    let mut n1 = TestNode::open(65537, "a", &root);
+    let mut n3 = TestNode::open(196609, "c", &root);
     serve_one_operation(&mut n1, &mut n3);
     assert_eq!(
         projection(&n1.dir.join("state")),
-        "0 unflushed\n",
+        "1 1 unflushed\n",
         "the first boot leaves the running sentinel"
     );
 
@@ -180,7 +180,7 @@ fn the_full_cycle_halts_starts_and_crash_restarts_without_lockup() {
     assert_eq!(n3.node.stop(), OK);
     assert_eq!(
         projection(&n1.dir.join("state")),
-        "0 flushed\n",
+        "1 1 flushed\n",
         "the halt's drain point is proven on disk"
     );
     drop(n1);
@@ -188,22 +188,27 @@ fn the_full_cycle_halts_starts_and_crash_restarts_without_lockup() {
 
     // The clean start: the stopped quorum vouches, the same identity
     // continues — no bump, no reincarnation.
-    let mut n1 = TestNode::open(1, "a", &root);
-    assert_eq!(n1.node.own_id(), 1, "the clean start keeps the identity");
+    let mut n1 = TestNode::open(65537, "a", &root);
+    assert_eq!(
+        n1.node.own_id(),
+        65537,
+        "the clean start keeps the identity"
+    );
     assert_eq!(n1.node.idle(), OK);
     drain_sends(&mut n1);
     drop(n1);
 
     // The crash restart: a process that died while operating has no
     // same-identity clean restart — the running sentinel classifies
-    // crashed and the replacement pair is decided at boot.
-    let mut n1 = TestNode::open(1, "a", &root);
+    // crashed and the replacement pair is decided at boot; the emission
+    // gate lands the bump round before the announcement.
+    let mut n1 = TestNode::open(65537, "a", &root);
     assert_eq!(n1.node.idle(), OK);
     drain_sends(&mut n1);
     assert_eq!(
         n1.node.own_id(),
-        1 + (1 << 24),
-        "the crash restart bumps the identity"
+        65538,
+        "the crash restart announces the next life of the same system"
     );
     drain_sends(&mut n1);
 
@@ -218,7 +223,7 @@ fn the_full_cycle_halts_starts_and_crash_restarts_without_lockup() {
 #[test]
 fn a_corrupted_copy_panics_the_next_boot_and_is_never_healed() {
     let root = workdir("corrupt");
-    let mut n1 = TestNode::open(1, "a", &root);
+    let mut n1 = TestNode::open(65537, "a", &root);
     let superblock = n1.dir.join("state.superblock");
     let state = n1.dir.join("state").to_str().expect("path").to_owned();
     assert_eq!(n1.node.stop(), OK, "the clean stop");
@@ -239,7 +244,7 @@ fn a_corrupted_copy_panics_the_next_boot_and_is_never_healed() {
     }
     let before = fs::read(&superblock).expect("copies file");
 
-    let members = ["1:a", "2:b", "3:c"].join("\0");
+    let members = ["65537:a", "131073:b", "196609:c"].join("\0");
     for attempt in 0..2 {
         let boot = Node::open(&members, "a", &state, None, 0);
         assert!(
@@ -266,7 +271,7 @@ fn a_corrupted_copy_panics_the_next_boot_and_is_never_healed() {
 #[test]
 fn a_torn_spread_resolves_by_thresholds_with_the_logged_non_unanimity() {
     let root = workdir("torn");
-    let mut n1 = TestNode::open(1, "a", &root);
+    let mut n1 = TestNode::open(65537, "a", &root);
     let superblock = n1.dir.join("state.superblock");
     assert_eq!(n1.node.stop(), OK, "the clean stop leaves a stopped quorum");
     drop(n1);
@@ -282,8 +287,12 @@ fn a_torn_spread_resolves_by_thresholds_with_the_logged_non_unanimity() {
     // one copy of the next write): write the next transition through the
     // real store, then restore zones 1..3 to the stopped generation. All
     // four copies keep valid checksums; the spread is torn.
-    marker_ffi::write(&superblock, 0, marker_ffi::MarkerState::Unflushed)
-        .expect("the next transition's write");
+    marker_ffi::write(
+        &superblock,
+        marker_ffi::NodeIdentity::new(1, 1).expect("lawful pair"),
+        marker_ffi::MarkerState::Unflushed,
+    )
+    .expect("the next transition's write");
     for (index, snapshot) in stopped.iter().enumerate() {
         write_zone(&superblock, index + 1, snapshot, geometry);
     }
@@ -296,22 +305,22 @@ fn a_torn_spread_resolves_by_thresholds_with_the_logged_non_unanimity() {
         classified,
         marker_ffi::Classified {
             state: marker_ffi::MarkerState::Flushed,
-            incarnation: 0,
+            identity: marker_ffi::NodeIdentity::new(1, 1).expect("lawful pair"),
         },
         "the lone advanced copy cannot outvote the stopped quorum (min progress)"
     );
 
     // The boot through the real gate: the same verdict drives the clean
     // start under the same identity.
-    let n1 = TestNode::open(1, "a", &root);
+    let n1 = TestNode::open(65537, "a", &root);
     assert_eq!(
         n1.node.own_id(),
-        1,
+        65537,
         "the torn spread resolved to the stopped quorum: clean continue, no bump"
     );
     assert_eq!(
         projection(&n1.dir.join("state")),
-        "0 unflushed\n",
+        "1 1 unflushed\n",
         "the boot's latch rewrites the running sentinel over the resolved state"
     );
     drop(n1);

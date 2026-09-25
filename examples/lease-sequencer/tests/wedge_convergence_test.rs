@@ -200,7 +200,7 @@ fn the_limbos_poll_carries_the_forced_view() {
 fn leader_kill_restart_converges_through_the_limbos_poll() {
     let _ = std::fs::remove_dir_all(ROOT);
     std::fs::create_dir_all(ROOT).expect("scratch root");
-    let members = ["1:n1", "2:n2", "3:n3"].join("\0");
+    let members = ["65537:n1", "131073:n2", "196609:n3"].join("\0");
     let mut fabric = Fabric {
         now: 0,
         live: vec![1, 2, 3],
