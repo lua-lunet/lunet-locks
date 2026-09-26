@@ -4205,4 +4205,167 @@ mod reincarnation_remap_tests {
             "the source socket keeps its current attribution"
         );
     }
+
+    /// The remap's state machine, exhausted: the socket attribution
+    /// (matches old / mismatches old / no row) crossed with the announced
+    /// pair (a lawful next life / a skipped life / degenerate / unlawful
+    /// old) crossed with whether a row for `new` already exists. One cell
+    /// arms the remap; every other cell is a refusal that mutates nothing.
+    /// The table is the requirement; the exhaustive match refuses to
+    /// compile if a cell is added without a route.
+    #[test]
+    fn the_remap_transition_table_is_exhaustive() {
+        /// The socket's attribution against the `old` the pair names.
+        #[derive(Clone, Copy)]
+        enum Attribution {
+            Matches,
+            Mismatches,
+            NoRow,
+        }
+        /// The announced pair's shape against the identity law.
+        #[derive(Clone, Copy)]
+        enum PairShape {
+            NextLife,
+            SkippedLife,
+            Degenerate,
+            UnlawfulOld,
+        }
+        /// Whether a `peers` row for the announced `new` already exists.
+        #[derive(Clone, Copy)]
+        enum NewRow {
+            Absent,
+            Present,
+        }
+        /// What the cell must do.
+        #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+        enum Route {
+            Remap,
+            Refuse,
+        }
+        fn route(attribution: Attribution, pair: PairShape, new_row: NewRow) -> Route {
+            match attribution {
+                Attribution::Mismatches | Attribution::NoRow => Route::Refuse,
+                Attribution::Matches => match pair {
+                    PairShape::SkippedLife
+                    | PairShape::Degenerate
+                    | PairShape::UnlawfulOld => Route::Refuse,
+                    PairShape::NextLife => match new_row {
+                        NewRow::Present => Route::Refuse,
+                        NewRow::Absent => Route::Remap,
+                    },
+                },
+            }
+        }
+
+        const OLD: u32 = (2 << 16) | 1; // node 2, the genesis life
+        let cells = [
+            Attribution::Matches,
+            Attribution::Mismatches,
+            Attribution::NoRow,
+        ]
+        .into_iter()
+        .flat_map(|attribution| {
+            [
+                PairShape::NextLife,
+                PairShape::SkippedLife,
+                PairShape::Degenerate,
+                PairShape::UnlawfulOld,
+            ]
+            .into_iter()
+            .flat_map(move |pair| {
+                [NewRow::Absent, NewRow::Present]
+                    .into_iter()
+                    .map(move |new_row| (attribution, pair, new_row))
+            })
+        });
+        let mut armed = 0usize;
+        let mut refused = 0usize;
+        for (cell, (attribution, pair, new_row)) in cells.enumerate() {
+            let (mut a, b, _c, mut rng) = wire();
+            let fingerprint = a.host.fingerprint.clone();
+            // The announced pair for the cell's shape.
+            let new = match pair {
+                PairShape::NextLife => (2 << 16) | 2,
+                PairShape::SkippedLife => (2 << 16) | 3,
+                PairShape::Degenerate => OLD,
+                PairShape::UnlawfulOld => 5,
+            };
+            let old = match pair {
+                PairShape::UnlawfulOld => 5, // a zero system half is no identity
+                _ => OLD,
+            };
+            let frame = announcement(
+                ViewId {
+                    era: Era(1),
+                    view: View(0),
+                },
+                old,
+                new,
+            );
+            // The cell's attribution state.
+            match attribution {
+                Attribution::Matches => {} // the wire() rows already name OLD at b.udp
+                Attribution::Mismatches => {
+                    // Attribute b's socket to ANOTHER MEMBER (node 3's
+                    // genesis id): a stale row after a socket churn. The
+                    // pair names old = node 2, the attribution says node
+                    // 3, so G1 refuses; the adapter still knows the id
+                    // (a member), so its unknown-sender guard stays quiet.
+                    a.host.addr_to_id.insert(b.udp, 196609);
+                }
+                Attribution::NoRow => {
+                    a.host.addr_to_id.remove(&b.udp);
+                    a.host.peers.remove(&OLD);
+                }
+            }
+            // The cell's row-for-new state.
+            if let NewRow::Present = new_row {
+                a.host.peers.insert(new, _c.udp);
+            }
+            let (peers_before, addr_before) = (a.host.peers.clone(), a.host.addr_to_id.clone());
+            deliver(&b, &mut a, &fingerprint, &frame, &mut rng);
+            match route(attribution, pair, new_row) {
+                Route::Remap => {
+                    armed += 1;
+                    assert_eq!(
+                        a.host.peers.get(&new),
+                        Some(&b.udp),
+                        "cell {cell}: the bumped id's row is added at the source socket"
+                    );
+                    assert_eq!(
+                        a.host.addr_to_id.get(&b.udp),
+                        Some(&new),
+                        "cell {cell}: the socket is re-attributed to the bumped id"
+                    );
+                    assert_eq!(
+                        a.host.peers.get(&OLD),
+                        Some(&b.udp),
+                        "cell {cell}: the old id's row stays"
+                    );
+                }
+                Route::Refuse => {
+                    refused += 1;
+                    assert_eq!(
+                        a.host.peers, peers_before,
+                        "cell {cell}: a refusal changes no peers row"
+                    );
+                    assert_eq!(
+                        a.host.addr_to_id, addr_before,
+                        "cell {cell}: a refusal changes no attribution"
+                    );
+                }
+            }
+            // The invariants in every cell: the maps stay consistent — a
+            // socket names at most one current id, and every attributed id
+            // has a peers row.
+            for (addr, id) in &a.host.addr_to_id {
+                assert!(
+                    a.host.peers.contains_key(id),
+                    "cell {cell}: the attributed id {id} at {addr} has a peers row"
+                );
+            }
+        }
+        assert_eq!(armed, 1, "exactly one cell arms the remap");
+        assert_eq!(refused, 23, "every other cell refuses");
+    }
 }
