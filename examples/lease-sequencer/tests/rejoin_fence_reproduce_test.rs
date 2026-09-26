@@ -70,11 +70,18 @@ const CAPTURE: &str = concat!(
 /// One captured inbound frame: the recorded bytes, the offset from the
 /// fenced node's boot, and the sender identity the fenced node's transport
 /// attributed (the capture's `received_as_from`: the descriptor row, never
-/// the bump — the remap rows die with the crashed process).
+/// the bump — the remap rows die with the crashed process). The recorded
+/// run predates the identity-law packing, so the attribution's raw id
+/// translates to the lawful provisioned identity: (system half << 16) | 1.
 struct CapturedFrame {
     from: u32,
     at_ms: u64,
     bytes: Vec<u8>,
+}
+
+/// The lawful re-seat of a recorded old-band descriptor id.
+fn provisioned(system: u32) -> u32 {
+    (system << 16) | 1
 }
 
 fn unhex(hex: &str) -> Vec<u8> {
@@ -111,7 +118,8 @@ fn load_capture(case: &str) -> (u64, Vec<CapturedFrame>) {
             .get("received_as_from")
             .or_else(|| value.get("from"))
             .and_then(|f| f.as_u64())
-            .expect("the record names its sender") as u32;
+            .map(|f| provisioned(f as u32))
+            .expect("the record names its sender");
         frames.push(CapturedFrame {
             from,
             at_ms: value["source"]["ts_ms"].as_u64().expect("ts"),
@@ -126,15 +134,17 @@ fn load_capture(case: &str) -> (u64, Vec<CapturedFrame>) {
     (boot_ts, frames)
 }
 
-/// The crashed boot: the marker file the gate read is the running sentinel
-/// (`0 unflushed` — a SIGKILLed voter's durable state); no stopped quorum
-/// classifies the boot crashed, the identity bumps to incarnation 1
-/// (`3 + 2^24`), and the replica reopens clean over the genesis descriptor.
+/// The crashed boot: the marker file the gate reads is the running
+/// sentinel at the genesis life (`3 1 unflushed` — a SIGKILLed voter's
+/// durable state; system 3, crash counter 1, the projection's spelling);
+/// no stopped quorum classifies the boot crashed, the emission gate
+/// lands the next life's round at the boot gate, and the replica reopens
+/// clean over the genesis descriptor.
 fn open_crashed_n3(dir: &std::path::Path) -> Node {
     std::fs::create_dir_all(dir).expect("scratch dir");
     let state = dir.join("n3.state");
-    std::fs::write(&state, "0 unflushed\n").expect("the captured boot state");
-    let members = ["1:n1", "2:n2", "3:n3"].join("\0");
+    std::fs::write(&state, "3 1 unflushed\n").expect("the captured boot state");
+    let members = ["65537:n1", "131073:n2", "196609:n3"].join("\0");
     Node::open(&members, "n3", state.to_str().expect("utf8 path"), None, 0)
         .expect("the boot gate classifies the crashed marker and the node opens")
 }
@@ -143,8 +153,9 @@ fn open_crashed_n3(dir: &std::path::Path) -> Node {
 /// fenced restarting node ever drives): the heartbeat tick, the
 /// fenced-boot `recover()` on its resend cadence, the captured inbound
 /// frames at their recorded offsets, and the self-loop the transport's
-/// remap row produces (a send to the past-life id 3 lands back on the
-/// node's own socket — its journal's `ReincarnationRefused` drops).
+/// remap row produces (a send to the past-life id — the descriptor row —
+/// lands back on the node's own socket; its journal's
+/// `ReincarnationRefused` drops).
 struct Host {
     node: Node,
     /// The node's outbound `Reincarnation` frames so far.
@@ -162,7 +173,7 @@ impl Host {
             if u32::from_be_bytes(out.bytes[0..4].try_into().expect("tag")) == 13 {
                 self.announcements += 1;
             }
-            if out.to == 3 {
+            if out.to == 196609 {
                 let _ = self.node.receive(self.node.own_id(), &out.bytes);
             }
         }
@@ -215,7 +226,7 @@ fn reincarnating_into_the_view_churn_must_seat() {
     let _ = std::fs::remove_dir_all(&dir);
     let (host, frames) = drive("shallow", &dir);
     let status = host.node.status();
-    assert_eq!(host.node.own_id(), 16777219, "the crashed boot bumps");
+    assert_eq!(host.node.own_id(), 196610, "the crashed boot bumps");
     assert_eq!(
         status.state, STATE_RESTARTING,
         "the node never left the fence"
@@ -255,7 +266,7 @@ fn reincarnating_under_the_stale_sender_attribution_must_seat() {
     let _ = std::fs::remove_dir_all(&dir);
     let (host, frames) = drive("deep", &dir);
     let status = host.node.status();
-    assert_eq!(host.node.own_id(), 16777219, "the crashed boot bumps");
+    assert_eq!(host.node.own_id(), 196610, "the crashed boot bumps");
     assert!(host.announcements > 0, "the entry ticket fired");
     assert_eq!(host.received, frames.len() as u64, "the capture fed");
     let weight = host.node.voting_weight();

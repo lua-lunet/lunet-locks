@@ -31,7 +31,7 @@ service-specific forwarding, membership-administration, membership-snapshot,
 and reincarnation packets alongside opaque VRR datagrams.
 
 The Rust adapter retains the lock state machine, the tick clock, exactly-once
-reply correlation, and the durable incarnation marker. Teal owns sockets, TCP
+reply correlation, and the durable identity marker. Teal owns sockets, TCP
 framing, peer source validation, forwarding, and deterministic draining of
 native output buffers. The Teal wrapper never retains a borrowed Rust pointer;
 `close()` is idempotent and its LuaJIT finalizer is only a fallback.
@@ -41,13 +41,14 @@ native output buffers. The Teal wrapper never retains a borrowed Rust pointer;
 Membership is the JSONL deployment descriptor supplied with `--cluster`.
 Each line is one flattened JSON object `{"id":N,"name":"...","host":"...",
 "port":N,"genesis":true|false}`, so the file diffs and greps like a log.
-Each entry's `id` is that replica's live `NodeId` on the native ABI and in
-peer routing: admin-assigned, sparse, and never recycled — a recycled id
-would alias a superseded incarnation's identity. Ids are incarnation-0 ids
-bounded to `[0, 16777214]` (the bump arithmetic below derives every later
-identity in the high band, and id `16777215` is rejected because at
-incarnation 255 it would collide with the reserved `LEADER_UNKNOWN` value).
-The descriptor lists at least three genesis members; the genesis lines, in
+Each entry's `id` is that replica's provisioned identity: the packed pair
+(system half, crash counter 1) — the sysadmin-assigned system identifier
+in the high sixteen bits, the genesis life's crash counter in the low
+sixteen. Ids are admin-assigned, sparse, and never recycled — a recycled
+system half would alias a superseded identity. The durable marker (below)
+carries the life's crash counter from there; the packed u32 is the live
+`NodeId` on the native ABI and in peer routing. The descriptor lists at
+least three genesis members; the genesis lines, in
 line order, are the founding membership and the genesis succession sequence
 (`primary(v) = order[v mod N]` in the core). A member that joined a live
 cluster is appended after the genesis lines with `"genesis":false`, so the
@@ -297,7 +298,7 @@ agreeing snapshots. When the leader's reconfiguration command commits,
 it disseminates the as-at-new-generation snapshot to the new membership;
 recipients check only up-to-dateness, era plus slot. Adopted facts
 persist lazily on a routine tick in a membership sidecar next to the
-incarnation marker.
+identity marker.
 
 See [membership snapshots](membership-snapshots.md) for the wire shapes,
 the discovery and dissemination rules, the quorum arithmetic, and the
@@ -313,8 +314,10 @@ commit truth, so the era advances exactly when the establishing operation of
 a reconfiguration commits. `leader_for_view(era, view)` answers the primary
 of an arbitrary era-and-view pair through that same configuration history,
 or "unknown" when the era falls outside the retention window.
-`lunet_lock_node_own_id` reports the replica's live identity: the descriptor
-id at incarnation 0, the bumped high-band id after a dirty restart.
+`lunet_lock_node_own_id` reports the replica's live identity: the packed
+pair (descriptor system half, marker crash counter) — the provisioned
+identity at the genesis life, the marker's next life after a dirty
+restart.
 
 ## Lock-event journal and console feed
 
@@ -369,8 +372,9 @@ backup into the next view. The service's recovery loop drives the fenced-boot
 attempt while a replica is recovering: the drive ticks the core and, on a
 reincarnated node, re-announces its `(old, new)` pair.
 
-The `--state` file is the durable incarnation marker: one line,
-`<incarnation> <flushed|unflushed>`, written atomically (write, fsync,
+The `--state` file is the durable marker's compatibility projection: one
+line, `<system> <crash> <flushed|unflushed>` — the identity pair's halves,
+then the state word — written atomically (write, fsync,
 rename, parent-directory sync). The authoritative marker storage rides
 the vendored store's quorum-of-copies construction: a sibling
 `<state>.superblock` file holds four fixed, sector-aligned copies of the
@@ -409,15 +413,16 @@ leaves behind, so a restart of a process that has been running classifies
 
 A dirty restart reincarnates the replica — the core's Crash-Stop-Self-Evict
 protocol. There is no same-identity recovery after volatile-state loss: the
-incarnation counter bumps, the marker is rewritten under the new identity,
-and the bumped replica reopens over the deployment's genesis. Its fresh
+marker's crash counter bumps to the next life, the marker is rewritten
+under the new identity at the emission gate — one durable marker round
+(the next life at the running sentinel) that completes at the boot gate,
+before the replica releases its first announcement, seated or not — and
+the bumped replica reopens over the deployment's genesis. Its fresh
 identity is derived deterministically, without operator intervention:
-descriptor ids live in the low band `[0, 16777214]`, and the k-th
-incarnation's identity is `low + k * 16777216` — a unique high-band id that
-can never alias a descriptor id, never overflow an unsigned 32-bit value, and
-never reach the reserved `LEADER_UNKNOWN` value; the bump refuses at
-incarnation 255 rather than wrap a superseded identity back into
-circulation.
+the packed pair (descriptor system half, next crash counter) — the same
+system identifier, a strictly advancing life. A life that would not fit
+the packing's sixteen-bit counter half refuses the boot rather than wrap
+a superseded identity back into circulation.
 
 Durability is a stated property of the design. Under `Stability::Volatile`
 the core keeps protocol state in quorum memory, not local storage: a rolling

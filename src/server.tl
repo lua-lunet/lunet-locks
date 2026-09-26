@@ -15,8 +15,9 @@
 -- after).
 --
 -- A restarted replica reincarnates (the core's Crash-Stop-Self-Evict
--- protocol): the native adapter classifies the durable state file dirty,
--- bumps the identity, and announces the `Reincarnation(old, new)` pair on
+-- protocol): the native adapter classifies the durable marker dirty,
+-- bumps the identity (the marker pair's next life), and announces the
+-- `Reincarnation(old, new)` pair on
 -- the VRR channel. The wire body IS the addressing notice — the receive
 -- loop adds the new id's endpoint row when the pair arrives from the
 -- socket the deployment attributes to the old id, with no application-level
@@ -272,8 +273,8 @@ local function main(options: Options)
     -- descriptor, grown at runtime by the admin broadcast (a joining
     -- member's row is added, a departed member's rows are removed) and by
     -- the reincarnation remap (a restarted member's row moves to its
-    -- bumped id). The live identity comes from the adapter — after a dirty
-    -- restart it is the bumped high-band id, not the descriptor row.
+    -- next life's id). The live identity comes from the adapter — after a
+    -- dirty restart it is the marker's next life, not the descriptor row.
     local endpoint_by_id: {integer: string} = {}
     local id_by_endpoint: {string: integer} = {}
     local own_id = 0
@@ -1178,9 +1179,9 @@ local function main(options: Options)
                         -- deployment attributes to `old` IS the restarted
                         -- process's entry ticket — the wire body is the
                         -- notice, no application broadcast. The row for
-                        -- the bumped id is ADDED at the source endpoint
-                        -- (every bumped identity lives in the high band
-                        -- the native adapter's bump arithmetic derives)
+                        -- the new identity is ADDED at the source
+                        -- endpoint (the remap law: `new` is `old`'s next
+                        -- life — same system half, crash counter + 1)
                         -- and the announcement is delivered attributed to
                         -- the new identity, where the core's own gates
                         -- apply (only the leader acts; a forged or

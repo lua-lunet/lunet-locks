@@ -77,7 +77,7 @@ function M.main(argv_root: string, argv: {string}): integer
     fs.mkdir_p(fs.join(run_dir, "state"))
     fs.mkdir_p(fs.join(run_dir, "flight"))
     fs.mkdir_p(fs.join(run_dir, "aof/dc1"))
-    fs.write_all(fs.join(run_dir, "state/n1.state"), "3 flushed\n")
+    fs.write_all(fs.join(run_dir, "state/n1.state"), "1 3 flushed\n")
     -- The superblock copies are REAL marker files — written by the
     -- vendored Zig store through the lunet_locks_nuke tool's
     -- fresh-format reset — so the check's classification path runs
@@ -86,7 +86,7 @@ function M.main(argv_root: string, argv: {string}): integer
         shell.quote(nuke)
             .. " "
             .. shell.quote(fs.join(run_dir, "state/n1.state"))
-            .. " --set-state flushed --set-incarnation 3 --dangerously-skip-review >/dev/null 2>&1"
+            .. " --set-state flushed --set-system 1 --set-crash 3 --dangerously-skip-review >/dev/null 2>&1"
     )
     fs.write_all(fs.join(run_dir, "state/n1.state.membership"), '{"era":1,"slot":0}\n')
     fs.write_all(fs.join(run_dir, "flight/flight-1.jsonl"), "recording\n")
@@ -95,7 +95,7 @@ function M.main(argv_root: string, argv: {string}): integer
     fs.write_all(fs.join(run_dir, "aof/dc1/1789725519.meta"), "meta\n")
     fs.write_all(
         fs.join(run_dir, "n1.2026-09-18.log"),
-        " INFO stop: drained and flushed; the next boot continues under the same incarnation node=1\n"
+        " INFO stop: drained and flushed; the next boot continues under the same identity node=1\n"
     )
     fs.write_all(fs.join(run_dir, "n1.nohup"), "nohup\n")
     fs.write_all(
@@ -216,7 +216,7 @@ function M.main(argv_root: string, argv: {string}): integer
         shell.quote(nuke)
             .. " "
             .. shell.quote(fs.join(run_dir, "state/n1.state"))
-            .. " --set-state running --set-incarnation 3 --dangerously-skip-review >/dev/null 2>&1"
+            .. " --set-state running --set-system 1 --set-crash 3 --dangerously-skip-review >/dev/null 2>&1"
     )
     local planted_archive = fs.join(work, "planted-snapshot.tar.gz")
     local ok_planted, _p3, _m3 = snapshot.snapshot(run_dir, planted_archive)

@@ -151,9 +151,7 @@ fn run(args: &Args) -> i32 {
             }
         },
         _ => {
-            eprintln!(
-                "{PREFIX}: --set-system and --set-crash name the identity pair together"
-            );
+            eprintln!("{PREFIX}: --set-system and --set-crash name the identity pair together");
             return EXIT_USAGE;
         }
     };

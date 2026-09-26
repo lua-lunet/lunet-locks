@@ -2,8 +2,9 @@
 
 The crash-restart scenario stops a voter (SIGKILL, no drain) and boots it
 again on the same durable state. The boot gate reads the marker, classifies
-the start crashed (no stopped quorum), and the node reincarnates: it bumps
-its identity into the high band (`old + 2^24` per incarnation) and announces
+the start crashed (no stopped quorum), and the node reincarnates: it takes
+the marker pair's next life (the same system half, the crash counter
+advanced) and announces
 `Reincarnation(old, new)` to every member it can still name, once per
 second, until it stops being fenced. The leader of a settled view answers
 the announcement with the missed-range push and drives the forced weight
@@ -11,11 +12,13 @@ sequence that walks the node back to voting weight.
 
 This page is the evidence pack for the run where that walk never happened.
 The run is `local-softball9-2026-09-25` (the recording build's header commit
-is `1b9ba4b`, recorded with the dirty-tree override). Its `progress.log`
-declares three crash-restart cases BLOCKED; this page files the shallow n3
-case (the view-churn fence) in full and the deep n3 case (the install that
-never lands) at the fence phase. The in-process reproductions that replay
-this page's committed capture against a lone node in seconds live in
+is `1b9ba4b`, recorded with the dirty-tree override; the run predates the
+identity-law packing, so the recorded ids are the superseded band's). Its
+`progress.log` declares three crash-restart cases BLOCKED; this page files
+the shallow n3 case (the view-churn fence) in full and the deep n3 case
+(the install that never lands) at the fence phase. The in-process
+reproductions that replay this page's committed capture against a lone node
+in seconds live in
 `examples/lease-sequencer/tests/rejoin_fence_reproduce_test.rs`; both are
 filed RED.
 

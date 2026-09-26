@@ -225,32 +225,32 @@ fn the_internal_kinds_are_explicit_only() {
 #[test]
 fn given_a_scenario_the_flight_tape_feeds_the_playback_engine() {
     let dir = temp_dir("engine");
-    let recording = dir.join("flight-12.jsonl");
+    let recording = dir.join("flight-786433.jsonl");
     let frame = prepare_frame();
     write_recording(
         &recording,
         READER_COMMIT,
-        12,
+        786433,
         &[
             json!({"seq": 1, "kind": "receive-in", "ts_ms": 1789214915001u64,
-                   "detail": {"from": 10, "len": frame.len(), "hex": hex(&frame)}}),
+                   "detail": {"from": 655361, "len": frame.len(), "hex": hex(&frame)}}),
         ],
     );
     let mut capture: Vec<u8> = Vec::new();
     let mut options = FlightTapeOptions::default();
-    options.node = Some(12);
+    options.node = Some(786433);
     stream_recording(&recording, &options, &mut capture).expect("the recording streams");
 
     // The scenario is the node's initial condition; the tape is the
     // filtered-to-one-node message sequence.
     let scenario = Scenario::parse(
         r#"{
-          "node_id": 12,
+          "node_id": 786433,
           "name": "n3",
           "membership": [
-            {"id": 10, "name": "n1", "weight": 1},
-            {"id": 11, "name": "n2", "weight": 1},
-            {"id": 12, "name": "n3", "weight": 1}
+            {"id": 655361, "name": "n1", "weight": 1},
+            {"id": 720897, "name": "n2", "weight": 1},
+            {"id": 786433, "name": "n3", "weight": 1}
           ],
           "era": 1,
           "view": 0
@@ -520,7 +520,7 @@ fn the_endpoint_filter_matches_the_rendered_line() {
         44,
         &[
             json!({"seq": 1, "kind": "receive-in", "ts_ms": 1789214915001u64,
-                   "detail": {"from": 10, "len": 5, "hex": "aabb00ccdd"}}),
+                   "detail": {"from": 655361, "len": 5, "hex": "aabb00ccdd"}}),
             json!({"seq": 2, "kind": "emit", "ts_ms": 1789214915002u64,
                    "detail": {"kind": 1, "to": 10, "len": 3, "hex": "aabb00"}}),
             json!({"seq": 3, "kind": "emit", "ts_ms": 1789214915003u64,
@@ -623,7 +623,7 @@ mod real_capture {
         }
         drop(guard);
 
-        let recording = dir.join("flight-10.jsonl");
+        let recording = dir.join("flight-655361.jsonl");
         // The stable slice, streamed from the REAL recording.
         let mut capture: Vec<u8> = Vec::new();
         let (lines, mangled) =
@@ -649,12 +649,12 @@ mod real_capture {
         // exactly what `--from 10 --to 11` keeps.
         let grepped: Vec<&&str> = tape
             .iter()
-            .filter(|line| line.starts_with("10,11,"))
+            .filter(|line| line.starts_with("655361,720897,"))
             .collect();
-        assert!(!grepped.is_empty(), "the leader emitted to 11: {tape:?}");
+        assert!(!grepped.is_empty(), "the leader emitted to 720897: {tape:?}");
         let mut options = FlightTapeOptions::default();
-        options.from = Some(10);
-        options.to = Some(11);
+        options.from = Some(655361);
+        options.to = Some(720897);
         let mut filtered: Vec<u8> = Vec::new();
         let (kept, _) = stream_recording(&recording, &options, &mut filtered)
             .expect("the filtered stream runs");
@@ -677,12 +677,12 @@ mod real_capture {
             .collect();
         let scenario = Scenario::parse(
             r#"{
-              "node_id": 11,
+              "node_id": 720897,
               "name": "n2",
               "membership": [
-                {"id": 10, "name": "n1", "weight": 1},
-                {"id": 11, "name": "n2", "weight": 1},
-                {"id": 12, "name": "n3", "weight": 1}
+                {"id": 655361, "name": "n1", "weight": 1},
+                {"id": 720897, "name": "n2", "weight": 1},
+                {"id": 786433, "name": "n3", "weight": 1}
               ],
               "era": 1,
               "view": 0

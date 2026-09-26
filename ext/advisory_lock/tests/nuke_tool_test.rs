@@ -75,11 +75,7 @@ fn seed_store(dir: &Path, crash: u16, state: marker_ffi::MarkerState) -> PathBuf
         state,
     )
     .expect("the store's first write");
-    fs::write(
-        dir.join("state"),
-        format!("1 {crash} {}\n", state.name()),
-    )
-    .expect("the projection");
+    fs::write(dir.join("state"), format!("1 {crash} {}\n", state.name())).expect("the projection");
     dir.join("state")
 }
 

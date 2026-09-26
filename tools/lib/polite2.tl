@@ -700,7 +700,7 @@ local function scenario_crashes()
             local kv = logs.kv(line)
             if
                 (tonumber(kv.ts) or 0) >= t_boot
-                and (tonumber(kv.incarnation) or 0) >= 1
+                and (tonumber(kv.incarnation) or 0) >= 2
             then
                 bumped = "incarnation="
                     .. (kv.incarnation or "?")

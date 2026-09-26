@@ -52,7 +52,15 @@ fn scratch(name: &str) -> PathBuf {
 }
 
 fn members(ids: &[u32]) -> Vec<(u32, String)> {
-    ids.iter().map(|id| (*id, format!("node{id}"))).collect()
+    ids.iter()
+        .map(|id| (provisioned(*id), format!("node{id}")))
+        .collect()
+}
+
+/// The provisioned identity: node k's descriptor id is the packed pair
+/// (system k, crash counter 1).
+fn provisioned(system: u32) -> u32 {
+    (system << 16) | 1
 }
 
 fn summarize(verdicts: &[Verdict]) -> String {
@@ -73,8 +81,8 @@ fn summarize(verdicts: &[Verdict]) -> String {
 #[test]
 fn stage1_single_node_speaks_get_and_set() {
     let _guard = lock_scenarios();
-    let config = ClusterConfig::new(scratch("uds-stage1"), members(&[44, 55]), vec![44, 55])
-        .with_clients(vec![("probe1".into(), 44)]);
+    let config = ClusterConfig::new(scratch("uds-stage1"), members(&[44, 55]), vec![provisioned(44), provisioned(55)])
+        .with_clients(vec![("probe1".into(), provisioned(44))]);
     let verdicts = lease_sequencer::uds_harness::stage1(Cluster::launch(config).expect("launch"));
     assert!(
         verdicts.iter().all(|v| v.pass),
@@ -86,8 +94,8 @@ fn stage1_single_node_speaks_get_and_set() {
 #[test]
 fn stage2_two_nodes_of_three_stabilize_and_serve() {
     let _guard = lock_scenarios();
-    let config = ClusterConfig::new(scratch("uds-stage2"), members(&[44, 55, 66]), vec![44, 55])
-        .with_clients(vec![("client1".into(), 44), ("client2".into(), 55)]);
+    let config = ClusterConfig::new(scratch("uds-stage2"), members(&[44, 55, 66]), vec![provisioned(44), provisioned(55)])
+        .with_clients(vec![("client1".into(), provisioned(44)), ("client2".into(), provisioned(55))]);
     let verdicts = lease_sequencer::uds_harness::stage2(Cluster::launch(config).expect("launch"));
     assert!(
         verdicts.iter().all(|v| v.pass),
@@ -102,12 +110,12 @@ fn stage3_pause_holder_takeover() {
     let config = ClusterConfig::new(
         scratch("uds-stage3"),
         members(&[44, 55, 66]),
-        vec![44, 55, 66],
+        vec![provisioned(44), provisioned(55), provisioned(66)],
     )
     .with_clients(vec![
-        ("client1".into(), 44),
-        ("client2".into(), 55),
-        ("client3".into(), 66),
+        ("client1".into(), provisioned(44)),
+        ("client2".into(), provisioned(55)),
+        ("client3".into(), provisioned(66)),
     ]);
     let verdicts = lease_sequencer::uds_harness::stage3(Cluster::launch(config).expect("launch"));
     assert!(
@@ -139,12 +147,12 @@ fn stage4_three_clients_race_one_free_lock() {
     let config = ClusterConfig::new(
         scratch("uds-stage4"),
         members(&[44, 55, 66]),
-        vec![44, 55, 66],
+        vec![provisioned(44), provisioned(55), provisioned(66)],
     )
     .with_clients(vec![
-        ("client1".into(), 44),
-        ("client2".into(), 55),
-        ("client3".into(), 66),
+        ("client1".into(), provisioned(44)),
+        ("client2".into(), provisioned(55)),
+        ("client3".into(), provisioned(66)),
     ]);
     let verdicts = lease_sequencer::uds_harness::stage4(Cluster::launch(config).expect("launch"));
     assert!(
@@ -171,9 +179,9 @@ fn driver_hiccup_is_not_leader_death() {
     let config = ClusterConfig::new(
         scratch("uds-hiccup"),
         members(&[44, 55, 66]),
-        vec![44, 55, 66],
+        vec![provisioned(44), provisioned(55), provisioned(66)],
     )
-    .with_clients(vec![("client1".into(), 44)]);
+    .with_clients(vec![("client1".into(), provisioned(44))]);
     let mut cluster = Cluster::launch(config).expect("launch");
     let ready = cluster.wait_until(8000, |lines| {
         lines.iter().filter_map(|l| parse_line(l)).any(|l| {

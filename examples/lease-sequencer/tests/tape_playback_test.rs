@@ -35,10 +35,10 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use uuid::Uuid;
 
-const RECORDER: u32 = 99;
+const RECORDER: u32 = (99 << 16) | 1;
 const ERA: u32 = 4;
 const VIEW: u32 = 13;
-const LEADER: u32 = 66;
+const LEADER: u32 = (66 << 16) | 1;
 /// The window's committed frontier at its start; the recorded verbs'
 /// slots begin one past it.
 const COMMITTED_SLOT: u64 = 41_001;
@@ -147,7 +147,7 @@ fn frames_to_recorder(dir: &Path) -> Vec<TapeFrame> {
         .iter()
         .filter_map(|line| {
             let (from, to, json) = scenario::parse_tape_line(line)?;
-            if to != "99" {
+            if to != "6488065" {
                 return None;
             }
             if json.get("kind").and_then(|v| v.as_str()) != Some("wire") {
@@ -163,15 +163,15 @@ fn frames_to_recorder(dir: &Path) -> Vec<TapeFrame> {
 /// committed era-4 frontier, the silent client gate, and no lease state
 /// carried across the window (the replayed verbs define it).
 const SCENARIO_99: &str = r#"{
-  "node_id": 99,
+  "node_id": 6488065,
   "name": "node99",
   "membership": [
-    {"id": 44, "name": "node44", "weight": 1},
-    {"id": 55, "name": "node55", "weight": 1},
-    {"id": 66, "name": "node66", "weight": 1},
-    {"id": 77, "name": "node77", "weight": 0, "joined": true},
-    {"id": 88, "name": "node88", "weight": 0, "joined": true},
-    {"id": 99, "name": "node99", "weight": 0, "joined": true}
+    {"id": 2883585, "name": "node44", "weight": 1},
+    {"id": 3604481, "name": "node55", "weight": 1},
+    {"id": 4325377, "name": "node66", "weight": 1},
+    {"id": 5046273, "name": "node77", "weight": 0, "joined": true},
+    {"id": 5767169, "name": "node88", "weight": 0, "joined": true},
+    {"id": 6488065, "name": "node99", "weight": 0, "joined": true}
   ],
   "era": 4,
   "view": 13,

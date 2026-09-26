@@ -4,7 +4,7 @@
 # way over the genesis and learns the live configuration through
 # era-qualified discovery. The live cluster's descriptor (cluster.jsonl) is
 # the superset: shared lines identical, the joined members appended.
-{"id":1,"name":"dc1-node1","host":"127.0.0.1","port":41101,"genesis":true}
-{"id":2,"name":"dc2-node1","host":"127.0.0.1","port":41102,"genesis":true}
-{"id":3,"name":"dc3-node1","host":"127.0.0.1","port":41103,"genesis":true}
-{"id":7,"name":"dc3-node3","host":"127.0.0.1","port":41107,"genesis":false}
+"id":65537,"name":"dc1-node1","host":"127.0.0.1","port":41101,"genesis":true}
+"id":131073,"name":"dc2-node1","host":"127.0.0.1","port":41102,"genesis":true}
+"id":196609,"name":"dc3-node1","host":"127.0.0.1","port":41103,"genesis":true}
+"id":458753,"name":"dc3-node3","host":"127.0.0.1","port":41107,"genesis":false}

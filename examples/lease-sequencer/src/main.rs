@@ -3302,10 +3302,10 @@ mod forward_tests {
         let scratch = ScratchRoot(root.clone());
         let mut a = boot_host("a", &root);
         let mut b = boot_host("b", &root);
-        a.host.peers.insert(2, b.udp);
-        a.host.addr_to_id.insert(b.udp, 2);
-        b.host.peers.insert(1, a.udp);
-        b.host.addr_to_id.insert(a.udp, 1);
+        a.host.peers.insert(131073, b.udp);
+        a.host.addr_to_id.insert(b.udp, 131073);
+        b.host.peers.insert(65537, a.udp);
+        b.host.addr_to_id.insert(a.udp, 65537);
         let seed = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock")

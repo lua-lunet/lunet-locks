@@ -1,5 +1,5 @@
 //! Host-side FFI adapter between the LuaJIT host and the uVRR core
-//! (vrr-core, uvrr-core tag v0.7.4 @ e5b0a79 — the lifecycle boot gate; the core's constructors all sit in `node_from_sink` in this file: `lifecycle::boot` :2035, `Replica::reincarnate` :2379, `Replica::resume` :2393, `Replica::join` :2407, `Replica::provision` :2418).
+//! (vrr-core, uvrr-core tag v0.8.0 @ 450dcab — the lifecycle boot gate; the core's constructors all sit in `node_from_sink` in this file: `lifecycle::boot` :2035, `Replica::reincarnate` :2379, `Replica::resume` :2393, `Replica::join` :2407, `Replica::provision` :2418).
 //!
 //! Concrete core: `Replica<SegmentedLog, WeightedMajority>` running
 //! `Stability::Volatile` — nothing is persisted but the boot gate's
@@ -50,27 +50,46 @@
 //!   the era-1 traffic its genesis table covers and drops everything past it
 //!   by name — the same boundary upstream's own learner corpus states
 //!   (§10 acquisition, future work). The joiner fabricates nothing.
-//! - **Incarnation (the restart story).** The boot classification is the
+//! - **Identity (the restart story).** The boot classification is the
 //!   engine's (`lifecycle::boot` over the superblock quorum store,
 //!   `vrr::lifecycle`): no marker ever written is the FIRST life — the
-//!   first latch anchors identity 0; a stopped quorum is a CLEAN
-//!   continue under the SAME identity (`Replica::resume` behind the
-//!   engine's `Vouched` token); no stopped quorum is a CRASH — the
-//!   identity is dead, the replacement pair is decided at boot
-//!   (`Crashed::pair`), and the durable bump lands with the DEFERRED
-//!   latch once the engine itself observes the node seated
-//!   (`Replica::rejoined` mints the witness; until then the markers hold
-//!   the crash's evidence, so a re-crash re-decides the same pair and
-//!   the replay is absorbed). A bumped identity is derived
-//!   deterministically, without operator intervention: descriptor ids
-//!   are incarnation-0 ids in the low band `[0, 16777214]`, and the
-//!   k-th incarnation's identity is `low + k * 2^24` — a unique
-//!   high-band id that can never alias a descriptor id (the low band is
-//!   the whole descriptor space), never overflow u32, and never reach
-//!   the reserved LEADER_UNKNOWN value `u32::MAX` (descriptor id
-//!   16777215 is forbidden precisely because `255 * 2^24 + 16777215 =
-//!   4294967295`); the boot refuses past incarnation 255, mirroring
-//!   upstream's checked `Incarnation::bump`. A crashed boot reopens the
+//!   first latch anchors the genesis life (crash counter 1); a stopped
+//!   quorum is a CLEAN continue under the SAME identity
+//!   (`Replica::resume` behind the engine's `Vouched` token); no
+//!   stopped quorum is a CRASH — the identity is dead, the replacement
+//!   pair is decided at boot (`Crashed::pair`), and THE EMISSION GATE
+//!   lands the bump's one durable marker round — the next life at the
+//!   running sentinel — before the driver releases the first
+//!   announcement, unconditional, seated or not. The engine's session
+//!   is held so its typestate can latch the same round again once the
+//!   seated observation mints the witness (`Replica::rejoined`): the
+//!   same identity and state, idempotent on the marker.
+//!   Membership is the admin-assigned deployment descriptor: the member
+//!   buffer carries NUL-separated `<u32-id>:<name>` entries, in the
+//!   descriptor's line order. Each id is the member's provisioned
+//!   identity — the packed pair (system half, crash counter 1); the
+//!   marker's crash counter carries the life from there, so a crashed
+//!   boot's announced id is the strict next life of the same system.
+//!   The buffer order is the genesis succession sequence
+//!   (`primary(v) = order[v mod N]`). Member ids are the ABI's peer
+//!   addresses: `receive`'s `from`, send outputs' `to`, and the leader
+//!   outs carry the live packed ids; the host maps id -> endpoint
+//!   through the descriptor, and a later life of a member rides the
+//!   transport's remap. `own` is matched by name. A post-genesis
+//!   (joined-later) entry carries a `:j` suffix: `<u32-id>:<name>:j`. Such
+//!   entries are outside the genesis order — the core's `provision` refuses
+//!   an `own` that is not a founding member — so a node whose `own` names a
+//!   `:j` entry boots as a JOINER: `Replica::join` over the deployment's
+//!   genesis (the entries `provision` installs, mirrored byte-for-byte, plus
+//!   the era table folded from them), fenced `Restarting`, addressed but
+//!   outside every configuration until a committed `Join` admits it. Upstream
+//!   has no fresh-node catch-up at this commit: the establishing operation's
+//!   fan-out reaches configuration members only and the `GetState` serving
+//!   gate serves configuration members only, so the joiner evaluates only
+//!   the era-1 traffic its genesis table covers and drops everything past it
+//!   by name — the same boundary upstream's own learner corpus states
+//!   (§10 acquisition, future work). The joiner fabricates nothing.
+//!   A crashed boot reopens the
 //!   reincarnation way — a later life over the deployment's genesis
 //!   (`Replica::reincarnate` under the bumped identity; there is no
 //!   durable journal to carry forward) — and drives
@@ -91,11 +110,12 @@
 //!   `idle`, `leader_timeout`, `force_view`, `recover`, `reconfigure` —
 //!   before any marker write and before any task processing, making the
 //!   in-memory state final), and the durable write is the existing
-//!   sink drain. A node still inside the crashed path's deferred window
-//!   (its identity not yet latched) cannot run the halt's rounds — the
-//!   stop closes the wire, drains the sink, and leaves the markers at
-//!   the crash's evidence; the next boot re-classifies crashed and
-//!   re-decides the same pair. Marker storage: the lifecycle rides the
+//!   sink drain. A node still inside the crashed path's unseated window
+//!   (its engine session not yet latched) cannot run the halt's rounds —
+//!   the stop closes the wire, drains the sink, and leaves the markers
+//!   at the emission gate's round (the new life's running sentinel); the
+//!   next boot re-classifies crashed and derives the strictly next
+//!   life. Marker storage: the lifecycle rides the
 //!   vendored Zig store's quorum-of-copies superblock construction
 //!   (four fixed sector-aligned Aegis-checksummed copies, hash-chained
 //!   sequence/parent, quorum write with forced I/O verified at the 3/4
@@ -200,7 +220,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, trace, warn};
 use vrr::configuration::{EraTable, INIT_SLOT, MAX_MEMBERS, SystemOperation, VOID_SLOT};
 use vrr::effects::{Effect, Stability};
-use vrr::ids::{CrashCounter, Era, NodeId, Operation, OperationId, Slot, SystemId, Tick, View, ViewId};
+use vrr::ids::{
+    CrashCounter, Era, NodeId, Operation, OperationId, Slot, SystemId, Tick, View, ViewId,
+};
 use vrr::journal::{Journal, LogEntry, Payload, SegmentedLog};
 use vrr::lifecycle::{
     self, BootError, BootOutcome, Bumped, Crashed, Incarnation, Marker, Running, Vouched,
@@ -391,12 +413,13 @@ pub struct Node {
     state_path: PathBuf,
     /// The boot gate's latched session: the Running typestate whose
     /// schedule the stop path drives. `None` while the crashed
-    /// classification's durable latch defers (the identity is not yet
-    /// seated) and after the halt consumed it.
+    /// classification's engine session is unlatched (the seated witness
+    /// has not minted) and after the halt consumed it.
     session: Option<Running<GateStore>>,
-    /// The crashed classification's deferred latch: held until the
+    /// The crashed classification's engine session: held until the
     /// engine's seated observation (`Replica::rejoined`) mints the
-    /// witness, then fired once — the durable bump lands then.
+    /// witness, then latched once — the same marker round the emission
+    /// gate already made durable at boot, idempotent.
     deferred: Option<Crashed<GateStore>>,
     /// The drain point's wire-closed flag: set BEFORE any marker write at
     /// stop, and refusing every further inbound entry while set — the
@@ -463,14 +486,15 @@ impl Node {
         code
     }
 
-    /// The deferred latch's settle: the engine's seated observation
-    /// (`Replica::rejoined` — `Normal` at voting weight) mints the
-    /// witness, and the crashed classification's durable bump lands —
-    /// `(new, Joining)` written 4x through the machine. Checked after
-    /// every drive (the harness pattern: the latch fires on the first
-    /// step after which the witness mints). A failed latch write keeps
-    /// the deferral — the markers hold the crash's evidence, the next
-    /// boot re-decides the same pair, and the next drive retries.
+    /// The engine session's latch settle: the engine's seated
+    /// observation (`Replica::rejoined` — `Normal` at voting weight)
+    /// mints the witness, and the engine latches the crashed
+    /// classification — `(new, Joining)` written 4x through the machine,
+    /// the same round the emission gate made durable at boot. Checked
+    /// after every drive (the harness pattern: the latch fires on the
+    /// first step after which the witness mints). A failed latch write
+    /// keeps the session — the markers already hold the emission gate's
+    /// round, and the next drive retries.
     fn settle_deferred_latch(&mut self) {
         if self.poisoned || self.stopped {
             return;
@@ -1537,11 +1561,12 @@ impl Node {
     ///    round (`Stopped`, 4x): the next boot's stopped quorum proves
     ///    the clean stop.
     ///
-    /// A node still inside the crashed path's deferred window (its
-    /// identity not yet latched) has no Running session: the stop closes
-    /// the wire and drains the sink, and no marker round is lawful — the
-    /// markers hold the crash's evidence, the next boot re-classifies
-    /// crashed and re-decides the same pair.
+    /// A node still inside the crashed path's unseated window (its
+    /// engine session not yet latched) has no Running session: the stop
+    /// closes the wire and drains the sink, and no marker round is
+    /// lawful — the markers hold the emission gate's round (the new
+    /// life's running sentinel), the next boot re-classifies crashed
+    /// and derives the strictly next life.
     ///
     /// Idempotent: a second stop reports OK without writing anything. A
     /// failed round or drain reports SERVICE and the markers stand at
@@ -1577,7 +1602,7 @@ impl Node {
             }
             info!(
                 node = self.replica.own().0,
-                "stop: the deferred window drains and exits; the next boot re-decides the pair"
+                "stop: the unseated window drains and exits; the next boot derives the next life"
             );
             return OK;
         };
@@ -2123,10 +2148,9 @@ fn boot_gate(
             // here, before the driver releases the first announcement,
             // unconditionally (seated or not). A failed round refuses
             // the boot: the node is never half-announced.
-            crashed
-                .store()
-                .emission_gate(pair.new.0)
-                .map_err(|error| refuse(format!("the crash bump's marker write failed: {error}")))?;
+            crashed.store().emission_gate(pair.new.0).map_err(|error| {
+                refuse(format!("the crash bump's marker write failed: {error}"))
+            })?;
             let flush = match recovery {
                 None | Some((RecoveryFlush::Diskless, _)) => None,
                 Some((variant, scratch)) => Some(
@@ -3100,8 +3124,8 @@ mod tests {
     fn legacy_flushed_file_migrates_and_continues_clean() {
         let path = state_path("marker-compat-clean");
         fs::write(&path, "1 4 flushed\n").unwrap();
-        let decision =
-            boot_gate(GateStore::new(&path, test_sink(), 1), None).expect("migrated classification");
+        let decision = boot_gate(GateStore::new(&path, test_sink(), 1), None)
+            .expect("migrated classification");
         assert_eq!(
             decision.incarnation, 4,
             "the flush from the pre-routing era continues clean"
@@ -4266,7 +4290,10 @@ mod tests {
         // solicitation never re-fires). The establishing Prepare reaches
         // every backup, and the commit advances the era to 3: the
         // departed identity is gone from the folded configuration.
-        assert_eq!(reconfigure(&mut nodes[1], RECONFIGURE_LEAVE, JOINER_ID, 0), OK);
+        assert_eq!(
+            reconfigure(&mut nodes[1], RECONFIGURE_LEAVE, JOINER_ID, 0),
+            OK
+        );
         let prepare = pop_send(&mut nodes[1], TEST_IDS[0], vrr::wire::Tag::Prepare)
             .expect("the stop-the-world fallback reaches every backup");
         let prepare_three = pop_send(&mut nodes[1], TEST_IDS[2], vrr::wire::Tag::Prepare)
@@ -4351,7 +4378,10 @@ mod tests {
 
         // The promotion on the era-2 primary: the establishing Prepare goes
         // only to `qII - {L}` = {id 10, id 40}.
-        assert_eq!(reconfigure(&mut nodes[1], RECONFIGURE_INCREMENT, JOINER_ID, 0), OK);
+        assert_eq!(
+            reconfigure(&mut nodes[1], RECONFIGURE_INCREMENT, JOINER_ID, 0),
+            OK
+        );
         let to_voter = pop_send(&mut nodes[1], TEST_IDS[0], vrr::wire::Tag::Prepare)
             .expect("the pivot routes the establishing Prepare");
         let to_learner = pop_send(&mut nodes[1], JOINER_ID, vrr::wire::Tag::Prepare)
@@ -4511,7 +4541,10 @@ mod tests {
         // inside qII, the commit folds era 3, the planned quorum over
         // qI = {L, id 30} completes, and the ONE switch installs v' =
         // (3, 5) with StartView to every member of config(e+1).
-        assert_eq!(reconfigure(&mut nodes[1], RECONFIGURE_INCREMENT, JOINER_ID, 0), OK);
+        assert_eq!(
+            reconfigure(&mut nodes[1], RECONFIGURE_INCREMENT, JOINER_ID, 0),
+            OK
+        );
         let to_voter = pop_send(&mut nodes[1], TEST_IDS[0], vrr::wire::Tag::Prepare)
             .expect("the pivot routes the establishing Prepare");
         let to_learner = pop_send(&mut nodes[1], JOINER_ID, vrr::wire::Tag::Prepare)
@@ -4628,7 +4661,10 @@ mod tests {
         // The promotion through the non-stop overlap: the pivot places the
         // weight-0 learner inside qII, the commit folds era 3, the planned
         // quorum over qI completes, and the ONE switch installs v' = (3, 5).
-        assert_eq!(reconfigure(&mut nodes[1], RECONFIGURE_INCREMENT, JOINER_ID, 0), OK);
+        assert_eq!(
+            reconfigure(&mut nodes[1], RECONFIGURE_INCREMENT, JOINER_ID, 0),
+            OK
+        );
         let to_learner = pop_send(&mut nodes[1], JOINER_ID, vrr::wire::Tag::Prepare)
             .expect("the learner is inside qII: it receives the copy");
         let to_voter = pop_send(&mut nodes[1], TEST_IDS[0], vrr::wire::Tag::Prepare)
@@ -4699,7 +4735,10 @@ mod tests {
         // adapter drives the stop-the-world fallback: the establishing
         // Prepare reaches every backup, and the era awaits the ordinary
         // fence. A latency outcome, never an error.
-        assert_eq!(reconfigure(&mut nodes[1], RECONFIGURE_DECREMENT, JOINER_ID, 0), OK);
+        assert_eq!(
+            reconfigure(&mut nodes[1], RECONFIGURE_DECREMENT, JOINER_ID, 0),
+            OK
+        );
         let to_one = pop_send(&mut nodes[1], TEST_IDS[0], vrr::wire::Tag::Prepare)
             .expect("the stop-the-world fallback reaches every backup");
         let to_three = pop_send(&mut nodes[1], TEST_IDS[2], vrr::wire::Tag::Prepare)
@@ -4776,7 +4815,10 @@ mod tests {
         // pivot policy drives membership changes stop-the-world
         // (`pivot: None`): the establishing Prepare reaches every backup
         // and the commit folds era 5.
-        assert_eq!(reconfigure(&mut nodes[0], RECONFIGURE_LEAVE, JOINER_ID, 0), OK);
+        assert_eq!(
+            reconfigure(&mut nodes[0], RECONFIGURE_LEAVE, JOINER_ID, 0),
+            OK
+        );
         let prepare_one = pop_send(&mut nodes[0], TEST_IDS[1], vrr::wire::Tag::Prepare)
             .expect("the stop-the-world fallback reaches every backup");
         let prepare_three = pop_send(&mut nodes[0], TEST_IDS[2], vrr::wire::Tag::Prepare)

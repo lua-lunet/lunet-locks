@@ -11,9 +11,9 @@ end
 
 local function nodes(): {cluster_config.ClusterNode}
     return cluster_config.parse_jsonl(
-        '{"id":11,"name":"n1","host":"127.0.0.1","port":7001,"genesis":true}\n'
-            .. '{"id":22,"name":"n2","host":"127.0.0.1","port":7002,"genesis":true}\n'
-            .. '{"id":33,"name":"n3","host":"127.0.0.1","port":7003,"genesis":true}\n'
+        '{"id":720897,"name":"n1","host":"127.0.0.1","port":7001,"genesis":true}\n'
+            .. '{"id":1441793,"name":"n2","host":"127.0.0.1","port":7002,"genesis":true}\n'
+            .. '{"id":2162689,"name":"n3","host":"127.0.0.1","port":7003,"genesis":true}\n'
     )
 end
 
@@ -25,7 +25,7 @@ tested.test(
             {
                 given = "a parsed three-entry descriptor containing --node once",
                 should = "return members in descriptor order with their admin ids and endpoints",
-                expected = "11:n1:127.0.0.1:7001|22:n2:127.0.0.1:7002|33:n3:127.0.0.1:7003",
+                expected = "720897:n1:127.0.0.1:7001|1441793:n2:127.0.0.1:7002|2162689:n3:127.0.0.1:7003",
                 actual = table.concat(
                     {
                         tostring(members[1].id)
@@ -61,9 +61,9 @@ tested.test(
     "config keeps descriptor order, rejects duplicate names and absent locals",
     function()
         local sparse = cluster_config.parse_jsonl(
-            '{"id":303,"name":"n3","host":"127.0.0.1","port":7003,"genesis":true}\n'
-                .. '{"id":11,"name":"n1","host":"127.0.0.1","port":7001,"genesis":true}\n'
-                .. '{"id":22,"name":"n2","host":"127.0.0.1","port":7002,"genesis":true}\n'
+            '{"id":19857409,"name":"n3","host":"127.0.0.1","port":7003,"genesis":true}\n'
+                .. '{"id":720897,"name":"n1","host":"127.0.0.1","port":7001,"genesis":true}\n'
+                .. '{"id":1441793,"name":"n2","host":"127.0.0.1","port":7002,"genesis":true}\n'
         )
         local members = config.members("n1", sparse)
         local duplicate_names = fails(
@@ -104,7 +104,7 @@ tested.test(
             {
                 given = "a non-lexically-ordered sparse descriptor and invalid membership shapes",
                 should = "preserve line order as the genesis succession and reject the rest before sockets",
-                expected = "303:11:22:true:true",
+                expected = "19857409:720897:1441793:true:true",
                 actual = tostring(members[1].id)
                     .. ":"
                     .. tostring(members[2].id)
@@ -148,16 +148,16 @@ tested.test(
         local changed = config.members(
             "n1",
             cluster_config.parse_jsonl(
-                '{"id":11,"name":"n1","host":"127.0.0.1","port":7001,"genesis":true}\n'
-                    .. '{"id":22,"name":"n2","host":"127.0.0.1","port":7002,"genesis":true}\n'
-                    .. '{"id":33,"name":"n3","host":"127.0.0.1","port":7004,"genesis":true}\n'
+                '{"id":720897,"name":"n1","host":"127.0.0.1","port":7001,"genesis":true}\n'
+                    .. '{"id":1441793,"name":"n2","host":"127.0.0.1","port":7002,"genesis":true}\n'
+                    .. '{"id":2162689,"name":"n3","host":"127.0.0.1","port":7004,"genesis":true}\n'
             )
         )
         tested.assert(
             {
                 given = "the documented domain-separated, length-delimited ordered (id, name, endpoint) membership bytes",
                 should = "produce a stable SHA-256 short fingerprint and change with membership",
-                expected = "87df81de485555d1:true",
+                expected = "01d43e4d34c0669a:true",
                 actual = config.membership_fingerprint(members)
                     .. ":"
                     .. tostring(
@@ -174,21 +174,21 @@ tested.test(
     "the deployment fingerprint is over the genesis membership and survives superset growth",
     function()
         local grown = cluster_config.parse_jsonl(
-            '{"id":11,"name":"n1","host":"127.0.0.1","port":7001,"genesis":true}\n'
-                .. '{"id":22,"name":"n2","host":"127.0.0.1","port":7002,"genesis":true}\n'
-                .. '{"id":33,"name":"n3","host":"127.0.0.1","port":7003,"genesis":true}\n'
-                .. '{"id":44,"name":"n4","host":"127.0.0.1","port":7004,"genesis":false}\n'
+            '{"id":720897,"name":"n1","host":"127.0.0.1","port":7001,"genesis":true}\n'
+                .. '{"id":1441793,"name":"n2","host":"127.0.0.1","port":7002,"genesis":true}\n'
+                .. '{"id":2162689,"name":"n3","host":"127.0.0.1","port":7003,"genesis":true}\n'
+                .. '{"id":2883585,"name":"n4","host":"127.0.0.1","port":7004,"genesis":false}\n'
         )
         local repointed = cluster_config.parse_jsonl(
-            '{"id":11,"name":"n1","host":"127.0.0.1","port":7001,"genesis":true}\n'
-                .. '{"id":22,"name":"n2","host":"127.0.0.1","port":7002,"genesis":true}\n'
-                .. '{"id":33,"name":"n3","host":"127.0.0.1","port":7903,"genesis":true}\n'
+            '{"id":720897,"name":"n1","host":"127.0.0.1","port":7001,"genesis":true}\n'
+                .. '{"id":1441793,"name":"n2","host":"127.0.0.1","port":7002,"genesis":true}\n'
+                .. '{"id":2162689,"name":"n3","host":"127.0.0.1","port":7903,"genesis":true}\n'
         )
         tested.assert(
             {
                 given = "the genesis membership bytes under the v3 domain: an appended joiner, then a repointed genesis endpoint",
                 should = "keep the fingerprint byte-stable across a live join and move it when a genesis endpoint moves",
-                expected = "87df81de485555d1:87df81de485555d1:false",
+                expected = "01d43e4d34c0669a:01d43e4d34c0669a:false",
                 actual = config.genesis_fingerprint(nodes())
                     .. ":"
                     .. config.genesis_fingerprint(grown)
@@ -334,7 +334,7 @@ tested.test(
         -- and slot; the body discriminant at offset 20 mirrors the tag;
         -- `old` and `new` follow, then the past-life `committed` and
         -- `prepared` frontiers — 45 bytes total.
-        local frame = announcement_frame(303, 16777246)
+        local frame = announcement_frame(19857409, 19865602)
         assert(#frame == 45, "the fixture must sit at the core's exact frame size")
         local valid, old, new = transport.reincarnation_pair(frame)
         -- A wrong header tag, a wrong body discriminant, a truncation,
@@ -345,8 +345,8 @@ tested.test(
             .. be32(1)
             .. be64(0)
             .. string.char(13)
-            .. be32(303)
-            .. be32(16777246)
+            .. be32(19857409)
+            .. be32(19865602)
             .. be64(2)
             .. be64(2)
         local wrong_discriminant = be32(13)
@@ -354,8 +354,8 @@ tested.test(
             .. be32(1)
             .. be64(0)
             .. string.char(9)
-            .. be32(303)
-            .. be32(16777246)
+            .. be32(19857409)
+            .. be32(19865602)
             .. be64(2)
             .. be64(2)
         local truncated = frame:sub(1, 44)
@@ -373,7 +373,7 @@ tested.test(
             {
                 given = "the core's own 45-byte Reincarnation frame and five near-miss datagrams",
                 should = "decode the (old, new) pair from the exact frame and refuse every near miss",
-                expected = "true:303:16777246"
+                expected = "true:19857409:19865602"
                     .. ":false:0:0"
                     .. ":false:0:0"
                     .. ":false:0:0"
@@ -420,19 +420,19 @@ tested.test(
 )
 
 tested.test(
-    "a decoded low-band or degenerate pair never arms the reincarnation remap",
+    "a decoded pair that is not a lawful next life never arms the reincarnation remap",
     function()
         -- The wire shape decodes for any pair, but the remap arms only
-        -- for a real bump: a `new` in the descriptor band is not a
-        -- bumped identity, and `old == new` names no transition at all.
+        -- for a lawful next life: an unlawful `new` is no identity, and
+        -- `old == new` names no transition at all.
         local low_valid, low_old, low_new = transport.reincarnation_pair(
-            announcement_frame(303, 404)
+            announcement_frame(19857409, 404)
         )
         local deg_valid, deg_old, deg_new = transport.reincarnation_pair(
-            announcement_frame(303, 303)
+            announcement_frame(19857409, 19857409)
         )
-        local endpoint_by_id: {integer: string} = {[303] = "127.0.0.1:7002"}
-        local id_by_endpoint: {string: integer} = {["127.0.0.1:7002"] = 303}
+        local endpoint_by_id: {integer: string} = {[19857409] = "127.0.0.1:7002"}
+        local id_by_endpoint: {string: integer} = {["127.0.0.1:7002"] = 19857409}
         local low_applied = transport.apply_reincarnation_remap(
             endpoint_by_id, id_by_endpoint, "127.0.0.1:7002", low_old, low_new
         )
@@ -443,7 +443,7 @@ tested.test(
             {
                 given = "exact 45-byte frames whose pairs are not real bumps",
                 should = "decode the pair yet refuse the remap: no row, no re-attribution",
-                expected = "true:303:404:false:true:303:303:false",
+                expected = "true:19857409:404:false:true:19857409:19857409:false",
                 actual = tostring(low_valid)
                     .. ":"
                     .. tostring(low_old)
@@ -462,7 +462,7 @@ tested.test(
             }
         )
         assert(endpoint_by_id[404] == nil)
-        assert(id_by_endpoint["127.0.0.1:7002"] == 303)
+        assert(id_by_endpoint["127.0.0.1:7002"] == 19857409)
     end
 )
 

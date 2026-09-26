@@ -1,26 +1,26 @@
 local tested = require("tested")
 local transport = require("transport")
 
-local LOW = 303
-local BUMPED = 303 + 16777216
+local LOW = 19857409
+local BUMPED = LOW + 1
 local ENDPOINT = "127.0.0.1:27103"
 
 local function tables(): ({integer: string}, {string: integer})
     local endpoint_by_id: {integer: string} = {
-        [101] = "127.0.0.1:27101",
-        [202] = "127.0.0.1:27102",
-        [303] = ENDPOINT,
+        [6619137] = "127.0.0.1:27101",
+        [13238273] = "127.0.0.1:27102",
+        [LOW] = ENDPOINT,
     }
     local id_by_endpoint: {string: integer} = {
-        ["127.0.0.1:27101"] = 101,
-        ["127.0.0.1:27102"] = 202,
-        [ENDPOINT] = 303,
+        ["127.0.0.1:27101"] = 6619137,
+        ["127.0.0.1:27102"] = 13238273,
+        [ENDPOINT] = LOW,
     }
     return endpoint_by_id, id_by_endpoint
 end
 
 tested.test(
-    "the reincarnation remap adds the bumped id's row and keeps the old row",
+    "the reincarnation remap adds the next life's row and keeps the old row",
     function()
         local endpoint_by_id, id_by_endpoint = tables()
         local applied = transport.apply_reincarnation_remap(
@@ -29,7 +29,7 @@ tested.test(
         tested.assert(
             {
                 given = "a Reincarnation(old, new) pair from the old identity's socket",
-                should = "add the bumped id's row at the source endpoint and keep the old row",
+                should = "add the next life's row at the source endpoint and keep the old row",
                 expected = "applied=true|both-rows=true",
                 actual = "applied="
                     .. tostring(applied)
@@ -87,7 +87,7 @@ tested.test(
 )
 
 tested.test(
-    "the reincarnation remap refuses degenerate and low-band pairs",
+    "the reincarnation remap refuses pairs that are not a lawful next life",
     function()
         local endpoint_by_id, id_by_endpoint = tables()
         -- A degenerate pair (old == new) is not a bump.
@@ -103,7 +103,13 @@ tested.test(
                 ),
             }
         )
-        -- A bumped id outside the high band is not a bump product.
+        -- A new id that skips a life is not the next life.
+        assert(
+            not transport.apply_reincarnation_remap(
+                endpoint_by_id, id_by_endpoint, ENDPOINT, LOW, LOW + 2
+            )
+        )
+        -- An unlawful new id (a zero system half) is no identity.
         assert(
             not transport.apply_reincarnation_remap(
                 endpoint_by_id, id_by_endpoint, ENDPOINT, LOW, 404
@@ -112,7 +118,7 @@ tested.test(
         -- The old row is untouched by every refusal.
         assert(endpoint_by_id[LOW] == ENDPOINT)
         assert(endpoint_by_id[404] == nil)
-        assert(id_by_endpoint[ENDPOINT] == 303)
+        assert(id_by_endpoint[ENDPOINT] == 19857409)
     end
 )
 

@@ -136,13 +136,14 @@ fn spawn_cluster(dir: &Path) -> Vec<ServeProcess> {
     let bin = env!("CARGO_BIN_EXE_lease-sequencer");
     let mut descriptor = String::new();
     let mut ports = Vec::new();
-    for id in 1..=3 {
+    for id in 1..=3u32 {
         let peer = free_udp_port();
         let client = free_tcp_port();
         ports.push((peer, client));
         descriptor.push_str(&format!(
-            "{{\"id\":{id},\"name\":\"n{id}\",\"host\":\"127.0.0.1\",\"port\":{peer},\
-             \"genesis\":true}}\n"
+            "{{\"id\":{},\"name\":\"n{id}\",\"host\":\"127.0.0.1\",\"port\":{peer},\
+             \"genesis\":true}}\n",
+            (id << 16) | 1
         ));
     }
     let config_path = dir.join("cluster.jsonl");
@@ -470,11 +471,11 @@ fn clean_stop_case(signal_name: &str, stop_record: &str) {
     let boot_log = log_file(&rebooted);
     wait_log_contains(
         &boot_log,
-        "node provisioned own=1 incarnation=0",
+        "node provisioned own=65537 incarnation=1",
         Duration::from_secs(10),
     );
     assert!(
-        !log_contains(&boot_log, "later life in the high band"),
+        !log_contains(&boot_log, "later life of the same system"),
         "a clean-stop re-boot must NOT bump the identity"
     );
     send_signal(&rebooted, "TERM");
@@ -499,8 +500,8 @@ fn sigquit_drives_the_clean_stop_and_same_incarnation_reboot() {
 }
 
 /// The negative: SIGKILL skips the stop path entirely — the running
-/// sentinel stands and the next boot bumps the identity into the
-/// `>= 2^24` band (error-on-crashed), the documented crash shape.
+/// sentinel stands and the next boot announces the marker's next life
+/// (error-on-crashed), the documented crash shape.
 #[test]
 fn sigkill_leaves_the_running_sentinel_and_next_boot_bumps() {
     let _gate = gate_lock();
@@ -553,17 +554,16 @@ fn sigkill_leaves_the_running_sentinel_and_next_boot_bumps() {
     let boot_log = log_file(&rebooted);
     wait_log_contains(
         &boot_log,
-        "later life in the high band",
+        "later life of the same system",
         Duration::from_secs(30),
     );
     let bumped = assert_bumped_identity(&boot_log);
-    // The bumped life boots under its new identity; the marker round for
-    // the bump defers to the seated witness (the boot gate's
-    // crashed classification), so the identity evidence is the boot's
-    // own provisioned record.
+    // The bumped life boots under its new identity; the emission gate's
+    // round landed at the boot gate (before the announcement), so the
+    // identity evidence is the boot's own provisioned record.
     wait_log_contains(
         &boot_log,
-        &format!("node provisioned own={bumped} incarnation=1"),
+        &format!("node provisioned own={bumped} incarnation=2"),
         Duration::from_secs(30),
     );
     send_signal(&rebooted, "TERM");

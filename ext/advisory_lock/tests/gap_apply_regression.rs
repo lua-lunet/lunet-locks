@@ -100,7 +100,11 @@ fn a_gap_served_chunk_applies_its_whole_committed_range() {
 
     // The gap ruling at n2: the Prepare past the accepted frontier's
     // successor opens the fetch.
-    assert_eq!(n2.node.receive(65537, &held_prepare), OK, "the gap is named");
+    assert_eq!(
+        n2.node.receive(65537, &held_prepare),
+        OK,
+        "the gap is named"
+    );
     let fetch: Vec<(u32, Vec<u8>)> = drain_sends(&mut n2);
     assert!(!fetch.is_empty(), "the fetch rides the ruling");
     for (to, bytes) in &fetch {
@@ -139,7 +143,11 @@ fn a_gap_served_chunk_applies_its_whole_committed_range() {
         }
     }
     let next_prepare = next_prepare.expect("the rejoined member's Prepare");
-    assert_eq!(n2.node.receive(65537, &next_prepare), OK, "n2 accepts the tail");
+    assert_eq!(
+        n2.node.receive(65537, &next_prepare),
+        OK,
+        "n2 accepts the tail"
+    );
     let acks = drain_sends(&mut n2);
     assert!(!acks.is_empty(), "n2 acknowledges again");
 

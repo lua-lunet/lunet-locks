@@ -27,9 +27,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const BENCH_LOCK_ID: u64 = 0x0DDBA12;
 /// The poller client ids (disjoint from the embedded clients' base).
 const POLLER_CLIENT_BASE: u64 = 900_000;
-/// The leader-id band: the descriptor id is the low 24 bits of every
-/// live NodeId (the incarnation bump is the high band).
-const DESC_BAND: u32 = 0xFF_FFFF;
+/// The descriptor id of a live identity: the same system half at the
+/// genesis life — (system half << 16) | 1.
+fn descriptor_id(live: u32) -> u32 {
+    ((live >> 16) << 16) | 1
+}
 
 fn millis() -> u64 {
     SystemTime::now()
@@ -340,7 +342,7 @@ impl Driver {
                         .and_then(|token| token.parse().ok())
                         .unwrap_or(0);
                     if newest.is_none_or(|(best, _)| ts >= best) {
-                        newest = Some((ts, id & DESC_BAND));
+                        newest = Some((ts, descriptor_id(id)));
                     }
                 }
             }

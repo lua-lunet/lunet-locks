@@ -4,7 +4,7 @@
 -- reads transparently:
 --
 --   1. superblock files (`*.superblock`)
---   2. state files — the single-file `<incarnation> <state>` markers
+--   2. state files — the single-file `<system> <crash> <state>` markers
 --      (any file with a `.superblock` or `.membership` sibling, plus
 --      `*.state` files)
 --   3. flight-recorder tapes (`flight-*.jsonl`, rolled files included)

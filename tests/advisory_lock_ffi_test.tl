@@ -3,14 +3,14 @@ local cluster_config = require("cluster_config")
 local tested = require("tested")
 
 -- The sparse admin-assigned member ids, in descriptor (genesis succession)
--- order: 101 is the genesis primary.
-local MEMBER_IDS = {101, 202, 303}
+-- order: 6619137 is the genesis primary (system 101, the genesis life).
+local MEMBER_IDS = {6619137, 13238273, 19857409}
 
 local function members(): {cluster_config.ClusterNode}
     return cluster_config.parse_jsonl(
-        '{"id":101,"name":"n1","host":"127.0.0.1","port":27101,"genesis":true}\n'
-            .. '{"id":202,"name":"n2","host":"127.0.0.1","port":27102,"genesis":true}\n'
-            .. '{"id":303,"name":"n3","host":"127.0.0.1","port":27103,"genesis":true}\n'
+        '{"id":6619137,"name":"n1","host":"127.0.0.1","port":27101,"genesis":true}\n'
+            .. '{"id":13238273,"name":"n2","host":"127.0.0.1","port":27102,"genesis":true}\n'
+            .. '{"id":19857409,"name":"n3","host":"127.0.0.1","port":27103,"genesis":true}\n'
     )
 end
 
@@ -78,7 +78,7 @@ local function drain(nodes: {advisory_lock.Node})
 end
 
 -- A fresh three-node cluster brought to Normal: every node boots fenced;
--- the genesis primary (member id 101) self-promotes on a tick and the
+-- the genesis primary (member id 6619137) self-promotes on a tick and the
 -- Recovering backups adopt the view.
 -- Pass journal_dir="" and journal_roll_bytes=0 to disable journaling.
 local function boot_cluster(
@@ -132,8 +132,8 @@ tested.test(
         tested.assert(
             {
                 given = "three nodes booted over temp state files and pumped quiet",
-                should = "all reach normal in era 1 view 0 behind member id 101, each reporting its own descriptor identity",
-                expected = "normal:1:0:101:101:101:101|normal:1:0:101:101:202:202|normal:1:0:101:101:303:303",
+                should = "all reach normal in era 1 view 0 behind member id 6619137, each reporting its own descriptor identity",
+                expected = "normal:1:0:6619137:6619137:6619137:6619137|normal:1:0:6619137:6619137:13238273:13238273|normal:1:0:6619137:6619137:19857409:19857409",
                 actual = table.concat(summary, "|"),
             }
         )
@@ -310,9 +310,9 @@ tested.test(
     function()
         local nodes = boot_cluster("garbage", "", 0)
         local raised = pcall(
-            function() nodes[1]:receive(202, string.rep("\255", 64)) end
+            function() nodes[1]:receive(13238273, string.rep("\255", 64)) end
         )
-        local truncated = pcall(function() nodes[1]:receive(202, "\0\0\0\0") end)
+        local truncated = pcall(function() nodes[1]:receive(13238273, "\0\0\0\0") end)
         close_cluster(nodes)
         tested.assert(
             {
@@ -428,12 +428,15 @@ tested.test(
         -- The drain point closed the wire: every further inbound entry
         -- raises the mapped STOPPED error and processes nothing.
         local refused_request = pcall(function() nodes[1]:request(GET_JSON) end)
-        local refused_receive = pcall(function() nodes[1]:receive(202, "\0\0\0\0") end)
+        local refused_receive = pcall(
+            function() nodes[1]:receive(13238273, "\0\0\0\0") end
+        )
         local refused_idle = pcall(function() nodes[1]:idle() end)
         close_cluster(nodes)
-        -- The compatibility projection: "<incarnation> flushed" — the
-        -- marker advanced past `stopped` only because the drain completed.
-        -- A clean boot's incarnation is 0.
+        -- The compatibility projection: "<system> <crash> flushed" —
+        -- the marker advanced past `stopped` only because the drain
+        -- completed. A clean boot's life is the genesis one (crash
+        -- counter 1, system 101).
         local fh = io.open(paths[1], "r")
         local marker = (fh ~= nil and fh:read("a")) or ""
         if fh ~= nil then
@@ -443,7 +446,7 @@ tested.test(
             {
                 given = "a booted cluster whose leader is stopped through the graceful stop",
                 should = "refuse every further entry, stop idempotently, and leave the flushed marker",
-                expected = "true:true:false:false:false:0 flushed",
+                expected = "true:true:false:false:false:101 1 flushed",
                 actual = tostring(ok_stop)
                     .. ":"
                     .. tostring(ok_again)

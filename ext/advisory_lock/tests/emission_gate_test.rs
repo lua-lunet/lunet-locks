@@ -8,9 +8,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use lunet_advisory_lock::{Node, OK};
+use lunet_advisory_lock::Node;
 use lunet_locks_aof::marker as marker_ffi;
-use vrr::ids::{NodeId, SystemId, CrashCounter};
+use vrr::ids::{CrashCounter, NodeId, SystemId};
 
 fn workdir(name: &str) -> PathBuf {
     let unique = SystemTime::now()
@@ -31,9 +31,7 @@ fn members_string(systems: &[u16]) -> String {
     systems
         .iter()
         .enumerate()
-        .map(|(index, system)| {
-            format!("{}:n{}", ((*system as u32) << 16) | 1, index + 1)
-        })
+        .map(|(index, system)| format!("{}:n{}", ((*system as u32) << 16) | 1, index + 1))
         .collect::<Vec<_>>()
         .join("\0")
 }
@@ -101,7 +99,7 @@ fn a_failed_marker_write_at_the_crash_bump_emits_nothing() {
     let mut permissions = fs::metadata(&store_dir).expect("stat").permissions();
     permissions.set_mode(0o755);
     fs::set_permissions(&store_dir, permissions).expect("chmod");
-    let mut node = Node::open(&members, "n1", &state_str, None, 0).expect("the boot opens");
+    let node = Node::open(&members, "n1", &state_str, None, 0).expect("the boot opens");
     assert_eq!(node.own_id(), 65538, "the next life of the crashed pair");
     let classified =
         marker_ffi::classify(&store_dir.join("state.superblock")).expect("the marker reads");
@@ -116,7 +114,6 @@ fn a_failed_marker_write_at_the_crash_bump_emits_nothing() {
     );
     drop(node);
     let _ = fs::remove_dir_all(&dir);
-    let _ = OK;
 }
 
 /// A double crash never re-derives the same identity: two consecutive
@@ -136,7 +133,10 @@ fn a_double_crash_never_rederives_the_same_identity() {
     let second_boot = Node::open(&members, "n2", &state_str, None, 0).expect("second crash boot");
     let second = NodeId::from(second_boot.own_id());
     assert!(first.is_lawful(), "the first announced identity is lawful");
-    assert!(second.is_lawful(), "the second announced identity is lawful");
+    assert!(
+        second.is_lawful(),
+        "the second announced identity is lawful"
+    );
     assert_eq!(
         second,
         first.next_life().expect("the first life has a next"),
@@ -171,6 +171,9 @@ fn the_announced_identity_names_the_descriptor_system_and_the_markers_next_life(
         Some(6),
         "the crash half is the marker's next life"
     );
-    assert_eq!(announced, NodeId::new(SystemId::new(3).unwrap(), CrashCounter::new(6).unwrap()));
+    assert_eq!(
+        announced,
+        NodeId::new(SystemId::new(3).unwrap(), CrashCounter::new(6).unwrap())
+    );
     let _ = fs::remove_dir_all(&dir);
 }

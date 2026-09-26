@@ -266,10 +266,10 @@ local function last_expiry_of(rig: Rig, holder: integer): integer
     return expiry
 end
 
--- The live id may be a bumped (high-band) identity; the descriptor id
--- is the low band: id mod 2^24.
+-- The live id may be a later life of a member; the descriptor id is the
+-- same system half at the genesis life: (system half << 16) | 1.
 local function name_of(rig: Rig, id: integer): string
-    local desc = id % 16777216
+    local desc = (math.floor(id / 65536) * 65536) + 1
     for _, spec in ipairs(rig.specs) do
         if spec.id == desc then
             return spec.name
@@ -547,9 +547,9 @@ local function stability_body(root: string)
 
     for _, spec_line in ipairs(
         {
-            "4 dc1-node2 127.0.0.1:41104",
-            "5 dc2-node2 127.0.0.1:41105",
-            "6 dc3-node2 127.0.0.1:41106",
+            "262145 dc1-node2 127.0.0.1:41104",
+            "327681 dc2-node2 127.0.0.1:41105",
+            "393217 dc3-node2 127.0.0.1:41106",
         }
     ) do
         local id, name, endpoint = spec_line:match("^(%d+) (%S+) (%S+)")
@@ -561,14 +561,14 @@ local function stability_body(root: string)
         end
         print("join: id " .. id .. " (" .. name .. ") accepted")
     end
-    if drive_verb(rig, "increment", 4, "", "", 90000) == "" then
-        gate.fail("increment 4 not accepted within 90s")
+    if drive_verb(rig, "increment", 262145, "", "", 90000) == "" then
+        gate.fail("increment 262145 not accepted within 90000s")
     end
-    print("increment: id 4 accepted")
-    if drive_verb(rig, "increment", 5, "", "", 90000) == "" then
-        gate.fail("increment 5 not accepted within 90s")
+    print("increment: id 262145 accepted")
+    if drive_verb(rig, "increment", 327681, "", "", 90000) == "" then
+        gate.fail("increment 327681 not accepted within 90000s")
     end
-    print("increment: id 5 accepted (id 6 stays at weight 0)")
+    print("increment: id 327681 accepted (id 393217 stays at weight 0)")
 
     local before = total_renews(rig)
     wait_gate(
@@ -668,7 +668,7 @@ local function stability_body(root: string)
                     local ts = (tonumber(kv.ts) or 0) as integer
                     local own = (tonumber(kv.own) or 0) as integer
                     local inc = (tonumber(kv.incarnation) or 0) as integer
-                    if ts > kill_ts and inc >= 1 and own ~= hid % 16777216 then
+                    if ts > kill_ts and inc >= 2 and own ~= hid then
                         return true, tostring(own)
                     end
                 end
@@ -1046,7 +1046,7 @@ function M.acceptance(root: string): integer
             -- never by a verb.
             local drive_specs: {NodeSpec} = {}
             for _, spec in ipairs(rig.specs) do
-                if spec.id <= 6 then
+                if math.floor(spec.id / 65536) <= 6 then
                     drive_specs[#drive_specs + 1] = spec
                 end
             end
@@ -1064,9 +1064,9 @@ function M.acceptance(root: string): integer
             print("boot: genesis cluster stabilized")
 
             local join_specs = {
-                "4 dc1-node2 127.0.0.1:41104",
-                "5 dc2-node2 127.0.0.1:41105",
-                "6 dc3-node2 127.0.0.1:41106",
+                "262145 dc1-node2 127.0.0.1:41104",
+                "327681 dc2-node2 127.0.0.1:41105",
+                "393217 dc3-node2 127.0.0.1:41106",
             }
             for _, spec_line in ipairs(join_specs) do
                 local id, name, endpoint = spec_line:match("^(%d+) (%S+) (%S+)")
@@ -1081,15 +1081,15 @@ function M.acceptance(root: string): integer
                 print("join: id " .. id .. " (" .. name .. ") accepted")
                 clock.sleep(2)
             end
-            if drive_verb(rig, "increment", 4, "", "", 120000) == "" then
-                gate.fail("increment 4 not accepted within 120s")
+            if drive_verb(rig, "increment", 262145, "", "", 120000) == "" then
+                gate.fail("increment 262145 not accepted within 120s")
             end
-            print("increment: id 4 accepted")
+            print("increment: id 262145 accepted")
             clock.sleep(2)
-            if drive_verb(rig, "increment", 5, "", "", 120000) == "" then
-                gate.fail("increment 5 not accepted within 120s")
+            if drive_verb(rig, "increment", 327681, "", "", 120000) == "" then
+                gate.fail("increment 327681 not accepted within 120s")
             end
-            print("increment: id 5 accepted (id 6 stays at weight 0)")
+            print("increment: id 327681 accepted (id 393217 stays at weight 0)")
             clock.sleep(2)
 
             -- The live cluster is now at era 6 (five committed
@@ -1156,9 +1156,9 @@ function M.acceptance(root: string): integer
                 )
             end
             if not fs.read_all(sidecar_of(joiner)):find(
-                '"id":6,"weight":0', 1, true
+                '"id":393217,"weight":0', 1, true
             ) then
-                gate.fail("the adopted sidecar should carry the weight-0 learner id 6")
+                gate.fail("the adopted sidecar should carry the weight-0 learner id 393217")
             end
 
             -- The discovered addressing rows let the node address the live
@@ -1169,12 +1169,12 @@ function M.acceptance(root: string): integer
             end
 
             local reply_join7 = drive_verb(
-                rig, "join", 7, joiner, "127.0.0.1:41107", 120000
+                rig, "join", 458753, joiner, "127.0.0.1:41107", 120000
             )
             if reply_join7 == "" then
-                gate.fail("join 7 not accepted within 120s")
+                gate.fail("join 458753 not accepted within 120s")
             end
-            print("join: id 7 accepted (the fenced boot carried the join)")
+            print("join: id 458753 accepted (the fenced boot carried the join)")
             clock.sleep(2)
             wait_gate(
                 clock.now_ms() + 15000,
@@ -1185,10 +1185,10 @@ function M.acceptance(root: string): integer
                 end
             )
 
-            if drive_verb(rig, "increment", 7, "", "", 120000) == "" then
-                gate.fail("increment 7 not accepted within 120s")
+            if drive_verb(rig, "increment", 458753, "", "", 120000) == "" then
+                gate.fail("increment 458753 not accepted within 120s")
             end
-            print("increment: id 7 accepted")
+            print("increment: id 458753 accepted")
             clock.sleep(2)
             wait_gate(
                 clock.now_ms() + 15000,
@@ -1310,9 +1310,9 @@ function M.standby(root: string): integer
             -- the later eras.
             for _, spec_line in ipairs(
                 {
-                    "4 dc1-node2 127.0.0.1:41104",
-                    "5 dc2-node2 127.0.0.1:41105",
-                    "6 dc3-node2 127.0.0.1:41106",
+                    "262145 dc1-node2 127.0.0.1:41104",
+                    "327681 dc2-node2 127.0.0.1:41105",
+                    "393217 dc3-node2 127.0.0.1:41106",
                 }
             ) do
                 local id, name, endpoint = spec_line:match("^(%d+) (%S+) (%S+)")
@@ -1326,15 +1326,15 @@ function M.standby(root: string): integer
                 end
                 print("join: id " .. id .. " (" .. name .. ") accepted")
             end
-            if drive_verb(rig, "increment", 5, "", "", 90000) == "" then
-                gate.fail("increment 5 not accepted within 90s")
+            if drive_verb(rig, "increment", 327681, "", "", 90000) == "" then
+                gate.fail("increment 327681 not accepted within 90s")
             end
-            print("increment: id 5 accepted")
-            if drive_verb(rig, "increment", 6, "", "", 90000) == "" then
-                gate.fail("increment 6 not accepted within 90s")
+            print("increment: id 327681 accepted")
+            if drive_verb(rig, "increment", 393217, "", "", 90000) == "" then
+                gate.fail("increment 393217 not accepted within 90s")
             end
             print(
-                "increment: id 6 accepted ("
+                "increment: id 393217 accepted ("
                     .. standby_name
                     .. " stays at weight 0: the standby telemetry node)"
             )

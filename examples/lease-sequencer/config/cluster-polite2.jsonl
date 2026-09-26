@@ -1,4 +1,4 @@
-{"id":1,"name":"n1","host":"127.0.0.1","port":45201,"genesis":true}
-{"id":2,"name":"n2","host":"127.0.0.1","port":45202,"genesis":true}
-{"id":3,"name":"n3","host":"127.0.0.1","port":45203,"genesis":true}
-{"id":4,"name":"n4","host":"127.0.0.1","port":45204,"genesis":false}
+{"id":65537,"name":"n1","host":"127.0.0.1","port":45201,"genesis":true}
+{"id":131073,"name":"n2","host":"127.0.0.1","port":45202,"genesis":true}
+{"id":196609,"name":"n3","host":"127.0.0.1","port":45203,"genesis":true}
+{"id":262145,"name":"n4","host":"127.0.0.1","port":45204,"genesis":false}

@@ -361,17 +361,18 @@ fn a_boot_fenced_voter_must_adopt_or_emit_actionable_evidence() {
     let members = ["65537:n1", "131073:n2", "196609:n3"].join("\0");
     let mut fabric = Fabric {
         now: 0,
-        live: vec![1, 2, 3],
-        held: vec![3],
+        live: vec![65537, 131073, 196609],
+        held: vec![196609],
         post_heal: false,
         gossips: 0,
-        hosts: [1usize, 2, 3]
+        hosts: [65537u32, 131073, 196609]
             .iter()
-            .map(|id| Host {
+            .enumerate()
+            .map(|(index, id)| Host {
                 node: Node::open(
                     &members,
-                    &format!("n{id}"),
-                    &format!("{ROOT}/n{id}.state"),
+                    &format!("n{}", index + 1),
+                    &format!("{ROOT}/n{}.state", index + 1),
                     None,
                     0,
                 )
@@ -380,7 +381,7 @@ fn a_boot_fenced_voter_must_adopt_or_emit_actionable_evidence() {
                 last_poll: 0,
                 last_commit_ms: 0,
                 last_gossip: 0,
-                serving: *id != 3,
+                serving: *id != 196609,
                 request_num: 0,
                 received: 0,
                 emitted: 0,
@@ -579,7 +580,7 @@ fn a_boot_fenced_voter_must_adopt_or_emit_actionable_evidence() {
         }) && fabric
             .hosts
             .iter()
-            .filter(|h| h.own() != 3)
+            .filter(|h| h.own() != 196609)
             .all(|h| h.last_commit_ms >= fabric.now - POLL_MS * 2)
         {
             committed = true;

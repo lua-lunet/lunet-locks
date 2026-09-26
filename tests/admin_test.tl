@@ -9,22 +9,22 @@ tested.test(
         local join_valid, join = admin.decode_verb(
             '{"action":"join","message_id":"'
                 .. UUID
-                .. '","id":400,"name":"n4","endpoint":"127.0.0.1:7004"}'
+                .. '","id":26476545,"name":"n4","endpoint":"127.0.0.1:7004"}'
         )
         local increment_valid, increment = admin.decode_verb(
-            '{"action":"increment","message_id":"' .. UUID .. '","id":400}'
+            '{"action":"increment","message_id":"' .. UUID .. '","id":26476545}'
         )
         local decrement_valid, decrement = admin.decode_verb(
-            '{"action":"decrement","message_id":"' .. UUID .. '","id":400}'
+            '{"action":"decrement","message_id":"' .. UUID .. '","id":26476545}'
         )
         local leave_valid, leave = admin.decode_verb(
-            '{"action":"leave","message_id":"' .. UUID .. '","id":400}'
+            '{"action":"leave","message_id":"' .. UUID .. '","id":26476545}'
         )
         tested.assert(
             {
                 given = "one well-formed verb per membership change",
                 should = "decode each with its typed fields",
-                expected = "join:400:n4:127.0.0.1:7004|increment:400|decrement:400|leave:400",
+                expected = "join:26476545:n4:127.0.0.1:7004|increment:26476545|decrement:26476545|leave:26476545",
                 actual = join.action
                     .. ":"
                     .. tostring(join.id)
@@ -104,7 +104,7 @@ tested.test(
         end
         table.insert(
             checks,
-            refuses('{"action":"resize","message_id":"' .. UUID .. '","id":400}')
+            refuses('{"action":"resize","message_id":"' .. UUID .. '","id":26476545}')
         )
         table.insert(
             checks, refuses('{"action":"join","message_id":"' .. UUID .. '","id":-1}')
@@ -113,7 +113,9 @@ tested.test(
             checks,
             refuses('{"action":"join","message_id":"' .. UUID .. '","id":4294967295}')
         )
-        table.insert(checks, refuses('{"action":"join","message_id":"nope","id":400}'))
+        table.insert(
+            checks, refuses('{"action":"join","message_id":"nope","id":26476545}')
+        )
         table.insert(
             checks,
             refuses('{"action":"decrement","message_id":"' .. UUID .. '","id":x}')
@@ -123,7 +125,7 @@ tested.test(
             refuses(
                 '{"action":"join","message_id":"'
                     .. UUID
-                    .. '","id":400,"name":"n4","endpoint":"localhost:7004"}'
+                    .. '","id":26476545,"name":"n4","endpoint":"localhost:7004"}'
             )
         )
         table.insert(
@@ -131,13 +133,15 @@ tested.test(
             refuses(
                 '{"action":"join","message_id":"'
                     .. UUID
-                    .. '","id":400,"name":"n4!","endpoint":"127.0.0.1:7004"}'
+                    .. '","id":26476545,"name":"n4!","endpoint":"127.0.0.1:7004"}'
             )
         )
         table.insert(
             checks,
             refuses(
-                '{"action":"join","message_id":"' .. UUID .. '","id":400,"name":"n4"}'
+                '{"action":"join","message_id":"'
+                    .. UUID
+                    .. '","id":26476545,"name":"n4"}'
             )
         )
         local all_refused = true
@@ -182,15 +186,15 @@ tested.test(
 tested.test(
     "admin frames the join and leave broadcasts and decodes them losslessly",
     function()
-        local join = admin.encode_join(400, "n4", "127.0.0.1:7004")
+        local join = admin.encode_join(26476545, "n4", "127.0.0.1:7004")
         local change_valid, change = admin.decode_change(join)
-        local leave = admin.encode_leave(400)
+        local leave = admin.encode_leave(26476545)
         local leave_valid, leave_change = admin.decode_change(leave)
         tested.assert(
             {
                 given = "one ADMIN payload per endpoint-moving membership change",
                 should = "decode each with its typed change; the leave carries only the id",
-                expected = "true:join:400:n4:127.0.0.1:7004:true:leave:400:",
+                expected = "true:join:26476545:n4:127.0.0.1:7004:true:leave:26476545:",
                 actual = tostring(change_valid)
                     .. ":"
                     .. change.kind
@@ -242,15 +246,15 @@ tested.test(
 tested.test(
     "admin builds the operator acknowledgment with its acceptance fact",
     function()
-        local accepted = admin.encode_ack("join", 400)
-        local accepted_decrement = admin.encode_ack("decrement", 400)
-        local rejected_json = '{"action":"leave","id":400,"accepted":false}'
+        local accepted = admin.encode_ack("join", 26476545)
+        local accepted_decrement = admin.encode_ack("decrement", 26476545)
+        local rejected_json = '{"action":"leave","id":26476545,"accepted":false}'
         tested.assert(
             {
                 given = "an accepted join, an accepted decrement and the documented rejected-verb shape",
                 should = "encode the ack with the action, the id and the acceptance fact",
-                expected = 'true:{"action":"join","id":400,"accepted":true}:{"action":"decrement","id":400,"accepted":true}',
-                actual = tostring(admin.encode_ack("join", 400) == accepted)
+                expected = 'true:{"action":"join","id":26476545,"accepted":true}:{"action":"decrement","id":26476545,"accepted":true}',
+                actual = tostring(admin.encode_ack("join", 26476545) == accepted)
                     .. ":"
                     .. accepted
                     .. ":"
@@ -268,8 +272,8 @@ tested.test(
             {
                 given = "a verb whose establishing commit did not land within the client deadline",
                 should = "refuse it with a reason, never accept uncommitted state",
-                expected = '{"action":"decrement","id":400,"accepted":false,"reason":"deadline"}',
-                actual = admin.encode_deadline_ack("decrement", 400),
+                expected = '{"action":"decrement","id":26476545,"accepted":false,"reason":"deadline"}',
+                actual = admin.encode_deadline_ack("decrement", 26476545),
             }
         )
     end
@@ -279,7 +283,7 @@ tested.test(
     "the dedup cache drives a verb once and replays the first outcome for duplicates",
     function()
         local cache = admin.new_cache(8)
-        local accepted_ack = '{"action":"decrement","id":400,"accepted":true}'
+        local accepted_ack = '{"action":"decrement","id":26476545,"accepted":true}'
         local states = cache:seen(UUID) .. ":" .. tostring(cache:claim(UUID))
         local duplicate_while_in_flight = cache:seen(UUID)
         cache:settle(UUID, accepted_ack)
@@ -287,7 +291,7 @@ tested.test(
         local replayed, ack = cache:replay(UUID)
         -- A late settle (a duplicate drive's refusal) never overwrites the
         -- first outcome.
-        cache:settle(UUID, '{"action":"decrement","id":400,"accepted":false}')
+        cache:settle(UUID, '{"action":"decrement","id":26476545,"accepted":false}')
         local replayed_again, ack_again = cache:replay(UUID)
         tested.assert(
             {
@@ -319,7 +323,7 @@ tested.test(
     "a re-driven committed verb returns the ORIGINAL ack, not a fresh refusal",
     function()
         local cache = admin.new_cache(8)
-        local original = '{"action":"increment","id":404,"accepted":true}'
+        local original = '{"action":"increment","id":26476545,"accepted":true}'
         cache:claim(UUID)
         cache:settle(UUID, original)
         -- The re-drive reaches the cache settled: it replays the original
@@ -345,14 +349,14 @@ tested.test(
         cache:release(UUID)
         local released_state = cache:seen(UUID)
         local reclaimed = cache:claim(UUID)
-        cache:settle(UUID, '{"action":"join","id":404,"accepted":true}')
+        cache:settle(UUID, '{"action":"join","id":26476545,"accepted":true}')
         cache:release(UUID)
         local replayed, ack = cache:replay(UUID)
         tested.assert(
             {
                 given = "a NotPrimary drive (claim released) and then a settled outcome on the reclaimed claim",
                 should = "allow the fresh drive after release and keep the settled ack after a settled release",
-                expected = "new:true:true:{\"action\":\"join\",\"id\":404,\"accepted\":true}",
+                expected = "new:true:true:{\"action\":\"join\",\"id\":26476545,\"accepted\":true}",
                 actual = released_state
                     .. ":"
                     .. tostring(reclaimed)

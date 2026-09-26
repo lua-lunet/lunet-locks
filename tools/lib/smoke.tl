@@ -28,10 +28,10 @@ end
 -- admin verbs below.
 local CLUSTER_JSONL = table.concat(
     {
-        '{"id":101,"name":"n1","host":"127.0.0.1","port":27101,"genesis":true}',
-        '{"id":202,"name":"n2","host":"127.0.0.1","port":27102,"genesis":true}',
-        '{"id":303,"name":"n3","host":"127.0.0.1","port":27103,"genesis":true}',
-        '{"id":404,"name":"n4","host":"127.0.0.1","port":27104,"genesis":false}',
+        '{"id":6619137,"name":"n1","host":"127.0.0.1","port":27101,"genesis":true}',
+        '{"id":13238273,"name":"n2","host":"127.0.0.1","port":27102,"genesis":true}',
+        '{"id":19857409,"name":"n3","host":"127.0.0.1","port":27103,"genesis":true}',
+        '{"id":26476545,"name":"n4","host":"127.0.0.1","port":27104,"genesis":false}',
     },
     "\n"
 ) .. "\n"
@@ -441,7 +441,7 @@ function M.main(root: string, _argv: {string}): integer
             work,
             28101,
             "join",
-            '{"action":"join","message_id":"%s","id":404,"name":"n4","endpoint":"127.0.0.1:27104"}',
+            '{"action":"join","message_id":"%s","id":26476545,"name":"n4","endpoint":"127.0.0.1:27104"}',
             "a"
         )
         local _join_ok = join_ok -- observational stage; the stream is the record
@@ -456,7 +456,7 @@ function M.main(root: string, _argv: {string}): integer
             work,
             28101,
             "increment",
-            '{"action":"increment","message_id":"%s","id":404}',
+            '{"action":"increment","message_id":"%s","id":26476545}',
             "b"
         )
         local _inc_ok = inc_ok
@@ -471,7 +471,7 @@ function M.main(root: string, _argv: {string}): integer
             work,
             28101,
             "decrement",
-            '{"action":"decrement","message_id":"%s","id":404}',
+            '{"action":"decrement","message_id":"%s","id":26476545}',
             "c"
         )
         local _dec_ok = dec_ok
@@ -483,7 +483,7 @@ function M.main(root: string, _argv: {string}): integer
         clock.sleep(2)
 
         local leave_ok = drive_admin(
-            work, 28101, "leave", '{"action":"leave","message_id":"%s","id":404}', "d"
+            work, 28101, "leave", '{"action":"leave","message_id":"%s","id":26476545}', "d"
         )
         local _leave_ok = leave_ok
         local leave_start_raw = fs.read_all(fs.join(work, "leave.start"))

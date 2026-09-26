@@ -203,14 +203,15 @@ fn leader_kill_restart_converges_through_the_limbos_poll() {
     let members = ["65537:n1", "131073:n2", "196609:n3"].join("\0");
     let mut fabric = Fabric {
         now: 0,
-        live: vec![1, 2, 3],
-        hosts: [1usize, 2, 3]
+        live: vec![65537, 131073, 196609],
+        hosts: [65537u32, 131073, 196609]
             .iter()
-            .map(|id| Host {
+            .enumerate()
+            .map(|(index, id)| Host {
                 node: Node::open(
                     &members,
-                    &format!("n{id}"),
-                    &format!("{ROOT}/n{id}.state"),
+                    &format!("n{}", index + 1),
+                    &format!("{ROOT}/n{}.state", index + 1),
                     None,
                     0,
                 )
@@ -254,7 +255,7 @@ fn leader_kill_restart_converges_through_the_limbos_poll() {
 
     // P2: TERM the leader (a clean stop — the marker ends `flushed`),
     // restart it on the same boot line.
-    let killed_id = leader as u32 + 1;
+    let killed_id = fabric.hosts[leader].own();
     let _ = fabric.hosts[leader].node.stop();
     fabric.live.retain(|&id| id != killed_id);
     let fresh = Node::open(

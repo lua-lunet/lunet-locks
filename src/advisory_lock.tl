@@ -269,9 +269,10 @@ function Node:abdicate(): boolean, string
     return check(rc)
 end
 
--- The node's live identity: the descriptor id at incarnation 0, the bumped
--- high-band id after a dirty restart. The host compares leaders against it
--- — after a bump the descriptor row still names the superseded id.
+-- The node's live identity: the provisioned identity (the descriptor's
+-- packed pair) at the genesis life, the marker's next life after a
+-- dirty restart. The host compares leaders against it — after a bump
+-- the descriptor row still names the superseded life.
 function Node:own_id(): integer
     check(
         (tonumber(native.lunet_lock_node_own_id(self._handle, self._leader)) or -127)

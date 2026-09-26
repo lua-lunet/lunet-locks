@@ -4,27 +4,18 @@
 -- like a log, not a blob.
 --
 -- Contract:
--- - Every entry's `id` is the replica's live `NodeId` on the ABI and in peer
---   routing; `config.tl`'s `members()` derives membership from this
---   descriptor, and `server.tl` maps ids to endpoints through it. Ids are
+-- - Every entry's `id` is the replica's PROVISIONED identity: the packed
+--   pair (system half, crash counter 1) — the sysadmin-assigned system
+--   identifier in the high sixteen bits, the genesis life's crash
+--   counter in the low sixteen. The member's marker (the durable
+--   NodeIdentity pair) carries the life from there: a restarted process
+--   bumps its crash counter and announces the next life's packed id —
+--   the same system half, never a descriptor alias. Ids are
 --   admin-assigned, sparse, and never recycled across deployments: a
---   recycled id would alias a superseded incarnation's identity. Sparse and
---   never-recycled ids remain an operator invariant this module cannot
---   enforce across runs (no persistent id allocator); it only rejects
---   in-file duplicate ids and duplicate names.
--- - The descriptor lists INCARNATION-0 ids: every entry's id is the
---   identity the member's first process runs under. A restarted process
---   reincarnates (the core's Crash-Stop-Self-Evict protocol): its durable
---   state file bumps an incarnation counter k and the process derives its
---   fresh identity as `incarnation-0 id + k * 16777216` — a high-band id
---   that never appears in this file and can never alias a descriptor id,
---   because the whole descriptor space is the low band. The bump
---   arithmetic stays inside u32 and dodges the reserved LEADER_UNKNOWN
---   value `4294967295` by construction: incarnation-0 ids are bounded to
---   `[0, 16777214]` here (id 16777215 is rejected — at incarnation 255 it
---   would derive exactly the reserved value), and the bump refuses at
---   incarnation 255 instead of wrapping a superseded identity into
---   circulation.
+--   recycled system half would alias a superseded identity. Sparse and
+--   never-recycled system halves remain an operator invariant this
+--   module cannot enforce across runs (no persistent id allocator); it
+--   only rejects in-file duplicate ids and duplicate names.
 -- - The `genesis` field marks the deployment's founding membership. The
 --   genesis lines (in line order) are the explicit genesis succession
 --   sequence the core folds as the founding configuration
@@ -108,13 +99,17 @@ local function parse_line(line: string, line_no: integer): ClusterNode
     local port = tonumber(port_text) as integer
     assert(id >= 0, "cluster_config: line " .. tostring(line_no) .. " id must be >= 0")
     assert(
-        id <= 16777214,
+        math.floor(id / 65536) >= 1,
         "cluster_config: line "
             .. tostring(line_no)
-            .. " id must be an incarnation-0 id in [0, 16777214]: a restarted process's"
-            .. " bumped identity is id + incarnation * 16777216 in the high band, and id"
-            .. " 16777215 at incarnation 255 would derive the reserved LEADER_UNKNOWN value"
-            .. " 4294967295"
+            .. " id must carry a non-zero system half (the packed pair's high sixteen bits)"
+    )
+    assert(
+        id % 65536 == 1,
+        "cluster_config: line "
+            .. tostring(line_no)
+            .. " id must be the provisioned identity (system half << 16) | 1: the descriptor"
+            .. " names the genesis life, the marker's crash counter carries the life from there"
     )
     assert(
         name_text:match("^[%w_-]+$") ~= nil,

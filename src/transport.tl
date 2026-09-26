@@ -125,12 +125,6 @@ local function valid_not_leader(
     return expected_source >= 0 and actual_source == expected_source
 end
 
--- The identity band where every bumped (reincarnated) id lives: the
--- k-th incarnation's id is `descriptor-id + k * 2^24`, so a bumped id is
--- at least 2^24 and can never alias a descriptor id (the low band is the
--- whole descriptor space).
-local REINCARNATION_ID_BAND = 16777216
-
 -- The `Reincarnation` announcement's header tag and body discriminant:
 -- the discriminant mirrors the tag and is written before the body fields.
 local REINCARNATION_TAG = 13
@@ -141,6 +135,13 @@ local REINCARNATION_TAG = 13
 -- u64 — 45 bytes. Refused by shape: a wrong tag, a wrong discriminant, a
 -- truncation, and an over-length datagram are all not announcements.
 local REINCARNATION_BYTES = 45
+
+-- A lawful identity: the packed pair (system half, crash counter half),
+-- both halves non-zero — the identity law's packing, mirrored here
+-- (uvrr-core `ids.rs`): MSB system, LSB crash counter.
+local function is_lawful(id: integer): boolean
+    return id >= 1 and id <= MAX_U32 and math.floor(id / 65536) >= 1 and id % 65536 ~= 0
+end
 
 -- The (old, new) identity pair inside a `Reincarnation` announcement:
 -- the first return is true only for the exact frame the core packs, and
@@ -160,7 +161,7 @@ local function reincarnation_pair(payload: string): (boolean, integer, integer)
 end
 
 -- The reincarnation remap over the live addressing tables (the restarted
--- replica's entry ticket): the row for the bumped id is ADDED at the
+-- replica's entry ticket): the row for the new identity is ADDED at the
 -- source endpoint and the source socket is attributed to the new identity
 -- from here on; the OLD id's row STAYS. The old identity is still named
 -- by the serving configuration every peer's core folded — its send
@@ -170,7 +171,10 @@ end
 -- steps evict the old identity from the serving configuration, and after
 -- that eviction the core addresses nothing to it. Applied exactly once
 -- per (old, new) pair: a second announcement of the same pair is a
--- no-op, and a bumped id that already has a row is refused.
+-- no-op, and an id that already has a row is refused. The remap law:
+-- both ids are lawful identities and `new` is `old`'s next life (same
+-- system half, crash counter + 1) — the core's `NodeId::next_life`,
+-- mirrored in arithmetic.
 local function apply_reincarnation_remap(
     endpoint_by_id: {integer: string},
     id_by_endpoint: {string: integer},
@@ -178,7 +182,12 @@ local function apply_reincarnation_remap(
     old: integer,
     new: integer
 ): boolean
-    if old == new or new < REINCARNATION_ID_BAND or endpoint_by_id[new] ~= nil then
+    if
+        new ~= old + 1
+        or not is_lawful(old)
+        or not is_lawful(new)
+        or endpoint_by_id[new] ~= nil
+    then
         return false
     end
     endpoint_by_id[new] = source_endpoint

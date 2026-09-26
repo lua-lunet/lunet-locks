@@ -61,11 +61,11 @@ plus the existing TCP admin verbs:
   path — the wire closes, `Stopping` commits, the sink drains, `Stopped`
   commits, all over the store RPC — then boots again in the same
   process: the boot-read is answered flushed and the node resumes under
-  the same incarnation. The transport survives; the adapter does not.
+  the same identity. The transport survives; the adapter does not.
 - **SIGUSR2 — the dirty cycle, in-process.** The node drops the adapter
   without the stop path — no marker round — and boots again: the
   boot-read is answered with the running sentinel, the classification is
-  crashed, and the node reincarnates under a bumped identity.
+  crashed, and the node reincarnates under the marker's next life.
 - **SIGTERM — the clean swap.** The same clean stop path, then the
   process exits; the driver spawns the replacement, whose boot-read is
   answered from the driver's memory — the state outlives the process
@@ -117,7 +117,7 @@ A bench run is a fixed ladder with the client load always on:
 2. **Abdicate + clean cycle** — the leader abdicates; failover is
    measured; the old leader takes a SIGUSR1 cycle.
 3. **Clean swap** — a non-leader is SIGTERMed and respawned; it resumes
-   under the same incarnation.
+   under the same identity.
 4. **Crash swap** — a non-leader is SIGKILLed and respawned; it
    reincarnates bumped.
 5. **Abdicate + leader swap** — the leader abdicates, is confirmed

@@ -20,9 +20,9 @@ end
 
 local function three(): {snapshot.SnapshotMember}
     return {
-        member(101, 1, "127.0.0.1:27101"),
-        member(202, 1, "127.0.0.1:27102"),
-        member(303, 1, "127.0.0.1:27103"),
+        member(6619137, 1, "127.0.0.1:27101"),
+        member(13238273, 1, "127.0.0.1:27102"),
+        member(19857409, 1, "127.0.0.1:27103"),
     }
 end
 
@@ -62,7 +62,7 @@ tested.test(
             {
                 given = "an era-5, slot-chosen-at-4096 membership snapshot",
                 should = "round-trip through the strict binary shape",
-                expected = "era=5|slot=42|members=3|first=101:1:127.0.0.1:27101",
+                expected = "era=5|slot=42|members=3|first=6619137:1:127.0.0.1:27101",
                 actual = "era="
                     .. tostring(decoded.era)
                     .. "|slot="
@@ -149,9 +149,9 @@ tested.test(
         assert(not snapshot.agreeing(a, shape(3, 13, three())))
         assert(not snapshot.agreeing(a, shape(4, 12, three())))
         local changed = {
-            member(101, 1, "127.0.0.1:27101"),
-            member(202, 1, "127.0.0.1:27102"),
-            member(303, 0, "127.0.0.1:27103"),
+            member(6619137, 1, "127.0.0.1:27101"),
+            member(13238273, 1, "127.0.0.1:27102"),
+            member(19857409, 0, "127.0.0.1:27103"),
         }
         tested.assert(
             {
@@ -233,10 +233,10 @@ tested.test(
     "the descriptor builds the boot membership model over the genesis lines",
     function()
         local nodes = cluster_config.parse_jsonl(
-            '{"id":101,"name":"n1","host":"127.0.0.1","port":27101,"genesis":true}\n'
-                .. '{"id":202,"name":"n2","host":"127.0.0.1","port":27102,"genesis":true}\n'
-                .. '{"id":303,"name":"n3","host":"127.0.0.1","port":27103,"genesis":true}\n'
-                .. '{"id":404,"name":"n4","host":"127.0.0.1","port":27104,"genesis":false}\n'
+            '{"id":6619137,"name":"n1","host":"127.0.0.1","port":27101,"genesis":true}\n'
+                .. '{"id":13238273,"name":"n2","host":"127.0.0.1","port":27102,"genesis":true}\n'
+                .. '{"id":19857409,"name":"n3","host":"127.0.0.1","port":27103,"genesis":true}\n'
+                .. '{"id":26476545,"name":"n4","host":"127.0.0.1","port":27104,"genesis":false}\n'
         )
         local model = snapshot.descriptor_model(nodes)
         tested.assert(
@@ -251,7 +251,7 @@ tested.test(
                     .. "|members="
                     .. tostring(#model.members)
                     .. "|joiner-weight="
-                    .. tostring(snapshot.member_weight(model.members, 404)),
+                    .. tostring(snapshot.member_weight(model.members, 26476545)),
             }
         )
         assert(model.era == 1 and model.slot == 0 and #model.members == 3)
@@ -263,40 +263,44 @@ tested.test(
     function()
         local model = three()
         local join_ok, joined = snapshot.apply_change(
-            model, "join", 404, "127.0.0.1:27104"
+            model, "join", 26476545, "127.0.0.1:27104"
         )
         assert(join_ok and #joined == 4)
-        assert(snapshot.member_weight(joined, 404) == 0)
+        assert(snapshot.member_weight(joined, 26476545) == 0)
         -- A join of an existing member is refused untouched.
-        local join_dup, same = snapshot.apply_change(joined, "join", 404, "127.0.0.1:9")
-        assert(not join_dup and same == joined)
-        local inc_ok, incremented = snapshot.apply_change(joined, "increment", 404, "")
-        assert(inc_ok and snapshot.member_weight(incremented, 404) == 1)
-        local dec_ok, decremented = snapshot.apply_change(
-            incremented, "decrement", 404, ""
+        local join_dup, same = snapshot.apply_change(
+            joined, "join", 26476545, "127.0.0.1:9"
         )
-        assert(dec_ok and snapshot.member_weight(decremented, 404) == 0)
-        local _, left = snapshot.apply_change(decremented, "leave", 404, "")
+        assert(not join_dup and same == joined)
+        local inc_ok, incremented = snapshot.apply_change(
+            joined, "increment", 26476545, ""
+        )
+        assert(inc_ok and snapshot.member_weight(incremented, 26476545) == 1)
+        local dec_ok, decremented = snapshot.apply_change(
+            incremented, "decrement", 26476545, ""
+        )
+        assert(dec_ok and snapshot.member_weight(decremented, 26476545) == 0)
+        local _, left = snapshot.apply_change(decremented, "leave", 26476545, "")
         tested.assert(
             {
                 given = "the full join/increment/decrement/leave sequence",
                 should = "move the model additively and remove the departed member",
                 expected = "join-w0|increment-w1|decrement-w0|leave-true|canonical=true",
                 actual = "join-w"
-                    .. tostring(snapshot.member_weight(joined, 404))
+                    .. tostring(snapshot.member_weight(joined, 26476545))
                     .. "|increment-w"
-                    .. tostring(snapshot.member_weight(incremented, 404))
+                    .. tostring(snapshot.member_weight(incremented, 26476545))
                     .. "|decrement-w"
-                    .. tostring(snapshot.member_weight(decremented, 404))
+                    .. tostring(snapshot.member_weight(decremented, 26476545))
                     .. "|leave-"
-                    .. tostring(snapshot.member_weight(left, 404) == -1)
+                    .. tostring(snapshot.member_weight(left, 26476545) == -1)
                     .. "|canonical="
-                    .. tostring(left[1].id == 101 and left[3].id == 303),
+                    .. tostring(left[1].id == 6619137 and left[3].id == 19857409),
             }
         )
         -- A leave of an absent member and an unknown action are refused.
-        assert(not snapshot.apply_change(left, "leave", 404, ""))
-        assert(not snapshot.apply_change(left, "resign", 404, ""))
+        assert(not snapshot.apply_change(left, "leave", 26476545, ""))
+        assert(not snapshot.apply_change(left, "resign", 26476545, ""))
     end
 )
 

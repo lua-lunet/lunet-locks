@@ -176,11 +176,12 @@ fn clean_restart_while_the_cluster_advances_converges() {
         live: vec![65537, 131073, 196609],
         hosts: [65537u32, 131073, 196609]
             .iter()
-            .map(|id| Host {
+            .enumerate()
+            .map(|(index, id)| Host {
                 node: Node::open(
                     &members,
-                    &format!("n{id}"),
-                    &format!("{ROOT}/n{id}.state"),
+                    &format!("n{}", index + 1),
+                    &format!("{ROOT}/n{}.state", index + 1),
                     None,
                     0,
                 )

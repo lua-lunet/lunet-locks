@@ -12,8 +12,8 @@ tested.test(
         local text = [[
 # comment lines and blank lines are ignored
 
-{"id":0,"name":"n1","host":"127.0.0.1","port":7001,"genesis":true}
-{"id":7,"name":"n2","host":"127.0.0.1","port":7002,"genesis":true}
+{"id":65537,"name":"n1","host":"127.0.0.1","port":7001,"genesis":true}
+{"id":458753,"name":"n2","host":"127.0.0.1","port":7002,"genesis":true}
 ]]
         local nodes = cluster_config.parse_jsonl(text)
         local roundtrip = cluster_config.parse_jsonl(cluster_config.encode_jsonl(nodes))
@@ -21,7 +21,7 @@ tested.test(
             {
                 given = "a sparse, comment-and-blank-line-tolerant JSONL descriptor",
                 should = "parse both nodes with their admin-chosen ids and round-trip losslessly",
-                expected = "0:n1:7001:true|7:n2:7002:true",
+                expected = "65537:n1:7001:true|458753:n2:7002:true",
                 actual = tostring(roundtrip[1].id)
                     .. ":"
                     .. roundtrip[1].name
@@ -46,15 +46,15 @@ tested.test(
     "cluster_config preserves line order: the genesis lines are the explicit succession",
     function()
         local nodes = cluster_config.parse_jsonl(
-            '{"id":300,"name":"n1","host":"127.0.0.1","port":7001,"genesis":true}\n'
-                .. '{"id":100,"name":"n2","host":"127.0.0.1","port":7002,"genesis":true}\n'
-                .. '{"id":200,"name":"n3","host":"127.0.0.1","port":7003,"genesis":true}\n'
+            '{"id":19660801,"name":"n1","host":"127.0.0.1","port":7001,"genesis":true}\n'
+                .. '{"id":6553601,"name":"n2","host":"127.0.0.1","port":7002,"genesis":true}\n'
+                .. '{"id":13107201,"name":"n3","host":"127.0.0.1","port":7003,"genesis":true}\n'
         )
         tested.assert(
             {
                 given = "a descriptor whose line order differs from id and name order",
                 should = "keep line order verbatim: the core folds it as the genesis member order (primary(v) = order[v mod N])",
-                expected = "300|100|200",
+                expected = "19660801|6553601|13107201",
                 actual = tostring(nodes[1].id)
                     .. "|"
                     .. tostring(nodes[2].id)
@@ -71,8 +71,8 @@ tested.test(
         local duplicate_id = fails(
             function(): boolean
                 cluster_config.parse_jsonl(
-                    '{"id":0,"name":"n1","host":"127.0.0.1","port":7001,"genesis":true}\n'
-                        .. '{"id":0,"name":"n2","host":"127.0.0.1","port":7002,"genesis":true}\n'
+                    '{"id":65537,"name":"n1","host":"127.0.0.1","port":7001,"genesis":true}\n'
+                        .. '{"id":65537,"name":"n2","host":"127.0.0.1","port":7002,"genesis":true}\n'
                 )
                 return true
             end
@@ -80,8 +80,8 @@ tested.test(
         local duplicate_name = fails(
             function(): boolean
                 cluster_config.parse_jsonl(
-                    '{"id":0,"name":"n1","host":"127.0.0.1","port":7001,"genesis":true}\n'
-                        .. '{"id":1,"name":"n1","host":"127.0.0.1","port":7002,"genesis":true}\n'
+                    '{"id":65537,"name":"n1","host":"127.0.0.1","port":7001,"genesis":true}\n'
+                        .. '{"id":131073,"name":"n1","host":"127.0.0.1","port":7002,"genesis":true}\n'
                 )
                 return true
             end
@@ -89,7 +89,7 @@ tested.test(
         local bad_host = fails(
             function(): boolean
                 cluster_config.parse_jsonl(
-                    '{"id":0,"name":"n1","host":"localhost","port":7001,"genesis":true}\n'
+                    '{"id":65537,"name":"n1","host":"localhost","port":7001,"genesis":true}\n'
                 )
                 return true
             end
@@ -109,20 +109,28 @@ tested.test(
 )
 
 tested.test(
-    "cluster_config ids are incarnation-0 ids in the low band the bump arithmetic reserves around",
+    "cluster_config ids are the provisioned identities: (system half << 16) | 1",
     function()
-        local reserved_derivation = fails(
+        local zero_system_half = fails(
             function(): boolean
                 cluster_config.parse_jsonl(
-                    '{"id":16777215,"name":"n1","host":"127.0.0.1","port":7001,"genesis":true}\n'
+                    '{"id":1,"name":"n1","host":"127.0.0.1","port":7001,"genesis":true}\n'
                 )
                 return true
             end
         )
-        local high_band = fails(
+        local zero_crash_half = fails(
             function(): boolean
                 cluster_config.parse_jsonl(
-                    '{"id":16777216,"name":"n1","host":"127.0.0.1","port":7001,"genesis":true}\n'
+                    '{"id":65536,"name":"n1","host":"127.0.0.1","port":7001,"genesis":true}\n'
+                )
+                return true
+            end
+        )
+        local past_genesis_life = fails(
+            function(): boolean
+                cluster_config.parse_jsonl(
+                    '{"id":131074,"name":"n1","host":"127.0.0.1","port":7001,"genesis":true}\n'
                 )
                 return true
             end
@@ -144,20 +152,23 @@ tested.test(
             end
         )
         local max_allowed = cluster_config.parse_jsonl(
-            '{"id":16777214,"name":"n1","host":"127.0.0.1","port":7001,"genesis":true}\n'
+            '{"id":4294901761,"name":"n1","host":"127.0.0.1","port":7001,"genesis":true}\n'
         )
-        local zero_allowed = cluster_config.parse_jsonl(
-            '{"id":0,"name":"n1","host":"127.0.0.1","port":7001,"genesis":true}\n'
+        local min_allowed = cluster_config.parse_jsonl(
+            '{"id":65537,"name":"n1","host":"127.0.0.1","port":7001,"genesis":true}\n'
         )
         tested.assert(
             {
-                given = "ids outside the incarnation-0 low band: the reserved-derivation id,"
-                    .. " the first high-band id, the reserved LEADER_UNKNOWN value, and a negative",
-                should = "reject each and admit both band edges",
-                expected = "true:true:true:true:16777214:0",
-                actual = tostring(reserved_derivation)
+                given = "ids that are not the provisioned identity: a zero system half,"
+                    .. " a zero crash half, a crash half past the genesis life, the packing's"
+                    .. " all-ones word, and a negative",
+                should = "reject each and admit both provisioned edges",
+                expected = "true:true:true:true:true:4294901761:65537",
+                actual = tostring(zero_system_half)
                     .. ":"
-                    .. tostring(high_band)
+                    .. tostring(zero_crash_half)
+                    .. ":"
+                    .. tostring(past_genesis_life)
                     .. ":"
                     .. tostring(u32_overflow)
                     .. ":"
@@ -165,7 +176,7 @@ tested.test(
                     .. ":"
                     .. tostring(max_allowed[1].id)
                     .. ":"
-                    .. tostring(zero_allowed[1].id),
+                    .. tostring(min_allowed[1].id),
             }
         )
     end
@@ -177,7 +188,7 @@ tested.test(
         local missing = fails(
             function(): boolean
                 cluster_config.parse_jsonl(
-                    '{"id":0,"name":"n1","host":"127.0.0.1","port":7001}\n'
+                    '{"id":65537,"name":"n1","host":"127.0.0.1","port":7001}\n'
                 )
                 return true
             end
@@ -185,7 +196,7 @@ tested.test(
         local bad_value = fails(
             function(): boolean
                 cluster_config.parse_jsonl(
-                    '{"id":0,"name":"n1","host":"127.0.0.1","port":7001,"genesis":"yes"}\n'
+                    '{"id":65537,"name":"n1","host":"127.0.0.1","port":7001,"genesis":"yes"}\n'
                 )
                 return true
             end
@@ -205,17 +216,17 @@ tested.test(
     "genesis_members returns the founding membership in line order and requires a quorum of them",
     function()
         local nodes = cluster_config.parse_jsonl(
-            '{"id":300,"name":"n1","host":"127.0.0.1","port":7001,"genesis":true}\n'
-                .. '{"id":100,"name":"n2","host":"127.0.0.1","port":7002,"genesis":true}\n'
-                .. '{"id":200,"name":"n3","host":"127.0.0.1","port":7003,"genesis":true}\n'
-                .. '{"id":400,"name":"n4","host":"127.0.0.1","port":7004,"genesis":false}\n'
+            '{"id":19660801,"name":"n1","host":"127.0.0.1","port":7001,"genesis":true}\n'
+                .. '{"id":6553601,"name":"n2","host":"127.0.0.1","port":7002,"genesis":true}\n'
+                .. '{"id":13107201,"name":"n3","host":"127.0.0.1","port":7003,"genesis":true}\n'
+                .. '{"id":26214401,"name":"n4","host":"127.0.0.1","port":7004,"genesis":false}\n'
         )
         local genesis = cluster_config.genesis_members(nodes)
         tested.assert(
             {
                 given = "a descriptor with three genesis members and one appended joiner",
                 should = "select the genesis lines in order and refuse a deployment without three of them",
-                expected = "300|100|200:true",
+                expected = "19660801|6553601|13107201:true",
                 actual = tostring(genesis[1].id)
                     .. "|"
                     .. tostring(genesis[2].id)
@@ -227,8 +238,8 @@ tested.test(
                             function(): boolean
                                 cluster_config.genesis_members(
                                     cluster_config.parse_jsonl(
-                                        '{"id":300,"name":"n1","host":"127.0.0.1","port":7001,"genesis":true}\n'
-                                            .. '{"id":100,"name":"n2","host":"127.0.0.1","port":7002,"genesis":false}\n'
+                                        '{"id":19660801,"name":"n1","host":"127.0.0.1","port":7001,"genesis":true}\n'
+                                            .. '{"id":6553601,"name":"n2","host":"127.0.0.1","port":7002,"genesis":false}\n'
                                     )
                                 )
                                 return true
@@ -244,21 +255,21 @@ tested.test(
     "the descriptor superset relation holds for appended joining members and fails otherwise",
     function()
         local incumbents = cluster_config.parse_jsonl(
-            '{"id":300,"name":"n1","host":"127.0.0.1","port":7001,"genesis":true}\n'
-                .. '{"id":100,"name":"n2","host":"127.0.0.1","port":7002,"genesis":true}\n'
-                .. '{"id":200,"name":"n3","host":"127.0.0.1","port":7003,"genesis":true}\n'
+            '{"id":19660801,"name":"n1","host":"127.0.0.1","port":7001,"genesis":true}\n'
+                .. '{"id":6553601,"name":"n2","host":"127.0.0.1","port":7002,"genesis":true}\n'
+                .. '{"id":13107201,"name":"n3","host":"127.0.0.1","port":7003,"genesis":true}\n'
         )
         local grown = cluster_config.parse_jsonl(
-            '{"id":300,"name":"n1","host":"127.0.0.1","port":7001,"genesis":true}\n'
-                .. '{"id":100,"name":"n2","host":"127.0.0.1","port":7002,"genesis":true}\n'
-                .. '{"id":200,"name":"n3","host":"127.0.0.1","port":7003,"genesis":true}\n'
-                .. '{"id":400,"name":"n4","host":"127.0.0.1","port":7004,"genesis":false}\n'
+            '{"id":19660801,"name":"n1","host":"127.0.0.1","port":7001,"genesis":true}\n'
+                .. '{"id":6553601,"name":"n2","host":"127.0.0.1","port":7002,"genesis":true}\n'
+                .. '{"id":13107201,"name":"n3","host":"127.0.0.1","port":7003,"genesis":true}\n'
+                .. '{"id":26214401,"name":"n4","host":"127.0.0.1","port":7004,"genesis":false}\n'
         )
         local reordered = cluster_config.parse_jsonl(
-            '{"id":100,"name":"n2","host":"127.0.0.1","port":7002,"genesis":true}\n'
-                .. '{"id":300,"name":"n1","host":"127.0.0.1","port":7001,"genesis":true}\n'
-                .. '{"id":200,"name":"n3","host":"127.0.0.1","port":7003,"genesis":true}\n'
-                .. '{"id":400,"name":"n4","host":"127.0.0.1","port":7004,"genesis":false}\n'
+            '{"id":6553601,"name":"n2","host":"127.0.0.1","port":7002,"genesis":true}\n'
+                .. '{"id":19660801,"name":"n1","host":"127.0.0.1","port":7001,"genesis":true}\n'
+                .. '{"id":13107201,"name":"n3","host":"127.0.0.1","port":7003,"genesis":true}\n'
+                .. '{"id":26214401,"name":"n4","host":"127.0.0.1","port":7004,"genesis":false}\n'
         )
         tested.assert(
             {

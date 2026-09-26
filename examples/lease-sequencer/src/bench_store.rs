@@ -20,9 +20,11 @@
 //! - **Clean boot** — `read` answered with the drain-proven `stopped`,
 //!   then the latch `commit` with the sentinel.
 //! - **Dirty boot** (SIGUSR2 cycle, SIGKILL) — `read` answered with the
-//!   recorded sentinel; the durable bump defers to the seated witness,
-//!   so the bumped sentinel `commit` lands later, unsignalled but
-//!   expected exactly once while the node is unseated.
+//!   recorded sentinel; the emission gate's bump `commit` (the next
+//!   life at the running sentinel) lands at boot, before the first
+//!   announcement, and the engine's seated latch lands the same round
+//!   again when the witness mints — the same identity and marker,
+//!   expected at most twice.
 //!
 //! Everything else is a violation.
 
@@ -64,11 +66,10 @@ enum Phase {
     /// The dirty boot read was answered: the deferred bump commit lands
     /// exactly once when the witness seats.
     Unseated,
-    /// A clean stop was signalled inside the deferred window: no marker
-    /// round is lawful there (the markers hold the crash's evidence) and
-    /// the host's sink drain rides outside the store, so the store sees
-    /// nothing — unless the witness seats first, in which case the bump
-    /// commit lands and the full halt rounds follow.
+    /// A clean stop was signalled inside the deferred window: the store
+    /// has already seen the emission gate's bump round (it landed at
+    /// boot), so the store is silent until the witness seats — then the
+    /// engine's latch round lands and the full halt rounds follow.
     StopFromUnseated,
 }
 
@@ -78,6 +79,10 @@ pub struct NodeDiscipline {
     incarnation: u64,
     marker: Option<String>,
     phase: Phase,
+    /// The bump rounds landed in the current life: the emission gate's
+    /// boot round is the first, the engine's seated latch round the
+    /// second. Reset by every boot read (a new life begins).
+    bump_rounds: u8,
     /// The latched violation, if any: the first surprise, kept whole.
     violation: Option<String>,
 }
@@ -95,6 +100,7 @@ impl NodeDiscipline {
             incarnation: 0,
             marker: None,
             phase: Phase::FirstBoot,
+            bump_rounds: 0,
             violation: None,
         }
     }
@@ -164,6 +170,7 @@ impl NodeDiscipline {
 
     /// A `read_copies` call: the reply is the recorded verdict.
     pub fn on_read(&mut self) -> serde_json::Value {
+        self.bump_rounds = 0;
         match self.phase {
             Phase::FirstBoot => {
                 self.phase = Phase::Latch;
@@ -202,16 +209,27 @@ impl NodeDiscipline {
                 self.phase = Phase::ExpectDrain;
                 serde_json::json!({"ok": true})
             }
-            // The unseated bump commit may race a signalled stop or land
-            // just before a kill's death: it is the deferred witness
-            // write, lawful once, and the signalled expectation stands.
-            // `checked_add` keeps a direct caller's u64::MAX incarnation
-            // a simple non-match — never an overflow panic.
-            Phase::ExpectStopping | Phase::DirtyBoot
-                if is_sentinel(marker) && self.incarnation.checked_add(1) == Some(incarnation) =>
+            // The EMISSION GATE lands the bump round at boot (the next
+            // life at the running sentinel, before the first
+            // announcement), and the engine's seated latch lands the
+            // same round again when the witness mints: two identical
+            // sentinel rounds at incarnation + 1, the first recorded
+            // here (the identity stays unseated), the second latches
+            // Running.
+            Phase::Unseated if is_sentinel(marker) && self.bump_rounds == 0
+                && self.incarnation.checked_add(1) == Some(incarnation) =>
             {
                 self.incarnation = incarnation;
                 self.marker = Some(marker.to_string());
+                self.bump_rounds = 1;
+                serde_json::json!({"ok": true})
+            }
+            Phase::Unseated if is_sentinel(marker) && self.bump_rounds >= 1
+                && incarnation == self.incarnation =>
+            {
+                self.marker = Some(marker.to_string());
+                self.bump_rounds += 1;
+                self.phase = Phase::Running;
                 serde_json::json!({"ok": true})
             }
             Phase::ExpectStopped if marker == STOPPED => {
@@ -220,22 +238,24 @@ impl NodeDiscipline {
                 serde_json::json!({"ok": true})
             }
             // The stop was signalled inside the deferred window, but the
-            // witness seated before the stop ran: the bump commit lands
-            // lawfully, and the stop then owes the full halt rounds.
+            // witness seated before the stop ran: the engine's latch
+            // round lands lawfully (the emission gate's round already
+            // stands), and the stop then owes the full halt rounds.
             Phase::StopFromUnseated
-                if is_sentinel(marker) && self.incarnation.checked_add(1) == Some(incarnation) =>
+                if is_sentinel(marker) && incarnation == self.incarnation =>
             {
-                self.incarnation = incarnation;
                 self.marker = Some(marker.to_string());
                 self.phase = Phase::ExpectStopping;
                 serde_json::json!({"ok": true})
             }
-            Phase::Unseated
-                if is_sentinel(marker) && self.incarnation.checked_add(1) == Some(incarnation) =>
+            // A crash was signalled and the node lived long enough for
+            // the seated latch to land its round: the same round the
+            // emission gate already made durable, recorded, and the
+            // boot read that follows answers from it.
+            Phase::DirtyBoot
+                if is_sentinel(marker) && incarnation == self.incarnation =>
             {
-                self.incarnation = incarnation;
                 self.marker = Some(marker.to_string());
-                self.phase = Phase::Running;
                 serde_json::json!({"ok": true})
             }
             phase => self.refusal(format!(
@@ -357,7 +377,7 @@ mod tests {
     fn boot_clean(discipline: &mut NodeDiscipline) {
         assert_eq!(discipline.on_read(), serde_json::json!({"verdict": "none"}));
         assert_eq!(
-            discipline.on_commit(0, JOINING),
+            discipline.on_commit(1, JOINING),
             serde_json::json!({"ok": true})
         );
     }
@@ -376,20 +396,20 @@ mod tests {
         boot_clean(&mut discipline);
         discipline.signal_clean_stop();
         assert_eq!(
-            discipline.on_commit(0, STOPPING),
+            discipline.on_commit(1, STOPPING),
             serde_json::json!({"ok": true})
         );
         assert_eq!(discipline.on_drain(), serde_json::json!({"ok": true}));
         assert_eq!(
-            discipline.on_commit(0, STOPPED),
+            discipline.on_commit(1, STOPPED),
             serde_json::json!({"ok": true})
         );
         assert_eq!(
             discipline.on_read(),
-            serde_json::json!({"verdict": STOPPED, "incarnation": 0})
+            serde_json::json!({"verdict": STOPPED, "incarnation": 1})
         );
         assert_eq!(
-            discipline.on_commit(0, RESTARTING),
+            discipline.on_commit(1, RESTARTING),
             serde_json::json!({"ok": true})
         );
         assert!(discipline.violation().is_none());
@@ -402,10 +422,18 @@ mod tests {
         discipline.signal_crash();
         assert_eq!(
             discipline.on_read(),
-            serde_json::json!({"verdict": JOINING, "incarnation": 0})
+            serde_json::json!({"verdict": JOINING, "incarnation": 1})
         );
+        // The emission gate's bump round lands at boot.
         assert_eq!(
-            discipline.on_commit(1, JOINING),
+            discipline.on_commit(2, JOINING),
+            serde_json::json!({"ok": true})
+        );
+        assert!(discipline.violation().is_none());
+        assert!(discipline.at_rest());
+        // The engine's seated latch lands the same round again.
+        assert_eq!(
+            discipline.on_commit(2, JOINING),
             serde_json::json!({"ok": true})
         );
         assert!(discipline.violation().is_none());
@@ -451,26 +479,31 @@ mod tests {
         boot_clean(&mut discipline);
         discipline.signal_crash();
         discipline.on_read();
-        // The stop is signalled inside the deferred window, but the
-        // witness seats before the stop runs: the bump lands lawfully
-        // and the stop then owes the full halt rounds.
+        // The emission gate's round lands at boot, before any signal.
+        assert_eq!(
+            discipline.on_commit(2, JOINING),
+            serde_json::json!({"ok": true})
+        );
+        // The stop is signalled inside the deferred window, then the
+        // witness seats before the stop runs: the engine's latch round
+        // lands lawfully and the stop then owes the full halt rounds.
         discipline.signal_clean_stop();
         assert_eq!(
-            discipline.on_commit(1, RESTARTING),
+            discipline.on_commit(2, JOINING),
             serde_json::json!({"ok": true})
         );
         assert_eq!(
-            discipline.on_commit(1, STOPPING),
+            discipline.on_commit(2, STOPPING),
             serde_json::json!({"ok": true})
         );
         assert_eq!(discipline.on_drain(), serde_json::json!({"ok": true}));
         assert_eq!(
-            discipline.on_commit(1, STOPPED),
+            discipline.on_commit(2, STOPPED),
             serde_json::json!({"ok": true})
         );
         assert_eq!(
             discipline.on_read(),
-            serde_json::json!({"verdict": STOPPED, "incarnation": 1})
+            serde_json::json!({"verdict": STOPPED, "incarnation": 2})
         );
         assert!(discipline.violation().is_none());
     }
@@ -481,17 +514,23 @@ mod tests {
         boot_clean(&mut discipline);
         discipline.signal_crash();
         discipline.on_read();
-        // The stop runs before the witness seats: no marker round is
-        // lawful and the sink drain rides outside the store, so the
-        // store's next call is the re-boot's read, answered crashed.
+        // The emission gate's round lands at boot, before any signal.
+        assert_eq!(
+            discipline.on_commit(2, JOINING),
+            serde_json::json!({"ok": true})
+        );
+        // The stop runs before the witness seats: no further marker
+        // round is lawful (the round already stands) and the sink drain
+        // rides outside the store, so the store's next call is the
+        // re-boot's read, answered crashed at the landed life.
         discipline.signal_clean_stop();
         assert!(discipline.at_rest(), "the silent stop is a lawful rest");
         assert_eq!(
             discipline.on_read(),
-            serde_json::json!({"verdict": JOINING, "incarnation": 0})
+            serde_json::json!({"verdict": JOINING, "incarnation": 2})
         );
         assert_eq!(
-            discipline.on_commit(1, JOINING),
+            discipline.on_commit(3, JOINING),
             serde_json::json!({"ok": true})
         );
         assert!(discipline.violation().is_none());
@@ -503,6 +542,10 @@ mod tests {
         boot_clean(&mut discipline);
         discipline.signal_crash();
         discipline.on_read();
+        assert_eq!(
+            discipline.on_commit(2, JOINING),
+            serde_json::json!({"ok": true})
+        );
         discipline.signal_clean_stop();
         let reply = discipline.on_drain();
         assert_eq!(reply["ok"], false);

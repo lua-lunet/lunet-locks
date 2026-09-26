@@ -61,7 +61,7 @@ dropped, never partially applied.
 
 Every process carries a small in-memory membership model: an era, a
 choosing slot, and the member list `{id, weight, endpoint}`. It boots
-from the membership sidecar next to the incarnation marker when one
+from the membership sidecar next to the identity marker when one
 parses, otherwise from the deployment descriptor — the descriptor's
 genesis lines in line order at weight 1, era 1 (the founding
 configuration the core folds, chosen at slot 0). A post-genesis
@@ -128,7 +128,7 @@ by the commit stream and by later snapshots instead.
 ## Lazy write-behind
 
 Adopted membership facts persist asynchronously on a routine tick —
-never on the message hot path. The sidecar sits next to the incarnation
+never on the message hot path. The sidecar sits next to the identity
 marker at `<state-file>.membership`, one flattened JSON object per line:
 
 ```text
@@ -142,8 +142,7 @@ descriptor. It is rewritten atomically (temporary file, rename) with no
 fsync: the last write may be lost on power loss — the same documented
 loss window the AOF writer carries, and nothing depends on the file for
 safety. A sidecar that does not parse is ignored entirely at boot: the
-model falls back to the descriptor and discovery re-learns. The
-incarnation marker's bump semantics are untouched — the marker's
+model falls back to the descriptor and discovery re-learns. The membership sidecar sits beside the durable identity marker; its
 authoritative storage is the quorum-of-copies superblock beside the state
 file (four Aegis-checksummed copies, quorum write with forced I/O,
 highest-sequence read quorum), and the fsync+rename+dir-sync single file

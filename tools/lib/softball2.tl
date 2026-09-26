@@ -793,7 +793,7 @@ local function bumped_boot(name: string, since_ms: integer): string
         local kv = logs.kv(line)
         if
             (tonumber(kv.ts) or 0) >= since_ms
-            and (tonumber(kv.incarnation) or 0) >= 1
+            and (tonumber(kv.incarnation) or 0) >= 2
         then
             found = "incarnation="
                 .. (kv.incarnation or "?")

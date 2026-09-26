@@ -31,7 +31,7 @@ const SENTINEL_LOCK: u64 = 0x0DDBA11;
 const POLITE_LOCK: u64 = 0x0DDBA12;
 const ERA: u32 = 4;
 const VIEW: u32 = 13;
-const LEADER: u32 = 66;
+const LEADER: u32 = (66 << 16) | 1;
 /// The heartbeat noise floor (the recorded loudness) and the renewal
 /// run it carries.
 const HEARTBEAT_GETS: usize = 900;
@@ -448,10 +448,10 @@ fn given_a_recorded_set_through_the_harness_cluster_the_replay_is_deduped() {
     ));
     let config = ClusterConfig::new(
         run,
-        vec![(44, "node44".into()), (55, "node55".into())],
-        vec![44, 55],
+        vec![((44 << 16) | 1, "node44".into()), ((55 << 16) | 1, "node55".into())],
+        vec![(44 << 16) | 1, (55 << 16) | 1],
     )
-    .with_clients(vec![("probe1".into(), 44)]);
+    .with_clients(vec![("probe1".into(), (44 << 16) | 1)]);
     let mut cluster = Cluster::launch(config).expect("cluster launches");
     let ready = cluster.wait_until(8000, |lines| {
         lines.iter().any(|l| l.starts_with("node44,beef-"))

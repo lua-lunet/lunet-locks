@@ -220,10 +220,7 @@ impl MemBackend {
     fn rpc(&self, request: &serde_json::Value) -> io::Result<serde_json::Value> {
         let mut line = request.to_string();
         line.push('\n');
-        let mut socket = self
-            .socket
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let mut socket = self.socket.lock().unwrap_or_else(PoisonError::into_inner);
         socket.0.write_all(line.as_bytes())?;
         socket.0.flush()?;
         let mut reply = String::new();
@@ -322,15 +319,14 @@ impl GateStore {
             Backend::Disk { state } => {
                 #[cfg(not(target_os = "windows"))]
                 {
-                    let identity = marker::NodeIdentity::new(self.system, counter).ok_or_else(
-                        || {
+                    let identity =
+                        marker::NodeIdentity::new(self.system, counter).ok_or_else(|| {
                             io::Error::other(format!(
                                 "the identity pair ({}, {counter}) is not spellable: \
                                  a zero half is no identity",
                                 self.system
                             ))
-                        },
-                    )?;
+                        })?;
                     write_round(state, identity, marker::MarkerState::Unflushed)
                 }
                 #[cfg(target_os = "windows")]
@@ -415,8 +411,12 @@ fn read_copies_disk(state: &Path, system: u16) -> io::Result<Option<SuperblockCo
 /// The durable write: the quorum write, then the projection mirror.
 #[cfg(not(target_os = "windows"))]
 fn commit_disk(state: &Path, system: u16, copy: CopyState) -> io::Result<()> {
-    let counter = u16::try_from(copy.identity.0)
-        .map_err(|_| io::Error::other(format!("the life {} is not spellable as a crash counter", copy.identity.0)))?;
+    let counter = u16::try_from(copy.identity.0).map_err(|_| {
+        io::Error::other(format!(
+            "the life {} is not spellable as a crash counter",
+            copy.identity.0
+        ))
+    })?;
     let identity = marker::NodeIdentity::new(system, counter).ok_or_else(|| {
         io::Error::other(format!(
             "the identity pair ({system}, {counter}) is not spellable: a zero half is no identity"
@@ -436,8 +436,12 @@ fn commit_disk(state: &Path, system: u16, copy: CopyState) -> io::Result<()> {
 /// The durable write: Windows keeps the single-file discipline.
 #[cfg(target_os = "windows")]
 fn commit_disk(state: &Path, system: u16, copy: CopyState) -> io::Result<()> {
-    let counter = u16::try_from(copy.identity.0)
-        .map_err(|_| io::Error::other(format!("the life {} is not spellable as a crash counter", copy.identity.0)))?;
+    let counter = u16::try_from(copy.identity.0).map_err(|_| {
+        io::Error::other(format!(
+            "the life {} is not spellable as a crash counter",
+            copy.identity.0
+        ))
+    })?;
     write_marker(state, system, counter, copy.marker)
 }
 
@@ -455,7 +459,12 @@ fn write_round(
         }
         io::Error::other(format!("the marker quorum write failed (FFI code {code})"))
     })?;
-    write_marker(state, identity.system_identifier(), identity.crash_counter(), engine_marker(round))
+    write_marker(
+        state,
+        identity.system_identifier(),
+        identity.crash_counter(),
+        engine_marker(round),
+    )
 }
 
 impl LifecycleStore for GateStore {

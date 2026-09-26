@@ -1144,6 +1144,9 @@ pub struct Cluster {
     /// The in-memory mirror of the trace file: the analyzers read this.
     pub lines: Vec<String>,
     nodes: HashMap<u32, NodeSlot>,
+    /// The descriptor's id -> name map: the trace's node actors spell
+    /// the descriptor name (`node44`), whatever the live id is.
+    names: HashMap<u32, String>,
     /// The in-process node host threads; joined at drop so the stop
     /// sequence (markers, drain, flushed) completes before the next
     /// scenario starts instead of racing it on the same disk.
@@ -1169,6 +1172,14 @@ impl Cluster {
         let _ = writeln!(self.trace, "{line}");
         let _ = self.trace.flush();
         self.lines.push(line);
+    }
+
+    /// The node actor's trace tag: the descriptor name for a member id.
+    fn node_tag(&self, id: u32) -> String {
+        self.names
+            .get(&id)
+            .cloned()
+            .unwrap_or_else(|| format!("node{id}"))
     }
 
     fn marker(&mut self, event: &str, fields: &str) {
@@ -1295,11 +1306,13 @@ impl Cluster {
                 },
             );
         }
+        let names: HashMap<u32, String> = config.members.iter().cloned().collect();
         Ok(Cluster {
             config,
             trace,
             lines: Vec::new(),
             nodes,
+            names,
             threads,
             listener,
             incoming: Vec::new(),
@@ -1425,8 +1438,8 @@ impl Cluster {
         match chan {
             CHAN_VRR | CHAN_APP => {
                 let payload = payload_json(chan, rest);
-                let from_name = format!("node{from}");
-                let to_name = format!("node{peer}");
+                let from_name = self.node_tag(from);
+                let to_name = self.node_tag(peer);
                 self.record(&from_name, &to_name, &payload);
                 // A FORWARD_NOT_LEADER notch (peer 0) is the refusal route:
                 // the driver plays the forwarding follower's client socket
@@ -1446,7 +1459,7 @@ impl Cluster {
                         self.record(
                             "driver",
                             "driver",
-                            &format!("{{\"event\":\"drop\",\"to\":\"node{peer}\"}}"),
+                            &format!("{{\"event\":\"drop\",\"to\":\"{}\"}}", self.node_tag(peer)),
                         );
                     }
                 }
@@ -1465,7 +1478,7 @@ impl Cluster {
                     .ok()
                     .and_then(|v| v.get("client_id").and_then(|v| v.as_u64()))
                     .unwrap_or(0);
-                self.record(&format!("beef-{cid}"), &format!("node{from}"), &text);
+                self.record(&format!("beef-{cid}"), &self.node_tag(from), &text);
                 let body = frame_body(from, CHAN_CLIENT, rest);
                 if let Some(slot) = self.nodes.get_mut(&from) {
                     if let Some((stream, out)) = slot.request.as_mut() {
@@ -1498,13 +1511,13 @@ impl Cluster {
         let text = "{\"error\":\"not_leader\"}";
         let Some((client, action, issued)) = self.take_pending(mid) else {
             self.record(
-                &format!("node{from}"),
+                &self.node_tag(from),
                 "driver",
                 &format!("{{\"event\":\"unclaimed_not_leader\"}}"),
             );
             return;
         };
-        self.record(&format!("node{from}"), &client, text);
+        self.record(&self.node_tag(from), &client, text);
         let rtt = now.saturating_sub(issued);
         if rtt > 10 {
             self.rtt_violations
@@ -1556,7 +1569,7 @@ impl Cluster {
             // No message id: the node's own uncorrelated reply (never
             // expected — every op carries one).
             self.record(
-                &format!("node{from}"),
+                &self.node_tag(from),
                 "driver",
                 &format!("{{\"event\":\"reply_without_message_id\"}}"),
             );
@@ -1564,10 +1577,10 @@ impl Cluster {
         };
         let Some((client, action, issued)) = self.take_pending(mid) else {
             let cid = reply.get("client_id").and_then(|v| v.as_u64()).unwrap_or(0);
-            self.record(&format!("node{from}"), &format!("beef-{cid}"), text);
+            self.record(&self.node_tag(from), &format!("beef-{cid}"), text);
             return;
         };
-        self.record(&format!("node{from}"), &client, text);
+        self.record(&self.node_tag(from), &client, text);
         let rtt = now.saturating_sub(issued);
         if rtt > 10 {
             self.rtt_violations.push(format!(
@@ -1609,7 +1622,7 @@ impl Cluster {
                 body,
             )
         };
-        self.record(client, &format!("node{node}"), &text);
+        self.record(client, &self.node_tag(node), &text);
         if let Some(state) = self.clients.get_mut(client) {
             state.ops.push(op);
             state.pending = Some((mid, Some(action), now));
@@ -1637,7 +1650,7 @@ impl Cluster {
                 frame_body(0, CHAN_CLIENT, json_text.as_bytes()),
             )
         };
-        self.record(client, &format!("node{node}"), json_text);
+        self.record(client, &self.node_tag(node), json_text);
         if let Some(state) = self.clients.get_mut(client) {
             state.pending = Some((mid, None, now));
         }
