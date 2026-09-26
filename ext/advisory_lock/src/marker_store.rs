@@ -1,20 +1,19 @@
 //! The routed lifecycle marker: the engine's `LifecycleStore` over the
 //! superblock copies.
 //!
-//! The engine (`vrr::lifecycle`, uvrr-core tag v0.8.0 @ 450dcab) owns the marker
+//! The engine (`vrr::lifecycle`, uvrr-core tag v0.9.0 @ b2ba0d2) owns the marker
 //! machine — which marker, which copies, when, and in what order
 //! (`docs/uvrr-boot-gate.md` §3). This module is the host's durable
 //! mechanics: the vendored Zig store's quorum-of-copies construction,
 //! reached through the AOF C ABI's marker exports (`ext/lunet-locks-aof`),
 //! plus the single-file compatibility projection.
 //!
-//! The bridge to the engine's internal machine: the durable marker is the
+//! The bridge to the engine's machine: the durable marker is the
 //! `NodeIdentity` pair (system identifier, crash counter) — it vouches for
-//! the life — and the engine's `Incarnation` input is the marker pair's
-//! crash counter (the life's number) read at this boot-gate boundary. The
-//! packed u32 is what goes on the wire; this module derives the engine's
-//! number from the pair on every read and spells the pair back on every
-//! write.
+//! the life — and the engine's lifecycle input is the packed pair itself,
+//! read at this boot-gate boundary. The packed u32 is what goes on the
+//! wire; this module spells the pair on every write and reads it back on
+//! every boot.
 //!
 //! - **Read** (`read_copies`) — the working quorum's verdict: the
 //!   highest-sequence valid copies at the `.open` threshold (2/4). THE
@@ -72,7 +71,8 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use vrr::lifecycle::{CopyState, Incarnation, LifecycleStore, Marker, SuperblockCopies};
+use vrr::ids::{CrashCounter, NodeId, SystemId};
+use vrr::lifecycle::{CopyState, LifecycleStore, Marker, SuperblockCopies};
 
 use crate::ffi::{JournalSink, read_marker, write_marker};
 
@@ -159,7 +159,7 @@ fn engine_marker(state: lunet_locks_aof::marker::MarkerState) -> Marker {
 /// Four uniform copies: the store's read resolved one verdict (the Zig
 /// quorum machinery's own minimum-progress discipline), and the engine's
 /// cohort classification over a uniform set reads exactly that verdict.
-fn uniform(identity: Incarnation, marker: Marker) -> SuperblockCopies {
+fn uniform(identity: NodeId, marker: Marker) -> SuperblockCopies {
     SuperblockCopies {
         copies: [CopyState { identity, marker }; 4],
     }
@@ -270,8 +270,8 @@ enum Backend {
 /// The host's durable mechanics for the boot gate: the superblock quorum
 /// store plus the single-file projection, wired to the committed-
 /// transition sink for the halt's drain. The system identifier is the
-/// descriptor's own member's system half — every marker round this store
-/// spells carries it.
+/// descriptor's own member's system half — the projection read is
+/// checked against it.
 pub(crate) struct GateStore {
     backend: Backend,
     sink: SinkDoor,
@@ -307,36 +307,42 @@ impl GateStore {
     /// The emission gate's one durable round: the crash bump's marker
     /// write — the next life at the running sentinel — fsync-complete
     /// before the driver releases the first announcement. Unconditional:
-    /// the round lands seated or not. A life the packing cannot spell
-    /// (past the crash counter's sixteen bits) refuses here.
-    pub(crate) fn emission_gate(&self, life: u64) -> io::Result<()> {
-        let counter = u16::try_from(life).map_err(|_| {
-            io::Error::other(format!(
-                "the next life {life} is not spellable as a crash counter"
-            ))
-        })?;
+    /// the round lands seated or not. The argument is the bumped pair
+    /// itself; an identity with a zero half is no identity and refuses
+    /// here.
+    pub(crate) fn emission_gate(&self, identity: NodeId) -> io::Result<()> {
         match &self.backend {
             Backend::Disk { state } => {
                 #[cfg(not(target_os = "windows"))]
                 {
-                    let identity =
-                        marker::NodeIdentity::new(self.system, counter).ok_or_else(|| {
-                            io::Error::other(format!(
-                                "the identity pair ({}, {counter}) is not spellable: \
-                                 a zero half is no identity",
-                                self.system
-                            ))
-                        })?;
-                    write_round(state, identity, marker::MarkerState::Unflushed)
+                    let pair = marker::NodeIdentity::from_packed(identity.0).ok_or_else(|| {
+                        io::Error::other(format!(
+                            "the identity {identity} is not spellable: \
+                             a zero half is no identity"
+                        ))
+                    })?;
+                    write_round(state, pair, marker::MarkerState::Unflushed)
                 }
                 #[cfg(target_os = "windows")]
-                write_marker(state, self.system, counter, Marker::Joining)
+                {
+                    let system = identity.system_id().ok_or_else(|| {
+                        io::Error::other(format!(
+                            "the identity {identity} is not spellable: a zero half is no identity"
+                        ))
+                    })?;
+                    let counter = identity.crash_counter().ok_or_else(|| {
+                        io::Error::other(format!(
+                            "the identity {identity} is not spellable: a zero half is no identity"
+                        ))
+                    })?;
+                    write_marker(state, system.get(), counter.get(), Marker::Joining)
+                }
             }
             #[cfg(unix)]
             Backend::Mem(mem) => {
                 let reply = mem.rpc(&serde_json::json!({
                     "op": "commit",
-                    "incarnation": life,
+                    "incarnation": identity.0,
                     "marker": "joining",
                 }))?;
                 MemBackend::ack(&reply)
@@ -347,8 +353,8 @@ impl GateStore {
 
 /// The durable read: the working quorum's verdict, or the compatibility
 /// projection's while the copies predate this routing. The marker's
-/// `NodeIdentity` pair vouches for the life; the engine's incarnation
-/// input is the pair's crash counter (the life's number).
+/// `NodeIdentity` pair vouches for the life; the engine's lifecycle
+/// input is the packed pair.
 #[cfg(not(target_os = "windows"))]
 fn read_copies_disk(state: &Path, system: u16) -> io::Result<Option<SuperblockCopies>> {
     let superblock = superblock_path(state);
@@ -366,7 +372,13 @@ fn read_copies_disk(state: &Path, system: u16) -> io::Result<Option<SuperblockCo
                 "the projection names system {file_system} but the descriptor names system {system}"
             )));
         }
-        return Ok(Some(uniform(Incarnation(u64::from(crash)), marker)));
+        // The projection's parser refuses a zero half, so the pair's
+        // constructors always succeed here.
+        let identity = NodeId::new(
+            SystemId::new(file_system).expect("the projection refuses a zero half"),
+            CrashCounter::new(crash).expect("the projection refuses a zero half"),
+        );
+        return Ok(Some(uniform(identity, marker)));
     }
     // The copies exist: they are the authoritative read. THE
     // BOOT-READ SAFETY LAW: a bad checksum on ANY copy is a loud log
@@ -388,7 +400,7 @@ fn read_copies_disk(state: &Path, system: u16) -> io::Result<Option<SuperblockCo
         io::Error::other(format!("the marker quorum read failed (FFI code {code})"))
     })?;
     Ok(Some(uniform(
-        Incarnation(u64::from(classified.identity.crash_counter())),
+        NodeId(classified.identity.packed()),
         engine_marker(classified.state),
     )))
 }
@@ -405,21 +417,22 @@ fn read_copies_disk(state: &Path, system: u16) -> io::Result<Option<SuperblockCo
             "the projection names system {file_system} but the descriptor names system {system}"
         )));
     }
-    Ok(Some(uniform(Incarnation(u64::from(crash)), marker)))
+    let identity = NodeId::new(
+        SystemId::new(file_system).expect("the projection refuses a zero half"),
+        CrashCounter::new(crash).expect("the projection refuses a zero half"),
+    );
+    Ok(Some(uniform(identity, marker)))
 }
 
-/// The durable write: the quorum write, then the projection mirror.
+/// The durable write: the quorum write, then the projection mirror. The
+/// pair the engine decided is spelled as it stands — the identity's own
+/// halves, no re-derivation.
 #[cfg(not(target_os = "windows"))]
-fn commit_disk(state: &Path, system: u16, copy: CopyState) -> io::Result<()> {
-    let counter = u16::try_from(copy.identity.0).map_err(|_| {
+fn commit_disk(state: &Path, copy: CopyState) -> io::Result<()> {
+    let identity = marker::NodeIdentity::from_packed(copy.identity.0).ok_or_else(|| {
         io::Error::other(format!(
-            "the life {} is not spellable as a crash counter",
+            "the identity {} is not spellable: a zero half is no identity",
             copy.identity.0
-        ))
-    })?;
-    let identity = marker::NodeIdentity::new(system, counter).ok_or_else(|| {
-        io::Error::other(format!(
-            "the identity pair ({system}, {counter}) is not spellable: a zero half is no identity"
         ))
     })?;
     marker::write(&superblock_path(state), identity, zig_state(copy.marker)).map_err(|code| {
@@ -430,19 +443,30 @@ fn commit_disk(state: &Path, system: u16, copy: CopyState) -> io::Result<()> {
     })?;
     // The compatibility projection: the single-file write, only AFTER
     // the quorum write succeeded.
-    write_marker(state, system, counter, copy.marker)
+    write_marker(
+        state,
+        identity.system_identifier(),
+        identity.crash_counter(),
+        copy.marker,
+    )
 }
 
 /// The durable write: Windows keeps the single-file discipline.
 #[cfg(target_os = "windows")]
-fn commit_disk(state: &Path, system: u16, copy: CopyState) -> io::Result<()> {
-    let counter = u16::try_from(copy.identity.0).map_err(|_| {
+fn commit_disk(state: &Path, copy: CopyState) -> io::Result<()> {
+    let system = copy.identity.system_id().ok_or_else(|| {
         io::Error::other(format!(
-            "the life {} is not spellable as a crash counter",
+            "the identity {} is not spellable: a zero half is no identity",
             copy.identity.0
         ))
     })?;
-    write_marker(state, system, counter, copy.marker)
+    let counter = copy.identity.crash_counter().ok_or_else(|| {
+        io::Error::other(format!(
+            "the identity {} is not spellable: a zero half is no identity",
+            copy.identity.0
+        ))
+    })?;
+    write_marker(state, system.get(), counter.get(), copy.marker)
 }
 
 /// The one durable marker round: the quorum write of `(identity,
@@ -484,7 +508,7 @@ impl LifecycleStore for GateStore {
                                 "the bench store read named an unknown verdict '{word}'"
                             ))
                         })?;
-                        let incarnation = reply
+                        let packed = reply
                             .get("incarnation")
                             .and_then(|i| i.as_u64())
                             .ok_or_else(|| {
@@ -492,7 +516,13 @@ impl LifecycleStore for GateStore {
                                     "the bench store read reply carried no incarnation",
                                 )
                             })?;
-                        Ok(Some(uniform(Incarnation(incarnation), marker)))
+                        let identity = NodeId(u32::try_from(packed).map_err(|_| {
+                            io::Error::other(
+                                "the bench store read's identity does not pack into \
+                                 the pair's thirty-two bits",
+                            )
+                        })?);
+                        Ok(Some(uniform(identity, marker)))
                     }
                     None => Err(io::Error::other(
                         "the bench store read reply carried no verdict",
@@ -518,7 +548,7 @@ impl LifecycleStore for GateStore {
             "the boot gate's rewrites are uniform 4x"
         );
         match &self.backend {
-            Backend::Disk { state } => commit_disk(state, self.system, copy),
+            Backend::Disk { state } => commit_disk(state, copy),
             #[cfg(unix)]
             Backend::Mem(mem) => {
                 let reply = mem.rpc(&serde_json::json!({

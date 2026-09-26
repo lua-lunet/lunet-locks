@@ -224,9 +224,7 @@ use vrr::ids::{
     CrashCounter, Era, NodeId, Operation, OperationId, Slot, SystemId, Tick, View, ViewId,
 };
 use vrr::journal::{Journal, LogEntry, Payload, SegmentedLog};
-use vrr::lifecycle::{
-    self, BootError, BootOutcome, Bumped, Crashed, Incarnation, Marker, Running, Vouched,
-};
+use vrr::lifecycle::{self, BootError, BootOutcome, Bumped, Crashed, Marker, Running, Vouched};
 use vrr::message::{Body, Message};
 use vrr::observe::Diagnostic;
 use vrr::progress::Status;
@@ -2027,11 +2025,10 @@ struct BootDecision {
     /// witness (landing the same marker round the emission gate already
     /// made durable at boot). `None` on the latched paths.
     deferred: Option<Crashed<GateStore>>,
-    /// The life the boot decided — the crash counter of the marker pair
-    /// (the engine's incarnation input): 1 for a first boot, the
-    /// quorum-resolved counter for a clean continue, the next life's
-    /// counter for a crashed boot.
-    incarnation: u64,
+    /// The identity the boot decided — the packed pair: the genesis
+    /// pair for a first boot, the quorum-resolved pair for a clean
+    /// continue, the bumped pair for a crashed boot.
+    identity: NodeId,
     /// The clean start's proof token (`Replica::resume` requires it).
     vouched: Option<Vouched>,
     /// The crashed classification's replacement pair
@@ -2084,6 +2081,7 @@ struct BootDecision {
 /// checked bump refuses at exhaustion.
 fn boot_gate(
     store: GateStore,
+    system: SystemId,
     recovery: Option<(&RecoveryFlush, &Path)>,
 ) -> Result<BootDecision, i32> {
     let refuse = |what: String| -> i32 {
@@ -2104,7 +2102,13 @@ fn boot_gate(
             "the marker store refused the boot read: {error}"
         ))),
         Ok(BootOutcome::First(first)) => {
-            let session = match first.latch(Incarnation(1)) {
+            // The genesis pair: the descriptor's system half, the first
+            // life's counter.
+            let genesis = NodeId::new(
+                system,
+                CrashCounter::new(1).expect("the genesis life's counter is non-zero"),
+            );
+            let session = match first.latch(genesis) {
                 Ok(session) => session,
                 Err((_, error)) => {
                     return Err(refuse(format!("the first latch write failed: {error}")));
@@ -2113,14 +2117,14 @@ fn boot_gate(
             Ok(BootDecision {
                 session: Some(session),
                 deferred: None,
-                incarnation: 1,
+                identity: genesis,
                 vouched: None,
                 pair: None,
                 flush: None,
             })
         }
         Ok(BootOutcome::Clean(clean)) => {
-            let incarnation = clean.identity().0;
+            let identity = clean.identity();
             let (session, vouched) = match clean.latch() {
                 Ok(latched) => latched,
                 Err((_, error)) => {
@@ -2130,7 +2134,7 @@ fn boot_gate(
             Ok(BootDecision {
                 session: Some(session),
                 deferred: None,
-                incarnation,
+                identity,
                 vouched: Some(vouched),
                 pair: None,
                 flush: None,
@@ -2146,21 +2150,23 @@ fn boot_gate(
             // THE EMISSION GATE: the crash bump's one durable marker
             // round — the next life at the running sentinel — completes
             // here, before the driver releases the first announcement,
-            // unconditionally (seated or not). A failed round refuses
-            // the boot: the node is never half-announced.
-            crashed.store().emission_gate(pair.new.0).map_err(|error| {
+            // unconditionally (seated or not). The argument is the
+            // bumped pair itself. A failed round refuses the boot: the
+            // node is never half-announced.
+            crashed.store().emission_gate(pair.new).map_err(|error| {
                 refuse(format!("the crash bump's marker write failed: {error}"))
             })?;
             let flush = match recovery {
                 None | Some((RecoveryFlush::Diskless, _)) => None,
                 Some((variant, scratch)) => Some(
-                    recovery_flush::execute(scratch, *variant, pair.new.0).map_err(|_| CONFIG)?,
+                    recovery_flush::execute(scratch, *variant, u64::from(pair.new.0))
+                        .map_err(|_| CONFIG)?,
                 ),
             };
             Ok(BootDecision {
                 session: None,
                 deferred: Some(crashed),
-                incarnation: pair.new.0,
+                identity: pair.new,
                 vouched: None,
                 pair: Some(pair),
                 flush,
@@ -2334,7 +2340,7 @@ fn node_from_sink(
     };
     // The boot gate: the engine reads the durable markers, classifies
     // the start, and hands back the session whose type fixes the write
-    // schedule (see the module's Incarnation note and `boot_gate`). The
+    // schedule (see the `marker_store` bridge note and `boot_gate`). The
     // crashed classification is the recovery boundary: a configured E2
     // variant's forced flush executes there, against the caller-provided
     // scratch directory. The bench harness substitutes the store itself:
@@ -2364,11 +2370,17 @@ fn node_from_sink(
     };
     let decision = boot_gate(
         store,
+        system,
         recovery
             .as_ref()
             .map(|(variant, dir)| (variant, dir.as_path())),
     )?;
-    let incarnation = decision.incarnation;
+    let own_id = decision.identity;
+    // The life's number for the run's logs: the decided pair's crash
+    // counter (the pair is lawful — the boot gate's decision is
+    // asserted below).
+    let counter = own_id.crash_counter().map_or(0, CrashCounter::get);
+    let incarnation = u64::from(counter);
     if let Some(outcome) = decision.flush {
         info!(
             variant = outcome.variant,
@@ -2378,18 +2390,10 @@ fn node_from_sink(
             "recovery-boundary flush executed"
         );
     }
-    // The live identity: the packed pair (descriptor system half, marker
-    // crash counter — the life's number, the engine's incarnation input).
-    // The first life carries counter 1; a crashed boot's emission gate
+    // The live identity is the pair the boot gate decided: the genesis
+    // pair at the first life, the quorum-resolved pair on a clean
+    // continue, the bumped pair on a crashed boot — whose emission gate
     // already landed the next life's round before this point.
-    let counter = match u16::try_from(incarnation) {
-        Ok(counter) if counter > 0 => counter,
-        _ => return Err(CONFIG),
-    };
-    let own_id = match CrashCounter::new(counter) {
-        Some(counter) => NodeId::new(system, counter),
-        None => return Err(CONFIG),
-    };
     // The superseded identity on the CRASHED path: the bumped node
     // re-announces `Reincarnation(old, new)` on every fenced-boot drive
     // and, while it is below voting weight, on the host's §8 re-announce
@@ -2403,19 +2407,7 @@ fn node_from_sink(
     // `from == new` gate would refuse the announcement forever. A clean
     // resume or a first life carries no pair and announces nothing: the
     // pair is the crashed path's commitment.
-    let reincarnate_from = match decision.pair.as_ref() {
-        Some(pair) => {
-            let old_counter = match u16::try_from(pair.old.0) {
-                Ok(counter) => counter,
-                Err(_) => return Err(CONFIG),
-            };
-            match CrashCounter::new(old_counter) {
-                Some(counter) => Some(NodeId::new(system, counter)),
-                None => return Err(CONFIG),
-            }
-        }
-        None => None,
-    };
+    let reincarnate_from = decision.pair.as_ref().map(|pair| pair.old);
     // Invariant (asserted, always): the announced identity is lawful and
     // names the descriptor's system half; on the crashed path it is the
     // replacement pair's new identity — the strict next life of the
@@ -2937,8 +2929,9 @@ mod tests {
         let path = state_path("marker");
         // The first life: one anchor round — `(system 1, counter 1,
         // Joining)` 4x, the projection's running sentinel.
-        let decision = boot_gate(GateStore::new(&path, test_sink(), 1), None).expect("first boot");
-        assert_eq!(decision.incarnation, 1);
+        let decision = boot_gate(GateStore::new(&path, test_sink(), 1), test_system(), None)
+            .expect("first boot");
+        assert_eq!(decision.identity, test_identity(1));
         assert!(decision.session.is_some() && decision.deferred.is_none());
         drop(decision);
         assert_eq!(fs::read_to_string(&path).unwrap(), "1 1 unflushed\n");
@@ -2946,11 +2939,11 @@ mod tests {
         // pair is decided (counter 1 -> 2) and THE EMISSION GATE lands
         // the bump's one durable round at boot — before the driver
         // releases the first announcement, seated or not.
-        let decision =
-            boot_gate(GateStore::new(&path, test_sink(), 1), None).expect("crashed boot");
-        assert_eq!(decision.incarnation, 2);
+        let decision = boot_gate(GateStore::new(&path, test_sink(), 1), test_system(), None)
+            .expect("crashed boot");
+        assert_eq!(decision.identity, test_identity(2));
         let pair = decision.pair.expect("the replacement pair");
-        assert_eq!((pair.old.0, pair.new.0), (1, 2));
+        assert_eq!((pair.old, pair.new), (test_identity(1), test_identity(2)));
         assert!(decision.deferred.is_some() && decision.session.is_none());
         drop(decision);
         assert_eq!(
@@ -2961,8 +2954,12 @@ mod tests {
         // A re-boot over the landed round derives the strictly next
         // life: the identity law's counter never re-derives the same
         // identity.
-        let decision = boot_gate(GateStore::new(&path, test_sink(), 1), None).expect("replay");
-        assert_eq!(decision.pair.expect("the replayed pair").new.0, 3);
+        let decision =
+            boot_gate(GateStore::new(&path, test_sink(), 1), test_system(), None).expect("replay");
+        assert_eq!(
+            decision.pair.expect("the replayed pair").new,
+            test_identity(3)
+        );
         drop(decision);
         assert_eq!(fs::read_to_string(&path).unwrap(), "1 3 unflushed\n");
         // A clean checkpoint (flushed) continues under the same identity:
@@ -2972,9 +2969,9 @@ mod tests {
         // migration path the copy-free rig states boot through.
         fs::remove_file(superblock_path(&path)).unwrap();
         write_marker(&path, 1, 7, Marker::Stopped).unwrap();
-        let decision =
-            boot_gate(GateStore::new(&path, test_sink(), 1), None).expect("clean continue");
-        assert_eq!(decision.incarnation, 7);
+        let decision = boot_gate(GateStore::new(&path, test_sink(), 1), test_system(), None)
+            .expect("clean continue");
+        assert_eq!(decision.identity, test_identity(7));
         assert!(decision.session.is_some() && decision.pair.is_none());
         drop(decision);
         assert_eq!(fs::read_to_string(&path).unwrap(), "1 7 unflushed\n");
@@ -2994,30 +2991,30 @@ mod tests {
         let path = state_path("marker-bad");
         fs::write(&path, "not a marker\n").unwrap();
         assert_eq!(
-            boot_gate(GateStore::new(&path, test_sink(), 1), None).unwrap_err(),
+            boot_gate(GateStore::new(&path, test_sink(), 1), test_system(), None).unwrap_err(),
             CONFIG
         );
         // The projection's three-word spelling: two halves and a state.
         // A two-word line is an old-format marker: unreadable, refused.
         fs::write(&path, "999 unflushed\n").unwrap();
         assert_eq!(
-            boot_gate(GateStore::new(&path, test_sink(), 1), None).unwrap_err(),
+            boot_gate(GateStore::new(&path, test_sink(), 1), test_system(), None).unwrap_err(),
             CONFIG
         );
         fs::write(&path, "3 stale\n").unwrap();
         assert_eq!(
-            boot_gate(GateStore::new(&path, test_sink(), 1), None).unwrap_err(),
+            boot_gate(GateStore::new(&path, test_sink(), 1), test_system(), None).unwrap_err(),
             CONFIG
         );
         // A zero half is no identity: refused at the projection's edge.
         fs::write(&path, "0 1 unflushed\n").unwrap();
         assert_eq!(
-            boot_gate(GateStore::new(&path, test_sink(), 1), None).unwrap_err(),
+            boot_gate(GateStore::new(&path, test_sink(), 1), test_system(), None).unwrap_err(),
             CONFIG
         );
         fs::write(&path, "1 0 unflushed\n").unwrap();
         assert_eq!(
-            boot_gate(GateStore::new(&path, test_sink(), 1), None).unwrap_err(),
+            boot_gate(GateStore::new(&path, test_sink(), 1), test_system(), None).unwrap_err(),
             CONFIG
         );
         // The bump refuses when the next life would not fit the packing's
@@ -3026,16 +3023,16 @@ mod tests {
         // at the emission gate's spelling).
         fs::write(&path, "1 65535 unflushed\n").unwrap();
         assert_eq!(
-            boot_gate(GateStore::new(&path, test_sink(), 1), None).unwrap_err(),
+            boot_gate(GateStore::new(&path, test_sink(), 1), test_system(), None).unwrap_err(),
             CONFIG
         );
         // The last spellable life still continues clean.
         fs::write(&path, "1 65535 flushed\n").unwrap();
         assert_eq!(
-            boot_gate(GateStore::new(&path, test_sink(), 1), None)
+            boot_gate(GateStore::new(&path, test_sink(), 1), test_system(), None)
                 .expect("the exhausted identity still continues")
-                .incarnation,
-            65535
+                .identity,
+            test_identity(65535)
         );
         fs::remove_file(&path).unwrap();
         fs::remove_file(superblock_path(&path)).unwrap();
@@ -3051,17 +3048,18 @@ mod tests {
         let path = state_path("marker-flush");
         let scratch = state_path("marker-flush-scratch");
         fs::remove_dir_all(&scratch).ok();
-        boot_gate(GateStore::new(&path, test_sink(), 1), None).expect("first boot");
+        boot_gate(GateStore::new(&path, test_sink(), 1), test_system(), None).expect("first boot");
         assert!(
             !scratch.exists(),
             "boot_gate with no variant writes nothing"
         );
         let decision = boot_gate(
             GateStore::new(&path, test_sink(), 1),
+            test_system(),
             Some((&RecoveryFlush::SingleBlock, &scratch)),
         )
         .expect("crashed boot with the flush variant");
-        assert_eq!(decision.incarnation, 2);
+        assert_eq!(decision.identity, test_identity(2));
         let outcome = decision.flush.expect("the crashed boot reports the flush");
         assert_eq!(outcome.variant, "single");
         assert_eq!(outcome.bytes_written, 4096);
@@ -3073,11 +3071,13 @@ mod tests {
         );
         let decision = boot_gate(
             GateStore::new(&path, test_sink(), 1),
+            test_system(),
             Some((&RecoveryFlush::Diskless, &scratch)),
         )
         .expect("variant 0");
         assert_eq!(
-            decision.incarnation, 3,
+            decision.identity,
+            test_identity(3),
             "the replay re-decides from the landed round"
         );
         assert_eq!(decision.flush, None, "variant 0 writes nothing");
@@ -3094,13 +3094,14 @@ mod tests {
     fn existing_unflushed_files_boot_the_emission_gate_round() {
         let path = state_path("marker-compat");
         fs::write(&path, "1 7 unflushed\n").unwrap();
-        let decision =
-            boot_gate(GateStore::new(&path, test_sink(), 1), None).expect("crashed classification");
+        let decision = boot_gate(GateStore::new(&path, test_sink(), 1), test_system(), None)
+            .expect("crashed classification");
         assert_eq!(
-            decision.incarnation, 8,
+            decision.identity,
+            test_identity(8),
             "the running sentinel still classifies crashed"
         );
-        assert_eq!(decision.pair.expect("the pair").new.0, 8);
+        assert_eq!(decision.pair.expect("the pair").new, test_identity(8));
         drop(decision);
         assert_eq!(
             fs::read_to_string(&path).unwrap(),
@@ -3124,10 +3125,11 @@ mod tests {
     fn legacy_flushed_file_migrates_and_continues_clean() {
         let path = state_path("marker-compat-clean");
         fs::write(&path, "1 4 flushed\n").unwrap();
-        let decision = boot_gate(GateStore::new(&path, test_sink(), 1), None)
+        let decision = boot_gate(GateStore::new(&path, test_sink(), 1), test_system(), None)
             .expect("migrated classification");
         assert_eq!(
-            decision.incarnation, 4,
+            decision.identity,
+            test_identity(4),
             "the flush from the pre-routing era continues clean"
         );
         assert!(decision.session.is_some() && decision.pair.is_none());
@@ -3153,8 +3155,11 @@ mod tests {
     #[test]
     fn an_unreadable_marker_quorum_refuses_the_boot() {
         let path = state_path("marker-lost");
-        boot_gate(GateStore::new(&path, test_sink(), 1), None).expect("first boot");
-        drop(boot_gate(GateStore::new(&path, test_sink(), 1), None).expect("crashed boot"));
+        boot_gate(GateStore::new(&path, test_sink(), 1), test_system(), None).expect("first boot");
+        drop(
+            boot_gate(GateStore::new(&path, test_sink(), 1), test_system(), None)
+                .expect("crashed boot"),
+        );
         let superblock = superblock_path(&path);
         let geometry = lunet_locks_aof::marker::geometry().expect("geometry");
         {
@@ -3166,7 +3171,7 @@ mod tests {
                 .expect("tear the copies file down to one zone");
         }
         assert_eq!(
-            boot_gate(GateStore::new(&path, test_sink(), 1), None).unwrap_err(),
+            boot_gate(GateStore::new(&path, test_sink(), 1), test_system(), None).unwrap_err(),
             CONFIG,
             "the unreadable quorum refuses the boot"
         );
@@ -3188,6 +3193,20 @@ mod tests {
     /// a journal sink.
     fn test_sink() -> SinkDoor {
         Arc::new(Mutex::new(None))
+    }
+
+    /// The boot-gate tests' system half: every store is built for
+    /// system 1.
+    fn test_system() -> SystemId {
+        SystemId::new(1).expect("one is non-zero")
+    }
+
+    /// The pair the boot-gate tests expect: system 1, life `counter`.
+    fn test_identity(counter: u16) -> NodeId {
+        NodeId::new(
+            test_system(),
+            CrashCounter::new(counter).expect("a non-zero life"),
+        )
     }
 
     /// THE BOOT-READ SAFETY LAW: a bad checksum on ANY copy is a loud log

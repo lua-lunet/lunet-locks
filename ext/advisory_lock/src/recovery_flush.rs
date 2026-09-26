@@ -88,7 +88,7 @@ pub struct FlushOutcome {
 }
 
 /// The 64-byte ring header: magic, the FNV-1a checksum over the data line,
-/// the flush sequence (the boot's incarnation drives it), and the payload
+/// the flush sequence (the boot's packed identity drives it), and the payload
 /// length (64 on ring one; ring two carries the identical header — the
 /// checksum copy — with the payload region absent).
 fn ring_header(checksum: u64, sequence: u64, data_len: u64) -> [u8; HEADER_BYTES] {
