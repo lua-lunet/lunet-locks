@@ -47,8 +47,7 @@ fn main() {
     let server = Server::spawn(&dir, &bind, follow)
         .unwrap_or_else(|e| die(&format!("cannot bind {bind}: {e}")));
     println!(
-        "aof-console-bridge: {} on http://{} (series {}, follow {follow})",
-        "serving",
+        "aof-console-bridge: serving on http://{} (series {}, follow {follow})",
         server.port(),
         dir.display()
     );

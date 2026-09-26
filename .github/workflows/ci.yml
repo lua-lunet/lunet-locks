@@ -83,9 +83,13 @@ jobs:
         # formula installed by default.
         run: brew install luajit luarocks zlib
       - uses: jdx/mise-action@v2
-      # rustfmt + clippy are required by make ext-check (cargo fmt --check,
-      # cargo clippy); the default rust-toolchain profile omits them.
-      - uses: dtolnay/rust-toolchain@1.85
+      # rustfmt + clippy are required by make ext-check and make
+      # example-check (cargo fmt --check, cargo clippy); the default
+      # rust-toolchain profile omits them. The pin is the example crate's
+      # floor (its manifest's rust-version: let-chains in src/main.rs);
+      # the shipped crates keep their own lower floors in their
+      # manifests.
+      - uses: dtolnay/rust-toolchain@1.88
         with:
           components: rustfmt, clippy
       - name: Install project Lua tools
@@ -172,8 +176,9 @@ jobs:
           sudo ln -sfn /usr/lib /opt/luajit-shim/lib
       - uses: jdx/mise-action@v2
       # rustfmt + clippy are required by make ext-check (cargo fmt --check,
-      # cargo clippy); the default rust-toolchain profile omits them.
-      - uses: dtolnay/rust-toolchain@1.85
+      # cargo clippy); the default rust-toolchain profile omits them. The
+      # pin matches the test job (the example crate's floor).
+      - uses: dtolnay/rust-toolchain@1.88
         with:
           components: rustfmt, clippy
       - name: Install project Lua tools

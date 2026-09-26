@@ -213,10 +213,10 @@ fn keeps(kind: &str, options: &FlightTapeOptions, own: &str) -> bool {
     } else if internal {
         return false; // default: the playback surface only
     }
-    if let Some(node) = options.node {
-        if own != node.to_string() {
-            return false;
-        }
+    if let Some(node) = options.node
+        && own != node.to_string()
+    {
+        return false;
     }
     true
 }

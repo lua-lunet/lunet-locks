@@ -234,8 +234,8 @@ impl Contender {
         action: &Action,
         reply: Option<&Value>,
     ) -> Option<Action> {
-        let ok = reply.is_some_and(|reply| reply_ok(reply));
-        let remaining = reply.and_then(|reply| reply_remaining_ms(reply));
+        let ok = reply.is_some_and(reply_ok);
+        let remaining = reply.and_then(reply_remaining_ms);
         let holds = reply.is_some_and(|reply| reply_holds(reply, &self.holder));
         if holds {
             self.gate.holder = Some(self.holder.clone());
@@ -382,7 +382,7 @@ impl Signals {
     /// latches the process mode.
     pub fn register() -> Signals {
         let on = Arc::new(AtomicBool::new(false));
-        let mut signals = signal_hook::iterator::Signals::new(&[
+        let mut signals = signal_hook::iterator::Signals::new([
             signal_hook::consts::SIGUSR1,
             signal_hook::consts::SIGUSR2,
         ])
@@ -394,10 +394,10 @@ impl Signals {
                     if latch.swap(false, Ordering::Relaxed) {
                         println!("client stop (SIGUSR1) at wall={}", wall_ms());
                     }
-                } else if signal == signal_hook::consts::SIGUSR2 {
-                    if !latch.swap(true, Ordering::Relaxed) {
-                        println!("client start (SIGUSR2) at wall={}", wall_ms());
-                    }
+                } else if signal == signal_hook::consts::SIGUSR2
+                    && !latch.swap(true, Ordering::Relaxed)
+                {
+                    println!("client start (SIGUSR2) at wall={}", wall_ms());
                 }
             }
         });
@@ -750,7 +750,7 @@ mod tests {
         assert_eq!(value["op"], "get");
         assert_eq!(value["client_id"], 800_000);
         assert_eq!(value["request_num"], 1);
-        assert_eq!(value["lock_id"], 0x0DDBA12 as u64);
+        assert_eq!(value["lock_id"], 0x0DDBA12_u64);
         let message_id = uuid::Uuid::parse_str(value["message_id"].as_str().expect("uuid"))
             .expect("parseable message id");
         assert_eq!(action.message_id, *message_id.as_bytes());
@@ -830,7 +830,7 @@ mod tests {
         assert_eq!(value["op"], "set");
         assert_eq!(value["client_id"], 800_000);
         assert_eq!(value["request_num"], 2);
-        assert_eq!(value["lock_id"], 0x0DDBA12 as u64);
+        assert_eq!(value["lock_id"], 0x0DDBA12_u64);
         assert_eq!(value["lease"]["holder"], holder.as_str());
         assert_eq!(value["lease"]["lease_ms"], 500);
         assert_eq!(value["sent_at_ms"], 10_010);
@@ -881,7 +881,7 @@ mod tests {
         let poll = contender.next_action(at).expect("the poll fires");
         assert_eq!(poll.op, "get");
         let value: Value = serde_json::from_str(&poll.request).expect("valid json");
-        assert_eq!(value["lock_id"], 0x0DDBA12 as u64);
+        assert_eq!(value["lock_id"], 0x0DDBA12_u64);
     }
 
     #[test]

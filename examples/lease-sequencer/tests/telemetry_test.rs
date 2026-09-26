@@ -7,7 +7,6 @@ use lease_sequencer::telemetry::{
     Gate, TelemetryLog, TimeoutKnobs, marker_bytes, prune_plan, teardown_record,
 };
 use lunet_locks_aof::envelope::{Marker, Record};
-use lunet_locks_aof::{AofFile, Options};
 
 fn temp_dir(name: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!(
@@ -31,7 +30,7 @@ fn temp_dir(name: &str) -> std::path::PathBuf {
 /// active off, (stays) off, then back on.
 #[test]
 fn gate_follows_the_weight_sequence_0_1_2_0() {
-    let mut gate = Gate::new(0, 1000, 4 * 1024 * 1024);
+    let mut gate = Gate::new(0, 1000);
     assert!(gate.active(), "boot phase: active before any weight");
 
     gate.on_weight(Some(0));
@@ -50,7 +49,7 @@ fn gate_follows_the_weight_sequence_0_1_2_0() {
 /// A member with unknown weight (None, the boot phase) never disarms.
 #[test]
 fn gate_stays_active_while_weight_unknown() {
-    let mut gate = Gate::new(0, 1000, 4 * 1024 * 1024);
+    let mut gate = Gate::new(0, 1000);
     gate.on_weight(None);
     assert!(gate.active());
 }
@@ -59,7 +58,7 @@ fn gate_stays_active_while_weight_unknown() {
 /// the trace gap on re-arm.
 #[test]
 fn gate_reports_disarm_and_rearm_transitions() {
-    let mut gate = Gate::new(0, 1000, 4 * 1024 * 1024);
+    let mut gate = Gate::new(0, 1000);
     assert_eq!(gate.on_weight(Some(0)), None, "no event when already on");
     assert_eq!(gate.on_weight(Some(1)), Some(false), "disarm reported");
     assert_eq!(gate.on_weight(Some(2)), None, "no event when already off");
@@ -70,7 +69,7 @@ fn gate_reports_disarm_and_rearm_transitions() {
 /// stops when the AOF turns off, and resumes (fresh interval) on re-arm.
 #[test]
 fn flusher_stops_when_gate_inactive() {
-    let mut gate = Gate::new(0, 1000, 4 * 1024 * 1024);
+    let mut gate = Gate::new(0, 1000);
     assert!(gate.flush_due(1500), "past the interval while active");
     gate.note_flush(1500);
     assert!(!gate.flush_due(2000), "inside the interval");
@@ -273,11 +272,11 @@ fn interval_sample_record_passes_the_gate() {
             unsafe { lunet_locks_aof::ffi::RawIter::open(file.to_string_lossy().as_bytes()) }
                 .expect("iter");
         while let Some(entry) = iter.next_entry().expect("read") {
-            if let Some(record) = lunet_locks_aof::envelope::Record::decode(&entry.bytes) {
-                if record.marker == Marker::TelemetryIntervalSample {
-                    found = Some(record);
-                    break;
-                }
+            if let Some(record) = lunet_locks_aof::envelope::Record::decode(&entry.bytes)
+                && record.marker == Marker::TelemetryIntervalSample
+            {
+                found = Some(record);
+                break;
             }
         }
     }
@@ -364,8 +363,3 @@ fn telemetry_log_opens_with_force_off_and_retention() {
     log.teardown().unwrap();
     std::fs::remove_dir_all(&dir).unwrap();
 }
-
-/// Silence an unused-import warning when AofFile/Options are only used by
-/// the compile-time contract above.
-#[allow(unused)]
-fn _type_surface(_: fn(&std::path::Path) -> Result<AofFile, lunet_locks_aof::Error>, _: Options) {}

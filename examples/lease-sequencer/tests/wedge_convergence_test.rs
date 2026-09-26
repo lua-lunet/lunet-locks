@@ -207,7 +207,7 @@ fn leader_kill_restart_converges_through_the_limbos_poll() {
         hosts: [65537u32, 131073, 196609]
             .iter()
             .enumerate()
-            .map(|(index, id)| Host {
+            .map(|(index, _id)| Host {
                 node: Node::open(
                     &members,
                     &format!("n{}", index + 1),

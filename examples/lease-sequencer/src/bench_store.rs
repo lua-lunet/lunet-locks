@@ -216,16 +216,20 @@ impl NodeDiscipline {
             // sentinel rounds at incarnation + 1, the first recorded
             // here (the identity stays unseated), the second latches
             // Running.
-            Phase::Unseated if is_sentinel(marker) && self.bump_rounds == 0
-                && self.incarnation.checked_add(1) == Some(incarnation) =>
+            Phase::Unseated
+                if is_sentinel(marker)
+                    && self.bump_rounds == 0
+                    && self.incarnation.checked_add(1) == Some(incarnation) =>
             {
                 self.incarnation = incarnation;
                 self.marker = Some(marker.to_string());
                 self.bump_rounds = 1;
                 serde_json::json!({"ok": true})
             }
-            Phase::Unseated if is_sentinel(marker) && self.bump_rounds >= 1
-                && incarnation == self.incarnation =>
+            Phase::Unseated
+                if is_sentinel(marker)
+                    && self.bump_rounds >= 1
+                    && incarnation == self.incarnation =>
             {
                 self.marker = Some(marker.to_string());
                 self.bump_rounds += 1;
@@ -241,9 +245,7 @@ impl NodeDiscipline {
             // witness seated before the stop ran: the engine's latch
             // round lands lawfully (the emission gate's round already
             // stands), and the stop then owes the full halt rounds.
-            Phase::StopFromUnseated
-                if is_sentinel(marker) && incarnation == self.incarnation =>
-            {
+            Phase::StopFromUnseated if is_sentinel(marker) && incarnation == self.incarnation => {
                 self.marker = Some(marker.to_string());
                 self.phase = Phase::ExpectStopping;
                 serde_json::json!({"ok": true})
@@ -252,9 +254,7 @@ impl NodeDiscipline {
             // the seated latch to land its round: the same round the
             // emission gate already made durable, recorded, and the
             // boot read that follows answers from it.
-            Phase::DirtyBoot
-                if is_sentinel(marker) && incarnation == self.incarnation =>
-            {
+            Phase::DirtyBoot if is_sentinel(marker) && incarnation == self.incarnation => {
                 self.marker = Some(marker.to_string());
                 serde_json::json!({"ok": true})
             }

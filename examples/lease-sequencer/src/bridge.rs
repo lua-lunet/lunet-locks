@@ -474,10 +474,10 @@ pub fn replay_series(dir: &Path) -> (Vec<LockEvent>, LockState, BridgeMetrics) {
             if let Some(labels) = &lease.labels {
                 labels_seen.insert(op.lock_id, labels.clone());
             }
-            if let Some(lease_ms) = op.lease_ms {
-                if lease_ms > 0 {
-                    lease_ms_seen.insert(op.lock_id, lease_ms);
-                }
+            if let Some(lease_ms) = op.lease_ms
+                && lease_ms > 0
+            {
+                lease_ms_seen.insert(op.lock_id, lease_ms);
             }
         }
 
@@ -1016,12 +1016,12 @@ fn series_json(replay: &Replay, now_ms: u64) -> Value {
     // The held gauge: replay the lease intervals in ts order.
     let mut active: Vec<(u64, u64)> = Vec::new(); // (holder taken_at, expiry)
     for event in &replay.events {
-        fn bucket<'a>(
+        fn bucket(
             ts_ms: u64,
             first_bucket: u64,
             bucket_ms: u64,
-            buckets: &'a mut [Value],
-        ) -> Option<&'a mut Value> {
+            buckets: &mut [Value],
+        ) -> Option<&mut Value> {
             let index = ((ts_ms.saturating_sub(first_bucket)) / bucket_ms) as usize;
             buckets.get_mut(index)
         }
@@ -1048,10 +1048,9 @@ fn series_json(replay: &Replay, now_ms: u64) -> Value {
                     .split("expiry ")
                     .nth(1)
                     .and_then(|e| e.parse::<u64>().ok())
+                    && let Some(interval) = active.last_mut()
                 {
-                    if let Some(interval) = active.last_mut() {
-                        interval.1 = expiry;
-                    }
+                    interval.1 = expiry;
                 }
             }
             "release" | "break" => {
@@ -1075,10 +1074,11 @@ fn series_json(replay: &Replay, now_ms: u64) -> Value {
         // Held samples: last write wins per bucket.
         for (taken_at, expiry) in &active {
             let sample_ts = event.ts_ms;
-            if *taken_at <= sample_ts && *expiry > sample_ts {
-                if let Some(b) = bucket(sample_ts, first_bucket, bucket_ms, &mut buckets) {
-                    b["held"] = json!(active.len());
-                }
+            if *taken_at <= sample_ts
+                && *expiry > sample_ts
+                && let Some(b) = bucket(sample_ts, first_bucket, bucket_ms, &mut buckets)
+            {
+                b["held"] = json!(active.len());
             }
         }
     }

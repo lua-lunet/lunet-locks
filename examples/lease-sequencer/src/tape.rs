@@ -174,7 +174,7 @@ fn wire_body(front: &[u8]) -> Option<WireBody> {
         return Some(body); // a mangled body: the header fields still stand
     }
     let rest = &front[21.min(front.len())..];
-    if tag == 2 && rest.len() >= 8 + 4 + 1 {
+    if tag == 2 && rest.len() > 8 + 4 {
         // Prepare { entry { slot, era, payload }, committed }
         let cursor = 12;
         let disc = rest[cursor];
@@ -233,7 +233,7 @@ fn lock_fields(json: &[u8]) -> Option<Map<String, Value>> {
 /// did not name it.
 fn derive_recorder(dir: &Path) -> Option<u32> {
     for (path, _, _) in series(dir) {
-        let mut iter = match unsafe { retention_iter(&path) } {
+        let mut iter = match retention_iter(&path) {
             Ok(iter) => iter,
             Err(_) => continue,
         };
@@ -307,10 +307,10 @@ pub fn stream_dir(
                 Marker::TelemetryOutbound => Kind::Outbound,
                 Marker::TelemetryIntervalSample => Kind::Sample,
             };
-            if let Some(wanted) = &wanted {
-                if !wanted.contains(&kind) {
-                    continue;
-                }
+            if let Some(wanted) = &wanted
+                && !wanted.contains(&kind)
+            {
+                continue;
             }
             let Some(line) = tape_line(kind, ns, &record.payload, recorder) else {
                 counts.unnamed += 1;
@@ -472,9 +472,7 @@ fn insert_parsed(json: &mut Map<String, Value>, payload: &[u8]) {
             }
         }
         Err(_) => {
-            let raw = String::from_utf8_lossy(payload)
-                .replace('\n', " ")
-                .replace('\r', " ");
+            let raw = String::from_utf8_lossy(payload).replace(['\n', '\r'], " ");
             json.insert("raw".into(), Value::from(raw));
         }
     }

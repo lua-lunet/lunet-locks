@@ -45,10 +45,6 @@ pub struct Gate {
     flush_interval_ms: u64,
     /// The last flush the gate drove (its own clock, host ms).
     last_flush_ms: u64,
-    /// The rollover threshold (bytes): the active file is closed and a
-    /// fresh one opened at/after this size.
-    #[allow(dead_code)]
-    rollover_bytes: u64,
 }
 
 /// The gate's event: `Some(true)` re-armed the AOF, `Some(false)` disarmed
@@ -57,13 +53,12 @@ pub type GateEvent = Option<bool>;
 
 impl Gate {
     /// A gate that starts active (the boot phase), flushed last at
-    /// `last_flush_ms`, with the flush interval and the rollover threshold.
-    pub fn new(last_flush_ms: u64, flush_interval_ms: u64, rollover_bytes: u64) -> Self {
+    /// `last_flush_ms`, with the flush interval.
+    pub fn new(last_flush_ms: u64, flush_interval_ms: u64) -> Self {
         Gate {
             active: true,
             flush_interval_ms,
             last_flush_ms,
-            rollover_bytes,
         }
     }
 
@@ -100,11 +95,6 @@ impl Gate {
     /// Stamp the re-arm: the flusher restarts from NOW (a fresh interval).
     pub fn note_rearm(&mut self, now_ms: u64) {
         self.last_flush_ms = now_ms;
-    }
-
-    /// The rollover threshold.
-    pub fn rollover_bytes(&self) -> u64 {
-        self.rollover_bytes
     }
 }
 
@@ -165,7 +155,7 @@ impl TelemetryLog {
             closed: false,
             dir: dir.to_path_buf(),
             file: Some(file),
-            gate: Gate::new(0, flush_interval_ms, rollover_bytes),
+            gate: Gate::new(0, flush_interval_ms),
             retention_bytes,
             rollover_bytes,
         })

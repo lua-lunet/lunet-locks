@@ -119,7 +119,9 @@ fn the_planted_flush_claim_against_an_unflushed_marker_is_reported() {
         report.text
     );
     assert!(
-        report.text.contains("unflushed at identity system=1 crash=3"),
+        report
+            .text
+            .contains("unflushed at identity system=1 crash=3"),
         "the superblock copy state is named: {}",
         report.text
     );

@@ -16,12 +16,12 @@ use lease_sequencer::flight_tape::{
     FlightError, FlightTapeOptions, READER_COMMIT, check_commit, read_header, stream_recording,
 };
 use lease_sequencer::tape::tag_name;
-use scenario::{Scenario, TapeFrame, feed_tape, parse_tape_line, tape_frame};
+use scenario::{Scenario, feed_tape, parse_tape_line, tape_frame};
 use serde_json::{Value, json};
 use std::path::PathBuf;
 use vrr::journal::{LogEntry, Payload};
 use vrr::message::{Body, Message};
-use vrr::wire::{Header, Pack, Tag, Unpack};
+use vrr::wire::{Header, Pack, Tag};
 
 /// Writes one recording fixture: a header line plus event lines, the
 /// recorder's JSONL shape.
@@ -206,8 +206,10 @@ fn the_internal_kinds_are_explicit_only() {
     )
     .expect("the recording streams");
     assert_eq!(lines, 0, "the internal events are not the default surface");
-    let mut options = FlightTapeOptions::default();
-    options.kinds = vec!["internal".to_string()];
+    let options = FlightTapeOptions {
+        kinds: vec!["internal".to_string()],
+        ..Default::default()
+    };
     let mut capture: Vec<u8> = Vec::new();
     let (lines, _) = stream_recording(&recording, &options, &mut capture).expect("streams");
     assert_eq!(lines, 3, "every internal event on request");
@@ -237,8 +239,10 @@ fn given_a_scenario_the_flight_tape_feeds_the_playback_engine() {
         ],
     );
     let mut capture: Vec<u8> = Vec::new();
-    let mut options = FlightTapeOptions::default();
-    options.node = Some(786433);
+    let options = FlightTapeOptions {
+        node: Some(786433),
+        ..Default::default()
+    };
     stream_recording(&recording, &options, &mut capture).expect("the recording streams");
 
     // The scenario is the node's initial condition; the tape is the
@@ -302,14 +306,18 @@ fn the_deep_read_refuses_a_foreign_commit_before_any_extraction() {
                  "detail": {"code": 0}}),
         ],
     );
-    let mut options = FlightTapeOptions::default();
-    options.kinds = vec!["internal".to_string()];
+    let options = FlightTapeOptions {
+        kinds: vec!["internal".to_string()],
+        ..Default::default()
+    };
     let mut capture: Vec<u8> = Vec::new();
     let error = stream_recording(&recording, &options, &mut capture)
         .expect_err("the deep read refuses first");
     assert!(matches!(error, FlightError::CommitMismatch { .. }));
-    let mut options = FlightTapeOptions::default();
-    options.deep = true;
+    let options = FlightTapeOptions {
+        deep: true,
+        ..Default::default()
+    };
     let error =
         stream_recording(&recording, &options, &mut Vec::new()).expect_err("--deep is a deep read");
     assert!(matches!(error, FlightError::CommitMismatch { .. }));
@@ -347,8 +355,10 @@ fn the_stable_slice_streams_cross_commit_and_the_deep_read_does_not() {
     assert!(text.starts_with("66,44,"), "the CSV shape: {text:?}");
     assert!(text.contains("44,66,"), "the emit's rendered endpoints");
 
-    let mut options = FlightTapeOptions::default();
-    options.kinds = vec!["internal".to_string()];
+    let options = FlightTapeOptions {
+        kinds: vec!["internal".to_string()],
+        ..Default::default()
+    };
     let error = stream_recording(&recording, &options, &mut Vec::new())
         .expect_err("the deep read of a foreign commit refuses");
     assert!(matches!(error, FlightError::CommitMismatch { .. }));
@@ -385,8 +395,10 @@ fn the_extraction_stringifies_the_names_beside_the_raw_numbers() {
                    "detail": {"state": 0, "leader": 10}}),
         ],
     );
-    let mut options = FlightTapeOptions::default();
-    options.kinds = vec!["internal".to_string(), "emit".to_string()];
+    let options = FlightTapeOptions {
+        kinds: vec!["internal".to_string(), "emit".to_string()],
+        ..Default::default()
+    };
     let mut capture: Vec<u8> = Vec::new();
     let (lines, _) = stream_recording(&recording, &options, &mut capture).expect("streams");
     assert_eq!(lines, 5);
@@ -442,8 +454,10 @@ fn the_deep_read_streams_the_full_internal_log_on_the_same_commit() {
                               "lock_id": 17}}),
         ],
     );
-    let mut options = FlightTapeOptions::default();
-    options.deep = true;
+    let options = FlightTapeOptions {
+        deep: true,
+        ..Default::default()
+    };
     let mut capture: Vec<u8> = Vec::new();
     let (lines, mangled) = stream_recording(&recording, &options, &mut capture)
         .expect("the deep read streams on the same commit");
@@ -494,12 +508,18 @@ fn the_question_mark_endpoints_drop_unless_any() {
                    "detail": {"kind": 1, "to": 66, "len": 3, "hex": "aabb00"}}),
         ],
     );
-    let mut options = FlightTapeOptions::default();
-    options.from = Some(44);
+    let options = FlightTapeOptions {
+        from: Some(44),
+        ..Default::default()
+    };
     let mut capture: Vec<u8> = Vec::new();
     let (lines, _) = stream_recording(&recording, &options, &mut capture).expect("streams");
     assert_eq!(lines, 1, "the '?'-from line drops, the emit stays");
-    options.from_any = true;
+    let options = FlightTapeOptions {
+        from: Some(44),
+        from_any: true,
+        ..Default::default()
+    };
     let mut capture: Vec<u8> = Vec::new();
     let (lines, _) = stream_recording(&recording, &options, &mut capture).expect("streams");
     assert_eq!(lines, 2, "--from-any keeps the '?'-from line");
@@ -542,9 +562,11 @@ fn the_endpoint_filter_matches_the_rendered_line() {
         (44, Some(10)),
         (10, None),
     ] {
-        let mut options = FlightTapeOptions::default();
-        options.from = Some(from);
-        options.to = to;
+        let options = FlightTapeOptions {
+            from: Some(from),
+            to,
+            ..Default::default()
+        };
         let mut capture: Vec<u8> = Vec::new();
         stream_recording(&recording, &options, &mut capture).expect("streams");
         let kept: Vec<String> = String::from_utf8(capture)
@@ -651,15 +673,20 @@ mod real_capture {
             .iter()
             .filter(|line| line.starts_with("655361,720897,"))
             .collect();
-        assert!(!grepped.is_empty(), "the leader emitted to 720897: {tape:?}");
-        let mut options = FlightTapeOptions::default();
-        options.from = Some(655361);
-        options.to = Some(720897);
+        assert!(
+            !grepped.is_empty(),
+            "the leader emitted to 720897: {tape:?}"
+        );
+        let options = FlightTapeOptions {
+            from: Some(655361),
+            to: Some(720897),
+            ..Default::default()
+        };
         let mut filtered: Vec<u8> = Vec::new();
         let (kept, _) = stream_recording(&recording, &options, &mut filtered)
             .expect("the filtered stream runs");
         assert_eq!(
-            kept as usize,
+            kept,
             grepped.len(),
             "the filter matches the shell grep: {} vs {:?}",
             kept,
@@ -668,7 +695,7 @@ mod real_capture {
 
         // Extraction → force-feed a second node through the SAME
         // playback engine the telemetry tape feeds.
-        let frames: Vec<TapeFrame> = grepped
+        let frames: Vec<scenario::TapeFrame> = grepped
             .iter()
             .filter_map(|line| {
                 let (from, _to, json) = parse_tape_line(line)?;
@@ -704,8 +731,3 @@ mod real_capture {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
-
-/// Silence the unused-import warning when a helper is only used by one
-/// test above.
-#[allow(unused)]
-fn _type_surface(_: fn(u32) -> Value) {}

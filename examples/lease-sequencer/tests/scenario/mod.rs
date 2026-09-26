@@ -25,17 +25,15 @@
 //! slots before it. The faithful replay layer for a mid-stream window is
 //! therefore the lock Service — the node's committed state machine the
 //! core itself drives on every fold — fed the committed verbs extracted
-//! byte-exactly from the tape's `frame_hex` Prepare payloads. Both
-//! layers are implemented here; the acceptance pins both facts.
+//! byte-exactly from the tape's `frame_hex` Prepare payloads; that layer
+//! lives in `tests/tape_playback_test.rs`, the one consumer.
 
 use lease_sequencer::phi::Trailer;
 use lunet_advisory_lock::Node;
-use lunet_advisory_lock::locks::{Request, Service, Transition};
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::BTreeMap;
-use vrr::journal::Payload;
-use vrr::message::{Body, Message};
+use vrr::message::Message;
 use vrr::wire::Unpack;
 
 /// One membership row: the descriptor's id, display name, the recorded
@@ -149,7 +147,6 @@ pub struct TapeFrame {
     pub json: Value,
     pub front: Vec<u8>,
     pub tag: u32,
-    pub slot: u64,
 }
 
 /// Parses one `from,to,{jsonl}` tape line.
@@ -181,7 +178,6 @@ pub fn tape_frame(from: String, json: Value) -> Option<TapeFrame> {
         json,
         front,
         tag: message.header.tag as u32,
-        slot: message.header.slot.0,
     })
 }
 
@@ -194,8 +190,7 @@ pub struct FeedResult {
     pub skipped_no_sender: u64,
     /// The receive return codes, keyed by code.
     pub codes: BTreeMap<i32, u64>,
-    /// The node's status before the feed and after it.
-    pub status_before: lunet_advisory_lock::NodeStatus,
+    /// The node's status after the feed.
     pub status_after: Option<lunet_advisory_lock::NodeStatus>,
 }
 
@@ -206,7 +201,6 @@ pub struct FeedResult {
 /// trailer are unattributable and counted, never guessed.
 pub fn feed_tape(node: &mut Node, frames: &[TapeFrame]) -> FeedResult {
     let mut result = FeedResult {
-        status_before: node.status(),
         fed: 0,
         skipped_no_sender: 0,
         codes: BTreeMap::new(),
@@ -240,110 +234,4 @@ pub fn feed_tape(node: &mut Node, frames: &[TapeFrame]) -> FeedResult {
     }
     result.status_after = Some(node.status());
     result
-}
-
-/// One committed lock verb extracted byte-exactly from a tape frame.
-#[derive(Debug, Clone)]
-pub struct CommittedVerb {
-    pub ns: u64,
-    pub slot: u64,
-    pub message_id: String,
-    pub client_id: u64,
-    pub request_num: u64,
-    pub lock_id: u64,
-    pub op: String,
-    pub payload: Vec<u8>,
-}
-
-/// Extracts the committed lock verbs from the tape's Prepare frames: the
-/// payload rides the frame's own bytes, so the replay input is the
-/// recorded wire content itself.
-pub fn committed_verbs(frames: &[TapeFrame]) -> Vec<CommittedVerb> {
-    let mut verbs = Vec::new();
-    for frame in frames {
-        if frame.tag != 2 {
-            continue;
-        }
-        let Ok(message) = Message::unpack_from(&frame.front) else {
-            continue;
-        };
-        let Body::Prepare { entry, .. } = message.body else {
-            continue;
-        };
-        let Payload::Operation { id: _, payload } = &entry.payload else {
-            continue;
-        };
-        let Ok(request) = Service::decode(payload) else {
-            continue;
-        };
-        let (message_id, client_id, request_num) = request.ids();
-        let (op, lock_id) = match &request {
-            Request::Get { lock_id, .. } => ("get", *lock_id),
-            Request::Set { lock_id, .. } => ("set", *lock_id),
-            Request::Release { lock_id, .. } => ("release", *lock_id),
-            Request::Break { lock_id, .. } => ("break", *lock_id),
-        };
-        verbs.push(CommittedVerb {
-            ns: frame.json.get("ns").and_then(|v| v.as_u64()).unwrap_or(0),
-            slot: frame.slot,
-            message_id: message_id.to_string(),
-            client_id,
-            request_num,
-            lock_id,
-            op: op.to_string(),
-            payload: payload.to_vec(),
-        });
-    }
-    verbs
-}
-
-/// One replayed verb's outcome: the reply's granted flag and the
-/// transition the Service executed.
-#[derive(Debug, Clone, PartialEq)]
-pub struct ReplayedVerb {
-    pub slot: u64,
-    pub op: String,
-    pub lock_id: u64,
-    pub granted: Option<bool>,
-    pub holder: Option<String>,
-    pub transition: String,
-}
-
-/// Replays the committed verbs through the Service at their recorded
-/// clocks (the given-message engine's execution rule): the deterministic
-/// committed-state transitions the tape's bytes produce.
-pub fn replay_verbs(verbs: &[CommittedVerb]) -> Vec<ReplayedVerb> {
-    let mut service = Service::default();
-    let mut replayed = Vec::new();
-    for verb in verbs {
-        let execution_time = verb.ns / 1_000_000;
-        let Ok((bytes, transition)) = service.execute(
-            verb.message_id.parse().expect("a uuid message id"),
-            verb.client_id,
-            verb.request_num,
-            execution_time,
-            &verb.payload,
-        ) else {
-            continue;
-        };
-        let reply: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-        replayed.push(ReplayedVerb {
-            slot: verb.slot,
-            op: verb.op.clone(),
-            lock_id: verb.lock_id,
-            granted: reply.get("granted").and_then(|v| v.as_bool()),
-            holder: reply
-                .get("lease")
-                .and_then(|lease| lease.get("holder"))
-                .and_then(|v| v.as_str())
-                .map(|text| text.to_string()),
-            transition: match transition {
-                None => "none".to_string(),
-                Some(Transition::Hold { .. }) => "hold".to_string(),
-                Some(Transition::Renew { .. }) => "renew".to_string(),
-                Some(_) => "other".to_string(),
-            },
-        });
-    }
-    replayed
 }

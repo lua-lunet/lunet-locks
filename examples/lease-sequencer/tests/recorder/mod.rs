@@ -6,9 +6,9 @@
 //! the AOF appends through the vendored TB record layer, so a recorded
 //! corpus is the same artifact class the rig's telemetry AOFs are.
 
+use lease_sequencer::phi::Trailer;
 use lunet_locks_aof::envelope::Record;
 use lunet_locks_aof::ffi::RawFile;
-use lease_sequencer::phi::Trailer;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use uuid::Uuid;

@@ -137,11 +137,11 @@ fn main() {
         Ok(counts) => counts,
         Err(e) => die(&format!("{e}")),
     };
-    if out.is_some() {
+    if let Some(path) = &out {
         eprintln!(
             "skaffold_aof_tape: {} -> {} records={} lines={} undecodable={} unnamed={} filtered={}",
             dir.display(),
-            out.unwrap().display(),
+            path.display(),
             counts.records,
             counts.lines,
             counts.undecodable,

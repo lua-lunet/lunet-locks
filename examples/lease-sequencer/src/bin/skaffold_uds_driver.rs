@@ -1,8 +1,8 @@
-//! The harness driver binary: boots the node hosts (in-process or as
-//! `skaffold_uds_node` child processes), wires every peer and client
-//! message through the cluster-wide trace AOF, and runs one scenario
-//! (stage1 | stage2 | stage3) with its asserted invariants. Every scenario
-//! step prints a `[pass]`/`[fail]` line; exit 0 only when all pass.
+//! The harness driver binary: boots the node hosts in-process, wires
+//! every peer and client message through the cluster-wide trace AOF, and
+//! runs one scenario (stage1 | stage2 | stage3) with its asserted
+//! invariants. Every scenario step prints a `[pass]`/`[fail]` line;
+//! exit 0 only when all pass.
 
 use lease_sequencer::uds_harness::{
     Cluster, ClusterConfig, print_verdicts, stage1, stage2, stage3,
@@ -33,20 +33,12 @@ fn parse_clients(text: &str) -> Vec<(String, u32)> {
         .collect()
 }
 
-fn parse_num(text: &str) -> u64 {
-    text.strip_prefix("0x")
-        .and_then(|hex| u64::from_str_radix(hex, 16).ok())
-        .or_else(|| text.parse().ok())
-        .unwrap_or(0)
-}
-
 fn main() {
     let mut run_dir = PathBuf::new();
     let mut members_text = String::new();
     let mut boot_text = String::new();
     let mut clients_text = String::new();
     let mut scenario = String::from("stage3");
-    let mut node_bin: Option<PathBuf> = None;
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut index = 0;
     while index < argv.len() {
@@ -61,7 +53,6 @@ fn main() {
             "--boot" => boot_text = value.clone(),
             "--clients" => clients_text = value.clone(),
             "--scenario" => scenario = value.clone(),
-            "--node-bin" => node_bin = Some(PathBuf::from(value)),
             other => {
                 eprintln!("skaffold_uds_driver: unknown option {other}");
                 std::process::exit(2);
@@ -73,7 +64,7 @@ fn main() {
         eprintln!(
             "usage: skaffold_uds_driver --run-dir PATH --members 44:node44,55:node55,66:node66 \
              [--boot 44,55,66] [--clients client1:44,client2:55,client3:66] \
-             [--scenario stage1|stage2|stage3] [--node-bin PATH]"
+             [--scenario stage1|stage2|stage3]"
         );
         std::process::exit(2);
     }

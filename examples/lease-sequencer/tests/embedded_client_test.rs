@@ -73,7 +73,7 @@ struct Harness {
 
 impl Harness {
     fn boot(root: &Path) -> Harness {
-        let members = "65537:a\0131073:b";
+        let members = "65537:a\x00131073:b";
         let node_a = Node::open(
             members,
             "a",
@@ -122,8 +122,10 @@ impl Harness {
         for _ in 0..1000 {
             // a first, then b: the fixed order keeps the leader's queue
             // order (the SET race's determinism rides it).
-            let moved_a = Harness::drain_one(65537, &mut self.node_a, &mut self.node_b, &mut replies);
-            let moved_b = Harness::drain_one(131073, &mut self.node_b, &mut self.node_a, &mut replies);
+            let moved_a =
+                Harness::drain_one(65537, &mut self.node_a, &mut self.node_b, &mut replies);
+            let moved_b =
+                Harness::drain_one(131073, &mut self.node_b, &mut self.node_a, &mut replies);
             if !moved_a && !moved_b {
                 return replies;
             }

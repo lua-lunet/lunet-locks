@@ -335,14 +335,14 @@ pub fn check_shutdown(input: &Path) -> Result<Report, String> {
             }
             continue;
         }
-        if lower.ends_with(".state") {
-            if let Some(token) = &token {
-                nodes
-                    .entry(token.clone())
-                    .or_default()
-                    .state_bases
-                    .push(path.clone());
-            }
+        if lower.ends_with(".state")
+            && let Some(token) = &token
+        {
+            nodes
+                .entry(token.clone())
+                .or_default()
+                .state_bases
+                .push(path.clone());
         }
     }
     // A durable-state base is any file a `.superblock` names as its
@@ -401,8 +401,8 @@ pub fn check_shutdown(input: &Path) -> Result<Report, String> {
     text.push_str(&format!(
         "check-shutdown: {checked} node(s) checked: {verdict_word}\n"
     ));
-    if extracted.is_some() {
-        let _ = fs::remove_dir_all(extracted.unwrap());
+    if let Some(extracted) = extracted {
+        let _ = fs::remove_dir_all(extracted);
     }
     Ok(Report { text, verdict })
 }
@@ -415,9 +415,9 @@ fn resolve_input(input: &Path) -> Result<(PathBuf, Option<PathBuf>), String> {
         return Ok((input.to_path_buf(), None));
     }
     let is_gzip = fs::File::open(input)
-        .and_then(|mut file| {
+        .map(|mut file| {
             let mut magic = [0u8; 2];
-            Ok(file.read_exact(&mut magic).is_ok() && magic == [0x1f, 0x8b])
+            file.read_exact(&mut magic).is_ok() && magic == [0x1f, 0x8b]
         })
         .unwrap_or(false);
     if !is_gzip {
@@ -588,27 +588,27 @@ classification (code {code})",
         }
         // The reverse direction: the marker vouches for a flush, the
         // logs must carry the stop record.
-        if let Some(classified) = copy.classified {
-            if matches!(
+        if let Some(classified) = copy.classified
+            && matches!(
                 classified.state,
                 MarkerState::Flushed | MarkerState::Stopped
-            ) {
-                let has_flushed = parsed.iter().any(|(_log, records)| {
-                    records
-                        .iter()
-                        .any(|record| record.kind == StopKind::Flushed)
-                });
-                if !has_flushed {
-                    findings.push(format!(
-                        "INCONSISTENCY [{token}] marker-without-stop-record: the \
+            )
+        {
+            let has_flushed = parsed.iter().any(|(_log, records)| {
+                records
+                    .iter()
+                    .any(|record| record.kind == StopKind::Flushed)
+            });
+            if !has_flushed {
+                findings.push(format!(
+                    "INCONSISTENCY [{token}] marker-without-stop-record: the \
 superblock classifies {} at identity system={} crash={} for {} but no log carries a \
 drained-and-flushed stop record for this node",
-                        marker_word(classified.state),
-                        classified.identity.system_identifier(),
-                        classified.identity.crash_counter(),
-                        display_rel(&copy.base, root),
-                    ));
-                }
+                    marker_word(classified.state),
+                    classified.identity.system_identifier(),
+                    classified.identity.crash_counter(),
+                    display_rel(&copy.base, root),
+                ));
             }
         }
     }
@@ -754,7 +754,7 @@ fn ordering_findings(
         .iter()
         .filter(|record| record.kind == StopKind::Begin)
         .filter_map(|record| record.known_ts().map(|(ts, _from)| ts))
-        .last();
+        .next_back();
 
     if let Some(line_no) = work_after_line {
         let lines = fs::read_to_string(log)

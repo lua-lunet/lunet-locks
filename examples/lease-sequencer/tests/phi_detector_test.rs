@@ -276,12 +276,12 @@ fn a_fresh_commit_toggles_false_and_the_next_tick_resumes() {
 fn the_toggle_record_carries_state_ts_and_last_toggle_ts() {
     let mut toggle = phi::TimeoutToggle::new();
     let first = toggle.on_suspicion(1_000).expect("first toggle");
-    assert_eq!(first.timedout, true);
+    assert!(first.timedout);
     assert_eq!(first.at_ms, 1_000, "the current ts rides the record");
     assert_eq!(first.previous_ms, None, "no earlier toggle exists");
 
     let second = toggle.on_commit(1_400).expect("second toggle");
-    assert_eq!(second.timedout, false);
+    assert!(!second.timedout);
     assert_eq!(second.at_ms, 1_400);
     assert_eq!(
         second.previous_ms,

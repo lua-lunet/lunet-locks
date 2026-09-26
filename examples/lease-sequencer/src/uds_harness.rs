@@ -155,13 +155,6 @@ fn payload_json(chan: u8, rest: &[u8]) -> String {
 // Frame I/O: 4-byte big-endian length + payload, over unix stream sockets.
 // ---------------------------------------------------------------------------
 
-fn write_frame(stream: &mut UnixStream, payload: &[u8]) -> std::io::Result<()> {
-    let mut head = [0u8; 4];
-    head.copy_from_slice(&(payload.len() as u32).to_be_bytes());
-    stream.write_all(&head)?;
-    stream.write_all(payload)
-}
-
 /// One stream's nonblocking write buffer: frames enqueue as bytes and
 /// drain as the socket takes them; partial writes resume by position, so
 /// the driver's own hop never waits on a busy peer.
@@ -372,6 +365,10 @@ pub struct NodeHost {
     driver_path: PathBuf,
     log: Option<File>,
     heartbeat_ms: u64,
+    /// The phi fallback wait: an unsettled sketch falls back to the fixed
+    /// gate (`experimental-phi` only; the normal build's sloppy timeout
+    /// never reads it).
+    #[cfg(feature = "experimental-phi")]
     election_ms: u64,
     recovery_ms: u64,
     /// The phi monitor (`experimental-phi` only).
@@ -391,6 +388,8 @@ pub struct NodeHost {
     last_recovery: u64,
     last_status_note: u64,
     last_seen_leader: u32,
+    /// The Commit-trailer sequence the phi build's leader stamps.
+    #[cfg(feature = "experimental-phi")]
     heartbeat_seq: u32,
     last_leader_commit_ms: u64,
     heartbeat_request_num: u64,
@@ -458,6 +457,7 @@ impl NodeHost {
             driver_path: options.driver_path.clone(),
             log,
             heartbeat_ms: options.heartbeat_ms,
+            #[cfg(feature = "experimental-phi")]
             election_ms: options.election_ms,
             recovery_ms: options.recovery_ms,
             timeout_knobs: TimeoutKnobs {
@@ -470,6 +470,7 @@ impl NodeHost {
             last_recovery: 0,
             last_status_note: 0,
             last_seen_leader: u32::MAX,
+            #[cfg(feature = "experimental-phi")]
             heartbeat_seq: 0,
             last_leader_commit_ms: 0,
             heartbeat_request_num: 0,
@@ -609,14 +610,12 @@ impl NodeHost {
                 // leader, or answer the 0x03 notch back through the driver
                 // (the driver plays the forwarding follower's client
                 // socket and correlates the refusal to the contender).
-                FORWARD_REQUEST => {
-                    if rest.len() > 17 {
-                        let json = String::from_utf8_lossy(&rest[17..]).into_owned();
-                        let rc = self.node.request(json.as_bytes());
-                        self.flush_outputs(now);
-                        if rc != OK {
-                            self.send_not_leader_notch(&rest[1..17], now);
-                        }
+                FORWARD_REQUEST if rest.len() > 17 => {
+                    let json = String::from_utf8_lossy(&rest[17..]).into_owned();
+                    let rc = self.node.request(json.as_bytes());
+                    self.flush_outputs(now);
+                    if rc != OK {
+                        self.send_not_leader_notch(&rest[1..17], now);
                     }
                 }
                 _ => {}
@@ -634,14 +633,16 @@ impl NodeHost {
                 }
                 let status = self.node.status();
                 let mid = message_id_of(&String::from_utf8_lossy(rest));
-                if rc == NOT_LEADER && status.leader != u32::MAX && status.leader != self.own_id {
-                    if let Some(mid) = mid {
-                        let mut payload = vec![FORWARD_REQUEST];
-                        payload.extend_from_slice(&mid);
-                        payload.extend_from_slice(rest);
-                        self.send_driver(status.leader, CHAN_APP, &payload);
-                        return;
-                    }
+                if rc == NOT_LEADER
+                    && status.leader != u32::MAX
+                    && status.leader != self.own_id
+                    && let Some(mid) = mid
+                {
+                    let mut payload = vec![FORWARD_REQUEST];
+                    payload.extend_from_slice(&mid);
+                    payload.extend_from_slice(rest);
+                    self.send_driver(status.leader, CHAN_APP, &payload);
+                    return;
                 }
                 if let Some(mid) = mid {
                     self.send_not_leader_notch(&mid, now);
@@ -738,7 +739,7 @@ impl NodeHost {
     /// build's arm point): one uniform random in `[min, max]`, logged
     /// when the armed wait changed.
     #[cfg(not(feature = "experimental-phi"))]
-    fn rearm_election_wait(&mut self, now: u64) {
+    fn rearm_election_wait(&mut self, _now: u64) {
         let wait = phi::random_wait_ms(
             self.timeout_knobs.min_ms,
             self.timeout_knobs.max_ms,
@@ -1112,12 +1113,6 @@ impl ClusterConfig {
     }
 }
 
-struct Pending {
-    client: String,
-    action: Option<Action>,
-    issued_ms: u64,
-}
-
 struct ClientState {
     name: String,
     node: u32,
@@ -1130,7 +1125,6 @@ struct ClientState {
 }
 
 struct NodeSlot {
-    id: u32,
     request_path: PathBuf,
     /// The driver→node stream (blocks-free: frames buffer, then drain).
     request: Option<(UnixStream, OutBuf)>,
@@ -1231,7 +1225,6 @@ impl Cluster {
                     threads.push(handle);
                     stops.push(stop);
                     NodeSlot {
-                        id: *id,
                         request_path,
                         request: None,
                         out: None,
@@ -1268,7 +1261,6 @@ impl Cluster {
                             std::io::Error::other(format!("node{id} spawn failed: {e}"))
                         })?;
                     NodeSlot {
-                        id: *id,
                         request_path,
                         request: None,
                         out: None,
@@ -1345,7 +1337,7 @@ impl Cluster {
             if slot.request.is_some() || !slot.request_path.exists() {
                 continue;
             }
-            if let Ok(mut stream) = UnixStream::connect(&slot.request_path) {
+            if let Ok(stream) = UnixStream::connect(&slot.request_path) {
                 let _ = stream.set_nonblocking(true);
                 slot.request = Some((stream, OutBuf::new()));
             }
@@ -1353,14 +1345,9 @@ impl Cluster {
     }
 
     fn accept_out(&mut self) {
-        loop {
-            match self.listener.accept() {
-                Ok((stream, _)) => {
-                    let _ = stream.set_nonblocking(true);
-                    self.incoming.push((stream, FrameBuf::new()));
-                }
-                Err(_) => break,
-            }
+        while let Ok((stream, _)) = self.listener.accept() {
+            let _ = stream.set_nonblocking(true);
+            self.incoming.push((stream, FrameBuf::new()));
         }
         let mut identified: Vec<(u32, Vec<Vec<u8>>, UnixStream, FrameBuf)> = Vec::new();
         let mut remaining: Vec<(UnixStream, FrameBuf)> = Vec::new();
@@ -1480,11 +1467,11 @@ impl Cluster {
                     .unwrap_or(0);
                 self.record(&format!("beef-{cid}"), &self.node_tag(from), &text);
                 let body = frame_body(from, CHAN_CLIENT, rest);
-                if let Some(slot) = self.nodes.get_mut(&from) {
-                    if let Some((stream, out)) = slot.request.as_mut() {
-                        let _ = out.enqueue(&body);
-                        let _ = out.flush(stream);
-                    }
+                if let Some(slot) = self.nodes.get_mut(&from)
+                    && let Some((stream, out)) = slot.request.as_mut()
+                {
+                    let _ = out.enqueue(&body);
+                    let _ = out.flush(stream);
                 }
             }
             _ => {}
@@ -1513,7 +1500,7 @@ impl Cluster {
             self.record(
                 &self.node_tag(from),
                 "driver",
-                &format!("{{\"event\":\"unclaimed_not_leader\"}}"),
+                "{\"event\":\"unclaimed_not_leader\"}",
             );
             return;
         };
@@ -1537,20 +1524,20 @@ impl Cluster {
     fn take_pending(&mut self, mid: [u8; 16]) -> Option<(String, Option<Action>, u64)> {
         let mut found = None;
         for (name, state) in self.clients.iter_mut() {
-            if let Some((pending_mid, action, issued)) = &state.pending {
-                if *pending_mid == mid {
-                    found = Some((name.clone(), action.clone(), *issued));
-                    break;
-                }
+            if let Some((pending_mid, action, issued)) = &state.pending
+                && *pending_mid == mid
+            {
+                found = Some((name.clone(), action.clone(), *issued));
+                break;
             }
         }
         if found.is_some() {
             for state in self.clients.values_mut() {
-                if let Some((pending_mid, _, _)) = &state.pending {
-                    if *pending_mid == mid {
-                        state.pending = None;
-                        break;
-                    }
+                if let Some((pending_mid, _, _)) = &state.pending
+                    && *pending_mid == mid
+                {
+                    state.pending = None;
+                    break;
                 }
             }
         }
@@ -1571,7 +1558,7 @@ impl Cluster {
             self.record(
                 &self.node_tag(from),
                 "driver",
-                &format!("{{\"event\":\"reply_without_message_id\"}}"),
+                "{\"event\":\"reply_without_message_id\"}",
             );
             return;
         };
@@ -1627,11 +1614,11 @@ impl Cluster {
             state.ops.push(op);
             state.pending = Some((mid, Some(action), now));
         }
-        if let Some(slot) = self.nodes.get_mut(&node) {
-            if let Some((stream, out)) = slot.request.as_mut() {
-                let _ = out.enqueue(&body);
-                let _ = out.flush(stream);
-            }
+        if let Some(slot) = self.nodes.get_mut(&node)
+            && let Some((stream, out)) = slot.request.as_mut()
+        {
+            let _ = out.enqueue(&body);
+            let _ = out.flush(stream);
         }
     }
 
@@ -1654,11 +1641,11 @@ impl Cluster {
         if let Some(state) = self.clients.get_mut(client) {
             state.pending = Some((mid, None, now));
         }
-        if let Some(slot) = self.nodes.get_mut(&node) {
-            if let Some((stream, out)) = slot.request.as_mut() {
-                let _ = out.enqueue(&body);
-                let _ = out.flush(stream);
-            }
+        if let Some(slot) = self.nodes.get_mut(&node)
+            && let Some((stream, out)) = slot.request.as_mut()
+        {
+            let _ = out.enqueue(&body);
+            let _ = out.flush(stream);
         }
         Ok(())
     }
@@ -1928,7 +1915,7 @@ fn view_change_count(lines: &[String]) -> usize {
         .iter()
         .filter_map(|line| parse_line(line))
         .filter(|l| l.from.starts_with("node") && l.to.starts_with("node"))
-        .filter(|l| matches!(l.json.get("tag").and_then(|v| v.as_u64()), Some(5 | 6 | 7)))
+        .filter(|l| matches!(l.json.get("tag").and_then(|v| v.as_u64()), Some(5..=7)))
         .count()
 }
 
@@ -1998,7 +1985,6 @@ pub fn stage1(mut cluster: Cluster) -> Vec<Verdict> {
         "{{\"op\":\"get\",\"message_id\":\"{mid}\",\"client_id\":900001,\"request_num\":1,\
          \"lock_id\":14531090}}"
     );
-    let issued = millis();
     let _ = cluster.raw_issue("probe1", &get);
     let got = cluster.wait_until(1000, |lines| {
         lines.iter().any(|l| l.starts_with("node44,probe1,{"))
@@ -2146,7 +2132,7 @@ pub fn stage2(mut cluster: Cluster) -> Vec<Verdict> {
         .count();
     out.push(verdict(
         "stage2: third client probes politely (gap >= 900 ms)",
-        client2_gets.len() >= 1 && min_gap >= 900,
+        !client2_gets.is_empty() && min_gap >= 900,
         format!("gets={} min_gap_ms={min_gap}", client2_gets.len()),
     ));
     out.push(verdict(

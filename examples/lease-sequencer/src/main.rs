@@ -183,6 +183,10 @@ struct Host {
     fingerprint: String,
     own_id: u32,
     heartbeat_ms: u64,
+    /// The phi fallback wait: an unsettled sketch falls back to the fixed
+    /// gate (`experimental-phi` only; the normal build's randomized
+    /// `[min, max]` arm never reads it).
+    #[cfg(feature = "experimental-phi")]
     election_ms: u64,
     recovery_ms: u64,
     stagger_ms: u64,
@@ -684,27 +688,30 @@ fn parse_options() -> Options {
             );
             exit(2);
         }
-        if !options.aof_dir.is_empty() || !options.telemetry_aof_dir.is_empty() {
-            eprintln!(
-                "lease-sequencer: --bench-store excludes --aof-dir and \
-                 --telemetry-aof-dir (the journal, the logs, and the flight \
-                 tape are the bench's evidence)"
-            );
-            exit(2);
-        }
-        if options.recovery_flush != RecoveryFlush::Diskless {
-            eprintln!(
-                "lease-sequencer: --bench-store excludes --recovery-flush \
-                 (the bench store is the force-feed)"
-            );
-            exit(2);
-        }
-        if options.journal_dir.is_empty() {
-            eprintln!(
-                "lease-sequencer: --bench-store requires --journal-dir \
-                 (the journal is the bench's CAS chain)"
-            );
-            exit(2);
+        #[cfg(feature = "experimental-phi")]
+        {
+            if !options.aof_dir.is_empty() || !options.telemetry_aof_dir.is_empty() {
+                eprintln!(
+                    "lease-sequencer: --bench-store excludes --aof-dir and \
+                     --telemetry-aof-dir (the journal, the logs, and the flight \
+                     tape are the bench's evidence)"
+                );
+                exit(2);
+            }
+            if options.recovery_flush != RecoveryFlush::Diskless {
+                eprintln!(
+                    "lease-sequencer: --bench-store excludes --recovery-flush \
+                     (the bench store is the force-feed)"
+                );
+                exit(2);
+            }
+            if options.journal_dir.is_empty() {
+                eprintln!(
+                    "lease-sequencer: --bench-store requires --journal-dir \
+                     (the journal is the bench's CAS chain)"
+                );
+                exit(2);
+            }
         }
     }
     options
@@ -890,7 +897,7 @@ impl Host {
     /// `[min, max]`, logged with the note and the timeout-decision
     /// record when the armed wait changed.
     #[cfg(not(feature = "experimental-phi"))]
-    fn rearm_election_wait(&mut self, now: u64, unit: f64) {
+    fn rearm_election_wait(&mut self, _now: u64, unit: f64) {
         let wait = phi::random_wait_ms(self.timeout_knobs.min_ms, self.timeout_knobs.max_ms, unit);
         if wait != self.election_wait_armed {
             let previous = self.election_wait_armed;
@@ -2161,6 +2168,7 @@ fn serve(options: &Options, nodes: &[ClusterNode], lifecycle: &Lifecycle) -> Ser
         fingerprint,
         own_id,
         heartbeat_ms: options.heartbeat_ms,
+        #[cfg(feature = "experimental-phi")]
         election_ms: options.election_ms,
         recovery_ms: options.recovery_ms,
         stagger_ms: rank * 200,
@@ -2186,7 +2194,7 @@ fn serve(options: &Options, nodes: &[ClusterNode], lifecycle: &Lifecycle) -> Ser
             active: true,
         },
         #[cfg(feature = "experimental-phi")]
-        phi_monitor: phi_monitor(&options),
+        phi_monitor: phi_monitor(options),
         #[cfg(feature = "experimental-phi")]
         phi_cfg: phi::PhiConfig {
             phi_threshold: options.phi_threshold,
@@ -2274,16 +2282,26 @@ fn serve(options: &Options, nodes: &[ClusterNode], lifecycle: &Lifecycle) -> Ser
     // window (documented). The bench's SIGUSR1/SIGUSR2 cycle flags ride
     // the same loop top.
     loop {
-        if lifecycle.hup.swap(false, std::sync::atomic::Ordering::Relaxed) {
+        if lifecycle
+            .hup
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
             host.note("sighup: config reload not wired; noop");
         }
         if lifecycle.stopped.load(std::sync::atomic::Ordering::Relaxed) {
-            let name = if lifecycle.caught_term.swap(false, std::sync::atomic::Ordering::Relaxed)
+            let name = if lifecycle
+                .caught_term
+                .swap(false, std::sync::atomic::Ordering::Relaxed)
             {
                 "sigterm"
-            } else if lifecycle.caught_int.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            } else if lifecycle
+                .caught_int
+                .swap(false, std::sync::atomic::Ordering::Relaxed)
+            {
                 "sigint"
-            } else if lifecycle.caught_quit.swap(false, std::sync::atomic::Ordering::Relaxed)
+            } else if lifecycle
+                .caught_quit
+                .swap(false, std::sync::atomic::Ordering::Relaxed)
             {
                 "sigquit"
             } else {
@@ -3130,7 +3148,7 @@ mod forward_tests {
     //! see the lease expire and race for the takeover.
 
     use super::*;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -3166,17 +3184,29 @@ mod forward_tests {
         client: u16,
     }
 
-    fn boot_host(name: &str, root: &PathBuf) -> NodeHost {
+    fn boot_host(name: &str, root: &Path) -> NodeHost {
         let state = root.join(format!("{name}.state"));
         // A parallel-test boot race (same-process marker churn) is
         // tolerated by one fresh-root retry; the boot CONFIG error otherwise.
-        let node = match Node::open("65537:a\x00131073:b", name, state.to_str().expect("path"), None, 0) {
+        let node = match Node::open(
+            "65537:a\x00131073:b",
+            name,
+            state.to_str().expect("path"),
+            None,
+            0,
+        ) {
             Ok(node) => node,
             Err(_) => {
                 let root = temp_root();
                 let state = root.join(format!("{name}.state"));
-                Node::open("65537:a\x00131073:b", name, state.to_str().expect("path"), None, 0)
-                    .expect("node boots")
+                Node::open(
+                    "65537:a\x00131073:b",
+                    name,
+                    state.to_str().expect("path"),
+                    None,
+                    0,
+                )
+                .expect("node boots")
             }
         };
         let own_id = node.own_id();
@@ -3215,6 +3245,7 @@ mod forward_tests {
             fingerprint,
             own_id,
             heartbeat_ms: 100,
+            #[cfg(feature = "experimental-phi")]
             election_ms: 200,
             recovery_ms: 200,
             stagger_ms: 200,
@@ -3382,7 +3413,7 @@ mod forward_tests {
                         || e.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(e) => panic!("{e}"),
             }
-            if buf.iter().any(|byte| *byte == b'\n') {
+            if buf.contains(&b'\n') {
                 break;
             }
         }
@@ -3558,7 +3589,7 @@ mod forward_tests {
     }
 
     fn one_refusal_scenario() {
-        let (mut a, mut b, mut rng, _scratch) = harness();
+        let (a, mut b, mut rng, _scratch) = harness();
         // A conn with a pending forward: a real socket pair installed
         // straight into the host (the accept path is covered above), with
         // one op in flight whose leader-side refusal is what we feed next.
@@ -3608,7 +3639,7 @@ mod forward_tests {
                         || e.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(e) => panic!("{e}"),
             }
-            if buf.iter().any(|byte| *byte == b'\n') {
+            if buf.contains(&b'\n') {
                 break;
             }
         }
@@ -3698,7 +3729,7 @@ mod boot_hint_tests {
             .find(|node| node.name == "w1b-r1")
             .expect("the own row exists");
         assert_eq!(own.id, 45);
-        assert_eq!(own.genesis, false);
+        assert!(!own.genesis);
         assert_eq!(own.endpoint, "[2001:db8::1]:9103");
         assert_eq!(own.host, "[2001:db8::1]");
         assert_eq!(own.port, 9103);
@@ -3758,7 +3789,7 @@ mod reincarnation_remap_tests {
     //! the lawful outcome for a mis-attributed sender.
 
     use super::*;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
     use vrr::ids::{Era, NodeId, Slot, View, ViewId};
@@ -3799,7 +3830,7 @@ mod reincarnation_remap_tests {
         dir
     }
 
-    fn boot_host(name: &str, root: &PathBuf) -> NodeHost {
+    fn boot_host(name: &str, root: &Path) -> NodeHost {
         let state = root.join(format!("{name}.state"));
         let node = match Node::open(
             "65537:a\x00131073:b\x00196609:c",
@@ -3855,6 +3886,7 @@ mod reincarnation_remap_tests {
             fingerprint,
             own_id,
             heartbeat_ms: 100,
+            #[cfg(feature = "experimental-phi")]
             election_ms: 200,
             recovery_ms: 200,
             stagger_ms: 200,
@@ -4141,8 +4173,7 @@ mod reincarnation_remap_tests {
         let (mut a, mut b, mut c, mut rng) = settled();
         let status = a.host.node.status();
         assert_eq!(
-            status.leader,
-            65537,
+            status.leader, 65537,
             "the genesis primary leads the harness"
         );
         let view = ViewId {
@@ -4246,9 +4277,9 @@ mod reincarnation_remap_tests {
             match attribution {
                 Attribution::Mismatches | Attribution::NoRow => Route::Refuse,
                 Attribution::Matches => match pair {
-                    PairShape::SkippedLife
-                    | PairShape::Degenerate
-                    | PairShape::UnlawfulOld => Route::Refuse,
+                    PairShape::SkippedLife | PairShape::Degenerate | PairShape::UnlawfulOld => {
+                        Route::Refuse
+                    }
                     PairShape::NextLife => match new_row {
                         NewRow::Present => Route::Refuse,
                         NewRow::Absent => Route::Remap,

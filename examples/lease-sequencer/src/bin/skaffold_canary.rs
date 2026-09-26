@@ -197,8 +197,8 @@ fn udp_canary_round(
     let mut acked = vec![false; count];
     let mut buf = [0u8; 512];
     while !acked.iter().all(|a| *a) && Instant::now() < deadline {
-        for i in 0..count {
-            if !acked[i] {
+        for (i, acked) in acked.iter().enumerate() {
+            if !acked {
                 let payload = own_payload(runid, i);
                 let _ = sock.send_to(payload.as_bytes(), peer);
             }

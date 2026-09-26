@@ -22,7 +22,6 @@ const STALL_MS: u64 = 20;
 const WATCH_MS: u64 = 500;
 
 const STATE_NORMAL: u32 = 0;
-const STATE_VIEW_CHANGE: u32 = 1;
 const STATE_RECOVERING: u32 = 2;
 
 const ROOT: &str = "/Users/Shared/lua-lunet/lunet-locks/.tmp/clean-restart-test";
@@ -177,7 +176,7 @@ fn clean_restart_while_the_cluster_advances_converges() {
         hosts: [65537u32, 131073, 196609]
             .iter()
             .enumerate()
-            .map(|(index, id)| Host {
+            .map(|(index, _id)| Host {
                 node: Node::open(
                     &members,
                     &format!("n{}", index + 1),

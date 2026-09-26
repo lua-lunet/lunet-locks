@@ -153,10 +153,8 @@ fn spawn_cluster(dir: &Path) -> Vec<ServeProcess> {
     for (index, (peer, client)) in ports.iter().enumerate() {
         let _ = peer;
         let name = format!("n{}", index + 1);
-        let stdout = fs::File::create(dir.join(format!("{name}.stdout")))
-            .expect("stdout capture");
-        let stderr = fs::File::create(dir.join(format!("{name}.stderr")))
-            .expect("stderr capture");
+        let stdout = fs::File::create(dir.join(format!("{name}.stdout"))).expect("stdout capture");
+        let stderr = fs::File::create(dir.join(format!("{name}.stderr"))).expect("stderr capture");
         let child = Command::new(bin)
             .args([
                 "--name",
@@ -166,7 +164,9 @@ fn spawn_cluster(dir: &Path) -> Vec<ServeProcess> {
                 "--client",
                 &format!("127.0.0.1:{client}"),
                 "--state",
-                dir.join(format!("{name}.state")).to_str().expect("state path"),
+                dir.join(format!("{name}.state"))
+                    .to_str()
+                    .expect("state path"),
                 "--log",
                 dir.join(format!("{name}.log")).to_str().expect("log path"),
             ])
@@ -522,7 +522,7 @@ fn sigkill_leaves_the_running_sentinel_and_next_boot_bumps() {
 
     // The peers do not carry evidence this case needs; stop them so the
     // re-boot runs alone.
-    stop_cluster(peers.drain(..).collect());
+    stop_cluster(std::mem::take(&mut peers));
 
     let bin = env!("CARGO_BIN_EXE_lease-sequencer");
     let config_path = dir.join("cluster.jsonl");

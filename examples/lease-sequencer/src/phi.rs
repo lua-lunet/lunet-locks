@@ -341,6 +341,12 @@ pub struct TimeoutToggle {
     last_toggle_ms: Option<u64>,
 }
 
+impl Default for TimeoutToggle {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TimeoutToggle {
     pub fn new() -> Self {
         Self {
@@ -639,7 +645,6 @@ pub mod ffi {
     use super::*;
     use chrono::{Local, TimeZone};
     use phi_accrual_detector::{Detector, PhiInteraction};
-    use std::ffi::c_void;
     use std::sync::Mutex;
 
     /// The pointee of a [`PhiHandle`]: the crate's Detector plus the
@@ -833,9 +838,4 @@ pub mod ffi {
             unsafe { drop(Box::from_raw(handle)) };
         }
     }
-
-    // The c_void alias keeps the C ABI's pointer vocabulary honest for
-    // non-Rust headers.
-    #[allow(dead_code)]
-    type Void = c_void;
 }

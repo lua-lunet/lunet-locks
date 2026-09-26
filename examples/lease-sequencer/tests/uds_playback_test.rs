@@ -44,7 +44,7 @@ const HEARTBEAT_GAP_MS: u64 = 250;
 /// ticks are the recorded clocks.
 const BASE_MS: u64 = 1_793_000_000_000;
 /// The renewal SETs' holder: one holder across the whole run.
-const RENEWAL_HOLDER: Uuid = Uuid::from_u128(0x0DDB_A11_00_01);
+const RENEWAL_HOLDER: Uuid = Uuid::from_u128(0x00DD_BA11_0001);
 
 /// One decoded committed op from the recorded wire stream.
 #[derive(Debug, Clone)]
@@ -365,8 +365,7 @@ fn given_the_recorded_heartbeat_get_reply_shape() {
     let (_, ops) = extract_corpus();
     let get = ops
         .iter()
-        .filter(|op| op.lock_id == SENTINEL_LOCK && op.op == "get")
-        .next()
+        .find(|op| op.lock_id == SENTINEL_LOCK && op.op == "get")
         .expect("a heartbeat GET must be in the corpus");
     let mut service = Service::default();
     let execution_time = get.ns / 1_000_000;
@@ -424,8 +423,7 @@ fn given_a_recorded_set_through_the_harness_cluster_the_replay_is_deduped() {
     let (_, ops) = extract_corpus();
     let stale = ops
         .iter()
-        .filter(|op| op.op == "set")
-        .next()
+        .find(|op| op.op == "set")
         .expect("a recorded SET must be in the corpus")
         .clone();
     let ns = std::time::SystemTime::now()
@@ -448,7 +446,10 @@ fn given_a_recorded_set_through_the_harness_cluster_the_replay_is_deduped() {
     ));
     let config = ClusterConfig::new(
         run,
-        vec![((44 << 16) | 1, "node44".into()), ((55 << 16) | 1, "node55".into())],
+        vec![
+            ((44 << 16) | 1, "node44".into()),
+            ((55 << 16) | 1, "node55".into()),
+        ],
         vec![(44 << 16) | 1, (55 << 16) | 1],
     )
     .with_clients(vec![("probe1".into(), (44 << 16) | 1)]);

@@ -38,8 +38,12 @@ TOOL_SOURCES = $(wildcard tools/lib/*.tl)
 # POSIX bin helpers carry no logic and still get the discipline: shellcheck
 # plus the client-signal behavioural smoke.
 SIGNAL_BIN := examples/lease-sequencer/bin
+# The example crate's bench feature shape (the phi + flight-recorder rig
+# lane). The lint gate runs the example crate in BOTH shapes.
+BENCH_DIR := examples/lease-sequencer
+BENCH_FEATURES := experimental-phi flight-recorder
 
-.PHONY: init deps build check test smoke simulation simulation-test lunet-runtime docs clean ext ext-check ext-test fmt lint hooks sh-check sh-smoke docker-build docker-simulation sanity release-images build-proof package package-verify bench
+.PHONY: init deps build check test smoke simulation simulation-test lunet-runtime docs clean ext ext-check ext-test example-check fmt lint hooks sh-check sh-smoke docker-build docker-simulation sanity release-images build-proof package package-verify bench
 
 init:
 	@command -v mise >/dev/null 2>&1 || { echo "ERROR: mise is not on PATH. Install it from https://mise.jdx.dev and try again."; exit 1; }
@@ -80,7 +84,7 @@ sh-check:
 sh-smoke:
 	$(SIGNAL_BIN)/client-signal-smoke.sh
 
-check: build lint sh-check sh-smoke
+check: build lint example-check sh-check sh-smoke
 	$(CYAN) check $(CHECK_SOURCES)
 	$(CYAN) check $(TOOL_SOURCES)
 
@@ -128,8 +132,6 @@ simulation: lunet-runtime build $(SIM_BIN)
 # the target carries the override (the tapes stamp dirty and every
 # reader annotates it). Release evidence stays the clean-commit
 # softball run.
-BENCH_DIR := examples/lease-sequencer
-BENCH_FEATURES := experimental-phi flight-recorder
 bench:
 	cd $(BENCH_DIR) && FLIGHT_RECORDER_ALLOW_DIRTY=1 cargo build \
 		--features "$(BENCH_FEATURES)" \
@@ -228,6 +230,16 @@ ext-check:
 	mise exec -- zig fmt --check ext/lunet-locks-aof/zig/src
 	cargo fmt --manifest-path ext/paxe-core/Cargo.toml -- --check
 	cargo clippy --manifest-path ext/paxe-core/Cargo.toml --all-targets -- -D warnings
+
+# The example crate is gated like the ext crates, in BOTH its feature
+# shapes: the default build and the bench build. The bench shape's
+# flight-recorder feature trips the AOF crate's clean-commit guard on a
+# development tree, so the line carries the bench target's override (a
+# clean CI checkout never trips the guard).
+example-check:
+	cargo fmt --manifest-path $(BENCH_DIR)/Cargo.toml -- --check
+	cargo clippy --manifest-path $(BENCH_DIR)/Cargo.toml --all-targets -- -D warnings
+	FLIGHT_RECORDER_ALLOW_DIRTY=1 cargo clippy --manifest-path $(BENCH_DIR)/Cargo.toml --all-targets --features "$(BENCH_FEATURES)" -- -D warnings
 
 ext-test: ext-check
 	cargo test --manifest-path ext/advisory_lock/Cargo.toml

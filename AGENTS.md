@@ -125,6 +125,14 @@ No instruction conflicts with Andon; if one appears to, Andon wins.
   for data mining only.
 - `make init` also installs `tl` into `.rocks/` for the LuaJIT 5.1 ABI,
   idempotently; `make check` runs `tl check` over `tools/lib`.
+- Rust warnings are errors, permanently. Every Rust crate in this repo —
+  the three `ext/` crates and `examples/lease-sequencer` — is gated in
+  `make check` (`ext-check`, `example-check`) with `cargo fmt --check` and
+  `cargo clippy --all-targets -- -D warnings`, the example crate in both
+  its feature shapes (default and the bench build's
+  `experimental-phi flight-recorder`). An `#[allow]` exists only at a
+  load-bearing site (e.g. the zero-cost tracing trick), and its comment
+  above states exactly why it pays.
 
 ## Teal no-surprises recap
 
