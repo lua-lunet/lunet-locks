@@ -2491,11 +2491,16 @@ fn timers(host: &mut Host, now: u64, rng: &mut Rng) {
     }
     // The rejoin gossip's joiner half (`rejoin`): a fenced `Joining` boot
     // — a fresh provisioned voter whose engine sits at the boot fence —
-    // never assumes the cluster will come to it. Its own resend timer
-    // gossips the entry ticket to every peer; the leader's answering push
-    // is the evidence the boot fence qualifies, so the node catches up
-    // and stays a streamed witness until a view change seats it.
-    if status.state == STATE_JOINING
+    // never assumes the cluster will come to it. A bumped boot awaiting
+    // its first seat is the same fence shape: the engine boots unseated
+    // (voting weight 0) and the cluster is views ahead. Both gosssip the
+    // entry ticket to every peer on the resend timer; the leader's
+    // answering push is the evidence the boot fence qualifies, so the
+    // node catches up and stays a streamed witness until a view change
+    // seats it.
+    let unseated_reincarnation =
+        host.reincarnated && host.node.voting_weight().is_none_or(|weight| weight == 0);
+    if (status.state == STATE_JOINING || unseated_reincarnation)
         && now.saturating_sub(host.last_gossip) >= rejoin::GOSSIP_RESEND_MS
     {
         host.last_gossip = now;
