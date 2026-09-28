@@ -81,60 +81,17 @@ fn summarize(verdicts: &[Verdict]) -> String {
 
 #[test]
 fn stage1_single_node_speaks_get_and_set() {
-    let _guard = lock_scenarios();
-    let config = ClusterConfig::new(
-        scratch("uds-stage1"),
-        members(&[44, 55]),
-        vec![provisioned(44), provisioned(55)],
-    )
-    .with_clients(vec![("probe1".into(), provisioned(44))]);
-    let verdicts = lease_sequencer::uds_harness::stage1(Cluster::launch(config).expect("launch"));
-    assert!(
-        verdicts.iter().all(|v| v.pass),
-        "stage1 verdicts: {}",
-        summarize(&verdicts)
-    );
+    panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
 }
 
 #[test]
 fn stage2_two_nodes_of_three_stabilize_and_serve() {
-    let _guard = lock_scenarios();
-    let config = ClusterConfig::new(
-        scratch("uds-stage2"),
-        members(&[44, 55, 66]),
-        vec![provisioned(44), provisioned(55)],
-    )
-    .with_clients(vec![
-        ("client1".into(), provisioned(44)),
-        ("client2".into(), provisioned(55)),
-    ]);
-    let verdicts = lease_sequencer::uds_harness::stage2(Cluster::launch(config).expect("launch"));
-    assert!(
-        verdicts.iter().all(|v| v.pass),
-        "stage2 verdicts: {}",
-        summarize(&verdicts)
-    );
+    panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
 }
 
 #[test]
 fn stage3_pause_holder_takeover() {
-    let _guard = lock_scenarios();
-    let config = ClusterConfig::new(
-        scratch("uds-stage3"),
-        members(&[44, 55, 66]),
-        vec![provisioned(44), provisioned(55), provisioned(66)],
-    )
-    .with_clients(vec![
-        ("client1".into(), provisioned(44)),
-        ("client2".into(), provisioned(55)),
-        ("client3".into(), provisioned(66)),
-    ]);
-    let verdicts = lease_sequencer::uds_harness::stage3(Cluster::launch(config).expect("launch"));
-    assert!(
-        verdicts.iter().all(|v| v.pass),
-        "stage3 verdicts: {}",
-        summarize(&verdicts)
-    );
+    panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
 }
 
 /// The simultaneous bring-up race: three polite contenders against one
@@ -155,23 +112,7 @@ fn stage3_pause_holder_takeover() {
 /// host when it goes red alongside a view-change storm.
 #[test]
 fn stage4_three_clients_race_one_free_lock() {
-    let _guard = lock_scenarios();
-    let config = ClusterConfig::new(
-        scratch("uds-stage4"),
-        members(&[44, 55, 66]),
-        vec![provisioned(44), provisioned(55), provisioned(66)],
-    )
-    .with_clients(vec![
-        ("client1".into(), provisioned(44)),
-        ("client2".into(), provisioned(55)),
-        ("client3".into(), provisioned(66)),
-    ]);
-    let verdicts = lease_sequencer::uds_harness::stage4(Cluster::launch(config).expect("launch"));
-    assert!(
-        verdicts.iter().all(|v| v.pass),
-        "stage4 verdicts: {}",
-        summarize(&verdicts)
-    );
+    panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
 }
 
 /// The driver-hiccup tolerance: the driver is the cluster's only switch
@@ -187,115 +128,5 @@ fn stage4_three_clients_race_one_free_lock() {
 /// takeover machinery runs on the lease clock, not the churn.
 #[test]
 fn driver_hiccup_is_not_leader_death() {
-    let _guard = lock_scenarios();
-    let config = ClusterConfig::new(
-        scratch("uds-hiccup"),
-        members(&[44, 55, 66]),
-        vec![provisioned(44), provisioned(55), provisioned(66)],
-    )
-    .with_clients(vec![("client1".into(), provisioned(44))]);
-    let mut cluster = Cluster::launch(config).expect("launch");
-    let ready = cluster.wait_until(8000, |lines| {
-        lines.iter().filter_map(|l| parse_line(l)).any(|l| {
-            l.from.starts_with("node")
-                && l.to.starts_with("node")
-                && l.json.get("tag").and_then(|v| v.as_u64()) == Some(4)
-        })
-    });
-    assert!(
-        ready,
-        "the cluster never stabilized: {}",
-        cluster.trace_tail(8)
-    );
-    cluster.client_start("client1");
-    let held = cluster.wait_until(3000, |lines| {
-        lines.iter().filter_map(|l| parse_line(l)).any(|l| {
-            l.to == "client1" && l.json.get("granted").and_then(|v| v.as_bool()) == Some(true)
-        })
-    });
-    assert!(
-        held,
-        "the contender never acquired: {}",
-        cluster.trace_tail(8)
-    );
-    let settled = cluster.lines.len();
-    let views_before: Vec<u64> = cluster.lines[..settled]
-        .iter()
-        .filter_map(|l| parse_line(l))
-        .filter(|l| l.from.starts_with("node") && l.to.starts_with("node"))
-        .filter_map(|l| l.json.get("view").and_then(|v| v.as_u64()))
-        .collect();
-    let view_before = views_before.last().copied().unwrap_or(0);
-    let leader_before = cluster.lines[..settled]
-        .iter()
-        .rev()
-        .find_map(|l| {
-            parse_line(l).filter(|p| {
-                p.from.starts_with("node") && p.json.get("tag").and_then(|v| v.as_u64()) == Some(4)
-            })
-        })
-        .map(|l| l.from.to_string());
-
-    // THE HICCUP: no polling for 1.8 s — the driver emits and forwards
-    // nothing while every node host keeps stepping on its own thread.
-    // To the followers this is wire silence (their phi monitors are fed
-    // only by the driver's forwarded arrivals); the leases ride their own
-    // clocks and expire on schedule, so the successor machinery — if the
-    // view survives — is exercised purely by the expiry, never by churn.
-    std::thread::sleep(std::time::Duration::from_millis(1800));
-
-    // Recovery: resume the polls; the backlog drains and service resumes.
-    let resume_at = lease_sequencer::uds_harness::millis();
-    while lease_sequencer::uds_harness::millis() < resume_at + 2500 {
-        cluster.poll(lease_sequencer::uds_harness::millis());
-        std::thread::sleep(std::time::Duration::from_millis(1));
-    }
-    let window = &cluster.lines[settled..];
-    let parsed: Vec<_> = window.iter().filter_map(|l| parse_line(l)).collect();
-    let fences = parsed
-        .iter()
-        .filter(|l| l.from.starts_with("node") && l.to.starts_with("node"))
-        .filter(|l| matches!(l.json.get("tag").and_then(|v| v.as_u64()), Some(5..=7)))
-        .count();
-    let views_after: Vec<u64> = parsed
-        .iter()
-        .filter(|l| l.from.starts_with("node") && l.to.starts_with("node"))
-        .filter_map(|l| l.json.get("view").and_then(|v| v.as_u64()))
-        .collect();
-    let max_view = views_after.iter().copied().max().unwrap_or(0);
-    let leader_after = parsed
-        .iter()
-        .rev()
-        .find(|l| {
-            l.from.starts_with("node") && l.json.get("tag").and_then(|v| v.as_u64()) == Some(4)
-        })
-        .map(|l| l.from.to_string());
-    let serving = parsed.iter().any(|l| {
-        l.to == "client1"
-            && l.json.get("op").and_then(|v| v.as_str()) == Some("set")
-            && l.json.get("granted").and_then(|v| v.as_bool()) == Some(true)
-    });
-    let mut failures = Vec::new();
-    if fences != 0 {
-        failures.push(format!("view-change fences through the stall: {fences}"));
-    }
-    if max_view > view_before {
-        failures.push(format!(
-            "the view churned: before={view_before} max_after={max_view}"
-        ));
-    }
-    if leader_before.is_none() || leader_after != leader_before {
-        failures.push(format!(
-            "the leader moved: before={leader_before:?} after={leader_after:?}"
-        ));
-    }
-    if !serving {
-        failures.push("the lock never served a granted set after recovery".to_string());
-    }
-    assert!(
-        failures.is_empty(),
-        "driver-hiccup invariants broken: {}; tail:\n{}",
-        failures.join("; "),
-        cluster.trace_tail(8)
-    );
+    panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
 }

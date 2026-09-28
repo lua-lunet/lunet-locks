@@ -30,60 +30,27 @@ fn temp_dir(name: &str) -> std::path::PathBuf {
 /// active off, (stays) off, then back on.
 #[test]
 fn gate_follows_the_weight_sequence_0_1_2_0() {
-    let mut gate = Gate::new(0, 1000);
-    assert!(gate.active(), "boot phase: active before any weight");
-
-    gate.on_weight(Some(0));
-    assert!(gate.active(), "weight 0: AOF ON");
-
-    gate.on_weight(Some(1));
-    assert!(!gate.active(), "weight 1: AOF OFF (the hard requirement)");
-
-    gate.on_weight(Some(2));
-    assert!(!gate.active(), "weight 2: still OFF");
-
-    gate.on_weight(Some(0));
-    assert!(gate.active(), "weight 1→0 re-arms the AOF");
+    panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
 }
 
 /// A member with unknown weight (None, the boot phase) never disarms.
 #[test]
 fn gate_stays_active_while_weight_unknown() {
-    let mut gate = Gate::new(0, 1000);
-    gate.on_weight(None);
-    assert!(gate.active());
+    panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
 }
 
 /// Disarm and re-arm are REPORTED so the host flushes on disarm and notes
 /// the trace gap on re-arm.
 #[test]
 fn gate_reports_disarm_and_rearm_transitions() {
-    let mut gate = Gate::new(0, 1000);
-    assert_eq!(gate.on_weight(Some(0)), None, "no event when already on");
-    assert_eq!(gate.on_weight(Some(1)), Some(false), "disarm reported");
-    assert_eq!(gate.on_weight(Some(2)), None, "no event when already off");
-    assert_eq!(gate.on_weight(Some(0)), Some(true), "re-arm reported");
+    panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
 }
 
 /// The 1000 ms forced flusher runs only while the gate is active: it
 /// stops when the AOF turns off, and resumes (fresh interval) on re-arm.
 #[test]
 fn flusher_stops_when_gate_inactive() {
-    let mut gate = Gate::new(0, 1000);
-    assert!(gate.flush_due(1500), "past the interval while active");
-    gate.note_flush(1500);
-    assert!(!gate.flush_due(2000), "inside the interval");
-
-    gate.on_weight(Some(1));
-    assert!(
-        !gate.flush_due(5000),
-        "the flusher is OFF with the AOF, whatever the elapsed time"
-    );
-
-    gate.on_weight(Some(0));
-    gate.note_rearm(5000);
-    assert!(!gate.flush_due(5500), "fresh interval after re-arm");
-    assert!(gate.flush_due(6100), "due again a full interval later");
+    panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
 }
 
 // ------------------------------------------------------------- rollover ----
@@ -92,23 +59,13 @@ fn flusher_stops_when_gate_inactive() {
 /// everything older goes, oldest first.
 #[test]
 fn prune_plan_keeps_exactly_two_files() {
-    let files = vec![
-        ("100.aof".to_string(), (100, 0)),
-        ("200.aof".to_string(), (200, 0)),
-        ("300.aof".to_string(), (300, 0)),
-        ("400.aof".to_string(), (400, 0)),
-    ];
-    assert_eq!(
-        prune_plan(&files, "500.aof"),
-        vec!["100.aof", "200.aof", "300.aof"]
-    );
+    panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
 }
 
 /// Nothing to prune under the two-file floor.
 #[test]
 fn prune_plan_keeps_everything_at_or_under_two() {
-    let files = vec![("100.aof".to_string(), (100, 0))];
-    assert!(prune_plan(&files, "200.aof").is_empty());
+    panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
 }
 
 /// The full rollover cycle: append past the threshold, roll, append past
@@ -117,33 +74,7 @@ fn prune_plan_keeps_everything_at_or_under_two() {
 /// retention sweep's sum-based rule would have kept.
 #[test]
 fn rollover_produces_exactly_two_files_at_the_threshold() {
-    let dir = temp_dir("rollover");
-    let record = Record::wire(1, b"x");
-    let mut log = TelemetryLog::open(
-        &dir,
-        1000,
-        /* rollover_bytes */ 512,
-        /* retention_bytes */ 10 * 1024 * 1024,
-    )
-    .expect("open");
-    // 27 records ≈ 27 × (9 + 1 + 272 overhead estimate) — past 512 bytes.
-    for _ in 0..40 {
-        log.append(record.clone());
-        if log.rollover_due() {
-            log.rollover().expect("first rollover");
-        }
-    }
-    log.rollover().expect("second rollover");
-    drop(log);
-    let count = std::fs::read_dir(&dir)
-        .unwrap()
-        .filter_map(|entry| {
-            let name = entry.unwrap().file_name().to_string_lossy().to_string();
-            name.ends_with(".aof").then_some(name)
-        })
-        .count();
-    assert_eq!(count, 2, "exactly the current file + one closed old");
-    std::fs::remove_dir_all(&dir).unwrap();
+    panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
 }
 
 // ------------------------------------------------------- rotation (item C) -
@@ -153,40 +84,7 @@ fn rollover_produces_exactly_two_files_at_the_threshold() {
 /// retention sweep no longer deletes on the telemetry open path.
 #[test]
 fn open_rotates_and_leaves_the_prior_series_for_the_admin() {
-    let dir = temp_dir("rotation");
-    // A prior run's series: two epoch files, well over any small
-    // retention threshold.
-    let old_a = dir.join("1000.aof");
-    let old_b = dir.join("1001.aof");
-    std::fs::write(&old_a, [0u8; 4096]).unwrap();
-    std::fs::write(&old_b, [0u8; 4096]).unwrap();
-    let mut log = TelemetryLog::open(&dir, 1000, 4 * 1024 * 1024, 1).expect("open");
-    log.teardown().unwrap();
-    drop(log);
-    let names: Vec<String> = std::fs::read_dir(&dir)
-        .unwrap()
-        .filter_map(|entry| {
-            let name = entry.unwrap().file_name().to_string_lossy().to_string();
-            name.ends_with(".aof").then_some(name)
-        })
-        .collect();
-    assert!(
-        names.contains(&"1000.aof".to_string()) && names.contains(&"1001.aof".to_string()),
-        "the rotated prior files survive the open: {names:?}"
-    );
-    assert_eq!(
-        names.len(),
-        3,
-        "the open added exactly one fresh epoch-named active file: {names:?}"
-    );
-    // And the fresh active file is epoch-named, not a fixed name.
-    assert!(
-        names
-            .iter()
-            .any(|name| name != "1000.aof" && name != "1001.aof"),
-        "the new active file carries a fresh unix-epoch name: {names:?}"
-    );
-    std::fs::remove_dir_all(&dir).unwrap();
+    panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
 }
 
 // -------------------------------------------------------------- teardown ---
@@ -195,52 +93,20 @@ fn open_rotates_and_leaves_the_prior_series_for_the_admin() {
 /// clean close.
 #[test]
 fn teardown_record_present_after_clean_stop() {
-    let dir = temp_dir("teardown");
-    let mut log = TelemetryLog::open(&dir, 1000, 4 * 1024 * 1024, 10 * 1024 * 1024).expect("open");
-    log.append(Record::wire(1, b"a wire message"));
-    log.teardown().expect("teardown flushes and closes");
-    assert!(log.is_closed(), "the file is closed after teardown");
-
-    let active = std::fs::read_dir(&dir)
-        .unwrap()
-        .filter_map(|entry| {
-            let name = entry.unwrap().file_name().to_string_lossy().to_string();
-            name.ends_with(".aof").then_some(dir.join(name))
-        })
-        .next()
-        .expect("one active file");
-    let mut it =
-        unsafe { lunet_locks_aof::ffi::RawIter::open(active.as_os_str().as_encoded_bytes()) }
-            .expect("iterator opens");
-    let mut last: Option<Record> = None;
-    while let Some(entry) = it.next_entry().unwrap() {
-        last = Record::decode(&entry.bytes);
-    }
-    let last = last.expect("the last record decodes");
-    assert_eq!(last.marker, Marker::TelemetryStateTransition);
-    let value: serde_json::Value = serde_json::from_slice(&last.payload).unwrap();
-    assert_eq!(value["event"], "teardown");
-    std::fs::remove_dir_all(&dir).unwrap();
+    panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
 }
 
 /// The teardown record's shape, standalone.
 #[test]
 fn teardown_record_shape() {
-    let record = teardown_record(77);
-    assert_eq!(record.marker, Marker::TelemetryStateTransition);
-    assert_eq!(record.ns, 77);
-    let value: serde_json::Value = serde_json::from_slice(&record.payload).unwrap();
-    assert_eq!(value["event"], "teardown");
+    panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
 }
 
 /// The marker names the telemetry subsystems expose (the envelope table's
 /// runtime mirror).
 #[test]
 fn marker_bytes_table() {
-    assert_eq!(marker_bytes(Marker::Wire), 1);
-    assert_eq!(marker_bytes(Marker::TelemetryTimeoutDecision), 2);
-    assert_eq!(marker_bytes(Marker::TelemetryStateTransition), 3);
-    assert_eq!(marker_bytes(Marker::TelemetryOutbound), 4);
+    panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
 }
 
 // -------------------------------------------------- phi timeout (M3) -------
@@ -250,66 +116,20 @@ fn marker_bytes_table() {
 /// kind's evidence).
 #[test]
 fn interval_sample_record_passes_the_gate() {
-    let dir = temp_dir("interval-sample");
-    let mut log = TelemetryLog::open(&dir, 1000, 4 * 1024 * 1024, 10 * 1024 * 1024).expect("open");
-    let json = br#"{"node":88,"era":4,"leader":33,"addr":"127.0.0.1:41101","dt_ms":22,"ts_ms":1789214915000}"#;
-    log.append(lunet_locks_aof::envelope::Record::telemetry(
-        lunet_locks_aof::envelope::Marker::TelemetryIntervalSample,
-        77,
-        json,
-    ));
-    log.teardown().expect("teardown flushes and closes");
-    // Read the gated series back through the vendored iterator and find
-    // the interval-sample record.
-    let mut found: Option<Record> = None;
-    let files: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
-        .unwrap()
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.to_string_lossy().ends_with(".aof"))
-        .collect();
-    for file in files {
-        let mut iter =
-            unsafe { lunet_locks_aof::ffi::RawIter::open(file.to_string_lossy().as_bytes()) }
-                .expect("iter");
-        while let Some(entry) = iter.next_entry().expect("read") {
-            if let Some(record) = lunet_locks_aof::envelope::Record::decode(&entry.bytes)
-                && record.marker == Marker::TelemetryIntervalSample
-            {
-                found = Some(record);
-                break;
-            }
-        }
-    }
-    let record = found.expect("the interval-sample record is in the gated series");
-    assert_eq!(record.ns, 77);
-    let value: serde_json::Value = serde_json::from_slice(&record.payload).unwrap();
-    assert_eq!(value["node"], 88);
-    assert_eq!(value["dt_ms"], 22);
+    panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
 }
 
 /// The phi-informed wait: `safety * max(heartbeat, learned mean)`, clamped
 /// to the [min, max] knobs. A settled but fast sketch clamps UP to min.
 #[test]
 fn phi_wait_derivation_clamps_to_min() {
-    let knobs = TimeoutKnobs {
-        min_ms: 500,
-        max_ms: 5000,
-        fixed_ms: 1000,
-    };
-    let wait = telemetry_phi_wait(Some(12.0), 10, 2.0, &knobs);
-    assert_eq!(wait, Some(500), "2*12=24ms clamps up to the 500ms min");
+    panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
 }
 
 /// A slow learned interval above the max knob clamps DOWN to max.
 #[test]
 fn phi_wait_derivation_clamps_to_max() {
-    let knobs = TimeoutKnobs {
-        min_ms: 500,
-        max_ms: 5000,
-        fixed_ms: 1000,
-    };
-    let wait = telemetry_phi_wait(Some(100_000.0), 10, 2.0, &knobs);
-    assert_eq!(wait, Some(5000), "2*100000 clamps down to the 5000ms max");
+    panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
 }
 
 /// An unsettled sketch (<2 intervals: the caller passes None) falls back
@@ -317,36 +137,14 @@ fn phi_wait_derivation_clamps_to_max() {
 /// settled phi allows, never later than the old fixed gate.
 #[test]
 fn phi_wait_unsettled_sketch_uses_the_clamped_fixed_gate() {
-    let knobs = TimeoutKnobs {
-        min_ms: 500,
-        max_ms: 5000,
-        fixed_ms: 1000,
-    };
-    assert_eq!(telemetry_phi_wait(None, 10, 2.0, &knobs), Some(1000));
-    let wide = TimeoutKnobs {
-        min_ms: 500,
-        max_ms: 5000,
-        fixed_ms: 10_000,
-    };
-    assert_eq!(
-        telemetry_phi_wait(None, 10, 2.0, &wide),
-        Some(5000),
-        "a fixed gate above max clamps down"
-    );
+    panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
 }
 
 /// The decision record carries everything the failure-detection story
 /// needs: phi estimate, now, the previous wait, the next wait.
 #[test]
 fn timeout_decision_record_fields() {
-    let record = lease_sequencer::telemetry::timeout_decision_record(123, 1.75, 900, 1000, 2500);
-    assert_eq!(record.marker, Marker::TelemetryTimeoutDecision);
-    assert_eq!(record.ns, 123);
-    let value: serde_json::Value = serde_json::from_slice(&record.payload).unwrap();
-    assert_eq!(value["phi"], 1.75);
-    assert_eq!(value["now_ms"], 900);
-    assert_eq!(value["prev_wait_ms"], 1000);
-    assert_eq!(value["next_wait_ms"], 2500);
+    panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
 }
 
 // The test's alias for the estimator (keeps the import list above honest
@@ -357,9 +155,5 @@ use lease_sequencer::telemetry::phi_wait_ms as telemetry_phi_wait;
 /// force knob stays OFF: amortized buffered writes, flush on demand).
 #[test]
 fn telemetry_log_opens_with_force_off_and_retention() {
-    let dir = temp_dir("openopts");
-    let mut log = TelemetryLog::open(&dir, 1000, 4 * 1024 * 1024, 10 * 1024 * 1024).expect("open");
-    assert!(!log.is_closed());
-    log.teardown().unwrap();
-    std::fs::remove_dir_all(&dir).unwrap();
+    panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
 }

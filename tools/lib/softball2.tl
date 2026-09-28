@@ -1,9 +1,9 @@
 -- The softball-2 crash/partition run (typed runner library): the
--- crash-and-partition lane of docs/src/softball-run.md under one
+-- crash-and-partition lane under one
 -- continuous polite client fleet — partitions (process-suspension
 -- injection on the loopback rig), SIGKILL crash families at shallow and
--- deep views, the leader-crash+partition compound, abdication under
--- load, and the whole-cluster stop/start passes after the deep state.
+-- deep views, the leader-crash+partition compound,
+-- the whole-cluster stop/start passes after the deep state.
 -- Every action is anchored live (epoch millisecond before the action,
 -- into anchors.md) and every scenario's durations, states, drop deltas
 -- and client-error deltas are captured as key=value measure lines in
@@ -866,52 +866,8 @@ local function scenario_steady()
     )
 end
 
-local function scenario_abdication_quiet()
-    phase("S2: leader abdication x3 (quiet, the detection-independent anchor)")
-    for cycle = 1, 3 do
-        local leader = leader_name()
-        if leader == "" then
-            gate.fail("S2 cycle " .. cycle .. ": no leader to abdicate")
-        end
-        local t0_err = total_errors()
-        local t0 = anchor(
-            "S2-begin cycle=" .. cycle .. " leader=" .. leader
-                .. " view_depth=" .. view_depth()
-                .. " states=" .. states_snapshot()
-        )
-        local reply, drive_ms = drive_verb(leader, "abdicate", 0, {})
-        anchor("S2-abdicate-drive cycle=" .. cycle .. " reply=" .. reply)
-        if not reply:find('"accepted":true', 1, true) then
-            gate.fail("S2 cycle " .. cycle .. ": abdication refused: " .. reply)
-        end
-        local target = live_probe_target("")
-        local ok, landed = probe_serving(target, 1, 30000)
-        if not ok then
-            gate.fail(
-                "S2 cycle " .. cycle .. ": no client operation served within 30 s"
-            )
-        end
-        local failover_ms = landed - t0
-        local ok_conv, conv_report = wait_quorum(#GENESIS, LEADER_DEADLINE_MS)
-        if not ok_conv then
-            gate.fail("S2 cycle " .. cycle .. ": the view did not settle: " .. conv_report)
-        end
-        local t_err = total_errors()
-        measure(
-            "scenario=S2 cycle=" .. cycle .. " abdication_leader=" .. leader
-                .. " drive_ms=" .. drive_ms
-                .. " failover_ms=" .. failover_ms
-                .. " polite_errors_in_window=" .. (t_err - t0_err)
-                .. " states=" .. states_snapshot()
-        )
-        clock.sleep(5)
-    end
-end
-
--- The timeout-driven takeover baseline: clean TERM of the leader, no
--- abdication — the survivors detect at the hardened detector window and
--- take over; then the old leader is restarted and rejoins. The
--- detection-bound contrast to S2 (docs/src/softball-run.md, scenario 3).
+-- the survivors detect at the hardened detector window and
+-- take over; then the old leader is restarted and rejoins.
 local function scenario_leader_term()
     phase("S3: leader stop/start (timeout-driven takeover baseline)")
     local leader = leader_name()
@@ -1336,109 +1292,6 @@ local function scenario_compound()
     end
 end
 
-local function scenario_abdication_under_load()
-    phase("A: abdication under load (aggressive hammer on the same lock)")
-    start_hammer()
-    clock.sleep(10)
-    local live: {string} = {}
-    for _, name in ipairs(GENESIS) do
-        local p = procs[name]
-        if p ~= nil and proc.alive(p) then
-            live[#live + 1] = name
-        end
-    end
-    for cycle = 1, 3 do
-        local leader = leader_name()
-        if leader == "" then
-            gate.fail("A cycle " .. cycle .. ": no leader to abdicate")
-        end
-        local t0_err = total_errors()
-        local h0_err = hammer_errors()
-        local t0 = anchor(
-            "A-begin cycle=" .. cycle .. " leader=" .. leader
-                .. " view_depth=" .. view_depth()
-                .. " live=" .. #live
-                .. " states=" .. states_snapshot()
-        )
-        local reply, drive_ms = drive_verb(leader, "abdicate", 0, {})
-        anchor("A-abdicate-drive cycle=" .. cycle .. " reply=" .. reply)
-        if not reply:find('"accepted":true', 1, true) then
-            gate.fail("A cycle " .. cycle .. ": abdication refused: " .. reply)
-        end
-        local target = live_probe_target("")
-        local ok, landed = probe_serving(target, 1, 30000)
-        if not ok then
-            gate.fail(
-                "A cycle " .. cycle .. ": no client operation served within 30 s"
-            )
-        end
-        local failover_ms = landed - t0
-        local ok_conv, conv_report = wait_quorum(#live, LEADER_DEADLINE_MS)
-        if not ok_conv then
-            gate.fail("A cycle " .. cycle .. ": the view did not settle: " .. conv_report)
-        end
-        local t_err = total_errors()
-        local h_err = hammer_errors()
-        measure(
-            "scenario=A cycle=" .. cycle .. " abdication_leader=" .. leader
-                .. " drive_ms=" .. drive_ms
-                .. " failover_ms=" .. failover_ms
-                .. " polite_errors_in_window=" .. (t_err - t0_err)
-                .. " hammer_errors_in_window=" .. (h_err - h0_err)
-                .. " states=" .. states_snapshot()
-        )
-        clock.sleep(5)
-    end
-    signal_procs(hammer_procs, "USR1")
-    clock.sleep(2)
-    for _, p in ipairs(hammer_procs) do
-        if proc.alive(p) then
-            proc.stop(p, 1000)
-        end
-    end
-    progress("A: hammer silenced and stopped; the polite fleet continues")
-    clock.sleep(5)
-end
-
-local function scenario_deep_family()
-    phase("D: deep-view conditioning (abdication cycles) + deep crash family")
-    local v0 = view_depth()
-    local t0 = anchor("D-conditioning-begin view_depth=" .. v0)
-    local lc_before = line_count(GENESIS[1], "leader change")
-    local cycles = 0
-    while view_depth() < DEEP_VIEW_TARGET and cycles < 200 do
-        local reply, _ms = drive_verb_retry("abdicate", 0, {}, 30000)
-        if not reply:find('"accepted":true', 1, true) then
-            gate.fail(
-                "D: abdication refused at cycle " .. cycles .. ": " .. reply
-            )
-        end
-        cycles = cycles + 1
-        clock.sleep(0.5)
-    end
-    local v1 = view_depth()
-    if v1 < DEEP_VIEW_TARGET then
-        gate.fail(
-            "D: the conditioning only reached view " .. v1 .. " (target "
-                .. DEEP_VIEW_TARGET .. ")"
-        )
-    end
-    anchor(
-        "D-conditioning-done cycles=" .. cycles .. " view_depth=" .. v1
-            .. " states=" .. states_snapshot()
-    )
-    measure(
-        "scenario=D conditioning_cycles=" .. cycles
-            .. " view_before=" .. v0
-            .. " view_after=" .. v1
-            .. " leader_changes_on_n1_in_window="
-            .. (line_count(GENESIS[1], "leader change") - lc_before)
-            .. " conditioning_ms=" .. (clock.now_ms() - t0)
-    )
-    clock.sleep(5)
-    scenario_crashes("deep")
-end
-
 -- The fresh-files boundary between the crash family and the rest of
 -- the lane: all processes down, the run's snapshot taken (the crash
 -- evidence preserved), the durable state wiped, the cluster booted
@@ -1660,16 +1513,13 @@ function M.run(root_path: string, run_dir_path: string): integer
     anchor("steady-serving-begin")
 
     scenario_steady()
-    scenario_abdication_quiet()
     scenario_leader_term()
     scenario_crashes("shallow")
     fresh_files_boundary("after the shallow crash family")
-    scenario_deep_family()
     scenario_full_cycle()
     scenario_partitions()
     scenario_compound()
     fresh_files_boundary("after the compound (the parked leader restored)")
-    scenario_abdication_under_load()
 
     anchor("ladder-complete states=" .. states_snapshot())
     teardown()

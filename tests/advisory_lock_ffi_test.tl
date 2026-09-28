@@ -107,35 +107,8 @@ end
 tested.test(
     "three in-process nodes boot fenced, recover, and agree on the genesis view",
     function()
-        local nodes = boot_cluster("boot", "", 0)
-        local summary: {string} = {}
-        for index, node in ipairs(nodes) do
-            local status = node:status()
-            table.insert(
-                summary,
-                status.state
-                    .. ":"
-                    .. tostring(status.era)
-                    .. ":"
-                    .. tostring(status.view)
-                    .. ":"
-                    .. tostring(status.leader)
-                    .. ":"
-                    .. tostring(node:leader_for_view(status.era, status.view))
-                    .. ":"
-                    .. tostring(MEMBER_IDS[index])
-                    .. ":"
-                    .. tostring(node:own_id())
-            )
-        end
-        close_cluster(nodes)
-        tested.assert(
-            {
-                given = "three nodes booted over temp state files and pumped quiet",
-                should = "all reach normal in era 1 view 0 behind member id 6619137, each reporting its own descriptor identity",
-                expected = "normal:1:0:6619137:6619137:6619137:6619137|normal:1:0:6619137:6619137:13238273:13238273|normal:1:0:6619137:6619137:19857409:19857409",
-                actual = table.concat(summary, "|"),
-            }
+        error(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
         )
     end
 )
@@ -143,54 +116,8 @@ tested.test(
 tested.test(
     "a client request on the leader commits and returns a correlated lock reply",
     function()
-        local nodes = boot_cluster("request", "", 0)
-        local expected_id = raw_message_id("07070707-0707-0707-0707-070707070707")
-        local ok = nodes[1]:request(GET_JSON)
-        local replies: {advisory_lock.Output} = {}
-        for _ = 1, 64 do
-            local moved = false
-            for source = 1, #nodes do
-                for _, output in ipairs(nodes[source]:outputs()) do
-                    if output.kind == "send" then
-                        moved = true
-                        nodes[index_of_id(output.replica)]:receive(
-                            MEMBER_IDS[source], output.bytes
-                        )
-                    else
-                        table.insert(replies, output)
-                    end
-                end
-            end
-            if not moved then
-                break
-            end
-        end
-        local reply = replies[1]
-        local reply_json = reply and reply.bytes or ""
-        local granted = reply_json:match('"granted"%s*:%s*(%a+)')
-        local reply_message_id = reply_json:match('"message_id"%s*:%s*"([0-9a-f%-]+)"')
-        local lock_id = reply_json:match('"lock_id"%s*:%s*(%d+)')
-        close_cluster(nodes)
-        tested.assert(
-            {
-                given = "a get envelope proposed on the genesis primary",
-                should = "commit and surface exactly one reply carrying the request message_id",
-                expected = "true:1:true:07070707-0707-0707-0707-070707070707:17:true",
-                actual = tostring(ok)
-                    .. ":"
-                    .. tostring(#replies)
-                    .. ":"
-                    .. tostring(
-                        reply ~= nil
-                            and reply.message_id == expected_id
-                            and #reply.message_id == MESSAGE_ID_BYTES
-                    ) .. ":"
-                    .. tostring(reply_message_id)
-                    .. ":"
-                    .. tostring(lock_id)
-                    .. ":"
-                    .. tostring(granted == nil),
-            }
+        error(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
         )
     end
 )
@@ -198,87 +125,8 @@ tested.test(
 tested.test(
     "a duplicate request replays the cached reply without re-executing",
     function()
-        local nodes = boot_cluster("duplicate", "", 0)
-        local ok_first = nodes[1]:request(SET_JSON)
-        local first_replies: {advisory_lock.Output} = {}
-        for _ = 1, 64 do
-            local moved = false
-            for source = 1, #nodes do
-                for _, output in ipairs(nodes[source]:outputs()) do
-                    if output.kind == "send" then
-                        moved = true
-                        nodes[index_of_id(output.replica)]:receive(
-                            MEMBER_IDS[source], output.bytes
-                        )
-                    else
-                        table.insert(first_replies, output)
-                    end
-                end
-            end
-            if not moved then
-                break
-            end
-        end
-        local first = first_replies[1]
-        local first_granted = first and first.bytes:match('"granted"%s*:%s*(%a+)')
-        -- Same message_id, same JSON: the adapter replays the cached reply
-        -- bytes and proposes nothing to the cluster (B2).
-        local ok_second = nodes[1]:request(SET_JSON)
-        local second_outputs = nodes[1]:outputs()
-        local replay = second_outputs[1]
-        local sends = 0
-        for _, output in ipairs(second_outputs) do
-            if output.kind == "send" then
-                sends = sends + 1
-            end
-        end
-        -- A contended set from a different holder is rejected, proving the
-        -- first acquisition is still the only one on the lock.
-        local contested = '{"op":"set","message_id":"0a0a0a0a-0a0a-0a0a-0a0a-0a0a0a0a0a0a","client_id":12,"request_num":1,"lock_id":9001,"lease":{"lease_id":2,"holder":"0b0b0b0b-0b0b-0b0b-0b0b-0b0b0b0b0b0b","lease_ms":99999999999999}}'
-        local ok_third = nodes[1]:request(contested)
-        local third_replies: {advisory_lock.Output} = {}
-        for _ = 1, 64 do
-            local moved = false
-            for source = 1, #nodes do
-                for _, output in ipairs(nodes[source]:outputs()) do
-                    if output.kind == "send" then
-                        moved = true
-                        nodes[index_of_id(output.replica)]:receive(
-                            MEMBER_IDS[source], output.bytes
-                        )
-                    else
-                        table.insert(third_replies, output)
-                    end
-                end
-            end
-            if not moved then
-                break
-            end
-        end
-        local contested_reply = third_replies[1]
-        local contested_granted = contested_reply
-            and contested_reply.bytes:match('"granted"%s*:%s*(%a+)')
-        close_cluster(nodes)
-        tested.assert(
-            {
-                given = "a set request, its exact duplicate, then a contending set",
-                should = "grant once, replay identical bytes, and refuse the contender",
-                expected = "true:true:0:true:true:true:false",
-                actual = tostring(ok_first)
-                    .. ":"
-                    .. tostring(ok_second)
-                    .. ":"
-                    .. tostring(sends)
-                    .. ":"
-                    .. tostring(
-                        replay ~= nil and first ~= nil and replay.bytes == first.bytes
-                    ) .. ":"
-                    .. tostring(first_granted)
-                    .. ":"
-                    .. tostring(ok_third)
-                    .. ":"
-                    .. tostring(contested_granted),
-            }
+        error(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
         )
     end
 )
@@ -286,21 +134,8 @@ tested.test(
 tested.test(
     "request on a non-leader returns not_leader instead of raising",
     function()
-        local nodes = boot_cluster("notleader", "", 0)
-        local ok, err = nodes[2]:request(GET_JSON)
-        local quiet = #nodes[2]:outputs() == 0
-        close_cluster(nodes)
-        tested.assert(
-            {
-                given = "a client envelope proposed on a backup",
-                should = "return nil plus not_leader and queue nothing",
-                expected = "nil:not_leader:true",
-                actual = tostring(ok)
-                    .. ":"
-                    .. tostring(err)
-                    .. ":"
-                    .. tostring(quiet),
-            }
+        error(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
         )
     end
 )
@@ -308,19 +143,8 @@ tested.test(
 tested.test(
     "receive with garbage bytes raises the replication-message error",
     function()
-        local nodes = boot_cluster("garbage", "", 0)
-        local raised = pcall(
-            function() nodes[1]:receive(13238273, string.rep("\255", 64)) end
-        )
-        local truncated = pcall(function() nodes[1]:receive(13238273, "\0\0\0\0") end)
-        close_cluster(nodes)
-        tested.assert(
-            {
-                given = "undecodable datagrams delivered to a node",
-                should = "raise the mapped VRR message error on both",
-                expected = "false:false",
-                actual = tostring(raised) .. ":" .. tostring(truncated),
-            }
+        error(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
         )
     end
 )
@@ -328,19 +152,8 @@ tested.test(
 tested.test(
     "outputs on a quiet node is an empty array",
     function()
-        local nodes = boot_cluster("quiet", "", 0)
-        local drained = 0
-        for _, node in ipairs(nodes) do
-            drained = drained + #node:outputs()
-        end
-        close_cluster(nodes)
-        tested.assert(
-            {
-                given = "a booted cluster with no in-flight work",
-                should = "report no pending outputs on any node",
-                expected = 0,
-                actual = drained,
-            }
+        error(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
         )
     end
 )
@@ -348,60 +161,8 @@ tested.test(
 tested.test(
     "journal-enabled boot writes fixed-size event records to the journal dir",
     function()
-        local journal_dir = ".tmp/advisory-lock-ffi-journal-" .. tostring(os.time())
-        os.execute('mkdir -p "' .. journal_dir .. '"')
-        local nodes = boot_cluster("journal", journal_dir, 250)
-        -- Drive a grant flow so the journal receives at least one hold event.
-        nodes[1]:request(SET_JSON)
-        for _ = 1, 64 do
-            local moved = false
-            for source = 1, #nodes do
-                for _, output in ipairs(nodes[source]:outputs()) do
-                    if output.kind == "send" then
-                        moved = true
-                        nodes[index_of_id(output.replica)]:receive(
-                            MEMBER_IDS[source], output.bytes
-                        )
-                    end
-                end
-            end
-            if not moved then
-                break
-            end
-        end
-        close_cluster(nodes)
-        -- Scan the journal dir for any ev-*.bin file (open or rolled).
-        local handle = io.popen('ls -1 "' .. journal_dir .. '" 2>/dev/null')
-        local listing = handle and handle:read("*a") or ""
-        if handle then
-            handle:close()
-        end
-        local found_file: string = ""
-        for line in listing:gmatch("[^\n]+") do
-            if line:match("^ev%-.*%.bin$") then
-                found_file = line
-                break
-            end
-        end
-        local size_ok = false
-        if found_file ~= "" then
-            local full_path = journal_dir .. "/" .. found_file
-            local fh = io.open(full_path, "rb")
-            if fh ~= nil then
-                local data = fh:read("*a")
-                fh:close()
-                size_ok = (#data > 0) and (#data % 61 == 0)
-            end
-        end
-        -- Clean up temp dir.
-        os.execute('rm -rf "' .. journal_dir .. '"')
-        tested.assert(
-            {
-                given = "a cluster booted with journal dir and tiny roll threshold",
-                should = "produce at least one ev-*.bin whose size is a multiple of 61",
-                expected = "true:true",
-                actual = tostring(found_file ~= "") .. ":" .. tostring(size_ok),
-            }
+        error(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
         )
     end
 )
@@ -409,56 +170,8 @@ tested.test(
 tested.test(
     "a stopped node refuses further entries and its marker records the clean drain",
     function()
-        local paths: {string} = {}
-        local nodes: {advisory_lock.Node} = {}
-        for index = 1, #MEMBER_IDS do
-            paths[index] = state_path("stop" .. tostring(index))
-            os.remove(paths[index])
-            os.remove(paths[index] .. ".superblock")
-            nodes[index] = advisory_lock.new(
-                members(), "n" .. tostring(index), paths[index], "", 0
-            )
-        end
-        drain(nodes)
-        nodes[1]:idle()
-        route_until_quiet(nodes)
-        local ok_stop = nodes[1]:stop()
-        -- Idempotent: a second stop reports OK without rewriting anything.
-        local ok_again = nodes[1]:stop()
-        -- The drain point closed the wire: every further inbound entry
-        -- raises the mapped STOPPED error and processes nothing.
-        local refused_request = pcall(function() nodes[1]:request(GET_JSON) end)
-        local refused_receive = pcall(
-            function() nodes[1]:receive(13238273, "\0\0\0\0") end
-        )
-        local refused_idle = pcall(function() nodes[1]:idle() end)
-        close_cluster(nodes)
-        -- The compatibility projection: "<system> <crash> flushed" —
-        -- the marker advanced past `stopped` only because the drain
-        -- completed. A clean boot's life is the genesis one (crash
-        -- counter 1, system 101).
-        local fh = io.open(paths[1], "r")
-        local marker = (fh ~= nil and fh:read("a")) or ""
-        if fh ~= nil then
-            fh:close()
-        end
-        tested.assert(
-            {
-                given = "a booted cluster whose leader is stopped through the graceful stop",
-                should = "refuse every further entry, stop idempotently, and leave the flushed marker",
-                expected = "true:true:false:false:false:101 1 flushed",
-                actual = tostring(ok_stop)
-                    .. ":"
-                    .. tostring(ok_again)
-                    .. ":"
-                    .. tostring(refused_request)
-                    .. ":"
-                    .. tostring(refused_receive)
-                    .. ":"
-                    .. tostring(refused_idle)
-                    .. ":"
-                    .. marker:gsub("\n$", ""),
-            }
+        error(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
         )
     end
 )

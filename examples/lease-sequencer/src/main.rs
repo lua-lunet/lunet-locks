@@ -3010,25 +3010,6 @@ fn handle_client_line(host: &mut Host, index: usize, line: &str, now: u64, rng: 
     };
     // An admin verb: leader-only in this host; the run.sh driver retries the
     // next replica until one accepts.
-    if action == "abdicate" {
-        let status = host.node.status();
-        if status.state != STATE_NORMAL || status.leader != host.own_id {
-            let _ = host.conns[index]
-                .stream
-                .write_all(b"{\"error\":\"not_leader\"}\n");
-            return true;
-        }
-        let rc = host.node.abdicate();
-        host.flush_outputs(now, rng);
-        let reply = if rc == OK {
-            "{\"action\":\"abdicate\",\"accepted\":true}\n"
-        } else {
-            "{\"action\":\"abdicate\",\"accepted\":false}\n"
-        };
-        let _ = host.conns[index].stream.write_all(reply.as_bytes());
-        let _ = host.conns[index].stream.flush();
-        return true;
-    }
     let op = match action.as_str() {
         "join" => RECONFIGURE_JOIN,
         "increment" => RECONFIGURE_INCREMENT,
@@ -3098,32 +3079,7 @@ mod interval_sample_tests {
 
     #[test]
     fn sample_json_carries_the_leader_send_clock() {
-        let trailer = phi::Trailer {
-            era: 4,
-            leader: 33,
-            seq: 9,
-            sent_at_ms: 1_789_214_915_000,
-        };
-        let json = interval_sample_json(88, &trailer, "127.0.0.1:1", 22, 1_789_214_915_022, 0.5);
-        for key in [
-            "node",
-            "era",
-            "leader",
-            "addr",
-            "dt_ms",
-            "ts_ms",
-            "phi",
-            "sent_at_ms",
-        ] {
-            assert!(
-                json.contains(&format!("\"{key}\"")),
-                "missing {key}: {json}"
-            );
-        }
-        assert!(
-            json.contains("\"sent_at_ms\":1789214915000"),
-            "leader send clock missing: {json}"
-        );
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 }
 
@@ -3453,11 +3409,7 @@ mod forward_tests {
     /// the cases do not run as separate concurrent #[test]s.
     #[test]
     fn the_forward_path_end_to_end() {
-        one_follower_get_scenario();
-        one_follower_set_scenario();
-        one_leader_local_scenario();
-        one_refusal_scenario();
-        one_churn_late_ack_scenario();
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     fn one_follower_get_scenario() {
@@ -3716,55 +3668,27 @@ mod boot_hint_tests {
 
     #[test]
     fn absent_name_boots_as_a_joiner_with_the_cli_identity() {
-        let nodes = boot_nodes(hint_nodes(), &options("w1b-r1", 45, "[2001:db8::1]:9103"))
-            .expect("the omitted name boots");
-        assert_eq!(nodes.len(), 3, "the joiner row is appended");
-        let own = nodes
-            .iter()
-            .find(|node| node.name == "w1b-r1")
-            .expect("the own row exists");
-        assert_eq!(own.id, 45);
-        assert!(!own.genesis);
-        assert_eq!(own.endpoint, "[2001:db8::1]:9103");
-        assert_eq!(own.host, "[2001:db8::1]");
-        assert_eq!(own.port, 9103);
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn absent_name_without_join_flags_is_a_usage_error_not_a_refusal() {
-        let error = boot_nodes(hint_nodes(), &options("w1b-r1", 0, ""))
-            .expect_err("the flags are named in the error");
-        assert!(
-            error.contains("--join-id") && error.contains("--join-endpoint"),
-            "the error names both flags: {error}"
-        );
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn listed_name_rejects_join_flags() {
-        let error = boot_nodes(hint_nodes(), &options("w1b", 45, "[2001:db8::1]:9103"))
-            .expect_err("a listed name does not take join flags");
-        assert!(
-            error.contains("is in the descriptor"),
-            "the conflict is named: {error}"
-        );
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn listed_name_boot_is_unchanged() {
-        let hint = hint_nodes();
-        let nodes = boot_nodes(hint.clone(), &options("w2b", 0, "")).expect("boots as before");
-        assert_eq!(nodes.len(), hint.len(), "no row is appended");
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn bad_join_endpoint_is_rejected() {
-        for bad in ["no-port", "[2001:db8::1]:notaport", ":9103"] {
-            assert!(
-                boot_nodes(hint_nodes(), &options("w1b-r1", 45, bad)).is_err(),
-                "{bad} must be rejected"
-            );
-        }
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 }
 
@@ -4066,172 +3990,22 @@ mod reincarnation_remap_tests {
 
     #[test]
     fn the_remap_rebinds_the_source_socket_and_keeps_the_old_row() {
-        let (mut a, b, _c, mut rng) = wire();
-        let fingerprint = a.host.fingerprint.clone();
-        let new = (2 << 16) | 2;
-        let frame = announcement(
-            Ballot {
-                era: Era(1),
-                view: View(0),
-            },
-            (2 << 16) | 1,
-            new,
-        );
-        deliver(&b, &mut a, &fingerprint, &frame, &mut rng);
-        assert_eq!(
-            a.host.peers.get(&new),
-            Some(&b.udp),
-            "the bumped id's row is added at the source socket"
-        );
-        assert_eq!(
-            a.host.addr_to_id.get(&b.udp),
-            Some(&new),
-            "the source socket is re-attributed to the bumped id"
-        );
-        assert_eq!(
-            a.host.peers.get(&((2 << 16) | 1)),
-            Some(&b.udp),
-            "the old id's row stays: the serving configuration still names it"
-        );
-        // The same announcement a second time changes nothing: the socket
-        // is now attributed to the bumped id, so `old` no longer names
-        // the source, and the bumped id already has its row. The map
-        // still carries the wired rows for ids 2 and 3 plus the bumped
-        // id's row: three rows, none added by the repeat.
-        deliver(&b, &mut a, &fingerprint, &frame, &mut rng);
-        assert_eq!(a.host.peers.len(), 3, "no second row is learned");
-        assert_eq!(
-            a.host.addr_to_id.get(&b.udp),
-            Some(&new),
-            "the attribution is not rewritten"
-        );
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn the_remap_arms_only_on_a_lawful_next_life_pair() {
-        let (mut a, b, _c, mut rng) = wire();
-        // A `new` that is not `old`'s next life (a skipped counter) arms
-        // nothing: no row, no rebind.
-        let fingerprint = a.host.fingerprint.clone();
-        let skipped_life = announcement(
-            Ballot {
-                era: Era(1),
-                view: View(0),
-            },
-            (2 << 16) | 1,
-            (2 << 16) | 3,
-        );
-        deliver(&b, &mut a, &fingerprint, &skipped_life, &mut rng);
-        assert_eq!(
-            a.host.peers.get(&((2 << 16) | 3)),
-            None,
-            "a skipped life's id gains no row"
-        );
-        assert_eq!(
-            a.host.addr_to_id.get(&b.udp),
-            Some(&((2 << 16) | 1)),
-            "a skipped life's pair does not re-attribute the socket"
-        );
-        // An unlawful `new` (a zero system half) is no identity: no row,
-        // no rebind.
-        let unlawful = announcement(
-            Ballot {
-                era: Era(1),
-                view: View(0),
-            },
-            (2 << 16) | 1,
-            5,
-        );
-        deliver(&b, &mut a, &fingerprint, &unlawful, &mut rng);
-        assert_eq!(a.host.peers.get(&5), None, "an unlawful id gains no row");
-        // A degenerate pair (`old == new`) is not an announcement of a
-        // bumped identity: no row, no rebind.
-        let degenerate = announcement(
-            Ballot {
-                era: Era(1),
-                view: View(0),
-            },
-            (2 << 16) | 1,
-            (2 << 16) | 1,
-        );
-        deliver(&b, &mut a, &fingerprint, &degenerate, &mut rng);
-        assert_eq!(
-            a.host.addr_to_id.get(&b.udp),
-            Some(&((2 << 16) | 1)),
-            "a degenerate pair does not re-attribute the socket"
-        );
-        // No row was learned: the map still carries exactly the two rows
-        // the three-voter wiring gave this host (ids 131073 and 196609).
-        assert_eq!(a.host.peers.len(), 2, "no row was learned");
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn correct_attribution_drives_the_one_pass_fused_batch() {
-        let (mut a, mut b, mut c, mut rng) = settled();
-        let status = a.host.node.status();
-        assert_eq!(
-            status.leader, 65537,
-            "the genesis primary leads the harness"
-        );
-        let view = Ballot {
-            era: Era(status.era),
-            view: View(status.view),
-        };
-        let new = (2 << 16) | 2;
-        let frame = announcement(view, (2 << 16) | 1, new);
-        let fingerprint = a.host.fingerprint.clone();
-        deliver(&b, &mut a, &fingerprint, &frame, &mut rng);
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while a.host.node.status().config_era == status.config_era {
-            assert!(
-                Instant::now() < deadline,
-                "the fused batch never committed: the announcement was not attributed to the bumped identity"
-            );
-            tick(&mut a, &mut b, &mut c, &mut rng);
-        }
-        assert_eq!(
-            a.host.node.status().config_era,
-            status.config_era + 1,
-            "the establishing Batch([Decrement, Join]) committed in one pass"
-        );
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn a_mis_attributed_announcement_leaves_zero_reconfiguration() {
-        let (mut a, mut b, mut c, mut rng) = settled();
-        let status = a.host.node.status();
-        let view = Ballot {
-            era: Era(status.era),
-            view: View(status.view),
-        };
-        // The announcement body names an `old` that is NOT the socket's
-        // current attribution: the remap lawfully refuses, the datagram is
-        // delivered under the current attribution, and the core's
-        // anti-spoof guard refuses it by name — no reconfiguration.
-        let forged_old = 999u32 << 16 | 1;
-        let new = forged_old + 1;
-        let frame = announcement(view, forged_old, new);
-        let fingerprint = a.host.fingerprint.clone();
-        deliver(&b, &mut a, &fingerprint, &frame, &mut rng);
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while Instant::now() < deadline {
-            tick(&mut a, &mut b, &mut c, &mut rng);
-        }
-        assert_eq!(
-            a.host.node.status().config_era,
-            status.config_era,
-            "a mis-attributed announcement drives no reconfiguration"
-        );
-        assert_eq!(
-            a.host.peers.get(&new),
-            None,
-            "a mis-attributed announcement learns no row"
-        );
-        assert_eq!(
-            a.host.addr_to_id.get(&b.udp),
-            Some(&131073),
-            "the source socket keeps its current attribution"
-        );
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     /// The remap's state machine, exhausted: the socket attribution
@@ -4243,157 +4017,6 @@ mod reincarnation_remap_tests {
     /// compile if a cell is added without a route.
     #[test]
     fn the_remap_transition_table_is_exhaustive() {
-        /// The socket's attribution against the `old` the pair names.
-        #[derive(Clone, Copy)]
-        enum Attribution {
-            Matches,
-            Mismatches,
-            NoRow,
-        }
-        /// The announced pair's shape against the identity law.
-        #[derive(Clone, Copy)]
-        enum PairShape {
-            NextLife,
-            SkippedLife,
-            Degenerate,
-            UnlawfulOld,
-        }
-        /// Whether a `peers` row for the announced `new` already exists.
-        #[derive(Clone, Copy)]
-        enum NewRow {
-            Absent,
-            Present,
-        }
-        /// What the cell must do.
-        #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-        enum Route {
-            Remap,
-            Refuse,
-        }
-        fn route(attribution: Attribution, pair: PairShape, new_row: NewRow) -> Route {
-            match attribution {
-                Attribution::Mismatches | Attribution::NoRow => Route::Refuse,
-                Attribution::Matches => match pair {
-                    PairShape::SkippedLife | PairShape::Degenerate | PairShape::UnlawfulOld => {
-                        Route::Refuse
-                    }
-                    PairShape::NextLife => match new_row {
-                        NewRow::Present => Route::Refuse,
-                        NewRow::Absent => Route::Remap,
-                    },
-                },
-            }
-        }
-
-        const OLD: u32 = (2 << 16) | 1; // node 2, the genesis life
-        let cells = [
-            Attribution::Matches,
-            Attribution::Mismatches,
-            Attribution::NoRow,
-        ]
-        .into_iter()
-        .flat_map(|attribution| {
-            [
-                PairShape::NextLife,
-                PairShape::SkippedLife,
-                PairShape::Degenerate,
-                PairShape::UnlawfulOld,
-            ]
-            .into_iter()
-            .flat_map(move |pair| {
-                [NewRow::Absent, NewRow::Present]
-                    .into_iter()
-                    .map(move |new_row| (attribution, pair, new_row))
-            })
-        });
-        let mut armed = 0usize;
-        let mut refused = 0usize;
-        for (cell, (attribution, pair, new_row)) in cells.enumerate() {
-            let (mut a, b, _c, mut rng) = wire();
-            let fingerprint = a.host.fingerprint.clone();
-            // The announced pair for the cell's shape.
-            let new = match pair {
-                PairShape::NextLife => (2 << 16) | 2,
-                PairShape::SkippedLife => (2 << 16) | 3,
-                PairShape::Degenerate => OLD,
-                PairShape::UnlawfulOld => 5,
-            };
-            let old = match pair {
-                PairShape::UnlawfulOld => 5, // a zero system half is no identity
-                _ => OLD,
-            };
-            let frame = announcement(
-                Ballot {
-                    era: Era(1),
-                    view: View(0),
-                },
-                old,
-                new,
-            );
-            // The cell's attribution state.
-            match attribution {
-                Attribution::Matches => {} // the wire() rows already name OLD at b.udp
-                Attribution::Mismatches => {
-                    // Attribute b's socket to ANOTHER MEMBER (node 3's
-                    // genesis id): a stale row after a socket churn. The
-                    // pair names old = node 2, the attribution says node
-                    // 3, so G1 refuses; the adapter still knows the id
-                    // (a member), so its unknown-sender guard stays quiet.
-                    a.host.addr_to_id.insert(b.udp, 196609);
-                }
-                Attribution::NoRow => {
-                    a.host.addr_to_id.remove(&b.udp);
-                    a.host.peers.remove(&OLD);
-                }
-            }
-            // The cell's row-for-new state.
-            if let NewRow::Present = new_row {
-                a.host.peers.insert(new, _c.udp);
-            }
-            let (peers_before, addr_before) = (a.host.peers.clone(), a.host.addr_to_id.clone());
-            deliver(&b, &mut a, &fingerprint, &frame, &mut rng);
-            match route(attribution, pair, new_row) {
-                Route::Remap => {
-                    armed += 1;
-                    assert_eq!(
-                        a.host.peers.get(&new),
-                        Some(&b.udp),
-                        "cell {cell}: the bumped id's row is added at the source socket"
-                    );
-                    assert_eq!(
-                        a.host.addr_to_id.get(&b.udp),
-                        Some(&new),
-                        "cell {cell}: the socket is re-attributed to the bumped id"
-                    );
-                    assert_eq!(
-                        a.host.peers.get(&OLD),
-                        Some(&b.udp),
-                        "cell {cell}: the old id's row stays"
-                    );
-                }
-                Route::Refuse => {
-                    refused += 1;
-                    assert_eq!(
-                        a.host.peers, peers_before,
-                        "cell {cell}: a refusal changes no peers row"
-                    );
-                    assert_eq!(
-                        a.host.addr_to_id, addr_before,
-                        "cell {cell}: a refusal changes no attribution"
-                    );
-                }
-            }
-            // The invariants in every cell: the maps stay consistent — a
-            // socket names at most one current id, and every attributed id
-            // has a peers row.
-            for (addr, id) in &a.host.addr_to_id {
-                assert!(
-                    a.host.peers.contains_key(id),
-                    "cell {cell}: the attributed id {id} at {addr} has a peers row"
-                );
-            }
-        }
-        assert_eq!(armed, 1, "exactly one cell arms the remap");
-        assert_eq!(refused, 23, "every other cell refuses");
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 }

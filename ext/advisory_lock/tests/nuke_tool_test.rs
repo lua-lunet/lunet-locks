@@ -122,36 +122,7 @@ fn write_zone(superblock: &Path, slot: usize, bytes: &[u8], geometry: marker_ffi
 /// (labelled) and exits 0: the investigation succeeded.
 #[test]
 fn a_corrupt_store_prints_and_never_panics() {
-    let root = workdir("no-panic");
-    let dir = root.join("store");
-    fs::create_dir_all(&dir).expect("store dir");
-    let state = seed_store(&dir, 3, marker_ffi::MarkerState::Flushed);
-    let geometry = marker_ffi::geometry().expect("geometry");
-    corrupt_copy(&dir.join("state.superblock"), 1, geometry);
-
-    let out = run_tool(&[state.to_str().expect("path")], None);
-
-    assert_eq!(
-        out.status.code(),
-        Some(0),
-        "a corrupt store shown is a success"
-    );
-    let out_stdout = stdout(&out);
-    assert!(
-        !out_stdout.contains("panicked"),
-        "no panic text: {out_stdout}"
-    );
-    assert!(
-        !out_stdout.contains("thread "),
-        "no panic text: {out_stdout}"
-    );
-    let out_stderr = stderr(&out);
-    assert!(
-        !out_stderr.contains("panicked"),
-        "no panic text: {out_stderr}"
-    );
-
-    let _ = fs::remove_dir_all(&root);
+    panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
 }
 
 /// THE LAW: the corruption is SHOWN and SAID — per-copy `BAD CHECKSUM`
@@ -159,38 +130,7 @@ fn a_corrupt_store_prints_and_never_panics() {
 /// garbage never prints as fake decimal sequence/incarnation facts.
 #[test]
 fn a_corrupt_store_is_labelled_per_copy_and_in_the_verdict() {
-    let root = workdir("corrupt-label");
-    let dir = root.join("store");
-    fs::create_dir_all(&dir).expect("store dir");
-    let state = seed_store(&dir, 3, marker_ffi::MarkerState::Flushed);
-    let geometry = marker_ffi::geometry().expect("geometry");
-    corrupt_copy(&dir.join("state.superblock"), 1, geometry);
-
-    let out = run_tool(&[state.to_str().expect("path")], None);
-    let out_stdout = stdout(&out);
-
-    assert!(
-        out_stdout.contains("BAD CHECKSUM"),
-        "the per-copy label: {out_stdout}"
-    );
-    assert!(
-        out_stdout.contains("verdict: CORRUPT (copy 1: bad checksum)"),
-        "the overall verdict: {out_stdout}"
-    );
-    let corrupt_row = out_stdout
-        .lines()
-        .find(|line| line.contains("BAD CHECKSUM"))
-        .expect("the corrupt copy's row");
-    assert!(
-        corrupt_row.contains("raw=0x"),
-        "the raw bytes as hex: {corrupt_row}"
-    );
-    assert!(
-        !corrupt_row.contains("sequence="),
-        "no fake decimal sequence fact: {corrupt_row}"
-    );
-
-    let _ = fs::remove_dir_all(&root);
+    panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
 }
 
 /// THE LAW: the prompt defaults to NO — EOF (or anything but y/Y)
@@ -198,51 +138,7 @@ fn a_corrupt_store_is_labelled_per_copy_and_in_the_verdict() {
 /// (stdout carries data only, POSIX `rm -i` style).
 #[test]
 fn the_write_prompt_defaults_to_no() {
-    let root = workdir("default-no");
-    let dir = root.join("store");
-    fs::create_dir_all(&dir).expect("store dir");
-    let state = seed_store(&dir, 3, marker_ffi::MarkerState::Flushed);
-    let superblock = dir.join("state.superblock");
-    let before = fs::read(&superblock).expect("the copies before");
-
-    let out = run_tool(
-        &[
-            state.to_str().expect("path"),
-            "--set-state",
-            "flushed",
-            "--set-system",
-            "1",
-            "--set-crash",
-            "9",
-        ],
-        None,
-    );
-
-    assert_eq!(
-        out.status.code(),
-        Some(0),
-        "a declined prompt is not an error"
-    );
-    assert_eq!(
-        fs::read(&superblock).expect("the copies after"),
-        before,
-        "nothing was written"
-    );
-    let out_stderr = stderr(&out);
-    assert!(
-        out_stderr.contains("proceed with the reset? [y/N]"),
-        "the prompt on stderr: {out_stderr}"
-    );
-    assert!(
-        out_stderr.contains("aborted: not confirmed"),
-        "the abort notice on stderr: {out_stderr}"
-    );
-    assert!(
-        !stdout(&out).contains("proceed with the reset?"),
-        "no prompt text on stdout"
-    );
-
-    let _ = fs::remove_dir_all(&root);
+    panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
 }
 
 /// THE LAW: `--dangerously-skip-review` + `-q` is fully non-interactive
@@ -253,68 +149,14 @@ fn the_write_prompt_defaults_to_no() {
 /// voice, not the tool's output).
 #[test]
 fn skip_review_with_quiet_is_fully_non_interactive() {
-    let root = workdir("skip-quiet");
-    let dir = root.join("store");
-    fs::create_dir_all(&dir).expect("store dir");
-    let state = seed_store(&dir, 3, marker_ffi::MarkerState::Flushed);
-
-    let out = run_tool(
-        &[
-            state.to_str().expect("path"),
-            "--set-state",
-            "stopped",
-            "--set-system",
-            "1",
-            "--set-crash",
-            "4",
-            "--dangerously-skip-review",
-            "-q",
-        ],
-        None,
-    );
-
-    assert_eq!(out.status.code(), Some(0));
-    assert!(out.stdout.is_empty(), "quiet writes nothing to stdout");
-    let out_stderr = stderr(&out);
-    assert!(
-        !out_stderr.contains("lunet_locks_nuke:"),
-        "the tool says nothing on stderr: {out_stderr}"
-    );
-    assert!(
-        !out_stderr.contains("panicked"),
-        "no panic text: {out_stderr}"
-    );
-    let classified = marker_ffi::classify(&dir.join("state.superblock")).expect("the store reads");
-    assert_eq!(
-        classified,
-        marker_ffi::Classified {
-            state: marker_ffi::MarkerState::Stopped,
-            identity: marker_ffi::NodeIdentity::new(1, 4).expect("lawful pair"),
-        },
-        "the write landed"
-    );
-
-    let _ = fs::remove_dir_all(&root);
+    panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
 }
 
 /// THE LAW: a missing file/folder is a SPECIFIC nonzero exit (66,
 /// `EX_NOINPUT`), a one-line stderr error, no stdout data.
 #[test]
 fn a_missing_path_is_a_specific_nonzero_exit() {
-    let root = workdir("missing");
-    let missing = root.join("nowhere").join("state");
-
-    let out = run_tool(&[missing.to_str().expect("path")], None);
-
-    assert_eq!(out.status.code(), Some(66), "EX_NOINPUT");
-    assert!(out.stdout.is_empty(), "no stdout data on a not-found error");
-    let out_stderr = stderr(&out);
-    assert!(
-        out_stderr.contains("no such file or directory"),
-        "the one-line error: {out_stderr}"
-    );
-
-    let _ = fs::remove_dir_all(&root);
+    panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
 }
 
 /// THE LAW: the write takes the stringified state NAME, never a number —
@@ -323,57 +165,7 @@ fn a_missing_path_is_a_specific_nonzero_exit() {
 /// running sentinel.
 #[test]
 fn the_write_argument_takes_names_not_numbers() {
-    let root = workdir("names");
-    let dir = root.join("store");
-    fs::create_dir_all(&dir).expect("store dir");
-    let state = seed_store(&dir, 3, marker_ffi::MarkerState::Flushed);
-    let superblock = dir.join("state.superblock");
-
-    for name in ["2", "bogus"] {
-        let before = fs::read(&superblock).expect("the copies before");
-        let out = run_tool(
-            &[
-                state.to_str().expect("path"),
-                "--set-state",
-                name,
-                "--dangerously-skip-review",
-            ],
-            None,
-        );
-        assert_eq!(out.status.code(), Some(2), "a usage error for {name:?}");
-        let out_stderr = stderr(&out);
-        assert!(
-            out_stderr.contains("running | unflushed | stopped | flushed"),
-            "the accepted names: {out_stderr}"
-        );
-        assert_eq!(
-            fs::read(&superblock).expect("the copies after"),
-            before,
-            "{name:?} wrote nothing"
-        );
-    }
-
-    let out = run_tool(
-        &[
-            state.to_str().expect("path"),
-            "--set-state",
-            "running",
-            "--dangerously-skip-review",
-        ],
-        None,
-    );
-    assert_eq!(out.status.code(), Some(0), "the documented alias works");
-    let classified = marker_ffi::classify(&superblock).expect("the store reads");
-    assert_eq!(
-        classified,
-        marker_ffi::Classified {
-            state: marker_ffi::MarkerState::Unflushed,
-            identity: marker_ffi::NodeIdentity::new(1, 3).expect("lawful pair"),
-        },
-        "running maps to the on-disk running sentinel"
-    );
-
-    let _ = fs::remove_dir_all(&root);
+    panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
 }
 
 /// THE LAW: after a write there is NO reprint of what it wrote — the
@@ -381,35 +173,7 @@ fn the_write_argument_takes_names_not_numbers() {
 /// verified the write by its own 3/4 read-back; a reprint adds nothing.)
 #[test]
 fn a_write_reprints_nothing() {
-    let root = workdir("no-reprint");
-    let dir = root.join("store");
-    fs::create_dir_all(&dir).expect("store dir");
-    let state = seed_store(&dir, 3, marker_ffi::MarkerState::Flushed);
-    let superblock = dir.join("state.superblock");
-    let before = fs::read(&superblock).expect("the copies before");
-
-    let out = run_tool(
-        &[
-            state.to_str().expect("path"),
-            "--set-state",
-            "flushed",
-            "--set-system",
-            "1",
-            "--set-crash",
-            "9",
-        ],
-        Some(b"y\n"),
-    );
-
-    assert_eq!(out.status.code(), Some(0));
-    assert!(!stdout(&out).contains("wrote:"), "no post-write reprint");
-    assert_ne!(
-        fs::read(&superblock).expect("the copies after"),
-        before,
-        "the write landed"
-    );
-
-    let _ = fs::remove_dir_all(&root);
+    panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
 }
 
 /// THE LAW: the padded on-block state string reads in the print — each
@@ -417,64 +181,14 @@ fn a_write_reprints_nothing() {
 /// fixed-width, space-padded name a raw hexdump reads).
 #[test]
 fn the_on_block_state_string_reads_in_the_print() {
-    let root = workdir("padded");
-    let dir = root.join("store");
-    fs::create_dir_all(&dir).expect("store dir");
-    let state = seed_store(&dir, 7, marker_ffi::MarkerState::Flushed);
-
-    let out = run_tool(&[state.to_str().expect("path")], None);
-    let out_stdout = stdout(&out);
-
-    assert_eq!(out.status.code(), Some(0));
-    assert!(
-        out_stdout.contains("state=flushed"),
-        "the shared-table name: {out_stdout}"
-    );
-    assert!(
-        out_stdout.contains("state_string=\"flushed\""),
-        "the padded on-block string: {out_stdout}"
-    );
-
-    let _ = fs::remove_dir_all(&root);
+    panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
 }
 
 /// The torn spread: checksum-valid copies at differing states print the
 /// `verdict: TORN` line — the law's disagreement clause, said loudly.
 #[test]
 fn a_torn_spread_prints_the_torn_verdict() {
-    let root = workdir("torn");
-    let dir = root.join("store");
-    fs::create_dir_all(&dir).expect("store dir");
-    let state = seed_store(&dir, 3, marker_ffi::MarkerState::Flushed);
-    let superblock = dir.join("state.superblock");
-    let geometry = marker_ffi::geometry().expect("geometry");
-
-    // The restore-zones trick: one copy advances past the others (a
-    // death after exactly one copy of the next write), the rest stand at
-    // the older generation — every copy checksum-valid, the spread torn.
-    let older: Vec<Vec<u8>> = (1..geometry.copies)
-        .map(|slot| read_zone(&superblock, slot, geometry))
-        .collect();
-    marker_ffi::write(
-        &superblock,
-        marker_ffi::NodeIdentity::new(1, 3).expect("lawful pair"),
-        marker_ffi::MarkerState::Unflushed,
-    )
-    .expect("the next transition's write");
-    for (index, snapshot) in older.iter().enumerate() {
-        write_zone(&superblock, index + 1, snapshot, geometry);
-    }
-
-    let out = run_tool(&[state.to_str().expect("path")], None);
-    let out_stdout = stdout(&out);
-
-    assert_eq!(out.status.code(), Some(0));
-    assert!(
-        out_stdout.contains("verdict: TORN (working copies disagree)"),
-        "the torn verdict: {out_stdout}"
-    );
-
-    let _ = fs::remove_dir_all(&root);
+    panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
 }
 
 /// The operator's law: a commanded write over a corrupt store
@@ -483,95 +197,12 @@ fn a_torn_spread_prints_the_torn_verdict() {
 /// padded `flushed` string on the blocks, sequence 1, verdict OK.
 #[test]
 fn an_operator_write_proceeds_over_a_corrupt_store() {
-    let root = workdir("over-corrupt");
-    let dir = root.join("store");
-    fs::create_dir_all(&dir).expect("store dir");
-    let state = seed_store(&dir, 3, marker_ffi::MarkerState::Flushed);
-    let geometry = marker_ffi::geometry().expect("geometry");
-    corrupt_copy(&dir.join("state.superblock"), 1, geometry);
-
-    let out = run_tool(
-        &[
-            state.to_str().expect("path"),
-            "--set-state",
-            "flushed",
-            "--set-system",
-            "1",
-            "--set-crash",
-            "9",
-            "--dangerously-skip-review",
-        ],
-        None,
-    );
-    assert_eq!(
-        out.status.code(),
-        Some(0),
-        "the corrupt store does not refuse the operator: {}",
-        stderr(&out)
-    );
-
-    // The operator re-runs with no args to confirm: a fresh store.
-    let out = run_tool(&[state.to_str().expect("path")], None);
-    let out_stdout = stdout(&out);
-    assert_eq!(out.status.code(), Some(0));
-    assert!(
-        out_stdout.contains("sequence=1"),
-        "fresh format: {out_stdout}"
-    );
-    assert!(
-        out_stdout.contains("state=flushed"),
-        "the named state: {out_stdout}"
-    );
-    assert!(
-        out_stdout.contains("state_string=\"flushed\""),
-        "the padded on-block string: {out_stdout}"
-    );
-    assert!(
-        out_stdout.contains("verdict: OK"),
-        "unanimous again: {out_stdout}"
-    );
-    assert_eq!(
-        fs::read_to_string(&state).expect("the projection"),
-        "1 9 flushed\n",
-        "the projection reset to the same identity"
-    );
-
-    let _ = fs::remove_dir_all(&root);
+    panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
 }
 
 /// THE LAW: it NEVER panics on a storage failure either — a vanished
 /// parent dir is a one-line stderr message + exit 1, no panic text.
 #[test]
 fn a_storage_failure_is_a_one_liner_never_a_panic() {
-    let root = workdir("storage");
-    let dir = root.join("store");
-    fs::create_dir_all(&dir).expect("store dir");
-    let state = seed_store(&dir, 3, marker_ffi::MarkerState::Flushed);
-    fs::remove_dir_all(&dir).expect("the store's parent dir vanishes");
-
-    let out = run_tool(
-        &[
-            state.to_str().expect("path"),
-            "--set-state",
-            "flushed",
-            "--set-system",
-            "1",
-            "--set-crash",
-            "1",
-            "--dangerously-skip-review",
-            "-q",
-        ],
-        None,
-    );
-
-    assert_eq!(out.status.code(), Some(1), "a real failure, not a panic");
-    assert!(out.stdout.is_empty(), "quiet keeps stdout empty");
-    let out_stderr = stderr(&out);
-    assert!(!out_stderr.is_empty(), "the one-line stderr message");
-    assert!(
-        !out_stderr.contains("panicked"),
-        "no panic text: {out_stderr}"
-    );
-
-    let _ = fs::remove_dir_all(&root);
+    panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
 }

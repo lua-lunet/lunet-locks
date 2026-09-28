@@ -95,15 +95,7 @@ fn wait_all_mode(workers: &[&Worker], want: u8, what: &str) {
 #[test]
 #[ignore = "raises real SIGUSR1/SIGUSR2 in this process; run solo (see module docs)"]
 fn a_real_signal_is_a_process_transition_every_worker_follows() {
-    let signals = Signals::register();
-    let first = spawn_worker(&signals, 1, false);
-    let second = spawn_worker(&signals, 1, false);
-    signal_hook::low_level::raise(signal_hook::consts::SIGUSR2).expect("SIGUSR2 raised");
-    wait_all_mode(&[&first, &second], 1, "both workers to start (SIGUSR2)");
-    signal_hook::low_level::raise(signal_hook::consts::SIGUSR1).expect("SIGUSR1 raised");
-    wait_all_mode(&[&first, &second], 0, "both workers to silence (SIGUSR1)");
-    first.stop();
-    second.stop();
+    panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
 }
 
 /// The rig shape: one fast drainer and one asleep inside its 200 ms
@@ -115,20 +107,5 @@ fn a_real_signal_is_a_process_transition_every_worker_follows() {
 #[test]
 #[ignore = "raises a real SIGUSR1 in this process; run solo (see module docs)"]
 fn a_worker_sleeping_through_the_silence_follows_it_on_wake() {
-    let signals = Signals::register();
-    signals.signal_start();
-    let fast = spawn_worker(&signals, 1, true);
-    let sleepy = spawn_worker(&signals, 200, true);
-    wait_all_mode(&[&fast, &sleepy], 1, "both workers chasing");
-    // The sleeper is mid-window: it cannot apply for another ~150 ms.
-    std::thread::sleep(Duration::from_millis(50));
-    signal_hook::low_level::raise(signal_hook::consts::SIGUSR1).expect("SIGUSR1 raised");
-    wait_all_mode(&[&fast], 0, "the fast worker to silence");
-    wait_all_mode(
-        &[&sleepy],
-        0,
-        "the sleeping worker to follow the silence on wake",
-    );
-    fast.stop();
-    sleepy.stop();
+    panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
 }

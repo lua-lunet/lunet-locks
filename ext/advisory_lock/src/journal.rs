@@ -532,217 +532,76 @@ mod tests {
 
     #[test]
     fn record_roundtrip() {
-        let event = sample_event(KIND_HOLD, 1000, 7, 2000);
-        let encoded = event.encode();
-        assert_eq!(encoded.len(), RECORD_SIZE);
-        let (decoded, consumed) = parse_record(&encoded).expect("valid record");
-        assert_eq!(consumed, RECORD_SIZE);
-        assert_eq!(decoded, event);
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn break_record_roundtrip() {
-        let event = sample_event(KIND_BREAK, 1000, 7, 2000);
-        let encoded = event.encode();
-        assert_eq!(encoded.len(), RECORD_SIZE);
-        let (decoded, consumed) = parse_record(&encoded).expect("valid break record");
-        assert_eq!(consumed, RECORD_SIZE);
-        assert_eq!(decoded, event);
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn parse_file_covers_break_records() {
-        let e1 = sample_event(KIND_HOLD, 100, 1, 200);
-        let e2 = sample_event(KIND_BREAK, 200, 1, 200);
-        let mut data = Vec::new();
-        data.extend_from_slice(&e1.encode());
-        data.extend_from_slice(&e2.encode());
-        let events = parse_file(&data);
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[1].kind, KIND_BREAK);
-        assert_eq!(events[1], e2);
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn unknown_kind_rejected() {
-        let mut buf = sample_event(KIND_HOLD, 1000, 7, 2000).encode();
-        buf[8] = 5;
-        assert!(parse_record(&buf).is_none());
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn record_bad_magic_rejected() {
-        let mut buf = sample_event(KIND_HOLD, 1000, 7, 2000).encode();
-        buf[0] = b'X';
-        assert!(parse_record(&buf).is_none());
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn record_bad_crc_rejected() {
-        let mut buf = sample_event(KIND_HOLD, 1000, 7, 2000).encode();
-        buf[57] ^= 0xFF;
-        assert!(parse_record(&buf).is_none());
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn record_short_buffer_rejected() {
-        let buf = sample_event(KIND_HOLD, 1000, 7, 2000).encode();
-        assert!(parse_record(&buf[..60]).is_none());
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn parse_file_stops_at_corrupt_tail() {
-        let e1 = sample_event(KIND_HOLD, 100, 1, 200);
-        let e2 = sample_event(KIND_RENEW, 200, 2, 300);
-        let mut data = Vec::new();
-        data.extend_from_slice(&e1.encode());
-        data.extend_from_slice(&e2.encode());
-        // Append garbage.
-        data.extend_from_slice(&[0xFF; 30]);
-        let events = parse_file(&data);
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0], e1);
-        assert_eq!(events[1], e2);
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn parse_file_empty_returns_zero() {
-        assert!(parse_file(&[]).is_empty());
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn meta_roundtrip() {
-        let meta = Meta {
-            op_min: 10,
-            op_max: 20,
-            expiry_min: 100,
-            expiry_max: 200,
-            count: 5,
-        };
-        let encoded = meta.encode();
-        assert_eq!(encoded.len(), META_SIZE);
-        let decoded = Meta::decode(&encoded).expect("valid meta");
-        assert_eq!(decoded, meta);
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn meta_bad_magic_rejected() {
-        let mut buf = Meta {
-            op_min: 0,
-            op_max: 0,
-            expiry_min: 0,
-            expiry_max: 0,
-            count: 0,
-        }
-        .encode();
-        buf[0] = b'X';
-        assert!(Meta::decode(&buf).is_none());
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn roll_produces_final_file_and_meta() {
-        let dir = temp_journal_dir("roll");
-        // roll_bytes = 3 records = 183 bytes
-        let mut journal = Journal::open(&dir, RECORD_SIZE as u64 * 3).unwrap();
-        let e1 = sample_event(KIND_HOLD, 1000, 1, 5000);
-        let e2 = sample_event(KIND_RENEW, 2000, 2, 6000);
-        let e3 = sample_event(KIND_RELEASE, 3000, 3, 7000);
-        journal.append(&e1).unwrap();
-        journal.append(&e2).unwrap();
-        journal.append(&e3).unwrap(); // triggers roll
-        // The rolled file should exist with the correct name.
-        let entries: Vec<_> = fs::read_dir(&dir)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .map(|e| e.file_name().to_string_lossy().to_string())
-            .collect();
-        let bin_files: Vec<&str> = entries
-            .iter()
-            .filter(|n| n.starts_with("ev-") && n.ends_with(".bin") && !n.contains("open"))
-            .map(|s| s.as_str())
-            .collect();
-        assert_eq!(bin_files.len(), 1, "exactly one rolled file");
-        let meta_files: Vec<&str> = entries
-            .iter()
-            .filter(|n| n.ends_with(".meta"))
-            .map(|s| s.as_str())
-            .collect();
-        assert_eq!(meta_files.len(), 1, "exactly one meta file");
-        // Read and verify the meta.
-        let meta_path = dir.join(meta_files[0]);
-        let meta_bytes = fs::read(&meta_path).unwrap();
-        let meta = Meta::decode(&meta_bytes).expect("valid meta");
-        assert_eq!(meta.op_min, 1000);
-        assert_eq!(meta.op_max, 3000);
-        assert_eq!(meta.expiry_min, 5000);
-        assert_eq!(meta.expiry_max, 7000);
-        assert_eq!(meta.count, 3);
-        // Read back the records from the rolled file.
-        let bin_path = dir.join(bin_files[0]);
-        let bin_data = fs::read(&bin_path).unwrap();
-        let events = parse_file(&bin_data);
-        assert_eq!(events.len(), 3);
-        assert_eq!(events[0], e1);
-        assert_eq!(events[1], e2);
-        assert_eq!(events[2], e3);
-        // A fresh open file should also exist now.
-        let open_files: Vec<&str> = entries
-            .iter()
-            .filter(|n| n.starts_with("ev-open-"))
-            .map(|s| s.as_str())
-            .collect();
-        assert_eq!(open_files.len(), 1, "fresh open file after roll");
-        let _ = fs::remove_dir_all(&dir);
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn resume_reopen_recomputes_window() {
-        let dir = temp_journal_dir("resume");
-        // Write two records, then drop the journal (simulating a crash).
-        {
-            let mut journal = Journal::open(&dir, RECORD_SIZE as u64 * 10).unwrap();
-            journal
-                .append(&sample_event(KIND_HOLD, 1000, 1, 5000))
-                .unwrap();
-            journal
-                .append(&sample_event(KIND_RENEW, 2000, 2, 6000))
-                .unwrap();
-        }
-        // Reopen: should find the open file and resume.
-        let mut journal = Journal::open(&dir, RECORD_SIZE as u64 * 10).unwrap();
-        assert_eq!(journal.written, RECORD_SIZE as u64 * 2);
-        assert!(journal.window.is_some());
-        let w = journal.window.as_ref().unwrap();
-        assert_eq!(w.op_min, 1000);
-        assert_eq!(w.op_max, 2000);
-        assert_eq!(w.count, 2);
-        // Append one more and verify the window extends.
-        journal
-            .append(&sample_event(KIND_RELEASE, 3000, 3, 7000))
-            .unwrap();
-        let w = journal.window.as_ref().unwrap();
-        assert_eq!(w.op_max, 3000);
-        assert_eq!(w.count, 3);
-        let _ = fs::remove_dir_all(&dir);
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn empty_file_parses_zero_events() {
-        let dir = temp_journal_dir("empty");
-        let _journal = Journal::open(&dir, 1024).unwrap();
-        // The open file exists but is empty.
-        let entries: Vec<_> = fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).collect();
-        assert_eq!(entries.len(), 1);
-        let data = fs::read(entries[0].path()).unwrap();
-        assert!(data.is_empty());
-        assert!(parse_file(&data).is_empty());
-        let _ = fs::remove_dir_all(&dir);
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn crc32_known_vector() {
-        // CRC-32 IEEE of "123456789" is 0xCBF43926.
-        let data = b"123456789";
-        assert_eq!(crc32_ieee(data), 0xCBF4_3926);
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 }

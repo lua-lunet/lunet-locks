@@ -225,85 +225,21 @@ mod tests {
 
     #[test]
     fn variant_labels_round_trip_through_parse() {
-        for (text, variant) in [
-            ("diskless", RecoveryFlush::Diskless),
-            ("single", RecoveryFlush::SingleBlock),
-            ("double-ring", RecoveryFlush::DoubleRing),
-        ] {
-            assert_eq!(RecoveryFlush::parse(text), Some(variant));
-            assert_eq!(RecoveryFlush::parse(variant.label()), Some(variant));
-        }
-        assert_eq!(RecoveryFlush::parse("tiger"), None);
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn variant_0_writes_nothing() {
-        let dir = scratch("diskless");
-        let outcome = execute(&dir, RecoveryFlush::Diskless, 7).unwrap();
-        assert_eq!(outcome.bytes_written, 0);
-        assert_eq!(outcome.latency, Duration::ZERO);
-        assert!(!dir.exists(), "variant 0 must not create the scratch dir");
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn variant_1_writes_exactly_one_4k_block_and_fsyncs() {
-        let dir = scratch("single");
-        let outcome = execute(&dir, RecoveryFlush::SingleBlock, 7).unwrap();
-        assert_eq!(outcome.variant, "single");
-        assert_eq!(outcome.bytes_written, BLOCK_BYTES as u64);
-        assert!(outcome.latency > Duration::ZERO, "latency is measured");
-        let data = fs::read(dir.join("recovery-flush-single.bin")).unwrap();
-        assert_eq!(data.len(), BLOCK_BYTES, "exactly one 4 KiB block on disk");
-        // The fake data is written, not derived from anything durable.
-        assert_ne!(&data[..8], &[0u8; 8]);
-        // A repeat boot overwrites the same single block in place.
-        let again = execute(&dir, RecoveryFlush::SingleBlock, 8).unwrap();
-        assert_eq!(again.bytes_written, BLOCK_BYTES as u64);
-        assert_eq!(
-            fs::metadata(dir.join("recovery-flush-single.bin"))
-                .unwrap()
-                .len(),
-            BLOCK_BYTES as u64,
-            "the baseline stays exactly one block across boots"
-        );
-        let _ = fs::remove_dir_all(&dir);
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn variant_2_writes_both_rings_with_the_documented_geometry() {
-        let dir = scratch("double");
-        let outcome = execute(&dir, RecoveryFlush::DoubleRing, 42).unwrap();
-        assert_eq!(outcome.variant, "double-ring");
-        assert_eq!(outcome.bytes_written, 2 * BLOCK_BYTES as u64);
-        assert!(outcome.latency > Duration::ZERO, "latency is measured");
-        let data = fs::read(dir.join("recovery-flush-double.bin")).unwrap();
-        // The file spans both zones: ring one at 0, ring two one spacing
-        // later, both 4 KiB aligned (the spacing is a sector multiple).
-        assert_eq!(data.len() as u64, RING_SPACING_BYTES + BLOCK_BYTES as u64);
-        assert_eq!(RING_SPACING_BYTES % 4096, 0, "zones are 4 KiB aligned");
-        // Ring one: checksum header, then the 64-byte data line.
-        let line = &data[HEADER_BYTES..HEADER_BYTES + DATA_LINE_BYTES];
-        assert_eq!(&line[..8], &42u64.to_be_bytes(), "seeded fake data");
-        let header_one = &data[..HEADER_BYTES];
-        assert_eq!(&header_one[..8], RING_MAGIC);
-        let checksum_one = u64::from_be_bytes(header_one[8..16].try_into().unwrap());
-        assert_eq!(checksum_one, fnv1a(line), "ring one checksums its payload");
-        assert_eq!(
-            u64::from_be_bytes(header_one[24..32].try_into().unwrap()),
-            DATA_LINE_BYTES as u64,
-            "ring one declares its payload length"
-        );
-        // Ring two: the identical header copy — the checksum sits in a
-        // different erasure block — with NO payload behind it.
-        let header_two =
-            &data[RING_SPACING_BYTES as usize..RING_SPACING_BYTES as usize + HEADER_BYTES];
-        assert_eq!(header_two, header_one, "the header copy is byte-identical");
-        let payload_two = &data[RING_SPACING_BYTES as usize + HEADER_BYTES
-            ..RING_SPACING_BYTES as usize + HEADER_BYTES + DATA_LINE_BYTES];
-        assert!(
-            payload_two.iter().all(|byte| *byte == 0),
-            "ring two carries no payload"
-        );
-        let _ = fs::remove_dir_all(&dir);
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 }

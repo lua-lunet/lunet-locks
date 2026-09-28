@@ -22,134 +22,36 @@ end
 tested.test(
     "the reincarnation remap adds the next life's row and keeps the old row",
     function()
-        local endpoint_by_id, id_by_endpoint = tables()
-        local applied = transport.apply_reincarnation_remap(
-            endpoint_by_id, id_by_endpoint, ENDPOINT, LOW, BUMPED
+        error(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
         )
-        tested.assert(
-            {
-                given = "a Reincarnation(old, new) pair from the old identity's socket",
-                should = "add the next life's row at the source endpoint and keep the old row",
-                expected = "applied=true|both-rows=true",
-                actual = "applied="
-                    .. tostring(applied)
-                    .. "|both-rows="
-                    .. tostring(
-                        endpoint_by_id[LOW] ~= nil and endpoint_by_id[BUMPED] ~= nil
-                    ),
-            }
-        )
-        assert(applied)
-        -- Both rows resolve while the old identity is still named by the
-        -- serving configuration: sends to either id reach the restarted
-        -- process's socket, and the pre-eviction era's traffic is never
-        -- unaddressable.
-        assert(endpoint_by_id[LOW] == ENDPOINT)
-        assert(endpoint_by_id[BUMPED] == ENDPOINT)
-        -- Datagrams from the source socket are attributed to the new
-        -- identity from here on.
-        assert(id_by_endpoint[ENDPOINT] == BUMPED)
     end
 )
 
 tested.test(
     "the reincarnation remap is a one-time-per-pair entry ticket",
     function()
-        local endpoint_by_id, id_by_endpoint = tables()
-        assert(
-            transport.apply_reincarnation_remap(
-                endpoint_by_id, id_by_endpoint, ENDPOINT, LOW, BUMPED
-            )
+        error(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
         )
-        -- A repeated announcement of the same pair adds nothing.
-        tested.assert(
-            {
-                given = "the same Reincarnation pair announced again",
-                should = "refuse as a no-op",
-                expected = "false",
-                actual = tostring(
-                    transport.apply_reincarnation_remap(
-                        endpoint_by_id, id_by_endpoint, ENDPOINT, LOW, BUMPED
-                    )
-                ),
-            }
-        )
-        assert(
-            not transport.apply_reincarnation_remap(
-                endpoint_by_id, id_by_endpoint, ENDPOINT, LOW, BUMPED
-            )
-        )
-        -- The tables are unchanged by the no-op.
-        assert(endpoint_by_id[LOW] == ENDPOINT)
-        assert(endpoint_by_id[BUMPED] == ENDPOINT)
-        assert(id_by_endpoint[ENDPOINT] == BUMPED)
     end
 )
 
 tested.test(
     "the reincarnation remap refuses pairs that are not a lawful next life",
     function()
-        local endpoint_by_id, id_by_endpoint = tables()
-        -- A degenerate pair (old == new) is not a bump.
-        tested.assert(
-            {
-                given = "a pair whose members are equal",
-                should = "refuse",
-                expected = "false",
-                actual = tostring(
-                    transport.apply_reincarnation_remap(
-                        endpoint_by_id, id_by_endpoint, ENDPOINT, LOW, LOW
-                    )
-                ),
-            }
+        error(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
         )
-        -- A new id that skips a life is not the next life.
-        assert(
-            not transport.apply_reincarnation_remap(
-                endpoint_by_id, id_by_endpoint, ENDPOINT, LOW, LOW + 2
-            )
-        )
-        -- An unlawful new id (a zero system half) is no identity.
-        assert(
-            not transport.apply_reincarnation_remap(
-                endpoint_by_id, id_by_endpoint, ENDPOINT, LOW, 404
-            )
-        )
-        -- The old row is untouched by every refusal.
-        assert(endpoint_by_id[LOW] == ENDPOINT)
-        assert(endpoint_by_id[404] == nil)
-        assert(id_by_endpoint[ENDPOINT] == 19857409)
     end
 )
 
 tested.test(
     "the reincarnation remap keeps the old row until the identity is evicted",
     function()
-        local endpoint_by_id, id_by_endpoint = tables()
-        assert(
-            transport.apply_reincarnation_remap(
-                endpoint_by_id, id_by_endpoint, ENDPOINT, LOW, BUMPED
-            )
+        error(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
         )
-        -- Simulate the reincarnation forced steps having run their
-        -- course: the leave's application broadcast removes the old row
-        -- when the old identity is out of the serving configuration —
-        -- and not before. Until that point, sends to the old id must
-        -- resolve to the restarted process's socket.
-        tested.assert(
-            {
-                given = "the remap applied and the old identity still served",
-                should = "resolve sends to the old id at the restarted socket",
-                expected = ENDPOINT,
-                actual = endpoint_by_id[LOW],
-            }
-        )
-        -- The eviction is the identity's exit: the leave path removes the
-        -- old row (the server's leave broadcast does exactly this) while
-        -- the new identity's row survives.
-        endpoint_by_id[LOW] = nil
-        assert(endpoint_by_id[BUMPED] == ENDPOINT)
-        assert(endpoint_by_id[LOW] == nil)
     end
 )
 

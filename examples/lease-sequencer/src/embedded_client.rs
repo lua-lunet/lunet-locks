@@ -734,191 +734,42 @@ mod tests {
 
     #[test]
     fn contender_boots_silent_and_schedules_nothing() {
-        let mut contender = contender();
-        assert_eq!(contender.mode(), Mode::Off);
-        assert_eq!(contender.next_action(2000), None);
-        assert_eq!(contender.scheduled_at(), None);
-        assert!(!contender.holds());
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn started_contender_probes_with_a_get_request() {
-        let mut contender = contender();
-        let action = probe_action(&mut contender);
-        assert_eq!(action.op, "get");
-        let value: Value = serde_json::from_str(&action.request).expect("valid json");
-        assert_eq!(value["op"], "get");
-        assert_eq!(value["client_id"], 800_000);
-        assert_eq!(value["request_num"], 1);
-        assert_eq!(value["lock_id"], 0x0DDBA12_u64);
-        let message_id = uuid::Uuid::parse_str(value["message_id"].as_str().expect("uuid"))
-            .expect("parseable message id");
-        assert_eq!(action.message_id, *message_id.as_bytes());
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn polite_floor_thins_the_foreign_probe_but_never_the_holder_renewal() {
-        let mut polite = Contender::new(
-            Config {
-                probe_floor_ms: 1000,
-                ..config()
-            },
-            0xDEAD_BEEF,
-        );
-        client_gate::start(polite.gate(), 1000);
-        let probe = polite.next_action(1000).expect("started contender probes");
-        let foreign = get_reply(250, "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee");
-        polite.absorb(1000, &probe, Some(&foreign));
-        // The floor fires: the probe waits at least the full floor even
-        // though the leader echoed only 250 ms of lease left.
-        let scheduled = polite
-            .scheduled_at()
-            .expect("a foreign probe stays scheduled");
-        assert!(
-            scheduled >= 1000 + 1000,
-            "the polite probe floor must hold the probe back: got {scheduled}"
-        );
-
-        // Aggressive keeps the old cadence: schedule rides just past the
-        // echoed expiry (remaining + jitter, with no floor).
-        let mut aggressive = contender();
-        client_gate::start(aggressive.gate(), 1000);
-        let probe = aggressive.next_action(1000).expect("started");
-        aggressive.absorb(1000, &probe, Some(&foreign));
-        let scheduled = aggressive
-            .scheduled_at()
-            .expect("aggressive probe schedules");
-        assert!(
-            (1250..1350).contains(&scheduled),
-            "aggressive probes past the echoed expiry: got {scheduled}"
-        );
-
-        // The holder's renewal is never floored: the free/probe race and
-        // the same-holder extension stay on the tight window.
-        let mut holder_client = Contender::new(
-            Config {
-                probe_floor_ms: 5000,
-                ..config()
-            },
-            0xDEAD_BEEF,
-        );
-        client_gate::start(holder_client.gate(), 1000);
-        let own = holder_client.holder().to_string();
-        let probe = holder_client.next_action(1000).expect("started");
-        let held = json!({"op": "get", "lease": {"lease_id": 5, "holder": own, "expiry": 10_500}, "executed_at": 10_000});
-        holder_client.absorb(1000, &probe, Some(&held));
-        let scheduled = holder_client
-            .scheduled_at()
-            .expect("holder schedules the renewal");
-        assert!(
-            scheduled <= 10_000 + 500,
-            "the holder renews ahead of its own deadline regardless of the floor: got {scheduled}"
-        );
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn free_probe_races_inline_with_a_set() {
-        let mut contender = contender();
-        let holder = contender.holder().to_string();
-        let probe = probe_action(&mut contender);
-        let free = json!({"op": "get", "lease": null, "executed_at": 10_000});
-        let race = contender
-            .absorb(10_010, &probe, Some(&free))
-            .expect("a free probe races to SET");
-        assert_eq!(race.op, "set");
-        let value: Value = serde_json::from_str(&race.request).expect("valid json");
-        assert_eq!(value["op"], "set");
-        assert_eq!(value["client_id"], 800_000);
-        assert_eq!(value["request_num"], 2);
-        assert_eq!(value["lock_id"], 0x0DDBA12_u64);
-        assert_eq!(value["lease"]["holder"], holder.as_str());
-        assert_eq!(value["lease"]["lease_ms"], 500);
-        assert_eq!(value["sent_at_ms"], 10_010);
-        assert_eq!(value["lease"]["lease_id"], 1);
-        // The race stakes holdership; the gate adopts it only once the
-        // race's own reply lands.
-        assert!(!contender.holds());
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn set_reply_adopts_holdership_and_schedules_the_renewal() {
-        let mut contender = contender();
-        let holder = contender.holder().to_string();
-        let probe = probe_action(&mut contender);
-        let free = json!({"op": "get", "lease": null, "executed_at": 10_000});
-        let race = contender
-            .absorb(10_010, &probe, Some(&free))
-            .expect("the free-probe SET race");
-        let granted = set_reply(true, &holder);
-        assert_eq!(
-            contender.absorb(10_020, &race, Some(&granted)),
-            None,
-            "the race's reply schedules no follow-up"
-        );
-        assert!(contender.holds());
-        // The renewal is one renewal-margin inside the window the race
-        // asked for: 500 - 250 = 250 ms past the absorb's now.
-        assert_eq!(contender.scheduled_at(), Some(10_020 + 250));
-        let renewal = contender
-            .next_action(10_270)
-            .expect("the renewal is due at the schedule");
-        assert_eq!(renewal.op, "extend");
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn foreign_incumbent_polls_past_expiry_with_jitter() {
-        let mut contender = contender();
-        let probe = probe_action(&mut contender);
-        let foreign = get_reply(300, "22222222-2222-2222-2222-222222222222");
-        assert_eq!(contender.absorb(1000, &probe, Some(&foreign)), None);
-        let at = contender.scheduled_at().expect("the poll is scheduled");
-        assert!(
-            (1300..1400).contains(&at),
-            "poll past the leader-echoed expiry with <100 ms jitter, got {at}"
-        );
-        assert!(!contender.holds());
-        // The poll is a probe, and the probe is against the same lock.
-        let poll = contender.next_action(at).expect("the poll fires");
-        assert_eq!(poll.op, "get");
-        let value: Value = serde_json::from_str(&poll.request).expect("valid json");
-        assert_eq!(value["lock_id"], 0x0DDBA12_u64);
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn own_live_lease_probe_reschedules_a_tight_renewal() {
-        let mut contender = contender();
-        let holder = contender.holder().to_string();
-        let probe = probe_action(&mut contender);
-        let own = get_reply(300, &holder);
-        assert_eq!(contender.absorb(1000, &probe, Some(&own)), None);
-        assert!(contender.holds(), "the probe found our own lease live");
-        let at = contender.scheduled_at().expect("the re-probe is scheduled");
-        assert!(
-            (1000..1050).contains(&at),
-            "the re-adopt is inside the tight race window, got {at}"
-        );
-        // The rescheduled op is a renewal, not another probe.
-        assert_eq!(contender.next_action(at).expect("due").op, "extend");
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn renewal_reply_schedules_the_next_renewal_inside_the_window() {
-        let mut contender = contender();
-        let holder = contender.holder().to_string();
-        let probe = probe_action(&mut contender);
-        let free = json!({"op": "get", "lease": null, "executed_at": 10_000});
-        let race = contender
-            .absorb(10_010, &probe, Some(&free))
-            .expect("the race");
-        let granted = set_reply(true, &holder);
-        contender.absorb(10_020, &race, Some(&granted));
-        let renewal = contender.next_action(10_270).expect("the renewal is due");
-        assert_eq!(renewal.op, "extend");
-        // The leader echoed 300 ms remaining: the next renewal is
-        // scheduled one renewal-margin inside that (300 - 250 = 50 ms).
-        let renewed = get_reply(300, &holder);
-        assert_eq!(contender.absorb(10_280, &renewal, Some(&renewed)), None);
-        assert_eq!(contender.scheduled_at(), Some(10_280 + 50));
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     /// A renewal the leader DENIED, in the rig's exact reply shape: no
@@ -947,41 +798,7 @@ mod tests {
     /// as an acked extension.
     #[test]
     fn denied_renewal_withdraws_the_stake_and_reprobes() {
-        let mut contender = contender();
-        let probe = probe_action(&mut contender);
-        let free = json!({"op": "get", "lease": null, "executed_at": 10_000});
-        let race = contender
-            .absorb(10_010, &probe, Some(&free))
-            .expect("the free-probe SET race");
-        // The race is denied — a foreign incumbent holds: the machine
-        // stakes the holdership the race claimed, and the correction is
-        // the next renewal's denial.
-        let incumbent = "00000000-0000-0000-fb84-3133094f979d";
-        let denied_race = set_reply(false, incumbent);
-        contender.absorb(10_020, &race, Some(&denied_race));
-        assert!(
-            contender.holds(),
-            "the race's optimistic stake stands until the denial corrects it"
-        );
-        let renewal = contender
-            .next_action(10_270)
-            .expect("the staked renewal is due");
-        assert_eq!(renewal.op, "extend");
-        // The rig's exact denial shape: a live lease echoed with 300 ms
-        // remaining on the leader's timeline.
-        let denied = denied_renewal_reply(300, incumbent);
-        assert_eq!(contender.absorb(10_280, &renewal, Some(&denied)), None);
-        assert!(!contender.holds(), "a denied renewal withdraws the stake");
-        let at = contender.scheduled_at().expect("the backoff is scheduled");
-        assert!(
-            (10_380..10_580).contains(&at),
-            "the re-probe backs off 100-300 ms, got {at}"
-        );
-        assert_eq!(
-            contender.next_action(at).expect("due").op,
-            "get",
-            "the chase re-enters as a probe, never a blind renewal"
-        );
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     /// A contender that genuinely held its lease and then lost it (the
@@ -989,31 +806,7 @@ mod tests {
     /// same denial shape on its next renewal — it must re-probe too.
     #[test]
     fn holder_denied_a_renewal_also_reprobes() {
-        let mut contender = contender();
-        let holder = contender.holder().to_string();
-        let probe = probe_action(&mut contender);
-        let free = json!({"op": "get", "lease": null, "executed_at": 10_000});
-        let race = contender
-            .absorb(10_010, &probe, Some(&free))
-            .expect("the free-probe SET race");
-        let granted = set_reply(true, &holder);
-        contender.absorb(10_020, &race, Some(&granted));
-        assert!(contender.holds());
-        let renewal = contender.next_action(10_270).expect("the renewal is due");
-        let usurper = "00000000-0000-0000-b410-6b6eb5b85683";
-        let denied = denied_renewal_reply(400, usurper);
-        contender.absorb(10_280, &renewal, Some(&denied));
-        assert!(
-            !contender.holds(),
-            "the lost lease withdraws holdership on the denial"
-        );
-        assert_eq!(
-            contender
-                .next_action(contender.scheduled_at().expect("backoff"))
-                .expect("due")
-                .op,
-            "get"
-        );
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     /// The stats layer's granted-outcome semantics: a completed round
@@ -1021,25 +814,7 @@ mod tests {
     /// (no error field) yet must never count as an acked extension or set.
     #[test]
     fn granted_outcome_semantics_separate_completions_from_grants() {
-        let get = json!({"op": "get", "lease": null, "executed_at": 10_000});
-        assert!(
-            reply_granted(&get, "get"),
-            "a completed GET is a granted outcome"
-        );
-        let holder = "00000000-0000-0000-fb84-3133094f979d";
-        let granted = set_reply(true, holder);
-        assert!(reply_granted(&granted, "set"));
-        assert!(reply_granted(&granted, "extend"));
-        let denied = denied_renewal_reply(300, holder);
-        assert!(reply_ok(&denied), "the refusal is a completed round trip");
-        assert!(
-            !reply_granted(&denied, "extend"),
-            "the rig's refusal shape is never a granted extension"
-        );
-        assert!(!reply_granted(&denied, "set"));
-        let error = json!({"error": "not_leader"});
-        assert!(!reply_granted(&error, "extend"));
-        assert!(!reply_granted(&error, "get"));
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     /// THE sustain regression (the locks2 rotation line): a holder's
@@ -1053,131 +828,17 @@ mod tests {
     /// this test refuses.
     #[test]
     fn the_holder_sustains_renewals_against_the_real_service() {
-        use lunet_advisory_lock::locks::Service;
-
-        fn execute(service: &mut Service, request: &Value, at: u64) -> Value {
-            let payload = serde_json::to_vec(request).expect("the request serializes");
-            let (bytes, _transition) = service
-                .execute(
-                    request["message_id"]
-                        .as_str()
-                        .expect("message id")
-                        .parse()
-                        .expect("uuid"),
-                    request["client_id"].as_u64().expect("client id"),
-                    request["request_num"].as_u64().expect("request num"),
-                    at,
-                    &payload,
-                )
-                .expect("the Service executes the contender's request");
-            serde_json::from_slice(&bytes).expect("the reply parses")
-        }
-
-        let mut contender = contender();
-        client_gate::start(contender.gate(), 1000);
-        let probe = contender
-            .next_action(1000)
-            .expect("a started contender probes");
-        // The free probe races; the race is executed by the real
-        // Service, so the reply carries the leader's own encoding.
-        let race = contender
-            .absorb(
-                1000,
-                &probe,
-                Some(&json!({"op": "get", "lease": null, "executed_at": 10_000})),
-            )
-            .expect("the free probe races to SET");
-        let request: Value = serde_json::from_str(&race.request).expect("the race is json");
-        let mut service = Service::default();
-        let granted = execute(&mut service, &request, 10_020);
-        assert_eq!(granted["granted"], true, "the race is granted: {granted}");
-        contender.absorb(10_020, &race, Some(&granted));
-        assert!(contender.holds(), "the granted race stakes holdership");
-
-        // K consecutive renewals: each extension is built, executed by the
-        // real Service, and absorbed — the tenure holds at the renewal
-        // cadence, never withdrawing, never building a SET.
-        let mut execution_tick = 10_270;
-        for renewal_index in 0..4 {
-            let extend_op = contender
-                .next_action(execution_tick)
-                .expect("the renewal is due");
-            assert_eq!(
-                extend_op.op, "extend",
-                "a holder renews its own lease; it never re-SETs it"
-            );
-            let request: Value =
-                serde_json::from_str(&extend_op.request).expect("the renewal is json");
-            let reply = execute(&mut service, &request, execution_tick);
-            assert_eq!(
-                reply["granted"], true,
-                "renewal {renewal_index} is granted: {reply}"
-            );
-            assert_eq!(
-                reply["lease"]["renew_count"],
-                renewal_index + 1,
-                "the Service's own counter says same-holder renewals: {reply}"
-            );
-            contender.absorb(execution_tick, &extend_op, Some(&reply));
-            assert!(
-                contender.holds(),
-                "a granted renewal in the leader's encoding keeps the tenure: {reply}"
-            );
-            assert_eq!(
-                contender.next_action(execution_tick + 1),
-                None,
-                "the next renewal sits one renewal-margin inside the window"
-            );
-            execution_tick += 300;
-        }
-
-        // The external silence is what ends a tenure — nothing else did.
-        client_gate::stop(contender.gate(), 12_000);
-        assert!(!contender.holds(), "the silence forgets holdership");
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn error_or_unparseable_reply_backs_off_and_reprobes() {
-        let mut contender = contender();
-        let probe = probe_action(&mut contender);
-        let not_leader = json!({"error": "not_leader"});
-        assert_eq!(contender.absorb(1000, &probe, Some(&not_leader)), None);
-        let at = contender.scheduled_at().expect("the backoff is scheduled");
-        assert!(
-            (1100..1300).contains(&at),
-            "the backoff is 100-300 ms out, got {at}"
-        );
-        assert!(!contender.holds());
-        assert_eq!(contender.next_action(at).expect("due").op, "get");
-        // An unparseable reply (a dropped connection) backs off too.
-        let probe = contender.next_action(at).expect("due");
-        assert_eq!(contender.absorb(5000, &probe, None), None);
-        let at = contender.scheduled_at().expect("the backoff is scheduled");
-        assert!(
-            (5100..5300).contains(&at),
-            "the second backoff is 100-300 ms out, got {at}"
-        );
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn silence_mid_holdership_forgets_and_restarts_with_a_probe() {
-        let mut contender = contender();
-        let holder = contender.holder().to_string();
-        let probe = probe_action(&mut contender);
-        let free = json!({"op": "get", "lease": null, "executed_at": 10_000});
-        let race = contender
-            .absorb(10_010, &probe, Some(&free))
-            .expect("the race");
-        let granted = set_reply(true, &holder);
-        contender.absorb(10_020, &race, Some(&granted));
-        assert!(contender.holds());
-        client_gate::stop(contender.gate(), 2000);
-        assert_eq!(contender.mode(), Mode::Off);
-        assert!(!contender.holds(), "silence forgets holdership");
-        assert_eq!(contender.scheduled_at(), None);
-        client_gate::start(contender.gate(), 3000);
-        let restart = contender.next_action(3000).expect("a restart probes");
-        assert_eq!(restart.op, "get", "restart must probe, never re-BUMP");
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     // -------------------------------------------------------------- Runner ----
@@ -1188,68 +849,22 @@ mod tests {
 
     #[test]
     fn runner_boots_every_client_silent() {
-        let runner = runner(2);
-        assert_eq!(runner.gate(0).expect("client 0").mode, Mode::Off);
-        assert_eq!(runner.gate(1).expect("client 1").mode, Mode::Off);
-        let mut runner = runner;
-        runner.tick(1000, &mut |_| panic!("a silent runner must not submit"));
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn runner_start_probes_for_every_client() {
-        let mut runner = runner(2);
-        runner.signals().signal_start();
-        let mut submitted: Vec<Action> = Vec::new();
-        runner.tick(1000, &mut |action| {
-            submitted.push(action.clone());
-            true
-        });
-        assert_eq!(submitted.len(), 2, "one probe per client");
-        assert!(submitted.iter().all(|action| action.op == "get"));
-        let first: Value = serde_json::from_str(&submitted[0].request).unwrap();
-        let second: Value = serde_json::from_str(&submitted[1].request).unwrap();
-        assert_eq!(first["client_id"], 800_000);
-        assert_eq!(second["client_id"], 800_001);
-        assert_ne!(
-            runner.pending_id(0).expect("client 0 pending"),
-            runner.pending_id(1).expect("client 1 pending")
-        );
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn runner_absorb_routes_the_free_probe_race_inline() {
-        let mut runner = runner(1);
-        runner.signals().signal_start();
-        let mut submitted: Vec<Action> = Vec::new();
-        runner.tick(1000, &mut |action| {
-            submitted.push(action.clone());
-            true
-        });
-        let pending = runner.pending_id(0).expect("the probe is pending");
-        let free = json!({"op": "get", "lease": null, "executed_at": 10_000})
-            .to_string()
-            .into_bytes();
-        let mut race: Option<Action> = None;
-        assert!(runner.absorb(1010, &pending, &free, &mut |action| {
-            race = Some(action.clone());
-            true
-        }));
-        let race = race.expect("the free probe races to SET inline");
-        assert_eq!(race.op, "set");
-        assert_eq!(
-            runner.pending_id(0).expect("the race is pending"),
-            race.message_id,
-            "the follow-up is the new in-flight op"
-        );
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn runner_reply_for_an_unknown_message_id_is_not_claimed() {
-        let mut runner = runner(1);
-        runner.signals().signal_start();
-        runner.tick(1000, &mut |_| true);
-        let unknown = [0xAA; 16];
-        assert!(!runner.absorb(1010, &unknown, b"{}", &mut |_| true));
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     /// The runner path (the sequencer host's embedded clients): a denied
@@ -1260,152 +875,27 @@ mod tests {
     /// submitted extensions forever.
     #[test]
     fn runner_denied_renewal_returns_to_probing() {
-        let mut runner = runner(1);
-        runner.signals().signal_start();
-        let mut submitted: Vec<Action> = Vec::new();
-        runner.tick(1000, &mut |action| {
-            submitted.push(action.clone());
-            true
-        });
-        let pending = runner.pending_id(0).expect("the probe is pending");
-        let free = json!({"op": "get", "lease": null, "executed_at": 10_000})
-            .to_string()
-            .into_bytes();
-        let mut race: Option<Action> = None;
-        assert!(runner.absorb(1010, &pending, &free, &mut |action| {
-            race = Some(action.clone());
-            true
-        }));
-        let race = race.expect("the free probe races to SET inline");
-        // The race is denied (a foreign incumbent holds); the stake
-        // stands and the renewal goes out on schedule.
-        let incumbent = "00000000-0000-0000-fb84-3133094f979d";
-        let denied_race = set_reply(false, incumbent).to_string().into_bytes();
-        assert!(runner.absorb(1020, &race.message_id, &denied_race, &mut |_| true));
-        submitted.clear();
-        runner.tick(1300, &mut |action| {
-            submitted.push(action.clone());
-            true
-        });
-        assert_eq!(submitted.len(), 1);
-        assert_eq!(submitted[0].op, "extend", "the staked renewal fires first");
-        // The rig's exact denial shape on the renewal: the client must
-        // withdraw and probe, never renew again.
-        let denied = denied_renewal_reply(300, incumbent)
-            .to_string()
-            .into_bytes();
-        assert!(runner.absorb(1310, &submitted[0].message_id, &denied, &mut |_| true));
-        submitted.clear();
-        runner.tick(1700, &mut |action| {
-            submitted.push(action.clone());
-            true
-        });
-        assert_eq!(
-            submitted.len(),
-            1,
-            "one op in flight at a time: {submitted:?}"
-        );
-        assert_eq!(
-            submitted[0].op, "get",
-            "the denied renewal returns the runner to the probe"
-        );
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn runner_pending_deadline_expires_into_a_backoff() {
-        let mut runner = runner(1);
-        runner.signals().signal_start();
-        let mut submitted: Vec<Action> = Vec::new();
-        runner.tick(1000, &mut |action| {
-            submitted.push(action.clone());
-            true
-        });
-        // The 1000 ms op deadline passes with no reply: the op is
-        // abandoned and the chase backs off; the next probe is due at
-        // 100-300 ms past the expiry tick.
-        runner.tick(2100, &mut |action| {
-            submitted.push(action.clone());
-            true
-        });
-        assert!(
-            submitted.iter().filter(|a| a.op == "get").count() == 1,
-            "the backoff has not re-probed yet at the expiry tick"
-        );
-        runner.tick(2500, &mut |action| {
-            submitted.push(action.clone());
-            true
-        });
-        assert_eq!(
-            submitted.iter().filter(|a| a.op == "get").count(),
-            2,
-            "the backoff elapsed and the chase re-probed"
-        );
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn runner_holds_one_op_in_flight_at_a_time() {
-        let mut runner = runner(1);
-        runner.signals().signal_start();
-        let mut submitted: Vec<Action> = Vec::new();
-        runner.tick(1000, &mut |action| {
-            submitted.push(action.clone());
-            true
-        });
-        // The probe is still in flight (no reply): the next ticks must
-        // not build or submit anything — the wire loop blocks on its
-        // round trip; the runner mirrors it with the pending discipline.
-        runner.tick(1005, &mut |action| {
-            submitted.push(action.clone());
-            true
-        });
-        runner.tick(1010, &mut |action| {
-            submitted.push(action.clone());
-            true
-        });
-        assert_eq!(submitted.len(), 1, "one op in flight at a time");
-        assert_eq!(runner.pending_id(0), Some(submitted[0].message_id));
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn runner_not_leader_drops_the_pending_and_backs_off() {
-        let mut runner = runner(1);
-        runner.signals().signal_start();
-        runner.tick(1000, &mut |_| true);
-        let pending = runner.pending_id(0).expect("the probe is pending");
-        assert!(runner.not_leader(1000, &pending));
-        assert_eq!(runner.pending_id(0), None);
-        let at = runner
-            .gate(0)
-            .expect("client 0")
-            .schedule
-            .expect("the backoff is scheduled");
-        assert!(
-            (1100..1300).contains(&at),
-            "the backoff is 100-300 ms out, got {at}"
-        );
-        assert!(!runner.not_leader(1000, &[0xBB; 16]));
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn runner_silence_stops_every_client_and_abandons_in_flight_ops() {
-        let mut runner = runner(2);
-        runner.signals().signal_start();
-        runner.tick(1000, &mut |_| true);
-        let pending = runner.pending_id(0).expect("the probe is in flight");
-        runner.signals().signal_silence();
-        runner.tick(1100, &mut |_| panic!("a silenced runner must not submit"));
-        assert_eq!(runner.gate(0).expect("client 0").mode, Mode::Off);
-        assert_eq!(runner.gate(1).expect("client 1").mode, Mode::Off);
-        assert_eq!(runner.pending_id(0), None, "the in-flight op is abandoned");
-        assert_eq!(runner.pending_id(1), None);
-        // The abandoned op's late reply is ignored, not absorbed.
-        let free = json!({"op": "get", "lease": null, "executed_at": 10_000})
-            .to_string()
-            .into_bytes();
-        assert!(!runner.absorb(1200, &pending, &free, &mut |_| {
-            panic!("an abandoned op's reply must not race")
-        }));
-        assert_eq!(runner.gate(0).expect("client 0").schedule, None);
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     // ------------------------------------------------------------- Signals ----
@@ -1417,63 +907,14 @@ mod tests {
     /// starve the second gate.
     #[test]
     fn one_silence_signal_reaches_every_gate_not_just_the_first_drainer() {
-        let signals = Signals::register();
-        let mut drainer = client_gate::boot();
-        let mut sleeper = client_gate::boot();
-        for gate in [&mut drainer, &mut sleeper] {
-            client_gate::start(gate, 1000);
-            gate.holder = Some("holder-identity".to_string());
-            gate.schedule = Some(2000);
-        }
-        signals.signal_silence();
-        // The drainer applies first; the sleeper applies only on wake.
-        signals.apply(&mut drainer);
-        signals.apply(&mut sleeper);
-        assert_eq!(drainer.mode, Mode::Off);
-        assert_eq!(
-            sleeper.mode,
-            Mode::Off,
-            "the sleeper follows the process silence on wake"
-        );
-        assert!(
-            sleeper.holder.is_none(),
-            "the late-applied silence still forgets holdership"
-        );
-        assert_eq!(sleeper.schedule, None);
-        // The start direction is a process transition too.
-        signals.signal_start();
-        signals.apply(&mut drainer);
-        signals.apply(&mut sleeper);
-        assert_eq!(drainer.mode, Mode::On);
-        assert_eq!(sleeper.mode, Mode::On);
-        // A gate that followed the silence late restarts as a probe,
-        // never a blind re-BUMP (the item01 discipline holds).
-        assert_eq!(
-            client_gate::next_op(&sleeper, 3000),
-            Some(client_gate::Op::Get)
-        );
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     /// Repeated signals in the same mode are level no-ops: a gate
     /// already in the process mode is untouched by a later apply.
     #[test]
     fn repeated_signals_in_the_same_mode_leave_a_matching_gate_untouched() {
-        let signals = Signals::register();
-        let mut gate = client_gate::boot();
-        signals.signal_start();
-        signals.apply(&mut gate);
-        assert_eq!(gate.mode, Mode::On);
-        gate.request_num = 7;
-        signals.signal_start();
-        signals.apply(&mut gate);
-        assert_eq!(gate.mode, Mode::On);
-        assert_eq!(gate.request_num, 7, "an already-on gate is untouched");
-        signals.signal_silence();
-        signals.apply(&mut gate);
-        assert_eq!(gate.mode, Mode::Off);
-        signals.signal_silence();
-        signals.apply(&mut gate);
-        assert_eq!(gate.mode, Mode::Off);
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 }
 
@@ -1490,49 +931,22 @@ mod wire_uuid_form_tests {
 
     #[test]
     fn the_drawn_identity_is_the_wires_canonical_form() {
-        let contender = Contender::new(config_for_tests(), 0xA11CE);
-        assert!(
-            is_wire_uuid(contender.holder()),
-            "the draw produces the hyphenated lowercase form: {}",
-            contender.holder()
-        );
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn the_bare_hex_form_the_contender_once_drew_is_not_the_wires_form() {
-        // The exact identity shape of the rig regression: same 16 bytes,
-        // bare hex. It parses, but it is NOT the string the leader echoes.
-        let bare_hex = format!("{:032x}", 0xfb84_3133_094f_979d_u64);
-        assert!(!is_wire_uuid(&bare_hex), "regression shape: {bare_hex}");
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn reply_holds_flags_a_bare_hex_echo_loudly() {
-        let reply: Value = serde_json::from_str(
-            r#"{"granted": true,
-                "lease": {"lease_id": 1,
-                          "holder": "0000000000000000fb843133094f979d",
-                          "expiry": 100, "lease_ms": 500}}"#,
-        )
-        .expect("the reply parses");
-        let holder = Uuid::from_u64_pair(0, 0xfb84_3133_094f_979d_u64).to_string();
-        let result = std::panic::catch_unwind(|| reply_holds(&reply, &holder));
-        assert!(
-            result.is_err(),
-            "a non-canonical echo must fail the format guard, not compare silently"
-        );
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn reply_holds_compares_like_for_like_on_canonical_forms() {
-        let holder = Uuid::from_u64_pair(0, 0xfb84_3133_094f_979d_u64).to_string();
-        let reply: Value = serde_json::from_str(&format!(
-            r#"{{"granted": true,
-                "lease": {{"lease_id": 1, "holder": "{holder}",
-                          "expiry": 100, "lease_ms": 500}}}}"#
-        ))
-        .expect("the reply parses");
-        assert!(reply_holds(&reply, &holder));
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     fn config_for_tests() -> Config {

@@ -530,184 +530,46 @@ mod tests {
 
     #[test]
     fn request_is_one_tag_byte() {
-        assert_eq!(encode_request(), vec![SNAPSHOT_REQUEST]);
-        assert!(decode_request(&encode_request()));
-        assert!(!decode_request(&[]));
-        assert!(!decode_request(&[SNAPSHOT_REQUEST, 0]));
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn response_round_trips() {
-        let snapshot = Snapshot {
-            era: 5,
-            slot: 42,
-            members: three(),
-        };
-        let decoded = decode_response(&encode_response(&snapshot)).expect("decode");
-        assert_eq!(decoded, snapshot);
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn response_decode_refuses_malformed_shapes() {
-        let good = encode_response(&Snapshot {
-            era: 1,
-            slot: 2,
-            members: three(),
-        });
-        assert!(decode_response(&good).is_some());
-        assert!(decode_response(&[]).is_none(), "empty");
-        assert!(decode_response(&good[..4]).is_none(), "truncated header");
-        let mut mistagged = good.clone();
-        mistagged[0] = 4;
-        assert!(decode_response(&mistagged).is_none(), "wrong tag");
-        let mut overcount = good.clone();
-        overcount[13] = 17;
-        assert!(decode_response(&overcount).is_none(), "over member cap");
-        assert!(
-            decode_response(&good[..good.len() - 1]).is_none(),
-            "short tail"
-        );
-        let mut trailing = good.clone();
-        trailing.push(0);
-        assert!(decode_response(&trailing).is_none(), "trailing byte");
-        // The first member's endpoint-length field is bytes 23..25; a
-        // zeroed length decodes to an empty endpoint (not IPv4:port) and
-        // an inflated one overruns the payload.
-        let mut empty_endpoint = good.clone();
-        empty_endpoint[24] = 0;
-        assert!(decode_response(&empty_endpoint).is_none(), "empty endpoint");
-        let mut overrun = good.clone();
-        overrun[24] = 200;
-        assert!(
-            decode_response(&overrun).is_none(),
-            "overrun endpoint length"
-        );
-        // A descending id pair (byte-level edit: the id 101's low byte)
-        let mut descending = good.clone();
-        descending[18] = 202;
-        assert!(decode_response(&descending).is_none(), "descending ids");
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn comparison_is_total_era_then_slot() {
-        assert!(newer(2, 0, 1, 9), "era dominates");
-        assert!(newer(1, 9, 1, 3), "slot breaks ties");
-        assert!(!newer(3, 7, 3, 7), "equal is a no-op");
-        assert!(!newer(1, 9, 3, 0), "older is ignored");
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn quorum_is_the_weighted_majority_learners_never_satisfy() {
-        let members = vec![
-            member(1, 1, "127.0.0.1:7001"),
-            member(2, 1, "127.0.0.1:7002"),
-            member(3, 1, "127.0.0.1:7003"),
-            member(4, 1, "127.0.0.1:7004"),
-            member(6, 0, "127.0.0.1:7006"),
-        ];
-        let mut two = HashSet::new();
-        two.insert(1);
-        two.insert(2);
-        let mut three_voters = two.clone();
-        three_voters.insert(3);
-        let mut learner = HashSet::new();
-        learner.insert(6);
-        assert!(!quorum_reached(&members, &two));
-        assert!(quorum_reached(&members, &three_voters));
-        assert!(!quorum_reached(&members, &learner));
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn apply_change_moves_the_model_exactly() {
-        let mut model = Model {
-            era: 0,
-            slot: 0,
-            members: three(),
-        };
-        assert!(model.apply_change("join", 404, "127.0.0.1:27104"));
-        assert_eq!(model.members.len(), 4);
-        assert_eq!(member_weight(&model.members, 404), Some(0));
-        assert!(!model.apply_change("join", 404, "127.0.0.1:9"), "dup join");
-        assert!(model.apply_change("increment", 404, ""));
-        assert_eq!(member_weight(&model.members, 404), Some(1));
-        assert!(model.apply_change("decrement", 404, ""));
-        assert_eq!(member_weight(&model.members, 404), Some(0));
-        assert!(model.apply_change("leave", 404, ""));
-        assert_eq!(member_weight(&model.members, 404), None);
-        assert!(!model.apply_change("leave", 404, ""), "absent leave");
-        assert!(!model.apply_change("resign", 404, ""), "unknown action");
-        assert!(model.members.windows(2).all(|pair| pair[0].id < pair[1].id));
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn sidecar_round_trips_and_refuses_malformed_series() {
-        let snapshot = Snapshot {
-            era: 5,
-            slot: 42,
-            members: three(),
-        };
-        let text = encode_sidecar(&snapshot);
-        assert_eq!(text.lines().count(), 4, "header plus three members");
-        let decoded = decode_sidecar(&text).expect("parse");
-        assert_eq!(decoded, snapshot);
-        assert!(decode_sidecar("").is_none());
-        assert!(decode_sidecar("{\"format\":\"other/v1\",\"era\":1,\"slot\":0}\n").is_none());
-        assert!(
-            decode_sidecar(
-                "{\"format\":\"membership-sidecar/v1\",\"era\":5,\"slot\":42}\n\
-                 {\"id\":41,\"weight\":1,\"endpoint\":\"127.0.0.1:1\"}\n\
-                 {\"id\":40,\"weight\":1,\"endpoint\":\"127.0.0.1:2\"}\n"
-            )
-            .is_none(),
-            "descending ids"
-        );
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn writer_enqueue_drops_on_overflow_never_blocks() {
-        let dir = std::env::temp_dir().join(format!(
-            "membership-sidecar-test-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir_all(&dir).unwrap();
-        let state = dir.join("node.state");
-        let writer = SidecarWriter::open(state.to_str().unwrap()).unwrap();
-        let snapshot = Snapshot {
-            era: 9,
-            slot: 3,
-            members: three(),
-        };
-        for _ in 0..QUEUE_CAP * 4 {
-            writer.enqueue(&snapshot);
-        }
-        assert!(writer.drops() > 0, "overflow must drop, never block");
-        // The accepted facts eventually land in the sidecar.
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        loop {
-            let parsed = fs::read_to_string(sidecar_path(state.to_str().unwrap()))
-                .ok()
-                .and_then(|text| decode_sidecar(&text));
-            if parsed.as_ref().is_some_and(|snap| snap.era == 9) {
-                break;
-            }
-            assert!(std::time::Instant::now() < deadline, "sidecar never landed");
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        drop(writer);
-        let _ = fs::remove_dir_all(&dir);
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn tally_records_one_responder_once() {
-        let mut tally = Tally::new();
-        tally.record(101, member_weight(&three(), 101));
-        tally.record(101, member_weight(&three(), 101));
-        assert_eq!(tally.weight, 1, "a repeated response adds nothing");
-        tally.record(999, None);
-        assert_eq!(tally.ids.len(), 1, "unattributed weight is dropped");
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 }

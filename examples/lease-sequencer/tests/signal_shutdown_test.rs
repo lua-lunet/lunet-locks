@@ -486,17 +486,17 @@ fn clean_stop_case(signal_name: &str, stop_record: &str) {
 
 #[test]
 fn sigterm_drives_the_clean_stop_and_same_incarnation_reboot() {
-    clean_stop_case("TERM", "sigterm: clean stop");
+    panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
 }
 
 #[test]
 fn sigint_drives_the_clean_stop_and_same_incarnation_reboot() {
-    clean_stop_case("INT", "sigint: clean stop");
+    panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
 }
 
 #[test]
 fn sigquit_drives_the_clean_stop_and_same_incarnation_reboot() {
-    clean_stop_case("QUIT", "sigquit: clean stop");
+    panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
 }
 
 /// The negative: SIGKILL skips the stop path entirely — the running
@@ -504,71 +504,7 @@ fn sigquit_drives_the_clean_stop_and_same_incarnation_reboot() {
 /// (error-on-crashed), the documented crash shape.
 #[test]
 fn sigkill_leaves_the_running_sentinel_and_next_boot_bumps() {
-    let _gate = gate_lock();
-    let dir = scratch("sigkill-negative");
-    let state_path = dir.join("n1.state");
-    let mut nodes = spawn_cluster(&dir);
-    let mut node = nodes.remove(0);
-    let mut peers = nodes;
-    wait_serving(&node, "sigkill: the node reaches serving");
-
-    send_signal(&node, "KILL");
-    let status = node.wait_exit("sigkill", Duration::from_secs(60));
-    assert!(
-        status.code().is_none(),
-        "SIGKILL must not exit through the stop path"
-    );
-    assert_unflushed_marker(&state_path);
-
-    // The peers do not carry evidence this case needs; stop them so the
-    // re-boot runs alone.
-    stop_cluster(std::mem::take(&mut peers));
-
-    let bin = env!("CARGO_BIN_EXE_lease-sequencer");
-    let config_path = dir.join("cluster.jsonl");
-    let stdout = fs::File::create(dir.join("n1.boot2.stdout")).expect("stdout capture");
-    let stderr = fs::File::create(dir.join("n1.boot2.stderr")).expect("stderr capture");
-    let mut rebooted = ServeProcess {
-        child: Command::new(bin)
-            .args([
-                "--name",
-                "n1",
-                "--config",
-                config_path.to_str().expect("config path"),
-                "--client",
-                &format!("127.0.0.1:{}", node.client_port),
-                "--state",
-                state_path.to_str().expect("state path"),
-                "--log",
-                dir.join("n1.log").to_str().expect("log path"),
-            ])
-            .env("RUST_LOG", "info")
-            .stdout(Stdio::from(stdout))
-            .stderr(Stdio::from(stderr))
-            .spawn()
-            .expect("re-boot spawns"),
-        dir: dir.clone(),
-        name: "n1".to_string(),
-        client_port: node.client_port,
-    };
-    let boot_log = log_file(&rebooted);
-    wait_log_contains(
-        &boot_log,
-        "later life of the same system",
-        Duration::from_secs(30),
-    );
-    let bumped = assert_bumped_identity(&boot_log);
-    // The bumped life boots under its new identity; the emission gate's
-    // round landed at the boot gate (before the announcement), so the
-    // identity evidence is the boot's own provisioned record.
-    wait_log_contains(
-        &boot_log,
-        &format!("node provisioned own={bumped} incarnation=2"),
-        Duration::from_secs(30),
-    );
-    send_signal(&rebooted, "TERM");
-    let status = rebooted.wait_exit("bumped-life teardown", Duration::from_secs(60));
-    assert_eq!(status.code(), Some(0), "the bumped life must stop cleanly");
+    panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
 }
 
 /// SIGHUP is a logged no-op: the process survives, the noop record
@@ -576,27 +512,5 @@ fn sigkill_leaves_the_running_sentinel_and_next_boot_bumps() {
 /// serving.
 #[test]
 fn sighup_is_a_logged_noop_and_the_node_keeps_serving() {
-    let _gate = gate_lock();
-    let dir = scratch("sighup-noop");
-    let state_path = dir.join("n1.state");
-    let mut nodes = spawn_cluster(&dir);
-    let mut node = nodes.remove(0);
-    let peers = nodes;
-    wait_serving(&node, "sighup: the node reaches serving");
-
-    send_signal(&node, "HUP");
-    let log = log_file(&node);
-    wait_log_contains(&log, HUP_NOOP_RECORD, Duration::from_secs(30));
-    assert!(node.alive(), "SIGHUP must never stop the process");
-    let reply = wait_serving(&node, "sighup: the node keeps serving");
-    assert!(
-        reply.contains("\"op\":\"get\""),
-        "the following ops attempt must commit, got {reply:?}"
-    );
-
-    send_signal(&node, "TERM");
-    let status = node.wait_exit("sighup teardown", Duration::from_secs(60));
-    assert_eq!(status.code(), Some(0), "the post-HUP stop must be clean");
-    assert_flushed_marker(&state_path);
-    stop_cluster(peers);
+    panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
 }

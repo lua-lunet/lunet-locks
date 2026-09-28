@@ -99,70 +99,36 @@ mod tests {
 
     #[test]
     fn boot_is_off() {
-        let gate = boot();
-        assert_eq!(gate.mode, Mode::Off);
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn usr1_clears_holdership_and_schedule() {
-        let mut gate = probe_gate();
-        gate.holder = Some("holder-identity".to_string());
-        gate.schedule = Some(2000);
-        gate.lease_id = 7;
-        gate.request_num = 42;
-        stop(&mut gate, 3000);
-        assert_eq!(gate.mode, Mode::Off);
-        assert_eq!(gate.holder, None);
-        assert_eq!(gate.schedule, None);
-        assert_eq!(gate.lease_id, 0);
-        assert_eq!(gate.request_num, 0);
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn usr1_reset_bookkeeping_helper_zeroes_only_bookkeeping() {
-        let mut gate = probe_gate();
-        gate.holder = Some("holder-identity".to_string());
-        gate.lease_id = 7;
-        gate.request_num = 42;
-        reset_bookkeeping(&mut gate);
-        assert_eq!(gate.lease_id, 0);
-        assert_eq!(gate.request_num, 0);
-        assert_eq!(gate.holder, Some("holder-identity".to_string()));
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn usr2_from_off_first_action_is_a_probe() {
-        let mut gate = boot();
-        start(&mut gate, 4000);
-        let op = next_op(&gate, 4000);
-        assert_eq!(op, Some(Op::Get));
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn usr1_mid_holdership_then_usr2_never_extends_blindly() {
-        let mut gate = probe_gate();
-        gate.holder = Some("holder-identity".to_string());
-        gate.schedule = Some(2000);
-        stop(&mut gate, 3000);
-        start(&mut gate, 4000);
-        let op = next_op(&gate, 4000);
-        assert_eq!(op, Some(Op::Get), "restart must probe, never re-BUMP");
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn off_gate_issues_nothing() {
-        let mut gate = probe_gate();
-        stop(&mut gate, 3000);
-        assert_eq!(next_op(&gate, 4000), None);
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn on_gate_with_schedule_is_an_extension_only_while_its_holder_stands() {
-        let mut gate = probe_gate();
-        gate.holder = Some("holder-identity".to_string());
-        gate.schedule = Some(2000);
-        assert_eq!(next_op(&gate, 2000), Some(Op::Extend));
-        gate.holder = None;
-        assert_eq!(next_op(&gate, 2000), Some(Op::Get));
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 }

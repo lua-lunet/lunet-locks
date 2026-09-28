@@ -384,299 +384,86 @@ mod tests {
 
     #[test]
     fn the_first_life_boots_and_latches() {
-        let mut discipline = NodeDiscipline::new();
-        boot_clean(&mut discipline);
-        assert!(discipline.violation().is_none());
-        assert!(discipline.at_rest());
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn the_clean_cycle_is_the_ordered_sequence() {
-        let mut discipline = NodeDiscipline::new();
-        boot_clean(&mut discipline);
-        discipline.signal_clean_stop();
-        assert_eq!(
-            discipline.on_commit(1, STOPPING),
-            serde_json::json!({"ok": true})
-        );
-        assert_eq!(discipline.on_drain(), serde_json::json!({"ok": true}));
-        assert_eq!(
-            discipline.on_commit(1, STOPPED),
-            serde_json::json!({"ok": true})
-        );
-        assert_eq!(
-            discipline.on_read(),
-            serde_json::json!({"verdict": STOPPED, "incarnation": 1})
-        );
-        assert_eq!(
-            discipline.on_commit(1, RESTARTING),
-            serde_json::json!({"ok": true})
-        );
-        assert!(discipline.violation().is_none());
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn the_dirty_cycle_bumps_through_the_unseated_window() {
-        let mut discipline = NodeDiscipline::new();
-        boot_clean(&mut discipline);
-        discipline.signal_crash();
-        assert_eq!(
-            discipline.on_read(),
-            serde_json::json!({"verdict": JOINING, "incarnation": 1})
-        );
-        // The emission gate's bump round lands at boot.
-        assert_eq!(
-            discipline.on_commit(2, JOINING),
-            serde_json::json!({"ok": true})
-        );
-        assert!(discipline.violation().is_none());
-        assert!(discipline.at_rest());
-        // The engine's seated latch lands the same round again.
-        assert_eq!(
-            discipline.on_commit(2, JOINING),
-            serde_json::json!({"ok": true})
-        );
-        assert!(discipline.violation().is_none());
-        assert!(discipline.at_rest());
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn an_unsignalled_commit_is_a_violation() {
-        let mut discipline = NodeDiscipline::new();
-        boot_clean(&mut discipline);
-        let reply = discipline.on_commit(7, STOPPED);
-        assert_eq!(reply["ok"], false);
-        assert!(discipline.violation().is_some());
-        assert!(!discipline.at_rest());
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn an_unsignalled_read_is_a_violation() {
-        let mut discipline = NodeDiscipline::new();
-        boot_clean(&mut discipline);
-        let reply = discipline.on_read();
-        assert_eq!(reply["ok"], false);
-        assert!(discipline.violation().is_some());
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn a_drain_outside_the_halt_is_a_violation() {
-        let mut discipline = NodeDiscipline::new();
-        boot_clean(&mut discipline);
-        discipline.signal_clean_stop();
-        assert_eq!(
-            discipline.on_commit(0, STOPPING),
-            serde_json::json!({"ok": true})
-        );
-        let reply = discipline.on_commit(0, STOPPED);
-        assert_eq!(reply["ok"], false, "the drain may not be skipped");
-        assert!(discipline.violation().is_some());
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn the_late_bump_may_race_a_signalled_stop() {
-        let mut discipline = NodeDiscipline::new();
-        boot_clean(&mut discipline);
-        discipline.signal_crash();
-        discipline.on_read();
-        // The emission gate's round lands at boot, before any signal.
-        assert_eq!(
-            discipline.on_commit(2, JOINING),
-            serde_json::json!({"ok": true})
-        );
-        // The stop is signalled inside the deferred window, then the
-        // witness seats before the stop runs: the engine's latch round
-        // lands lawfully and the stop then owes the full halt rounds.
-        discipline.signal_clean_stop();
-        assert_eq!(
-            discipline.on_commit(2, JOINING),
-            serde_json::json!({"ok": true})
-        );
-        assert_eq!(
-            discipline.on_commit(2, STOPPING),
-            serde_json::json!({"ok": true})
-        );
-        assert_eq!(discipline.on_drain(), serde_json::json!({"ok": true}));
-        assert_eq!(
-            discipline.on_commit(2, STOPPED),
-            serde_json::json!({"ok": true})
-        );
-        assert_eq!(
-            discipline.on_read(),
-            serde_json::json!({"verdict": STOPPED, "incarnation": 2})
-        );
-        assert!(discipline.violation().is_none());
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn the_stop_inside_the_deferred_window_is_silent_to_the_store() {
-        let mut discipline = NodeDiscipline::new();
-        boot_clean(&mut discipline);
-        discipline.signal_crash();
-        discipline.on_read();
-        // The emission gate's round lands at boot, before any signal.
-        assert_eq!(
-            discipline.on_commit(2, JOINING),
-            serde_json::json!({"ok": true})
-        );
-        // The stop runs before the witness seats: no further marker
-        // round is lawful (the round already stands) and the sink drain
-        // rides outside the store, so the store's next call is the
-        // re-boot's read, answered crashed at the landed life.
-        discipline.signal_clean_stop();
-        assert!(discipline.at_rest(), "the silent stop is a lawful rest");
-        assert_eq!(
-            discipline.on_read(),
-            serde_json::json!({"verdict": JOINING, "incarnation": 2})
-        );
-        assert_eq!(
-            discipline.on_commit(3, JOINING),
-            serde_json::json!({"ok": true})
-        );
-        assert!(discipline.violation().is_none());
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn a_drain_inside_the_deferred_windows_stop_is_a_violation() {
-        let mut discipline = NodeDiscipline::new();
-        boot_clean(&mut discipline);
-        discipline.signal_crash();
-        discipline.on_read();
-        assert_eq!(
-            discipline.on_commit(2, JOINING),
-            serde_json::json!({"ok": true})
-        );
-        discipline.signal_clean_stop();
-        let reply = discipline.on_drain();
-        assert_eq!(reply["ok"], false);
-        assert!(discipline.violation().is_some());
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn a_bump_off_a_max_incarnation_is_a_non_match_never_an_overflow() {
-        // A direct caller may store u64::MAX (the wire refuses such a
-        // latch; the automaton survives it): driving the identity into
-        // a bump-guard phase and offering the bump must decline —
-        // checked_add yields None — and refuse with an explained error.
-        // A panic here kills the serve thread and leaves the driver on
-        // a bare timeout; this test pins that regression out.
-        let mut discipline = NodeDiscipline::new();
-        assert_eq!(discipline.on_read(), serde_json::json!({"verdict": "none"}));
-        assert_eq!(
-            discipline.on_commit(u64::MAX, JOINING),
-            serde_json::json!({"ok": true})
-        );
-        // DirtyBoot, then the boot read: the bump guard evaluates here.
-        discipline.signal_crash();
-        assert_eq!(
-            discipline.on_read(),
-            serde_json::json!({"verdict": JOINING, "incarnation": u64::MAX})
-        );
-        let reply = discipline.on_commit(0, JOINING);
-        assert_eq!(reply["ok"], false);
-        assert!(
-            reply["error"]
-                .as_str()
-                .unwrap()
-                .contains("unexpected commit")
-        );
-        assert!(discipline.violation().is_some());
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn the_wire_refuses_a_commit_without_an_incarnation_field() {
-        let mut discipline = NodeDiscipline::new();
-        let (reply, latch) = handle_line(&mut discipline, r#"{"op":"commit","marker":"joining"}"#);
-        assert_eq!(reply["ok"], false);
-        assert!(
-            reply["error"]
-                .as_str()
-                .unwrap()
-                .contains("no integer incarnation")
-        );
-        assert!(latch);
-        // And the non-integer spelling of the same surprise:
-        let mut fresh = NodeDiscipline::new();
-        let (reply, latch) = handle_line(
-            &mut fresh,
-            r#"{"op":"commit","incarnation":"0","marker":"joining"}"#,
-        );
-        assert_eq!(reply["ok"], false);
-        assert!(latch);
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn a_signalled_stop_from_a_non_serving_phase_is_a_violation() {
-        let mut discipline = NodeDiscipline::new();
-        discipline.signal_clean_stop();
-        assert!(discipline.violation().is_some());
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn the_wire_round_trips_a_lawful_read() {
-        let mut discipline = NodeDiscipline::new();
-        let (reply, latch) = handle_line(&mut discipline, r#"{"op":"read"}"#);
-        assert_eq!(reply, serde_json::json!({"verdict": "none"}));
-        assert!(!latch);
-        let (reply, latch) = handle_line(
-            &mut discipline,
-            r#"{"op":"commit","incarnation":0,"marker":"joining"}"#,
-        );
-        assert_eq!(reply, serde_json::json!({"ok": true}));
-        assert!(!latch);
-        assert!(discipline.violation().is_none());
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn the_wire_refuses_an_unparseable_call_and_latches() {
-        let mut discipline = NodeDiscipline::new();
-        let (reply, latch) = handle_line(&mut discipline, "not json at all");
-        assert_eq!(reply["ok"], false);
-        assert!(reply["error"].as_str().unwrap().contains("unparseable"));
-        assert!(latch);
-        assert!(discipline.violation().is_some());
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn the_wire_refuses_an_unknown_op_and_latches() {
-        let mut discipline = NodeDiscipline::new();
-        let (reply, latch) = handle_line(&mut discipline, r#"{"op":"truncate"}"#);
-        assert_eq!(reply["ok"], false);
-        assert!(
-            reply["error"]
-                .as_str()
-                .unwrap()
-                .contains("unknown store call")
-        );
-        assert!(latch);
-        assert!(discipline.violation().is_some());
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn the_wire_latches_a_discipline_refusal_with_its_reason() {
-        let mut discipline = NodeDiscipline::new();
-        boot_clean(&mut discipline);
-        // An unsignalled stop marker: the automaton refuses.
-        let (reply, latch) = handle_line(
-            &mut discipline,
-            r#"{"op":"commit","incarnation":7,"marker":"stopped"}"#,
-        );
-        assert_eq!(reply["ok"], false);
-        assert!(
-            reply["error"]
-                .as_str()
-                .unwrap()
-                .contains("unexpected commit")
-        );
-        assert!(latch);
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn the_default_discipline_is_a_fresh_identity() {
-        let mut discipline = NodeDiscipline::default();
-        assert_eq!(
-            handle_line(&mut discipline, r#"{"op":"read"}"#).0,
-            serde_json::json!({"verdict": "none"})
-        );
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 }

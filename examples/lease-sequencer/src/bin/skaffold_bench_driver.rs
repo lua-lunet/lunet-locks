@@ -370,50 +370,6 @@ impl Driver {
         (!lease.is_null()).then_some(())
     }
 
-    fn abdicate(&self, index: usize) -> Result<(), String> {
-        let reply = tcp_call(
-            &self.node_addr(index),
-            "{\"action\":\"abdicate\"}",
-            Duration::from_secs(5),
-        )?;
-        if reply.contains("\"accepted\":true") {
-            Ok(())
-        } else {
-            Err(format!(
-                "{} refused the abdication: {reply}",
-                self.nodes[index].name
-            ))
-        }
-    }
-
-    /// Abdicate whoever currently leads: the log-derived leader can be
-    /// stale the moment after a failover, and a `not_leader` refusal is
-    /// side-effect-free, so the driver simply offers the verb to every
-    /// live node in turn until one accepts.
-    fn abdicate_leader(&self) -> Result<usize, String> {
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while Instant::now() < deadline {
-            if let Some(violation) = self.violation() {
-                return Err(format!(
-                    "the store discipline failed during the abdication: {violation}"
-                ));
-            }
-            for index in 0..self.nodes.len() {
-                if self.nodes[index].proc.is_none() {
-                    continue;
-                }
-                if self.abdicate(index).is_ok() {
-                    return Ok(index);
-                }
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        Err(format!(
-            "every abdication attempt was refused within 30 s\n{}",
-            self.err_tails()
-        ))
-    }
-
     fn signal(&self, index: usize, signal: &str) -> Result<(), String> {
         let node = &self.nodes[index];
         let Some(proc) = &node.proc else {
@@ -586,18 +542,7 @@ impl Driver {
             .map(|_| self.leader_index().expect("the wait just landed"))?;
         println!("bench: settled; leader {}", self.nodes[leader].name);
 
-        // 2. Abdicate + clean cycle: the detection-free failover, then
-        // the old leader's SIGUSR1 cycle.
-        let t0 = Instant::now();
-        let abdicated = self.abdicate_leader()?;
-        self.wait_serving("abdication: the successor serves")?;
-        println!("bench: abdication failover_ms={}", t0.elapsed().as_millis());
-        self.cycle(abdicated, "-USR1")?;
-        self.wait_running(abdicated, "the SIGUSR1 clean cycle re-boots")?;
-        self.wait_serving("the cluster serves after the clean cycle")?;
-        println!("bench: clean cycle on {}", self.nodes[abdicated].name);
-
-        // 3. Clean swap: a non-leader SIGTERMs out and respawns.
+        // 2. Clean swap: a non-leader SIGTERMs out and respawns.
         let index = self.non_leader_index()?;
         self.clean_stop(index)?;
         println!("bench: clean stop of {}", self.nodes[index].name);
@@ -606,7 +551,7 @@ impl Driver {
         self.wait_serving("the cluster serves after the clean swap")?;
         println!("bench: clean swap of {} resumed", self.nodes[index].name);
 
-        // 4. Crash swap: a non-leader is SIGKILLed and respawns.
+        // 3. Crash swap: a non-leader is SIGKILLed and respawns.
         let index = self.non_leader_index()?;
         self.crash(index)?;
         println!("bench: crash of {}", self.nodes[index].name);
@@ -618,20 +563,7 @@ impl Driver {
             self.nodes[index].name
         );
 
-        let t0 = Instant::now();
-        let abdicated = self.abdicate_leader()?;
-        self.wait_serving("the abdicated leader swap's successor serves")?;
-        println!("bench: abdication failover_ms={}", t0.elapsed().as_millis());
-        self.clean_stop(abdicated)?;
-        self.spawn(abdicated)?;
-        self.wait_running(abdicated, "the leader swap resumes")?;
-        self.wait_serving("the cluster serves after the leader swap")?;
-        println!(
-            "bench: leader swap of {} resumed",
-            self.nodes[abdicated].name
-        );
-
-        // 6. Leader crash: the phi detector drives the takeover.
+        // 4. Leader crash: the phi detector drives the takeover.
         let leader = self
             .wait_for(
                 "a leader before the leader crash",
@@ -651,7 +583,7 @@ impl Driver {
             self.nodes[leader].name
         );
 
-        // 7. Dirty cycle: a node takes a SIGUSR2 mid-load.
+        // 5. Dirty cycle: a node takes a SIGUSR2 mid-load.
         let index = self.non_leader_index()?;
         self.cycle(index, "-USR2")?;
         self.wait_running(index, "the SIGUSR2 dirty cycle re-boots")?;

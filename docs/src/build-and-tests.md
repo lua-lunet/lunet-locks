@@ -99,8 +99,7 @@ takeover, crash-stop reincarnation, and a complete teardown record —
 precedes every release. Its step 0 is the build-confirmation gate:
 `make sanity` (above) — the tree committed at HEAD and the colima
 cross-check of that commit passing, so no release is cut from a
-"only builds on my laptop" commit. The method and its acceptance gates
-are in [the softball run](softball-run.md).
+"only builds on my laptop" commit.
 
 The RELEASE dual-arch image gate is `make build-proof`: the two linux
 architecture images built from the committed tree, each carrying BOTH
@@ -296,4 +295,3 @@ the case; no host-loop autonomous drive ever runs inside the executor.
 | `docker/Dockerfile.fastbuild` | the colima build stages: deps-layer cache, the sanity check payload, the release artifacts, the amd64 rootfs staging |
 | `docker/Dockerfile.release` | the release image (both cdylib shapes + both node binaries + the pinned runtime) |
 | `tools/release_images.sh` | the release flow: gate, flight builds, dual-arch image assembly, ghcr.io push |
-| `docs/src/softball-run.md` | the mandatory pre-release softball run: profile, phases, gates, checklist |

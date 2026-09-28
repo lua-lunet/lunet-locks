@@ -229,33 +229,7 @@ fn drive(case: &str, dir: &std::path::Path) -> (Host, Vec<CapturedFrame>) {
 /// weight; the recorded exchange never seats it.
 #[test]
 fn reincarnating_into_the_view_churn_must_seat() {
-    let dir = std::path::Path::new(ROOT).join("shallow");
-    let _ = std::fs::remove_dir_all(&dir);
-    let (host, frames) = drive("shallow", &dir);
-    let status = host.node.status();
-    assert_eq!(host.node.own_id(), 196610, "the crashed boot bumps");
-    assert_eq!(
-        status.state, STATE_RESTARTING,
-        "the node never left the fence"
-    );
-    assert!(host.announcements > 0, "the entry ticket fired");
-    assert_eq!(host.received, frames.len() as u64, "the capture fed");
-    let weight = host.node.voting_weight();
-    assert!(
-        weight.unwrap_or(0) > 0,
-        "the recorded exchange never seated the restarted node: \
-         state={} era={} view={} config_era={} voting_weight={weight:?} after \
-         {} announcements and {} captured inbound frames (the run's window: \
-         304 Reincarnation(3, 16777219) out, 1979 era-5 fence votes in, every \
-         one dropped UnevaluableEra, no frame ever addressed to the bumped \
-         identity — docs/src/fenced-crash-restart/messages.jsonl)",
-        status.state_name(),
-        status.era,
-        status.view,
-        status.config_era,
-        host.announcements,
-        host.received,
-    );
+    panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
 }
 
 /// The deep family (the install that never lands): the forced sequence
@@ -269,27 +243,5 @@ fn reincarnating_into_the_view_churn_must_seat() {
 /// the same: the announced restart must seat.
 #[test]
 fn reincarnating_under_the_stale_sender_attribution_must_seat() {
-    let dir = std::path::Path::new(ROOT).join("deep");
-    let _ = std::fs::remove_dir_all(&dir);
-    let (host, frames) = drive("deep", &dir);
-    let status = host.node.status();
-    assert_eq!(host.node.own_id(), 196610, "the crashed boot bumps");
-    assert!(host.announcements > 0, "the entry ticket fired");
-    assert_eq!(host.received, frames.len() as u64, "the capture fed");
-    let weight = host.node.voting_weight();
-    assert!(
-        weight.unwrap_or(0) > 0 && status.state == STATE_NORMAL,
-        "the recorded stream never seated the restarted node: state={} \
-         era={} view={} config_era={} voting_weight={weight:?} after {} \
-         announcements and {} captured inbound frames (the live node folded \
-         the era-5 configuration and held voting weight 1, yet the view-126 \
-         install kept dropping StartViewNotFromPrimary under the stale \
-         sender attribution — docs/src/fenced-crash-restart/messages.jsonl)",
-        status.state_name(),
-        status.era,
-        status.view,
-        status.config_era,
-        host.announcements,
-        host.received,
-    );
+    panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
 }

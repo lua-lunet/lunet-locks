@@ -42,7 +42,7 @@ test on an "only builds on my laptop" commit.
 
 ## The mandatory pre-release cluster cycle
 
-The [softball run](softball-run.md) — then the polite run — is the
+The softball run — then the polite run — is the
 mandatory pair before any release: on a clean commit, power the VMs up,
 test softball (fresh files), move the files off, test polite (fresh
 files), copy everything off, then stop the VMs. Repeat until the pair

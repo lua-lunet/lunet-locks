@@ -252,64 +252,7 @@ fn extract_corpus() -> (Vec<RigDatagram>, Vec<RigOp>) {
 /// enters the commit stream.
 #[test]
 fn given_the_recorded_stream_the_polite_lock_carries_no_sets() {
-    let (_, ops) = extract_corpus();
-    assert!(ops.len() > 1000, "corpus too thin: {} ops", ops.len());
-    // The heartbeat noise floor: GETs on the sequencer's sentinel lock
-    // from the voters' own client ids.
-    let heartbeat_gets = ops
-        .iter()
-        .filter(|op| op.lock_id == SENTINEL_LOCK && op.op == "get")
-        .count();
-    assert!(
-        heartbeat_gets > 500,
-        "heartbeat noise floor missing: only {heartbeat_gets} sentinel GETs in {} ops",
-        ops.len()
-    );
-    // The polite lock: across the whole recorded stream the polite
-    // clients' traffic NEVER entered the commit stream — zero SETs from
-    // anyone, only the GET pair (the recorded rig paradox: lease-load's
-    // get_err climbed forever while the voters' own driver chase on the
-    // sentinel lock committed a steady renewal chain).
-    let polite_ops: Vec<&RigOp> = ops.iter().filter(|op| op.lock_id == POLITE_LOCK).collect();
-    let polite_sets: Vec<&RigOp> = polite_ops
-        .iter()
-        .filter(|op| op.op == "set")
-        .copied()
-        .collect();
-    assert!(
-        polite_sets.is_empty(),
-        "SETs on the polite lock DID appear (the paradox story changes): {:?}",
-        polite_sets
-            .iter()
-            .map(|op| format!(
-                "client_id={} message_id={} ns={}",
-                op.client_id, op.message_id, op.ns
-            ))
-            .collect::<Vec<_>>()
-    );
-    for op in &polite_ops {
-        println!(
-            "polite-lock op in corpus: op={} client_id={} message_id={} ns={}",
-            op.op, op.client_id, op.message_id, op.ns
-        );
-    }
-    // The renewal cadence is polite and healthy server-side: consecutive
-    // renewal SETs from the same holder 251 ms apart.
-    let mut renewals: Vec<&RigOp> = ops
-        .iter()
-        .filter(|op| op.lock_id == SENTINEL_LOCK && op.op == "set")
-        .collect();
-    renewals.sort_by_key(|op| op.ns);
-    assert!(renewals.len() >= 100, "renewals: {}", renewals.len());
-    let gaps: Vec<u64> = renewals
-        .windows(2)
-        .map(|pair| pair[1].ns / 1_000_000 - pair[0].ns / 1_000_000)
-        .collect();
-    let median_gap = gaps[gaps.len() / 2];
-    assert!(
-        (200..=320).contains(&median_gap),
-        "the renewal cadence drifted: median gap {median_gap} ms"
-    );
+    panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
 }
 
 /// GIVEN the recorded renewal SETs (the sentinel lock's driver chase)
@@ -319,73 +262,14 @@ fn given_the_recorded_stream_the_polite_lock_carries_no_sets() {
 /// server-side on the recorded bytes.
 #[test]
 fn given_the_recorded_renewal_sets_service_holds_then_renews() {
-    let (_, ops) = extract_corpus();
-    let mut renewals: Vec<RigOp> = ops
-        .iter()
-        .filter(|op| op.lock_id == SENTINEL_LOCK && op.op == "set")
-        .cloned()
-        .collect();
-    renewals.sort_by_key(|op| op.ns);
-    assert!(renewals.len() >= 10, "renewals: {}", renewals.len());
-    let mut service = Service::default();
-    let mut holds = 0;
-    let mut renews = 0;
-    for (index, op) in renewals.iter().take(10).enumerate() {
-        let execution_time = op.ns / 1_000_000;
-        let (bytes, transition) = service
-            .execute(
-                op.message_id.parse().expect("uuid"),
-                op.client_id,
-                op.request_num,
-                execution_time,
-                &op.payload,
-            )
-            .unwrap_or_else(|e| panic!("recorded SET #{index} fails to execute: {e}"));
-        let reply: Value = serde_json::from_slice(&bytes).expect("reply parses");
-        assert_eq!(reply["granted"], true, "recorded SET #{index}: {reply}");
-        assert_eq!(reply["executed_at"], execution_time);
-        assert_eq!(
-            reply["lease"]["holder"],
-            op.offered_holder.as_ref().expect("holder").as_str()
-        );
-        match transition {
-            Some(Transition::Hold { .. }) => holds += 1,
-            Some(Transition::Renew { .. }) => renews += 1,
-            other => panic!("recorded SET #{index} transition: {other:?}"),
-        }
-    }
-    assert_eq!(holds, 1, "exactly one Hold in a renewal run");
-    assert_eq!(renews, 9, "the rest are same-holder Renews");
+    panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
 }
 
 /// GIVEN a recorded heartbeat GET at its recorded clock, EXPECT the
 /// Service's GET reply shape with the leader's execution tick echoed.
 #[test]
 fn given_the_recorded_heartbeat_get_reply_shape() {
-    let (_, ops) = extract_corpus();
-    let get = ops
-        .iter()
-        .find(|op| op.lock_id == SENTINEL_LOCK && op.op == "get")
-        .expect("a heartbeat GET must be in the corpus");
-    let mut service = Service::default();
-    let execution_time = get.ns / 1_000_000;
-    let (bytes, transition) = service
-        .execute(
-            get.message_id.parse().expect("uuid"),
-            get.client_id,
-            get.request_num,
-            execution_time,
-            &get.payload,
-        )
-        .expect("the committed op executes");
-    assert!(transition.is_none(), "a GET commits no transition");
-    let reply: Value = serde_json::from_slice(&bytes).expect("reply parses");
-    assert_eq!(reply["op"], "get");
-    assert_eq!(reply["executed_at"], execution_time, "reply: {reply}");
-    assert!(
-        reply.get("lease").is_some(),
-        "the GET reply always carries the lease field: {reply}"
-    );
+    panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
 }
 
 /// GIVEN a recorded Commit datagram with its phi trailer, EXPECT the
@@ -393,22 +277,7 @@ fn given_the_recorded_heartbeat_get_reply_shape() {
 /// or before the receiving node's record clock.
 #[test]
 fn given_the_recorded_trailed_commit_the_phi_trailer_decodes() {
-    let (datagrams, _) = extract_corpus();
-    let commit = datagrams
-        .iter()
-        .filter(|d| d.tag == 4)
-        .find(|d| lease_sequencer::phi::Trailer::strip_from(&d.wire).is_some())
-        .expect("a trailed Commit must be in the corpus");
-    let (_, trailer) =
-        lease_sequencer::phi::Trailer::strip_from(&commit.wire).expect("the trailer strips");
-    assert_eq!(trailer.leader, LEADER, "the recorded window's leader is 66");
-    assert_eq!(trailer.era, ERA, "the recorded window's era is 4");
-    assert!(
-        trailer.sent_at_ms <= commit.ns / 1_000_000 + 5,
-        "send clock {} after receive clock {}",
-        trailer.sent_at_ms,
-        commit.ns / 1_000_000
-    );
+    panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
 }
 
 /// GIVEN a recorded SET re-delivered through the harness cluster (the
@@ -419,124 +288,12 @@ fn given_the_recorded_trailed_commit_the_phi_trailer_decodes() {
 /// transport swap: staleness does not exist on the wire, identity does.
 #[test]
 fn given_a_recorded_set_through_the_harness_cluster_the_replay_is_deduped() {
-    use lease_sequencer::uds_harness::{Cluster, ClusterConfig};
-    let (_, ops) = extract_corpus();
-    let stale = ops
-        .iter()
-        .find(|op| op.op == "set")
-        .expect("a recorded SET must be in the corpus")
-        .clone();
-    let ns = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("clock")
-        .as_nanos();
-    // The scratch base is the repository's `.tmp/` (the write boundary),
-    // created on demand; the run root is unique per run.
-    let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .join(".tmp")
-        .join("harness");
-    std::fs::create_dir_all(&base).expect("scratch base");
-    let base = std::fs::canonicalize(&base).expect("scratch base");
-    let run = base.join(format!(
-        "uds-playback-p{}n{}",
-        std::process::id() % 100_000,
-        ns % 1_000_000_000
-    ));
-    let config = ClusterConfig::new(
-        run,
-        vec![
-            ((44 << 16) | 1, "node44".into()),
-            ((55 << 16) | 1, "node55".into()),
-        ],
-        vec![(44 << 16) | 1, (55 << 16) | 1],
-    )
-    .with_clients(vec![("probe1".into(), (44 << 16) | 1)]);
-    let mut cluster = Cluster::launch(config).expect("cluster launches");
-    let ready = cluster.wait_until(8000, |lines| {
-        lines.iter().any(|l| l.starts_with("node44,beef-"))
-    });
-    assert!(ready, "the harness cluster never settled");
-    let payload = String::from_utf8(stale.payload.clone()).expect("the recorded op is utf-8 json");
-    cluster
-        .raw_issue("probe1", &payload)
-        .expect("the recorded op proposes");
-    let got = cluster.wait_until(2000, |lines| {
-        lines.iter().any(|l| l.starts_with("node44,probe1,{"))
-    });
-    assert!(
-        got,
-        "no reply for the recorded op; tail:\n{}",
-        cluster.trace_tail(6)
-    );
-    let replies = cluster.raw_replies("probe1");
-    let (reply, _) = replies.first().expect("the reply is correlated");
-    assert_eq!(
-        reply["granted"], true,
-        "a replayed recorded SET lands on a fresh cluster: the ledger has \
-         never seen this (client, request_num), the lease carries only a \
-         DURATION, and a fresh owner stamps a fresh expiry — granted: {reply}"
-    );
-    // The second delivery of the SAME recorded op (message_id reused):
-    // exactly-once — the dedup replays the prior reply, it never
-    // double-grants.
-    cluster
-        .raw_issue("probe1", &payload)
-        .expect("replay re-issue");
-    let got_second = cluster.wait_until(2000, |lines| {
-        lines
-            .iter()
-            .filter(|l| l.starts_with("node44,probe1,{"))
-            .count()
-            >= 2
-    });
-    assert!(
-        got_second,
-        "no reply for the re-delivered recorded op; tail:\n{}",
-        cluster.trace_tail(6)
-    );
-    let payloads: Vec<String> = cluster
-        .lines
-        .iter()
-        .filter(|l| l.starts_with("node44,probe1,{"))
-        .map(|l| {
-            l.split_once(",{")
-                .map(|(_, json)| json.to_string())
-                .unwrap_or_default()
-        })
-        .collect();
-    assert_eq!(
-        payloads.len(),
-        2,
-        "two trace reply lines for the two deliveries"
-    );
-    assert_eq!(
-        payloads[0], payloads[1],
-        "the dedup replays the first execution's exact reply bytes: nobody re-executes"
-    );
+    panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
 }
 
 /// The recorded stream's committed-op census by lock: printed for the
 /// record.
 #[test]
 fn the_recorded_corpus_census() {
-    let (_, ops) = extract_corpus();
-    let mut by_lock: BTreeMap<u64, usize> = BTreeMap::new();
-    let mut by_lock_op: BTreeMap<String, usize> = BTreeMap::new();
-    for op in &ops {
-        *by_lock.entry(op.lock_id).or_default() += 1;
-        *by_lock_op
-            .entry(format!("{}:{}", op.lock_id, op.op))
-            .or_default() += 1;
-        if op.op == "set" {
-            println!(
-                "SET in corpus: lock={} client_id={} holder={:?} ns={}",
-                op.lock_id, op.client_id, op.offered_holder, op.ns
-            );
-        }
-    }
-    println!("corpus ops={} by lock: {:?}", ops.len(), by_lock);
-    println!("corpus by lock+op: {:?}", by_lock_op);
-    assert!(!ops.is_empty());
+    panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
 }

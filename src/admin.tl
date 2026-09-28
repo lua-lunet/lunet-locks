@@ -64,7 +64,6 @@ local function valid_action(action: string): boolean
         or action == "increment"
         or action == "decrement"
         or action == "leave"
-        or action == "abdicate"
 end
 
 local function valid_uuid(message_id: string): boolean
@@ -111,7 +110,7 @@ local function decode_verb(json: string): (boolean, Verb)
                 endpoint = "",
             }
     end
-    if action ~= "abdicate" and (id_text == nil or not valid_member_id(id_text)) then
+    if id_text == nil or not valid_member_id(id_text) then
         return false,
             {
                 action = "",
@@ -274,14 +273,6 @@ local function encode_deadline_ack(action: string, id: integer): string
         .. ',"accepted":false,"reason":"deadline"}'
 end
 
-local function encode_abdicate_ack(accepted: boolean, reason: string): string
-    local line = '{"action":"abdicate","accepted":' .. tostring(accepted)
-    if not accepted and reason ~= "" then
-        line = line .. ',"reason":"' .. reason .. '"'
-    end
-    return line .. "}"
-end
-
 -- The verb dedup cache: correlates a driven verb by its message_id so the
 -- leader answers a duplicate with the FIRST outcome instead of re-driving
 -- it into a racing refusal. A claimed verb is in flight until its outcome
@@ -416,7 +407,6 @@ return {
     decode_change = decode_change,
     encode_ack = encode_ack,
     encode_deadline_ack = encode_deadline_ack,
-    encode_abdicate_ack = encode_abdicate_ack,
     new_cache = cache.new,
     next_in_rotation = next_in_rotation,
 }

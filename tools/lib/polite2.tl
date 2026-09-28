@@ -1,5 +1,5 @@
 -- The polite-2 maintenance run (typed runner library): the six-scenario
--- disruption ladder from docs/src/softball-run.md under one continuous
+-- disruption ladder under one continuous
 -- polite client fleet, every action anchored live (epoch millisecond
 -- before the action, into anchors.md), every scenario's durations and
 -- states captured as key=value measure lines in the same anchors file.
@@ -532,80 +532,9 @@ local function scenario_rotation()
     end
 end
 
-local function scenario_abdication()
-    phase("S2: leader abdication x3 (leadership rotation)")
-    local led: {string: string} = {}
-    for cycle = 1, 3 do
-        local leader = leader_name()
-        if leader == "" then
-            gate.fail("S2 cycle " .. cycle .. ": no leader to abdicate")
-        end
-        led[leader] = "cycle" .. cycle
-        local states_before = states_snapshot()
-        local t0 = anchor(
-            "S2-begin cycle="
-                .. cycle
-                .. " leader="
-                .. leader
-                .. " states="
-                .. states_before
-        )
-        local reply, drive_ms = drive_verb(leader, "abdicate", 0, {})
-        anchor("S2-abdicate-drive cycle=" .. cycle .. " reply=" .. reply)
-        if not reply:find('"accepted":true', 1, true) then
-            gate.fail("S2 cycle " .. cycle .. ": abdication refused: " .. reply)
-        end
-        local ok, landed = probe_serving(leader, 1, 30000)
-        if not ok then
-            gate.fail(
-                "S2 cycle "
-                    .. cycle
-                    .. ": no client operation served within 30 s of the abdication"
-            )
-        end
-        local failover_ms = landed - t0
-        local ok_conv, conv_report = wait_converged("", LEADER_DEADLINE_MS)
-        if not ok_conv then
-            gate.fail(
-                "S2 cycle " .. cycle .. ": the view did not settle: " .. conv_report
-            )
-        end
-        local t_settled = anchor(
-            "S2-settled cycle=" .. cycle .. " states=" .. states_snapshot()
-        )
-        measure(
-            "scenario=S2 cycle="
-                .. cycle
-                .. " abdication_leader="
-                .. leader
-                .. " drive_ms="
-                .. drive_ms
-                .. " failover_ms="
-                .. failover_ms
-                .. " settle_ms="
-                .. (t_settled - t0)
-        )
-        clock.sleep(12)
-    end
-    local held: {string} = {}
-    for _, name in ipairs(GENESIS) do
-        held[#held + 1] = name .. "=" .. (led[name] or "never")
-    end
-    for _, name in ipairs(GENESIS) do
-        if led[name] == nil then
-            gate.fail(
-                "S2: "
-                    .. name
-                    .. " never held leadership across the 3 cycles: "
-                    .. table.concat(held, " ")
-            )
-        end
-    end
-    progress("S2 leadership rotation complete: " .. table.concat(held, " "))
-end
 
 -- Scenario 3: clean TERM stop/start of the leader, the timeout-driven
--- takeover baseline (no abdication): detection + takeover under the
+-- takeover baseline — detection + takeover under the
 -- detector, then the old leader's rejoin.
 local function scenario_leader_term()
     phase("S3: leader stop/start (timeout-driven takeover baseline)")
@@ -1033,7 +962,6 @@ function M.maintenance(root_path: string, run_dir_path: string): integer
     scenario_steady()
 
     scenario_rotation()
-    scenario_abdication()
     scenario_leader_term()
     scenario_crashes()
     scenario_full_cycle()

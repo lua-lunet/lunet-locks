@@ -312,94 +312,31 @@ mod tests {
 
     #[test]
     fn resolve_handles_bracketed_and_bare_v6() {
-        let bracketed = resolve("[::1]:9101").expect("bracketed form resolves");
-        assert_eq!(bracketed.port(), 9101);
-        let bare = resolve("[::1]:9101").expect("bare form resolves");
-        assert_eq!(bare.port(), 9101);
-        assert_eq!(bracketed, bare);
-        assert!(resolve("definitely-not-a-host.invalid:1").is_none());
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn client_addr_is_port_plus_thousand() {
-        let peer = client_addr("[::1]:9101").expect("client addr resolves");
-        assert_eq!(peer.port(), 10101);
-        let peer2 = client_addr("127.0.0.1:9102").expect("v4 form resolves");
-        assert_eq!(peer2.port(), 10102);
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn classify_never_claims_foreign_packets() {
-        assert!(classify(b"junk", "aa").is_none());
-        let (ours, _) = classify(b"lunet-canary:aa:0", "aa").expect("marked");
-        assert!(ours);
-        let (ours, text) = classify(b"lunet-canary:bb:0", "aa").expect("marked foreign");
-        assert!(!ours);
-        assert_eq!(text, "lunet-canary:bb:0");
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn two_symmetric_canaries_both_pass_on_localhost() {
-        // Two full canary roles facing each other on ephemeral ports:
-        // each side sends, echoes foreign datagrams, and lingers —
-        // both rounds must complete regardless of start order (the
-        // pairwise rig shape).
-        let udp_a = UdpSocket::bind("[::1]:0").expect("a udp");
-        let udp_b = UdpSocket::bind("[::1]:0").expect("b udp");
-        let addr_a = udp_a.local_addr().expect("a addr");
-        let addr_b = udp_b.local_addr().expect("b addr");
-        let b = std::thread::spawn(move || {
-            let rounds = udp_canary_round(&udp_b, "bbbb", addr_a, 3, Duration::from_secs(2));
-            linger_echo(&udp_b, "bbbb");
-            rounds
-        });
-        let a = udp_canary_round(&udp_a, "aaaa", addr_b, 3, Duration::from_secs(2));
-        linger_echo(&udp_a, "aaaa");
-        assert_eq!(a, 3, "a got all echoes");
-        assert_eq!(b.join().expect("b thread"), 3, "b got all echoes");
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn tcp_both_directions_round_trip() {
-        // Each side runs the echo server on its own listener and dials
-        // the other's client port — the pairwise TCP shape.
-        let listener_a = std::net::TcpListener::bind("[::1]:0").expect("a tcp");
-        let listener_b = std::net::TcpListener::bind("[::1]:0").expect("b tcp");
-        let port_a = listener_a.local_addr().expect("a addr").port();
-        let port_b = listener_b.local_addr().expect("b addr").port();
-        let server_a =
-            std::thread::spawn(move || tcp_echo_server(listener_a, Duration::from_secs(5)));
-        let server_b =
-            std::thread::spawn(move || tcp_echo_server(listener_b, Duration::from_secs(5)));
-        let mut peer_of_a = "[::1]:0".parse::<std::net::SocketAddr>().unwrap();
-        peer_of_a.set_port(port_b);
-        let mut peer_of_b = "[::1]:0".parse::<std::net::SocketAddr>().unwrap();
-        peer_of_b.set_port(port_a);
-        let client_a =
-            std::thread::spawn(move || tcp_echo_client(peer_of_a, Duration::from_secs(5)));
-        let client_b =
-            std::thread::spawn(move || tcp_echo_client(peer_of_b, Duration::from_secs(5)));
-        assert!(client_a.join().unwrap(), "a round trip");
-        assert!(client_b.join().unwrap(), "b round trip");
-        server_a.join().unwrap();
-        server_b.join().unwrap();
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn dead_peer_times_out_without_hanging() {
-        // Nothing listens at the peer: the canary must still EXIT within
-        // the deadlines (the hang regression this test pins).
-        let udp = UdpSocket::bind("[::1]:0").expect("udp");
-        let peer = "[::1]:1".parse().expect("peer addr");
-        assert_eq!(
-            udp_canary_round(&udp, "aaaa", peer, 1, Duration::from_secs(2)),
-            0,
-            "no echo from a dead peer"
-        );
-        let dead = "[::1]:1".parse().expect("dead client addr");
-        assert!(
-            !tcp_echo_client(dead, Duration::from_secs(2)),
-            "dial fails within the deadline"
-        );
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 }

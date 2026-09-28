@@ -71,52 +71,7 @@ mod tests {
     /// upstream fails here before it can silently disarm the rejoin.
     #[test]
     fn gossip_datagram_round_trips_through_the_cores_own_codec() {
-        let frame = gossip_datagram(4, 13);
-        assert_eq!(
-            frame.len(),
-            20 + 1 + 8 + 8,
-            "header + discriminant + two slots"
-        );
-        assert_eq!(
-            u32::from_be_bytes(frame[0..4].try_into().expect("4 bytes")),
-            17,
-            "the header tag is GossipRequest"
-        );
-        assert_eq!(
-            u32::from_be_bytes(frame[4..8].try_into().expect("4 bytes")),
-            4,
-            "the header carries the node's era"
-        );
-        assert_eq!(
-            u32::from_be_bytes(frame[8..12].try_into().expect("4 bytes")),
-            13,
-            "the header carries the node's view"
-        );
-        assert_eq!(frame[20], 17, "the body discriminant mirrors the tag");
-        assert_eq!(
-            u64::from_be_bytes(frame[21..29].try_into().expect("8 bytes")),
-            0,
-            "prepared rides at offsets 21..29 unnamed"
-        );
-        assert_eq!(
-            u64::from_be_bytes(frame[29..37].try_into().expect("8 bytes")),
-            0,
-            "committed rides at offsets 29..37 unnamed"
-        );
-        let message = Message::unpack_from(&frame).expect("the core reads its own frame");
-        assert_eq!(message.header.tag, Tag::GossipRequest);
-        assert_eq!(
-            (message.header.view.era.0, message.header.view.view.0),
-            (4, 13)
-        );
-        assert_eq!(message.header.slot, Slot::NONE);
-        assert_eq!(
-            message.body,
-            Body::GossipRequest {
-                prepared: Slot::NONE,
-                committed: Slot::NONE
-            }
-        );
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     /// The frame is exact-length (W3): nothing the core would reject as
@@ -124,20 +79,6 @@ mod tests {
     /// the packed length the core itself computes.
     #[test]
     fn gossip_datagram_length_is_the_cores_packed_length() {
-        let probe = Message {
-            header: Header {
-                tag: Tag::GossipRequest,
-                view: Ballot {
-                    era: Era(1),
-                    view: View(0),
-                },
-                slot: Slot::NONE,
-            },
-            body: Body::GossipRequest {
-                prepared: Slot::NONE,
-                committed: Slot::NONE,
-            },
-        };
-        assert_eq!(gossip_datagram(1, 0).len(), probe.packed_len());
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 }

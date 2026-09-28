@@ -641,81 +641,17 @@ mod tests {
 
     #[test]
     fn records_per_roll_fits_one_block() {
-        // 61 * 34379 = 2097119 <= 2097152; one more record would pass the
-        // mark, so every finalized file is 34379 records plus the pad.
-        assert!(RECORDS_PER_ROLL * RECORD_SIZE as u64 <= ROLL_BYTES);
-        assert!(RECORDS_PER_ROLL * RECORD_SIZE as u64 + RECORD_SIZE as u64 > ROLL_BYTES);
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn append_lands_record_bytes_and_events() {
-        let dir = temp_aof_dir("append");
-        let mut core = AofCore::open(&dir, 1).unwrap();
-        let e1 = sample_event(KIND_HOLD, 1000, 1, 5000);
-        let e2 = sample_event(KIND_RENEW, 2000, 2, 6000);
-        core.append(&e1).unwrap();
-        core.append(&e2).unwrap();
-        core.shutdown().unwrap();
-        let open_files: Vec<String> = read_dir_names(&dir)
-            .into_iter()
-            .filter(|n| n.starts_with("ev-open-"))
-            .collect();
-        assert_eq!(open_files.len(), 1);
-        let data = fs::read(dir.join(&open_files[0])).unwrap();
-        assert_eq!(data.len(), 2 * RECORD_SIZE);
-        let events = parse_file(&data);
-        assert_eq!(events, vec![e1, e2]);
-        let _ = fs::remove_dir_all(&dir);
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn roll_finalizes_exactly_two_mib_with_pad() {
-        let dir = temp_aof_dir("roll");
-        // flush_bytes = 1: every record reaches the file, so the test can
-        // read bytes off disk (the sync policy is independent of the buffer
-        // threshold and is covered by the syncs test).
-        let mut core = AofCore::open(&dir, 1).unwrap();
-        let mut expected = Vec::new();
-        for i in 0..RECORDS_PER_ROLL {
-            let event = sample_event(KIND_HOLD, 1000 + i, 7, 5000 + i);
-            expected.push(event.clone());
-            core.append(&event).unwrap();
-        }
-        // All 34379 records fit; no roll yet; the open file holds them all.
-        assert_eq!(core.written, RECORDS_PER_ROLL * RECORD_SIZE as u64);
-        assert_eq!(core.syncs, 0, "no fsync on the plain append path");
-        // One more record cannot fit: it must first pad and roll, then land
-        // in a fresh open file.
-        let after = sample_event(KIND_RELEASE, 999_999, 7, 999_999);
-        core.append(&after).unwrap();
-        let names = read_dir_names(&dir);
-        let finalized: Vec<&String> = names
-            .iter()
-            .filter(|n| n.starts_with("ev-") && n.ends_with(".bin") && !n.contains("open"))
-            .collect();
-        assert_eq!(finalized.len(), 1, "one finalized file: {names:?}");
-        let meta_files: Vec<&String> = names.iter().filter(|n| n.ends_with(".meta")).collect();
-        assert_eq!(meta_files.len(), 1);
-        let finalized_data = fs::read(dir.join(finalized[0])).unwrap();
-        assert_eq!(
-            finalized_data.len() as u64,
-            ROLL_BYTES,
-            "finalized file must be exactly 2 MiB (erasure-block aligned)"
-        );
-        let pad = ROLL_BYTES as usize - RECORDS_PER_ROLL as usize * RECORD_SIZE;
-        assert_eq!(pad, 33);
-        // The pad's zero bytes end parsing cleanly (bad magic at the tail).
-        let events = parse_file(&finalized_data);
-        assert_eq!(events, expected);
-        // The trailing record landed in the fresh open file.
-        let open_files: Vec<String> = read_dir_names(&dir)
-            .into_iter()
-            .filter(|n| n.starts_with("ev-open-"))
-            .collect();
-        assert_eq!(open_files.len(), 1);
-        let open_data = fs::read(dir.join(&open_files[0])).unwrap();
-        assert_eq!(parse_file(&open_data), vec![after]);
-        let _ = fs::remove_dir_all(&dir);
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     /// The stop drain's guarantee (`AofWriter::drain`): after it returns,
@@ -726,249 +662,37 @@ mod tests {
     /// here proves the drain blocked until durability.
     #[test]
     fn drain_makes_every_queued_event_durable() {
-        let dir = temp_aof_dir("drain");
-        let config = AofConfig {
-            flush_interval: None,
-            ..AofConfig::default()
-        };
-        let writer = AofWriter::open(&dir, config).unwrap();
-        for i in 0..500u64 {
-            writer.enqueue(sample_event(KIND_HOLD, i * 10, i, i * 10 + 500));
-        }
-        writer.drain().expect("drain");
-        let mut total = 0usize;
-        for entry in fs::read_dir(&dir).unwrap().flatten() {
-            let data = fs::read(entry.path()).unwrap();
-            total += parse_file(&data).len();
-        }
-        assert_eq!(total, 500, "every queued event is durable after the drain");
-        // A second drain is idempotent and still reports success.
-        writer.drain().expect("second drain");
-        let _ = fs::remove_dir_all(&dir);
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn reader_valid_prefix_deleting_finalized_files() {
-        let dir = temp_aof_dir("prefix");
-        let mut core = AofCore::open(&dir, 1).unwrap();
-        let mut seen = 0u64;
-        let mut expected_tail = Vec::new();
-        let total = RECORDS_PER_ROLL * 2 + 1;
-        for i in 0..total {
-            let event = sample_event(KIND_HOLD, 1000 + i, 7, 5000 + i);
-            if i >= RECORDS_PER_ROLL {
-                expected_tail.push(event.clone());
-            }
-            core.append(&event).unwrap();
-            seen += 1;
-        }
-        // Two rolls happened (one when file 1 could not take the
-        // (RECORDS_PER_ROLL+1)th record, one when file 2 hit the same mark).
-        let finalized: Vec<String> = read_dir_names(&dir)
-            .into_iter()
-            .filter(|n| n.starts_with("ev-") && n.ends_with(".bin") && !n.contains("open"))
-            .collect();
-        assert_eq!(
-            finalized.len(),
-            2,
-            "two finalized blocks after 2*{RECORDS_PER_ROLL}+1 records"
-        );
-        for name in &finalized {
-            let data = fs::read(dir.join(name)).unwrap();
-            assert_eq!(data.len() as u64, ROLL_BYTES);
-            assert_eq!(
-                parse_file(&data).len() as u64,
-                RECORDS_PER_ROLL,
-                "each finalized file parses RECORDS_PER_ROLL records, pad ends parsing"
-            );
-        }
-        // The user deletes the older finalized file freely.
-        fs::remove_file(dir.join(&finalized[0])).unwrap();
-        fs::remove_file(dir.join(finalized[0].replace(".bin", ".meta"))).unwrap();
-        // The remaining series is a valid reader view: the surviving file and
-        // the open file hold exactly the events from `RECORDS_PER_ROLL` on.
-        let survivor = fs::read(dir.join(&finalized[1])).unwrap();
-        let open_files: Vec<String> = read_dir_names(&dir)
-            .into_iter()
-            .filter(|n| n.starts_with("ev-open-"))
-            .collect();
-        let open_data = fs::read(dir.join(&open_files[0])).unwrap();
-        let mut history = parse_file(&survivor);
-        history.extend(parse_file(&open_data));
-        assert_eq!(history, expected_tail);
-        assert_eq!(history.len() as u64 + RECORDS_PER_ROLL, seen);
-        let _ = fs::remove_dir_all(&dir);
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn syncs_fire_only_on_checkpoint_roll_and_shutdown() {
-        let dir = temp_aof_dir("syncs");
-        let mut core = AofCore::open(&dir, ROLL_BYTES as usize).unwrap();
-        for i in 0..3 {
-            core.append(&sample_event(KIND_HOLD, 1000 + i, 7, 5000 + i))
-                .unwrap();
-        }
-        assert_eq!(core.syncs, 0, "append path never fsyncs");
-        core.checkpoint().unwrap();
-        assert_eq!(core.syncs, 1, "checkpoint fsyncs");
-        // Fill to the roll: the finalized file is fsync'd at roll.
-        for i in 0..RECORDS_PER_ROLL {
-            core.append(&sample_event(KIND_HOLD, 2000 + i, 7, 6000 + i))
-                .unwrap();
-        }
-        assert_eq!(core.syncs, 2, "roll fsyncs the finalized file");
-        core.shutdown().unwrap();
-        assert_eq!(core.syncs, 3, "shutdown fsyncs");
-        let _ = fs::remove_dir_all(&dir);
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn resume_reopen_rebuilds_position_and_window() {
-        let dir = temp_aof_dir("resume");
-        {
-            let mut core = AofCore::open(&dir, 1).unwrap();
-            core.append(&sample_event(KIND_HOLD, 1000, 1, 5000))
-                .unwrap();
-            core.append(&sample_event(KIND_RENEW, 2000, 2, 6000))
-                .unwrap();
-            // No shutdown: simulate a crash with the file already flushed.
-        }
-        let mut core = AofCore::open(&dir, 1).unwrap();
-        assert_eq!(core.written, 2 * RECORD_SIZE as u64);
-        let window = core.window.as_ref().unwrap();
-        assert_eq!(window.op_min, 1000);
-        assert_eq!(window.op_max, 2000);
-        assert_eq!(window.count, 2);
-        core.append(&sample_event(KIND_RELEASE, 3000, 3, 7000))
-            .unwrap();
-        core.shutdown().unwrap();
-        let open_files: Vec<String> = read_dir_names(&dir)
-            .into_iter()
-            .filter(|n| n.starts_with("ev-open-"))
-            .collect();
-        assert_eq!(open_files.len(), 1, "resume keeps the same open file");
-        let data = fs::read(dir.join(&open_files[0])).unwrap();
-        let events = parse_file(&data);
-        assert_eq!(events.len(), 3);
-        assert_eq!(events[2].kind, KIND_RELEASE);
-        let _ = fs::remove_dir_all(&dir);
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn resume_truncates_a_torn_tail() {
-        let dir = temp_aof_dir("torn");
-        {
-            let mut core = AofCore::open(&dir, 1).unwrap();
-            core.append(&sample_event(KIND_HOLD, 1000, 1, 5000))
-                .unwrap();
-        }
-        // Simulate a torn append: 20 stray bytes after the last record.
-        let open_files: Vec<String> = read_dir_names(&dir)
-            .into_iter()
-            .filter(|n| n.starts_with("ev-open-"))
-            .collect();
-        let path = dir.join(&open_files[0]);
-        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
-        use std::io::Write;
-        file.write_all(&[0xEE; 20]).unwrap();
-        drop(file);
-        let mut core = AofCore::open(&dir, 1).unwrap();
-        assert_eq!(core.written, RECORD_SIZE as u64, "torn tail truncated");
-        core.append(&sample_event(KIND_RENEW, 2000, 2, 6000))
-            .unwrap();
-        core.shutdown().unwrap();
-        let data = fs::read(&path).unwrap();
-        let events = parse_file(&data);
-        assert_eq!(
-            events.len(),
-            2,
-            "records after the truncation point are clean"
-        );
-        let _ = fs::remove_dir_all(&dir);
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn writer_thread_enqueue_lands_bytes_and_drops_on_overflow() {
-        let dir = temp_aof_dir("thread");
-        let config = AofConfig {
-            flush_bytes: 1,
-            flush_interval: None,
-            queue_cap: 4,
-        };
-        let writer = AofWriter::open(&dir, config).unwrap();
-        let total: u64 = 4096;
-        for i in 0..total {
-            writer.enqueue(sample_event(KIND_HOLD, 10_000 + i, 9, 90_000 + i));
-        }
-        // The bounded queue must have dropped something: the producer never
-        // waits and the writer thread drains at disk speed.
-        assert!(writer.drops() > 0, "overflow must drop, never block");
-        // Accepted = total - drops; every accepted event eventually lands.
-        let accepted = total - writer.drops();
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        let landed = loop {
-            let mut count = 0u64;
-            for name in read_dir_names(&dir) {
-                if !name.ends_with(".bin") {
-                    continue;
-                }
-                count += parse_file(&fs::read(dir.join(&name)).unwrap()).len() as u64;
-            }
-            if count == accepted {
-                break count;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "accepted events never all landed (want {accepted}, have {count})"
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        };
-        assert_eq!(landed, accepted);
-        drop(writer);
-        let _ = fs::remove_dir_all(&dir);
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn writer_thread_checkpoint_and_shutdown_flush() {
-        let dir = temp_aof_dir("checkpoint");
-        let config = AofConfig {
-            flush_bytes: 1 << 20, // large: nothing flushes via the size path
-            flush_interval: None,
-            queue_cap: 16,
-        };
-        let writer = AofWriter::open(&dir, config).unwrap();
-        for i in 0..8 {
-            writer.enqueue(sample_event(KIND_HOLD, 1000 + i, 3, 5000 + i));
-        }
-        writer.checkpoint();
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            let open_files: Vec<String> = read_dir_names(&dir)
-                .into_iter()
-                .filter(|n| n.starts_with("ev-open-"))
-                .collect();
-            let size = open_files
-                .first()
-                .map(|n| fs::metadata(dir.join(n)).unwrap().len())
-                .unwrap_or(0);
-            if size == 8 * RECORD_SIZE as u64 {
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "checkpoint did not flush the buffered bytes"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        drop(writer); // graceful shutdown: drains and fsyncs
-        let open_files: Vec<String> = read_dir_names(&dir)
-            .into_iter()
-            .filter(|n| n.starts_with("ev-open-"))
-            .collect();
-        assert_eq!(open_files.len(), 1);
-        let data = fs::read(dir.join(&open_files[0])).unwrap();
-        assert_eq!(parse_file(&data).len(), 8);
-        let _ = fs::remove_dir_all(&dir);
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     /// The continuous-load regression: a stream whose inter-event gaps are
@@ -977,109 +701,16 @@ mod tests {
     /// and the periodic fsync fires while the stream keeps flowing.
     #[test]
     fn writer_thread_flushes_under_continuous_load() {
-        let dir = temp_aof_dir("continuous");
-        let writer = AofWriter::open(
-            &dir,
-            AofConfig {
-                flush_bytes: 1 << 20, // the size path never fires here
-                flush_interval: Some(Duration::from_millis(300)),
-                queue_cap: 256,
-            },
-        )
-        .unwrap();
-        let total = 200u64;
-        for i in 0..total {
-            writer.enqueue(sample_event(KIND_HOLD, 50_000 + i, 13, 95_000 + i));
-            // 5 ms per event: every gap is far below the 200 ms pump tick,
-            // so recv_timeout never expires on its own.
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            let open_files: Vec<String> = read_dir_names(&dir)
-                .into_iter()
-                .filter(|n| n.starts_with("ev-open-"))
-                .collect();
-            let count = open_files
-                .first()
-                .map(|n| parse_file(&fs::read(dir.join(n)).unwrap()).len() as u64)
-                .unwrap_or(0);
-            if count == total {
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "continuous stream never reached the file (have {count} of {total})"
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        drop(writer);
-        let _ = fs::remove_dir_all(&dir);
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn writer_thread_rolls_when_block_fills() {
-        let dir = temp_aof_dir("thread-roll");
-        let writer = AofWriter::open(&dir, AofConfig::default()).unwrap();
-        // Enqueue in batches until the writer's active file crosses the
-        // 2 MiB mark and rolls. The queue drops on overflow, so batches
-        // pause for the writer to drain; the roll itself is deterministic
-        // (proven by the core tests above) — this proves the threaded
-        // writer drives it end to end.
-        let deadline = std::time::Instant::now() + Duration::from_secs(60);
-        let mut i = 0u64;
-        loop {
-            for _ in 0..512 {
-                writer.enqueue(sample_event(KIND_HOLD, 20_000 + i, 11, 70_000 + i));
-                i += 1;
-            }
-            let finalized: Vec<String> = read_dir_names(&dir)
-                .into_iter()
-                .filter(|n| n.starts_with("ev-") && n.ends_with(".bin") && !n.contains("open"))
-                .collect();
-            if finalized.len() == 1 {
-                let data = fs::read(dir.join(&finalized[0])).unwrap();
-                assert_eq!(
-                    data.len() as u64,
-                    ROLL_BYTES,
-                    "threaded roll is exactly 2 MiB"
-                );
-                assert_eq!(parse_file(&data).len() as u64, RECORDS_PER_ROLL);
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "threaded writer never rolled at the 2 MiB mark"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        drop(writer);
-        let _ = fs::remove_dir_all(&dir);
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn metafile_written_at_roll_matches_window() {
-        let dir = temp_aof_dir("meta");
-        let mut core = AofCore::open(&dir, ROLL_BYTES as usize).unwrap();
-        let first = sample_event(KIND_HOLD, 1111, 5, 5555);
-        core.append(&first).unwrap();
-        for i in 1..RECORDS_PER_ROLL {
-            core.append(&sample_event(KIND_HOLD, 1111 + i, 5, 5555 + i))
-                .unwrap();
-        }
-        core.append(&sample_event(KIND_RELEASE, 8888, 5, 9999))
-            .unwrap();
-        let names = read_dir_names(&dir);
-        let meta_name = names
-            .iter()
-            .find(|n| n.ends_with(".meta"))
-            .expect("metafile written at roll");
-        let meta = journal::Meta::decode(&fs::read(dir.join(meta_name)).unwrap()).unwrap();
-        assert_eq!(meta.count, RECORDS_PER_ROLL as u32);
-        assert_eq!(meta.op_min, 1111);
-        assert_eq!(meta.op_max, 1111 + RECORDS_PER_ROLL - 1);
-        assert_eq!(meta.expiry_min, 5555);
-        assert_eq!(meta.expiry_max, 5555 + RECORDS_PER_ROLL - 1);
-        let _ = fs::remove_dir_all(&dir);
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 }

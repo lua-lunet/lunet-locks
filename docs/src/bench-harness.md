@@ -73,10 +73,8 @@ plus the existing TCP admin verbs:
 - **SIGKILL — the crash.** No stop path; the driver spawns the
   replacement, which reincarnates off the sentinel.
 
-Leader death is driven two ways, as separate measured steps: the
-`abdicate` admin verb (detection-free failover — the lower bound), and
-an unannounced kill (phi-detector-driven takeover — the baseline). An
-abdication is always confirmed serving before the old leader is stopped.
+Leader death is driven as an unannounced kill (phi-detector-driven
+takeover — the baseline).
 
 Partition injection is not in this harness: the loopback cluster's
 failure alphabet is stop, crash, and cycles.
@@ -114,17 +112,13 @@ A bench run is a fixed ladder with the client load always on:
 
 1. **Settle** — three nodes boot, elect, and serve; the chains begin
    identical and stay identical.
-2. **Abdicate + clean cycle** — the leader abdicates; failover is
-   measured; the old leader takes a SIGUSR1 cycle.
-3. **Clean swap** — a non-leader is SIGTERMed and respawned; it resumes
+2. **Clean swap** — a non-leader is SIGTERMed and respawned; it resumes
    under the same identity.
-4. **Crash swap** — a non-leader is SIGKILLed and respawned; it
+3. **Crash swap** — a non-leader is SIGKILLed and respawned; it
    reincarnates bumped.
-5. **Abdicate + leader swap** — the leader abdicates, is confirmed
-   serving, then is SIGTERMed and respawned.
-6. **Leader crash** — the leader is SIGKILLed; the phi detector drives
+4. **Leader crash** — the leader is SIGKILLed; the phi detector drives
    the takeover; the replacement reincarnates.
-7. **Dirty cycle** — a node takes a SIGUSR2 cycle mid-load.
+5. **Dirty cycle** — a node takes a SIGUSR2 cycle mid-load.
 
 Every step is bounded: a step that does not land inside its deadline
 fails the run. The run prints the per-step failover and takeover numbers

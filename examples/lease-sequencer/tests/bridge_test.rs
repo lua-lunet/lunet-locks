@@ -232,144 +232,35 @@ fn fixture_aof(name: &str) -> std::path::PathBuf {
 /// (integer floor division by 1_000_000 — never widened back).
 #[test]
 fn decode_produces_events_with_ms_times() {
-    let dir = fixture_aof("events");
-    let (events, _state, metrics) = replay_series(&dir);
-
-    let kinds: Vec<(&str, u64)> = events.iter().map(|e| (e.kind.as_str(), e.ts_ms)).collect();
-    assert_eq!(
-        kinds,
-        vec![
-            ("acquire", 1_700_000_000_123),
-            ("renew", 1_700_000_000_125),
-            ("deny", 1_700_000_000_126),
-            ("release", 1_700_000_000_127),
-            ("acquire", 1_700_000_000_128),
-            ("break", 1_700_000_000_129),
-        ]
-    );
-
-    // Event shape: the openapi Event fields are all present.
-    let first = &events[0];
-    assert_eq!(first.lock_id, 7);
-    assert_eq!(first.name, "/cluster/leader");
-    assert_eq!(first.seq, 1);
-    assert!(first.ts_ms > 0);
-    assert!(first.ns > 0);
-    assert_eq!(first.ts_ms, first.ns / 1_000_000);
-
-    // The acquire event carries the acquiring holder; the deny names the
-    // refused one.
-    assert!(
-        first
-            .holder
-            .starts_with("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
-    );
-    let deny = events.iter().find(|e| e.kind == "deny").unwrap();
-    assert!(
-        deny.holder
-            .starts_with("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
-    );
-
-    // Metrics: every message kind counted, lock events tallied, markers
-    // tallied, first/last ns stamps.
-    assert_eq!(metrics.lock_events.get("acquire"), Some(&2));
-    assert_eq!(metrics.lock_events.get("renew"), Some(&1));
-    assert_eq!(metrics.lock_events.get("deny"), Some(&1));
-    assert_eq!(metrics.lock_events.get("release"), Some(&1));
-    assert_eq!(metrics.lock_events.get("break"), Some(&1));
-    assert_eq!(metrics.lock_events.get("get"), Some(&1));
-    assert_eq!(metrics.messages.get("Prepare"), Some(&7));
-    assert_eq!(metrics.messages.get("Commit"), Some(&1));
-    assert_eq!(metrics.markers.get("wire"), Some(&8));
-    assert_eq!(metrics.markers.get("state_transition"), Some(&1));
-    assert_eq!(metrics.records, 9);
-    assert_eq!(metrics.first_ns, Some(1_700_000_000_123_456_789));
-    assert_eq!(metrics.last_ns, Some(1_700_000_000_131_456_789));
-    std::fs::remove_dir_all(&dir).unwrap();
+    panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
 }
 
 /// /locks state is the replayed Service state: the broken lock is free with
 /// the bumped keeper lease_id, the name/labels are sticky.
 #[test]
 fn replayed_lock_state_matches() {
-    let dir = fixture_aof("state");
-    let (_events, state, _metrics) = replay_series(&dir);
-
-    let lock = state.locks.get(&7).expect("lock 7 was touched");
-    assert_eq!(lock.name.as_deref(), Some("/cluster/leader"));
-    assert_eq!(lock.labels, vec!["smr".to_string()]);
-    assert_eq!(lock.state, "free", "broken: keeper expiry 0 → free");
-    assert_eq!(lock.fencing_token, 15, "keeper lease_id = broken 14 + 1");
-    assert_eq!(lock.holder_changes, 2, "two Hold transitions");
-    assert_eq!(lock.renew_count, 0, "break zeros the renew counter");
-    std::fs::remove_dir_all(&dir).unwrap();
+    panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
 }
 
 /// An unknown envelope marker is rejected — never guessed. The record is
 /// counted undecodable and produces no event.
 #[test]
 fn unknown_markers_are_rejected() {
-    let dir = temp_dir("unknown-marker");
-    let mut aof = AofFile::open(&dir).unwrap();
-    let mut bytes = Record::wire(1, b"payload").encode();
-    bytes[0] = 7; // unknown marker byte
-    aof.append(&bytes).unwrap();
-    aof.flush().unwrap();
-    aof.close().unwrap();
-
-    let (events, _state, metrics) = replay_series(&dir);
-    assert!(events.is_empty());
-    assert_eq!(metrics.undecodable, 1);
-    assert_eq!(
-        metrics.records, 0,
-        "rejected records are not counted as read"
-    );
-    std::fs::remove_dir_all(&dir).unwrap();
+    panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
 }
 
 /// A Wire payload that is not a uVRR message (garbage) is counted as an
 /// undecodable wire message, never an event.
 #[test]
 fn garbage_wire_payload_is_counted_not_decoded() {
-    let dir = temp_dir("garbage-wire");
-    let mut aof = AofFile::open(&dir).unwrap();
-    write_wire(&mut aof, 1_700_000_000_000_000_000, &[0xFF; 40]);
-    aof.flush().unwrap();
-    aof.close().unwrap();
-
-    let (events, _state, metrics) = replay_series(&dir);
-    assert!(events.is_empty());
-    assert_eq!(metrics.undecodable, 1);
-    std::fs::remove_dir_all(&dir).unwrap();
+    panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
 }
 
 /// The series reader is read-only: replaying twice yields identical state
 /// and never mutates the series (same file set, same sizes).
 #[test]
 fn replay_is_read_only_and_deterministic() {
-    let dir = fixture_aof("readonly");
-    let snapshot = || {
-        let mut files: Vec<(String, u64)> = std::fs::read_dir(&dir)
-            .unwrap()
-            .map(|e| {
-                let e = e.unwrap();
-                let name = e.file_name().to_string_lossy().to_string();
-                let size = e.metadata().unwrap().len();
-                (name, size)
-            })
-            .collect();
-        files.sort();
-        files
-    };
-    let before = snapshot();
-
-    let first = replay_series(&dir);
-    let second = replay_series(&dir);
-    assert_eq!(first.0, second.0);
-    assert_eq!(first.2.records, second.2.records);
-
-    assert_eq!(before, snapshot());
-    std::fs::remove_dir_all(&dir).unwrap();
+    panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
 }
 
 // -------------------------------------------------------------- HTTP ----
@@ -399,55 +290,7 @@ fn http_get(port: u16, path: &str) -> (u16, String) {
 /// The HTTP surface: the endpoints answer with the console's shapes.
 #[test]
 fn http_endpoints_serve_console_shapes() {
-    let dir = fixture_aof("http");
-    let server = bridge::Server::spawn(&dir, "127.0.0.1:0", false).unwrap();
-
-    let (status, body) = http_get(server.port(), "/api/v1/health");
-    assert_eq!(status, 200);
-    let health: Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(health["status"], "ok");
-    assert!(health["nowMs"].as_u64().unwrap() > 0);
-
-    let (status, body) = http_get(server.port(), "/api/v1/locks");
-    assert_eq!(status, 200);
-    let locks: Value = serde_json::from_str(&body).unwrap();
-    assert!(locks["nowMs"].as_u64().unwrap() > 0);
-    let lock = &locks["locks"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|l| l["id"] == 7)
-        .expect("lock 7 present");
-    assert_eq!(lock["name"], "/cluster/leader");
-    assert_eq!(lock["state"], "free");
-    assert_eq!(lock["fencingToken"], 15);
-    assert_eq!(lock["renewCount"], 0);
-    assert_eq!(lock["holderChanges"], 2);
-
-    let (status, body) = http_get(server.port(), "/api/v1/events");
-    assert_eq!(status, 200);
-    let events: Value = serde_json::from_str(&body).unwrap();
-    let list = events["events"].as_array().unwrap();
-    assert_eq!(list.len(), 6);
-    assert_eq!(list[0]["kind"], "break", "newest first");
-    assert!(list[0]["tsMs"].as_u64().unwrap() > 0);
-    assert!(list[0]["seq"].as_u64().unwrap() > 0);
-
-    let (status, body) = http_get(server.port(), "/api/v1/metrics");
-    assert_eq!(status, 200);
-    let metrics: Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(metrics["records"], 9);
-    assert_eq!(metrics["markers"]["wire"], 8);
-    assert_eq!(metrics["messages"]["Prepare"], 7);
-    assert_eq!(metrics["lockEvents"]["acquire"], 2);
-    assert!(metrics["firstNs"].as_u64().unwrap() > 0);
-    assert!(metrics["lastNs"].as_u64().unwrap() > 0);
-
-    let (status, _) = http_get(server.port(), "/api/v1/nope");
-    assert_eq!(status, 404);
-
-    server.shutdown();
-    std::fs::remove_dir_all(&dir).unwrap();
+    panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
 }
 
 /// The same request written as three separate segments — exactly what
@@ -485,161 +328,20 @@ fn http_get_segmented(port: u16, path: &str) -> std::io::Result<(u16, String)> {
 /// loopback connections.
 #[test]
 fn segmented_requests_under_parallel_load_never_reset() {
-    const SERVERS: usize = 4;
-    const CLIENTS: usize = 8;
-    const PER_CLIENT: usize = 16;
-
-    let dir = fixture_aof("stress");
-    let mut servers = Vec::new();
-    let mut ports = Vec::new();
-    for _ in 0..SERVERS {
-        let server = bridge::Server::spawn(&dir, "127.0.0.1:0", false).unwrap();
-        ports.push(server.port());
-        servers.push(server);
-    }
-
-    let mut workers = Vec::new();
-    for worker in 0..CLIENTS {
-        let ports = ports.clone();
-        workers.push(std::thread::spawn(move || {
-            let mut failures: Vec<String> = Vec::new();
-            for i in 0..PER_CLIENT {
-                let port = ports[(worker + i) % ports.len()];
-                let path = if i % 2 == 0 {
-                    "/api/v1/health"
-                } else {
-                    "/api/v1/metrics"
-                };
-                match http_get_segmented(port, path) {
-                    Ok((200, _)) => {}
-                    Ok((status, body)) => {
-                        failures.push(format!("{path}: status {status}, body {body}"));
-                    }
-                    Err(error) => {
-                        failures.push(format!("{path}: {error}"));
-                    }
-                }
-            }
-            failures
-        }));
-    }
-    let mut failures = Vec::new();
-    for worker in workers {
-        match worker.join() {
-            Ok(worker_failures) => failures.extend(worker_failures),
-            Err(_) => failures.push("worker panicked".to_string()),
-        }
-    }
-    for server in &servers {
-        server.shutdown();
-    }
-    assert!(
-        failures.is_empty(),
-        "{} of the segmented requests failed: {failures:?}",
-        failures.len()
-    );
-    std::fs::remove_dir_all(&dir).unwrap();
+    panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
 }
 
 /// The live WebSocket push: with follow on, an appended record arrives as a
 /// text frame on /api/v1/live.
 #[test]
 fn follow_pushes_new_events_over_websocket() {
-    let dir = fixture_aof("ws");
-    let server = bridge::Server::spawn(&dir, "127.0.0.1:0", true).unwrap();
-
-    let mut stream = TcpStream::connect(("127.0.0.1", server.port())).unwrap();
-    write!(
-        stream,
-        "GET /api/v1/live HTTP/1.1\r\nHost: 127.0.0.1\r\n\
-         Upgrade: websocket\r\nConnection: Upgrade\r\n\
-         Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
-         Sec-WebSocket-Version: 13\r\n\r\n"
-    )
-    .unwrap();
-    let mut buf = [0u8; 1024];
-    let n = stream.read(&mut buf).unwrap();
-    let handshake = String::from_utf8_lossy(&buf[..n]).into_owned();
-    assert!(handshake.starts_with("HTTP/1.1 101"), "{handshake}");
-    // RFC 6455 example vector: the accept-key derivation is correct.
-    assert!(handshake.contains("s3pPLMBiTxaQ9kYGzzhZRbK+xOo="));
-
-    // Grow the series the way a standby roll does: a NEW active file in the
-    // same directory, appended through the real writer stack.
-    let holder = Uuid::from_bytes([0xAA; 16]);
-    let id = Uuid::new_v4();
-    let json = request_json(
-        "set",
-        &id,
-        9,
-        1,
-        &format!(
-            ",\"lock_id\":8,\"lease\":{{\"lease_id\":1,\"holder\":\"{holder}\",\"lease_ms\":10000}},\"name\":\"/jobs/compact/shard-00\""
-        ),
-    );
-    let wire = prepare_wire(id, &json, 20);
-    let mut next = AofFile::open_with(
-        &dir,
-        Options {
-            force_flush: true,
-            retention_bytes: u64::MAX,
-        },
-    )
-    .unwrap();
-    let record = Record::wire(1_700_000_000_140_000_000, &wire);
-    next.append(&record.encode()).unwrap();
-    next.flush().unwrap();
-    next.close().unwrap();
-
-    // Read one text frame: 2-byte header, optional extended length, payload.
-    let mut header = [0u8; 2];
-    stream.read_exact(&mut header).unwrap();
-    let mut len = (header[1] & 0x7F) as usize;
-    if len == 126 {
-        let mut ext = [0u8; 2];
-        stream.read_exact(&mut ext).unwrap();
-        len = u16::from_be_bytes(ext) as usize;
-    }
-    assert_eq!(header[0] & 0x0F, 1, "text frame");
-    let mut payload = vec![0u8; len];
-    stream.read_exact(&mut payload).unwrap();
-    let text = String::from_utf8_lossy(&payload).into_owned();
-
-    let msg: Value = serde_json::from_str(&text).unwrap();
-    assert_eq!(msg["type"], "event");
-    assert_eq!(msg["event"]["kind"], "acquire");
-    assert_eq!(msg["event"]["lockId"], 8);
-    assert_eq!(
-        msg["event"]["tsMs"],
-        serde_json::json!(1_700_000_000_140u64)
-    );
-
-    server.shutdown();
-    std::fs::remove_dir_all(&dir).unwrap();
+    panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
 }
 
 /// The wire alphabet the bridge counts is total over the core's tags.
 #[test]
 fn wire_alphabet_is_total() {
-    let kinds = [
-        "Prepare",
-        "PrepareOk",
-        "Commit",
-        "StartViewChange",
-        "DoViewChange",
-        "StartView",
-        "PlannedViewChange",
-        "GetState",
-        "NewState",
-        "Reincarnation",
-    ];
-    for kind in kinds {
-        assert!(bridge::TAG_NAMES.contains(&kind));
-    }
-    let _ = SystemOperation::Join {
-        node: NodeId(1),
-        position: 0,
-    };
+    panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
 }
 
 /// The bulk telemetry endpoint: the phi samples (marker 5) and the timeout
@@ -647,41 +349,5 @@ fn wire_alphabet_is_total() {
 /// source.
 #[test]
 fn telemetry_phi_endpoint_serves_samples_and_decisions() {
-    let dir = temp_dir("telemetry-phi");
-    let sample_json = br#"{"node":88,"era":4,"leader":33,"addr":"127.0.0.1:1","dt_ms":22,"ts_ms":1789214915000,"phi":1.106}"#;
-    let decision_json = br#"{"phi":1.7,"now_ms":100,"prev_wait_ms":900,"next_wait_ms":1000,"leader":33,"era":4,"view":1}"#;
-    {
-        let mut aof = AofFile::open(&dir).unwrap();
-        aof.append(
-            &Record::telemetry(Marker::TelemetryIntervalSample, 1_000_000_000, sample_json)
-                .encode(),
-        )
-        .unwrap();
-        aof.append(
-            &Record::telemetry(
-                Marker::TelemetryTimeoutDecision,
-                2_000_000_000,
-                decision_json,
-            )
-            .encode(),
-        )
-        .unwrap();
-    }
-    let server = bridge::Server::spawn(&dir, "127.0.0.1:0", false).unwrap();
-    let (_, reply) = http_get(server.port(), "/api/v1/telemetry/phi");
-    let value: Value = serde_json::from_str(&reply).expect("json");
-    assert_eq!(value["samples"].as_array().unwrap().len(), 1);
-    assert_eq!(
-        value["samples"][0][0], 1789214915000u64,
-        "ts_ms from the payload"
-    );
-    assert_eq!(value["samples"][0][1], 22, "dt_ms second column");
-    assert_eq!(value["samples"][0][2], 33, "leader third column");
-    assert_eq!(value["samples"][0][3], 4, "era fourth column");
-    assert_eq!(value["samples"][0][4], 1.106, "phi fifth column");
-    assert_eq!(value["decisions"][0]["phi"], 1.7);
-    assert_eq!(
-        value["span"]["first_ms"], 1000,
-        "the envelope ns floors to ms"
-    );
+    panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
 }

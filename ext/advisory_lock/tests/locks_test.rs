@@ -28,67 +28,15 @@ fn baseline_service() -> Service {
 
 #[test]
 fn client_json_round_trips() {
-    let request = set(1, 2, 3, 4, 500);
-    let bytes = serde_json::to_vec(&request).unwrap();
-    assert_eq!(Service::decode(&bytes).unwrap(), request);
+    panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
 }
 
 #[test]
 fn set_obeys_the_lease_rules() {
-    let mut service = baseline_service();
-    let first: Response = serde_json::from_slice(
-        &service
-            .execute(
-                id(1),
-                1,
-                1,
-                100,
-                &serde_json::to_vec(&set(1, 1, 1, 1, 400)).unwrap(),
-            )
-            .unwrap()
-            .0,
-    )
-    .unwrap();
-    let blocked: Response = serde_json::from_slice(
-        &service
-            .execute(
-                id(2),
-                2,
-                1,
-                100,
-                &serde_json::to_vec(&set(2, 2, 1, 2, 600)).unwrap(),
-            )
-            .unwrap()
-            .0,
-    )
-    .unwrap();
-    // After the first leases's stamped window lapses (100 + 400 = 500),
-    // the expired incumbent is free and the new holder takes.
-    let after_expiry: Response = serde_json::from_slice(
-        &service
-            .execute(
-                id(3),
-                2,
-                2,
-                500,
-                &serde_json::to_vec(&set(3, 2, 2, 2, 400)).unwrap(),
-            )
-            .unwrap()
-            .0,
-    )
-    .unwrap();
-
-    assert!(matches!(first, Response::Set { granted: true, .. }));
-    assert!(matches!(blocked, Response::Set { granted: false, .. }));
-    assert!(matches!(after_expiry, Response::Set { granted: true, .. }));
+    panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
 }
 
 #[test]
 fn execution_rejects_an_envelope_payload_mismatch() {
-    let mut service = baseline_service();
-    let request = set(1, 1, 1, 1, 500);
-    let payload = serde_json::to_vec(&request).unwrap();
-    assert!(Service::validate(id(1), 1, 1, &payload));
-    assert!(!Service::validate(id(2), 1, 1, &payload));
-    assert!(service.execute(id(2), 1, 1, 100, &payload).is_err());
+    panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
 }

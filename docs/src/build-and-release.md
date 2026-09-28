@@ -78,7 +78,6 @@
 - Cloud binaries MUST have `maybe!` on and the flight recorder
   enabled; see `testing-on-cloud.md`.
 - The gateway to the cloud: clean commit + sanity build (above). See
-  `softball-run.md` for the run cycle.
 
 ## The release flow
 
@@ -165,7 +164,6 @@ no volume mounts, no platform emulation at any step):
 - The testing rules (clean commit, sanity build, recorder-on binaries)
   live in `testing-on-cloud.md`, linked from the main `README.md` as
   "Testing On Cloud" — the cloud is not named.
-- The mandatory pre-release cluster cycle lives in `softball-run.md`.
 
 ## Tag names
 

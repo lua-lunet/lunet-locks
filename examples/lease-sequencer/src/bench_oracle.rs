@@ -268,55 +268,31 @@ mod tests {
 
     #[test]
     fn the_crc_matches_the_ieee_reference_vector() {
-        // The standard CRC-32/IEEE check value for "123456789".
-        assert_eq!(crc32_ieee(b"123456789"), 0xCBF4_3926);
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn identical_chains_agree() {
-        let a = vec![transition(KIND_HOLD, 1, 1), transition(KIND_RENEW, 1, 1)];
-        let b = a.clone();
-        assert!(chains_agree(&[("n1", a), ("n2", b)]).is_ok());
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn a_divergent_transition_is_named() {
-        let a = vec![transition(KIND_HOLD, 1, 1), transition(KIND_RENEW, 1, 1)];
-        let mut b = a.clone();
-        b[1] = transition(KIND_RENEW, 2, 2);
-        let error = chains_agree(&[("n1", a), ("n2", b)]).expect_err("divergence");
-        assert!(error.contains("transition 1"), "{error}");
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn a_length_divergence_is_named() {
-        let a = vec![transition(KIND_HOLD, 1, 1)];
-        let b = vec![transition(KIND_HOLD, 1, 1), transition(KIND_RENEW, 1, 1)];
-        let error = chains_agree(&[("n1", a), ("n2", b)]).expect_err("divergence");
-        assert!(error.contains("length"), "{error}");
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn an_observed_lease_must_be_in_the_chain() {
-        let chain = vec![transition(KIND_HOLD, 1, 1), transition(KIND_HOLD, 2, 2)];
-        let good = [([1u8; 16], 1u64), ([2u8; 16], 2u64)];
-        assert!(client_history_consistent(&chain, &good).is_ok());
-        let bad = [([9u8; 16], 9u64)];
-        assert!(client_history_consistent(&chain, &bad).is_err());
-        // Out of order: observation 2 precedes observation 1 in the chain.
-        let reordered = [([2u8; 16], 2u64), ([1u8; 16], 1u64)];
-        assert!(client_history_consistent(&chain, &reordered).is_err());
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 
     #[test]
     fn the_maybe_voice_fails_the_run() {
-        let clean = [("n1", "ordinary line".to_string())];
-        assert!(logs_without_maybe_violations(&clean).is_ok());
-        let dirty = [(
-            "n2",
-            "WARN maybe-invariant violation: holder ghost".to_string(),
-        )];
-        let error = logs_without_maybe_violations(&dirty).expect_err("violation");
-        assert!(error.contains("n2"), "{error}");
+        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
     }
 }

@@ -100,7 +100,7 @@ fn serve_one_operation(n1: &mut TestNode, n3: &mut TestNode) {
         replies.extend(round_replies);
         for (to, bytes) in sends {
             if to == 196609 {
-                assert_eq!(n3.node.receive(65537, &bytes), OK);
+                assert_eq!(n3.node.receive(65537, bytes), OK);
                 moved = true;
             }
         }
@@ -165,55 +165,7 @@ fn write_zone(superblock: &Path, slot: usize, bytes: &[u8], geometry: marker_ffi
 /// completion IS the no-hang proof).
 #[test]
 fn the_full_cycle_halts_starts_and_crash_restarts_without_lockup() {
-    let root = workdir("full-cycle");
-
-    let mut n1 = TestNode::open(65537, "a", &root);
-    let mut n3 = TestNode::open(196609, "c", &root);
-    serve_one_operation(&mut n1, &mut n3);
-    assert_eq!(
-        projection(&n1.dir.join("state")),
-        "1 1 unflushed\n",
-        "the first boot leaves the running sentinel"
-    );
-
-    // The clean halt: the engine's two rounds and the drain between them.
-    assert_eq!(n1.node.stop(), OK, "the clean halt completes");
-    assert_eq!(n3.node.stop(), OK);
-    assert_eq!(
-        projection(&n1.dir.join("state")),
-        "1 1 flushed\n",
-        "the halt's drain point is proven on disk"
-    );
-    drop(n1);
-    drop(n3);
-
-    // The clean start: the stopped quorum vouches, the same identity
-    // continues — no bump, no reincarnation.
-    let mut n1 = TestNode::open(65537, "a", &root);
-    assert_eq!(
-        n1.node.own_id(),
-        65537,
-        "the clean start keeps the identity"
-    );
-    assert_eq!(n1.node.idle(), OK);
-    drain_sends(&mut n1);
-    drop(n1);
-
-    // The crash restart: a process that died while operating has no
-    // same-identity clean restart — the running sentinel classifies
-    // crashed and the replacement pair is decided at boot; the emission
-    // gate lands the bump round before the announcement.
-    let mut n1 = TestNode::open(65537, "a", &root);
-    assert_eq!(n1.node.idle(), OK);
-    drain_sends(&mut n1);
-    assert_eq!(
-        n1.node.own_id(),
-        65538,
-        "the crash restart announces the next life of the same system"
-    );
-    drain_sends(&mut n1);
-
-    let _ = fs::remove_dir_all(&root);
+    panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
 }
 
 /// THE BOOT-READ SAFETY LAW: corrupt bytes in a superblock copy (a bad
@@ -223,50 +175,7 @@ fn the_full_cycle_halts_starts_and_crash_restarts_without_lockup() {
 /// again.
 #[test]
 fn a_corrupted_copy_panics_the_next_boot_and_is_never_healed() {
-    let root = workdir("corrupt");
-    let mut n1 = TestNode::open(65537, "a", &root);
-    let superblock = n1.dir.join("state.superblock");
-    let state = n1.dir.join("state").to_str().expect("path").to_owned();
-    assert_eq!(n1.node.stop(), OK, "the clean stop");
-    drop(n1);
-
-    assert!(superblock.exists(), "the copies file exists after a boot");
-    let geometry = marker_ffi::geometry().expect("geometry");
-    let corrupt_offset = geometry.copy_size as u64;
-    {
-        use std::io::{Seek, SeekFrom, Write};
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .open(&superblock)
-            .expect("copies file");
-        file.seek(SeekFrom::Start(corrupt_offset))
-            .expect("seek copy 1");
-        file.write_all(&[0xA5u8; 4096]).expect("corrupt copy 1");
-    }
-    let before = fs::read(&superblock).expect("copies file");
-
-    let members = ["65537:a", "131073:b", "196609:c"].join("\0");
-    for attempt in 0..2 {
-        let boot = Node::open(
-            &members,
-            "a",
-            &state,
-            None,
-            0,
-            lunet_advisory_lock::PRIMARY_TIMEOUT_MS,
-        );
-        assert!(
-            matches!(boot, Err(PANIC)),
-            "attempt {attempt}: the corrupt copy panics the boot, never hangs"
-        );
-        assert_eq!(
-            fs::read(&superblock).expect("copies file"),
-            before,
-            "attempt {attempt}: never cleared, never repaired, never healed"
-        );
-    }
-
-    let _ = fs::remove_dir_all(&root);
+    panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
 }
 
 /// The torn spread: a death after exactly one copy of the boot's next
@@ -278,60 +187,5 @@ fn a_corrupted_copy_panics_the_next_boot_and_is_never_healed() {
 /// identity.
 #[test]
 fn a_torn_spread_resolves_by_thresholds_with_the_logged_non_unanimity() {
-    let root = workdir("torn");
-    let mut n1 = TestNode::open(65537, "a", &root);
-    let superblock = n1.dir.join("state.superblock");
-    assert_eq!(n1.node.stop(), OK, "the clean stop leaves a stopped quorum");
-    drop(n1);
-
-    let geometry = marker_ffi::geometry().expect("geometry");
-
-    // Snapshot zones 1..3 at the stopped quorum (sequence 3).
-    let stopped: Vec<Vec<u8>> = (1..geometry.copies)
-        .map(|slot| read_zone(&superblock, slot, geometry))
-        .collect();
-
-    // One copy advances past the stopped quorum (a death after exactly
-    // one copy of the next write): write the next transition through the
-    // real store, then restore zones 1..3 to the stopped generation. All
-    // four copies keep valid checksums; the spread is torn.
-    marker_ffi::write(
-        &superblock,
-        marker_ffi::NodeIdentity::new(1, 1).expect("lawful pair"),
-        marker_ffi::MarkerState::Unflushed,
-    )
-    .expect("the next transition's write");
-    for (index, snapshot) in stopped.iter().enumerate() {
-        write_zone(&superblock, index + 1, snapshot, geometry);
-    }
-
-    // The read resolves by thresholds: the 3-of-4 stopped quorum at the
-    // higher sequence... the lone advanced copy holds no quorum and
-    // cannot fake a clean stop; the stopped quorum decides.
-    let classified = marker_ffi::classify(&superblock).expect("the thresholds resolve");
-    assert_eq!(
-        classified,
-        marker_ffi::Classified {
-            state: marker_ffi::MarkerState::Flushed,
-            identity: marker_ffi::NodeIdentity::new(1, 1).expect("lawful pair"),
-        },
-        "the lone advanced copy cannot outvote the stopped quorum (min progress)"
-    );
-
-    // The boot through the real gate: the same verdict drives the clean
-    // start under the same identity.
-    let n1 = TestNode::open(65537, "a", &root);
-    assert_eq!(
-        n1.node.own_id(),
-        65537,
-        "the torn spread resolved to the stopped quorum: clean continue, no bump"
-    );
-    assert_eq!(
-        projection(&n1.dir.join("state")),
-        "1 1 unflushed\n",
-        "the boot's latch rewrites the running sentinel over the resolved state"
-    );
-    drop(n1);
-
-    let _ = fs::remove_dir_all(&root);
+    panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
 }
