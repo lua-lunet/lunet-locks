@@ -1,8 +1,9 @@
 //! The routed lifecycle marker: the engine's `LifecycleStore` over the
 //! superblock copies.
 //!
-//! The engine (`vrr::lifecycle`, uvrr-core tag v0.9.0 @ b2ba0d2) owns the marker
+//! The engine (`vrr::lifecycle`, uvrr-core tag v0.11.0 @ bef2d42) owns the marker
 //! machine — which marker, which copies, when, and in what order
+//! (docs/uvrr-io-obligations.md, the boot-gate chapter §3).
 //! This module is the host's durable
 //! mechanics: the vendored Zig store's quorum-of-copies construction,
 //! reached through the AOF C ABI's marker exports (`ext/lunet-locks-aof`),

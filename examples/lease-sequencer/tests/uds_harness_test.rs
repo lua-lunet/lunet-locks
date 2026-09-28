@@ -40,6 +40,7 @@ fn scratch(name: &str) -> PathBuf {
         .expect("clock")
         .as_nanos();
     let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.tmp/harness");
+    std::fs::create_dir_all(&base).expect("scratch base");
     let base = std::fs::canonicalize(&base).expect("scratch base");
     let dir = base.join(format!(
         "{}p{}n{}",

@@ -199,7 +199,7 @@ fn sha256_hex(data: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vrr::ids::{Era, NodeId, Slot, View, ViewId};
+    use vrr::ids::{Ballot, Era, NodeId, Slot, View};
     use vrr::message::{Body, Message};
     use vrr::wire::{Header, Pack, Tag};
 
@@ -218,7 +218,7 @@ mod tests {
         let message = Message {
             header: Header {
                 tag: Tag::Reincarnation,
-                view: ViewId {
+                view: Ballot {
                     era: Era(1),
                     view: View(0),
                 },
@@ -265,7 +265,7 @@ mod tests {
         let message = Message {
             header: Header {
                 tag: Tag::Reincarnation,
-                view: ViewId {
+                view: Ballot {
                     era: Era(1),
                     view: View(0),
                 },
@@ -323,7 +323,7 @@ mod tests {
         let commit = Message {
             header: Header {
                 tag: Tag::Commit,
-                view: ViewId {
+                view: Ballot {
                     era: Era(1),
                     view: View(0),
                 },

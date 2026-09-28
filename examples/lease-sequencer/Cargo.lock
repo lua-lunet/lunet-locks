@@ -619,7 +619,7 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "uuid",
- "vrr-core",
+ "uvrr-core",
 ]
 
 [[package]]
@@ -660,7 +660,7 @@ dependencies = [
  "serde_json",
  "tracing",
  "uuid",
- "vrr-core",
+ "uvrr-core",
 ]
 
 [[package]]
@@ -1216,6 +1216,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "uvrr-core"
+version = "0.11.0"
+
+[[package]]
 name = "valuable"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1226,10 +1230,6 @@ name = "value-bag"
 version = "1.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2799ffb329a792ecfd902b71306c8a815a6ef1c0470fa9953a6aa4d4cecbe511"
-
-[[package]]
-name = "vrr-core"
-version = "0.1.0"
 
 [[package]]
 name = "wasip2"

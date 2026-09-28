@@ -221,7 +221,7 @@ use tracing::{debug, info, trace, warn};
 use vrr::configuration::{EraTable, INIT_SLOT, MAX_MEMBERS, SystemOperation, VOID_SLOT};
 use vrr::effects::{Effect, Stability};
 use vrr::ids::{
-    CrashCounter, Era, NodeId, Operation, OperationId, Slot, SystemId, Tick, View, ViewId,
+    Ballot, CrashCounter, Era, NodeId, Operation, OperationId, Slot, SystemId, Tick, View,
 };
 use vrr::journal::{Journal, LogEntry, Payload, SegmentedLog};
 use vrr::lifecycle::{self, BootError, BootOutcome, Bumped, Crashed, Marker, Running, Vouched};
@@ -229,7 +229,6 @@ use vrr::message::{Body, Message};
 use vrr::observe::Diagnostic;
 use vrr::progress::Status;
 use vrr::quorum::{WeightedMajority, construct_pivot};
-use vrr::reconfiguration::AbdicationRefusal;
 use vrr::replica::{
     Input, PersistedProgress, Pivot, PlanRefusal, PublishOutcome, PublishRefusal, Replica,
     TimedInput, ViewChangeKnobs,
@@ -755,12 +754,6 @@ impl Node {
             Input::SubmitPlan { .. } => {
                 serde_json::json!({"input": "submit-plan"})
             }
-            Input::Abdicate { message } => serde_json::json!({
-                "input": "abdicate",
-                "era": message.current.era.0,
-                "view": message.current.view.0,
-                "target": message.target.0,
-            }),
         }
     }
 
@@ -1360,20 +1353,36 @@ impl Node {
             return STOPPED;
         }
         self.drive(Input::AdminForceView {
-            target: ViewId {
+            target: Ballot {
                 era: Era(era),
                 view: View(view),
             },
         })
     }
 
+    /// The leader steps aside on host request: the view increments by one
+    /// through the ordinary admin-force-view pipeline (the core has no
+    /// abdication input; the recipe is the view change plus the host's
+    /// own decision to keep or stop the process), and this method keeps
+    /// the member: the caller that wants the process gone drives the stop
+    /// contract itself. A non-leader caller is refused NOT_LEADER — the
+    /// host-side gate the core's admin input deliberately lacks (a
+    /// non-leader forcing a view is the cold-start feature; an abdication
+    /// addressed to a non-leader is a caller error).
     pub fn abdicate(&mut self) -> i32 {
         if self.stopped {
             // The drain point closed the wire: no further task processing.
             return STOPPED;
         }
         let snapshot = self.replica.observer().read();
-        let current = ViewId {
+        if self.primary_index() != self.replica.own().0 {
+            info!(
+                node = self.replica.own().0,
+                "abdicate refused: the caller is not the leader"
+            );
+            return NOT_LEADER;
+        }
+        let current = Ballot {
             era: Era(snapshot.era),
             view: View(snapshot.view),
         };
@@ -1395,12 +1404,7 @@ impl Node {
             target = target.view.0,
             "node abdicate entry"
         );
-        self.drive(Input::Abdicate {
-            message: vrr::reconfiguration::Abdication {
-                current,
-                target: target.view,
-            },
-        })
+        self.force_view(snapshot.era, target.view.0)
     }
 
     /// One timeout toggle's event capture (`docs/src/phi-and-timeouts.md`):
@@ -1738,7 +1742,6 @@ fn plan_error(rejection: PlanRefusal) -> i32 {
     debug!(?rejection, "plan refused");
     match rejection {
         PlanRefusal::NotPrimary { .. } => NOT_LEADER,
-        PlanRefusal::Abdication(AbdicationRefusal::ReceiverNotPrimary { .. }) => NOT_LEADER,
         PlanRefusal::Faulted(_) => FAULTED,
         _ => SERVICE,
     }
@@ -1881,7 +1884,7 @@ fn joiner_parts(
     if journal.install_suffix(VOID_SLOT, &genesis).is_err() {
         return Err(CONFIG);
     }
-    let view = ViewId {
+    let view = Ballot {
         era,
         view: View::INITIAL,
     };
@@ -3655,7 +3658,7 @@ mod tests {
 
         // The primary dies: every subsequent route skips its socket. The
         // backup's detector fires at ~16 ms (item19) — here, zero wait.
-        let target = ViewId {
+        let target = Ballot {
             era: Era(before.era),
             view: View(before.view + 1),
         };
@@ -3796,7 +3799,7 @@ mod tests {
             OK
         );
         route_until_quiet(&mut nodes, &TEST_IDS);
-        let target = ViewId {
+        let target = Ballot {
             era: Era(before.era),
             view: View(before.view + 1),
         };

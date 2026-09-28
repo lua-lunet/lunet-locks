@@ -1,11 +1,11 @@
 # Plain multi-stage Docker build, intentionally compatible with Colima's legacy
 # builder: it uses no BuildKit-only mounts, secrets, or cache directives.
 # `tools/docker_prepare_context.sh` vendors the transitive dependency sources
-# and the uvrr-core submodule source (the upstream tag v0.7.4 the manifest's
+# and the uvrr-core submodule source (the upstream tag v0.11.0 the manifest's
 # dependency names), so no git fetch happens inside Docker. The runtime stage
 # carries the diagnosis kit: the NTP/capture/RTT
 # tooling packages and the demo crate's binaries from the kit stage.
-ARG AOF_IMAGE=ghcr.io/lua-lunet/lunet-locks/tbio-core:v0.17.9-lunet.5-arm64
+ARG AOF_IMAGE=ghcr.io/lua-lunet/lunet-locks/tbio-core:2026.09.25-3539ece-arm64
 ARG LUNET_LOCKS_HEAD=unknown
 FROM ${AOF_IMAGE} AS aof
 
@@ -42,7 +42,7 @@ COPY ext/uvrr-core /app/ext/uvrr-core
 COPY ext/lunet-locks-aof /app/ext/lunet-locks-aof
 COPY ext/advisory_lock /app/ext/advisory_lock
 RUN cargo clean --release --manifest-path /app/ext/advisory_lock/Cargo.toml \
-        --package vrr-core \
+        --package uvrr-core \
     && cargo build --release --locked --manifest-path /app/ext/advisory_lock/Cargo.toml
 
 # The diagnosis-kit stage: the demo crate's binaries (the lease-sequencer

@@ -16,7 +16,7 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use uuid::Uuid;
 use vrr::configuration::SystemOperation;
-use vrr::ids::{Era, NodeId, OperationId, Slot, View, ViewId};
+use vrr::ids::{Ballot, Era, NodeId, OperationId, Slot, View};
 use vrr::journal::{LogEntry, Payload};
 use vrr::message::{Body, Message};
 use vrr::wire::Header;
@@ -59,7 +59,7 @@ fn prepare_wire(message_id: Uuid, json: &str, slot: u64) -> Vec<u8> {
     let message = Message {
         header: Header {
             tag: Tag::Prepare,
-            view: ViewId {
+            view: Ballot {
                 era: Era(0),
                 view: View(0),
             },
@@ -81,7 +81,7 @@ fn commit_wire() -> Vec<u8> {
     let message = Message {
         header: Header {
             tag: Tag::Commit,
-            view: ViewId {
+            view: Ballot {
                 era: Era(0),
                 view: View(0),
             },

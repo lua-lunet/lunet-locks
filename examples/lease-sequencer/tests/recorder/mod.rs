@@ -65,7 +65,7 @@ pub fn prepare_frame(
     let message = vrr::message::Message {
         header: vrr::wire::Header {
             tag: vrr::wire::Tag::Prepare,
-            view: vrr::ids::ViewId {
+            view: vrr::ids::Ballot {
                 era: vrr::ids::Era(era),
                 view: vrr::ids::View(view),
             },
@@ -95,7 +95,7 @@ pub fn commit_frame(era: u32, view: u32, slot: u64, committed: u64, trailer: &Tr
     let message = vrr::message::Message {
         header: vrr::wire::Header {
             tag: vrr::wire::Tag::Commit,
-            view: vrr::ids::ViewId {
+            view: vrr::ids::Ballot {
                 era: vrr::ids::Era(era),
                 view: vrr::ids::View(view),
             },

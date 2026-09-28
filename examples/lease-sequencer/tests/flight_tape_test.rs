@@ -74,7 +74,7 @@ fn prepare_frame() -> Vec<u8> {
     let message = Message {
         header: Header {
             tag: Tag::Prepare,
-            view: vrr::ids::ViewId {
+            view: vrr::ids::Ballot {
                 era: vrr::ids::Era(1),
                 view: vrr::ids::View(0),
             },

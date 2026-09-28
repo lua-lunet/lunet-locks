@@ -22,7 +22,7 @@
 //! (`Slot::NONE`), so the leader's push re-sends the whole history and
 //! the install path dedups what the node already holds.
 
-use vrr::ids::{Era, Slot, View, ViewId};
+use vrr::ids::{Ballot, Era, Slot, View};
 use vrr::message::{Body, Message};
 use vrr::wire::{Header, Pack, Tag};
 
@@ -41,7 +41,7 @@ pub fn gossip_datagram(era: u32, view: u32) -> Vec<u8> {
     let message = Message {
         header: Header {
             tag: Tag::GossipRequest,
-            view: ViewId {
+            view: Ballot {
                 era: Era(era),
                 view: View(view),
             },
@@ -127,7 +127,7 @@ mod tests {
         let probe = Message {
             header: Header {
                 tag: Tag::GossipRequest,
-                view: ViewId {
+                view: Ballot {
                     era: Era(1),
                     view: View(0),
                 },

@@ -3784,7 +3784,7 @@ mod reincarnation_remap_tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-    use vrr::ids::{Era, NodeId, Slot, View, ViewId};
+    use vrr::ids::{Ballot, Era, NodeId, Slot, View};
     use vrr::message::{Body, Message};
     use vrr::wire::{Header, Pack, Tag};
 
@@ -4014,7 +4014,7 @@ mod reincarnation_remap_tests {
     }
 
     /// The core's own packed announcement frame for `(old, new)`.
-    fn announcement(view: ViewId, old: u32, new: u32) -> Vec<u8> {
+    fn announcement(view: Ballot, old: u32, new: u32) -> Vec<u8> {
         let message = Message {
             header: Header {
                 tag: Tag::Reincarnation,
@@ -4065,7 +4065,7 @@ mod reincarnation_remap_tests {
         let fingerprint = a.host.fingerprint.clone();
         let new = (2 << 16) | 2;
         let frame = announcement(
-            ViewId {
+            Ballot {
                 era: Era(1),
                 view: View(0),
             },
@@ -4109,7 +4109,7 @@ mod reincarnation_remap_tests {
         // nothing: no row, no rebind.
         let fingerprint = a.host.fingerprint.clone();
         let skipped_life = announcement(
-            ViewId {
+            Ballot {
                 era: Era(1),
                 view: View(0),
             },
@@ -4130,7 +4130,7 @@ mod reincarnation_remap_tests {
         // An unlawful `new` (a zero system half) is no identity: no row,
         // no rebind.
         let unlawful = announcement(
-            ViewId {
+            Ballot {
                 era: Era(1),
                 view: View(0),
             },
@@ -4142,7 +4142,7 @@ mod reincarnation_remap_tests {
         // A degenerate pair (`old == new`) is not an announcement of a
         // bumped identity: no row, no rebind.
         let degenerate = announcement(
-            ViewId {
+            Ballot {
                 era: Era(1),
                 view: View(0),
             },
@@ -4168,7 +4168,7 @@ mod reincarnation_remap_tests {
             status.leader, 65537,
             "the genesis primary leads the harness"
         );
-        let view = ViewId {
+        let view = Ballot {
             era: Era(status.era),
             view: View(status.view),
         };
@@ -4195,7 +4195,7 @@ mod reincarnation_remap_tests {
     fn a_mis_attributed_announcement_leaves_zero_reconfiguration() {
         let (mut a, mut b, mut c, mut rng) = settled();
         let status = a.host.node.status();
-        let view = ViewId {
+        let view = Ballot {
             era: Era(status.era),
             view: View(status.view),
         };
@@ -4318,7 +4318,7 @@ mod reincarnation_remap_tests {
                 _ => OLD,
             };
             let frame = announcement(
-                ViewId {
+                Ballot {
                     era: Era(1),
                     view: View(0),
                 },
