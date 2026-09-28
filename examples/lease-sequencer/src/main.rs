@@ -3009,14 +3009,6 @@ fn handle_client_line(host: &mut Host, index: usize, line: &str, now: u64, rng: 
     };
     // An admin verb: leader-only in this host; the run.sh driver retries the
     // next replica until one accepts.
-    // The abdication is not a reconfiguration: nothing enters the log and
-    // no era advances. The leader drives the abdication through the
-    // adapter — the standard view-change emission for v+1 arms and the
-    // leader steps down in the same synchronous drive — and answers
-    // immediately: the emission is flushed before the ack, and the
-    // failover itself is the ordinary view change the successor completes.
-    // A non-leader answers not_leader; the driver rotates to the next
-    // replica (the same shape every admin verb here has).
     if action == "abdicate" {
         let status = host.node.status();
         if status.state != STATE_NORMAL || status.leader != host.own_id {

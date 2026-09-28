@@ -99,7 +99,7 @@
 //!   `lunet_lock_node_own_id` reports the live identity so the host can
 //!   compare leaders against it after a bump.
 //! - **Termination (the stop story).** The ENGINE owns the stop
-//!   schedule (`docs/uvrr-boot-gate.md` §3): the Running session's
+//!   schedule: the Running session's
 //!   `begin_stop` writes the halt's first round (`Stopping` — it
 //!   vouches for nothing), the host drain forces the committed-
 //!   transition sink to quiescence strictly between the rounds, and
@@ -1205,8 +1205,7 @@ impl Node {
         #[cfg(feature = "flight-recorder")]
         self.flight_bytes_in("request-in", 0, json);
         if self.stopped {
-            // The drain point closed the wire: no further task processing
-            // (docs/uvrr-termination-obligations.md §1).
+            // The drain point closed the wire: no further task processing.
             return STOPPED;
         }
         if json.len() > MAX_DATAGRAM {
@@ -1255,8 +1254,7 @@ impl Node {
         #[cfg(feature = "flight-recorder")]
         self.flight_bytes_in("receive-in", from, data);
         if self.stopped {
-            // The drain point closed the wire: no further inbound reads
-            // (docs/uvrr-termination-obligations.md §1).
+            // The drain point closed the wire: no further inbound reads.
             return STOPPED;
         }
         if data.len() > MAX_DATAGRAM {
@@ -1369,18 +1367,6 @@ impl Node {
         })
     }
 
-    /// The administrator's abdication (rules §12): the node, on host
-    /// request, immediately starts the view-change sequence for the view
-    /// after its own (the CAS pair is read from the node's live progress in
-    /// the same synchronous drive, so the CAS can only fail on a node
-    /// already inside a view change) and steps down — no new wire message
-    /// exists, the emission is the ordinary `StartViewChange` fence, the
-    /// successor the succession schedule names resumes as primary, and this
-    /// node rejoins as a member when the view settles. A proposal arriving
-    /// after the step-down is refused until the new view installs (the
-    /// ordinary status gate), which is the abdication's "stops accepting
-    /// new operations" property. `ReceiverNotPrimary` — the one refusal a
-    /// caller can act on — reports NOT_LEADER; the rest report SERVICE.
     pub fn abdicate(&mut self) -> i32 {
         if self.stopped {
             // The drain point closed the wire: no further task processing.
@@ -1536,9 +1522,8 @@ impl Node {
         self.drive(Input::Reconfigure { op: system, pivot })
     }
 
-    /// The graceful stop (the engine's halt schedule,
-    /// `docs/uvrr-boot-gate.md` §3, driven through the Running
-    /// typestate):
+    /// The graceful stop (the engine's halt schedule, driven through
+    /// the Running typestate):
     ///
     /// 1. **The wire closes first** — the mandatory drain point, and the
     ///    host obligation the engine assumes: the `stopped` flag is set
@@ -1746,12 +1731,9 @@ fn folded_era_regressed(previous: Option<u32>, current: u32) -> bool {
 }
 
 /// Map a plan refusal onto the ABI error codes. `NotPrimary` is the one a
-/// caller can act on (re-forward to the named primary); the abdication's
-/// `ReceiverNotPrimary` is the same actionable refusal for the §12 verb (a
-/// non-leader answered an abdication addressed to the leader); the rest —
+/// caller can act on (re-forward to the named primary); the rest —
 /// the fault, the reconfiguration gates, the outstanding-transition
-/// bookkeeping, the abdication's CAS and delta-rule refusals — are internal
-/// states the host cannot repair in place.
+/// bookkeeping — are internal states the host cannot repair in place.
 fn plan_error(rejection: PlanRefusal) -> i32 {
     debug!(?rejection, "plan refused");
     match rejection {
@@ -2041,7 +2023,7 @@ struct BootDecision {
 }
 
 /// The boot gate (`vrr::lifecycle::boot` over the superblock quorum
-/// store, `docs/uvrr-boot-gate.md`): the engine reads the durable
+/// store): the engine reads the durable
 /// markers, classifies the start, and hands back the session whose type
 /// fixes the write schedule. The verdicts:
 ///
@@ -2734,12 +2716,6 @@ pub unsafe extern "C" fn lunet_lock_node_force_view(node: *mut c_void, era: u32,
     })
 }
 
-/// The administrator's abdication (rules §12): the leader, on host request,
-/// immediately starts the view-change sequence for the view after its own
-/// (the ordinary `StartViewChange` fence — no new wire encoding) and steps
-/// down. Returns [`OK`], [`NOT_LEADER`] (the receiver is not the primary —
-/// the actionable refusal), [`SERVICE`] (the CAS or delta rule refused, or
-/// the node is poisoned), or [`STOPPED`] after the drain point.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lunet_lock_node_abdicate(node: *mut c_void) -> i32 {
     guarded(|| unsafe {
@@ -3292,8 +3268,7 @@ mod tests {
         fs::remove_file(&path).unwrap();
     }
 
-    /// The mandatory obligation's proof
-    /// (`docs/uvrr-termination-obligations.md` §1): once stopped, NO
+    /// The mandatory obligation's proof: once stopped, NO
     /// further inbound entry is picked up — request, receive, ticks, and
     /// the admin drives all refuse, and the node's state stays exactly as
     /// the drain point left it. RED before the lifecycle landed: there
@@ -3700,12 +3675,6 @@ mod tests {
         );
     }
 
-    /// The abdication ABI (rules §12): the leader, on host request, arms
-    /// the standard view-change emission for view v+1 in the SAME
-    /// synchronous drive — the ordinary `StartViewChange` fence, no new
-    /// wire encoding, no timeout wait, no tick — and steps down in the
-    /// same transition: its status leaves `Normal` and a further proposal
-    /// is refused until the view settles.
     #[test]
     fn abdicate_abi_emits_the_immediate_fence_and_steps_the_leader_down() {
         let mut nodes = boot_cluster();
@@ -3743,9 +3712,6 @@ mod tests {
         );
     }
 
-    /// The abdication's cluster completion: the standard view change the
-    /// emission armed settles at view v+1 with the succession schedule's
-    /// primary serving, and the old leader rejoins as an ordinary member.
     #[test]
     fn abdicate_abi_completes_the_view_change_new_leader_serves_old_leader_rejoins() {
         let mut nodes = boot_cluster();
@@ -3786,8 +3752,6 @@ mod tests {
         );
     }
 
-    /// The abdication addressed away from the leader is the actionable
-    /// refusal: NOT_LEADER, no wire traffic, no state move.
     #[test]
     fn abdicate_at_a_nonleader_reports_not_leader_and_moves_nothing() {
         let mut nodes = boot_cluster();

@@ -253,13 +253,6 @@ function Node:recover(): boolean
     )
 end
 
--- The administrator's abdication: the leader, on host request, immediately
--- starts the view-change sequence for the view after its own (the ordinary
--- StartViewChange fence — no new wire encoding) and steps down in the same
--- synchronous drive; it rejoins as a member when the new view settles.
--- NotPrimary — the one actionable refusal — returns the non-raising
--- "not_leader" so the caller re-forwards to the leader, exactly as for
--- lock requests and reconfigurations.
 function Node:abdicate(): boolean, string
     local rc = (tonumber(native.lunet_lock_node_abdicate(self._handle)) or -127)
         as integer

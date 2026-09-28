@@ -111,8 +111,6 @@ local function decode_verb(json: string): (boolean, Verb)
                 endpoint = "",
             }
     end
-    -- The abdicate verb names no member: it is addressed to the leader
-    -- itself. Every membership verb names the id.
     if action ~= "abdicate" and (id_text == nil or not valid_member_id(id_text)) then
         return false,
             {
@@ -276,11 +274,6 @@ local function encode_deadline_ack(action: string, id: integer): string
         .. ',"accepted":false,"reason":"deadline"}'
 end
 
--- The abdicate verb names no member, so its acknowledgments carry no id.
--- The accepted shape reports the armed view-change emission; the refused
--- shape reports the named refusal (the CAS, the delta rule). Unlike the
--- membership verbs there is no deadline shape: abdication commits
--- nothing, so the drive's outcome is final in the same drive.
 local function encode_abdicate_ack(accepted: boolean, reason: string): string
     local line = '{"action":"abdicate","accepted":' .. tostring(accepted)
     if not accepted and reason ~= "" then

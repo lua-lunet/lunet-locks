@@ -3,7 +3,7 @@
 //!
 //! The engine (`vrr::lifecycle`, uvrr-core tag v0.9.0 @ b2ba0d2) owns the marker
 //! machine — which marker, which copies, when, and in what order
-//! (`docs/uvrr-boot-gate.md` §3). This module is the host's durable
+//! This module is the host's durable
 //! mechanics: the vendored Zig store's quorum-of-copies construction,
 //! reached through the AOF C ABI's marker exports (`ext/lunet-locks-aof`),
 //! plus the single-file compatibility projection.

@@ -532,9 +532,6 @@ local function scenario_rotation()
     end
 end
 
--- Scenario 2: leader abdication cycled ×3. Each cycle measures
--- abdication-to-new-leader-serving (the failover lower bound, independent
--- of failure detection) and the full settle (every voter normal).
 local function scenario_abdication()
     phase("S2: leader abdication x3 (leadership rotation)")
     local led: {string: string} = {}

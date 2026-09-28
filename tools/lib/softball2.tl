@@ -401,9 +401,6 @@ local function verify_clients_started()
     end
 end
 
--- The abdication-under-load hammer: the aggressive shape on the SAME
--- lock (two contenders, two getters, no probe floor — the hammering
--- window's client-visible cost comes from here).
 local function start_hammer()
     local servers: {string} = {}
     for _, name in ipairs(GENESIS) do
@@ -869,9 +866,6 @@ local function scenario_steady()
     )
 end
 
--- The quiet abdication ladder: three abdication cycles under the
--- polite fleet (no hammer) — the detection-independent failover
--- measurement, the comparison frame's anchor at the hardened window.
 local function scenario_abdication_quiet()
     phase("S2: leader abdication x3 (quiet, the detection-independent anchor)")
     for cycle = 1, 3 do
@@ -1342,10 +1336,6 @@ local function scenario_compound()
     end
 end
 
--- Abdication under load: three abdication cycles while the aggressive
--- hammer hammers the SAME lock — failover per cycle and the
--- client-visible error count inside the window. The settle gate counts
--- the LIVE voters (a parked member must not fail the gate).
 local function scenario_abdication_under_load()
     phase("A: abdication under load (aggressive hammer on the same lock)")
     start_hammer()
@@ -1410,8 +1400,6 @@ local function scenario_abdication_under_load()
     clock.sleep(5)
 end
 
--- The deep-view conditioning: abdication cycles drive the view high
--- (the polite-2 S4 condition), measured; then the deep crash family.
 local function scenario_deep_family()
     phase("D: deep-view conditioning (abdication cycles) + deep crash family")
     local v0 = view_depth()

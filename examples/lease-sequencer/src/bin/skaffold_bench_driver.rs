@@ -618,8 +618,6 @@ impl Driver {
             self.nodes[index].name
         );
 
-        // 5. Abdicate + leader swap: the leader abdicates, is confirmed
-        // serving, then SIGTERMs out and respawns.
         let t0 = Instant::now();
         let abdicated = self.abdicate_leader()?;
         self.wait_serving("the abdicated leader swap's successor serves")?;

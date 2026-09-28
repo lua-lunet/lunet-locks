@@ -1,5 +1,4 @@
-//! The rejoin gossip's joiner half (uvrr-core
-//! `docs/uvrr-rejoin-gossip-and-witnesses.md` §2): the host obligation the
+//! The rejoin gossip's joiner half: the host obligation the
 //! strand exposed. Rejoining is a gossip protocol OUTSIDE the main uVRR
 //! protocol — a node outside the cluster never assumes the cluster will
 //! come to it: it gossips "I want to join" to every node it knows about,

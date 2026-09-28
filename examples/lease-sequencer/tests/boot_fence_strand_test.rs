@@ -28,10 +28,9 @@
 //! at any view, or a state-transfer request the leader accepts.
 //!
 //! The join gossip is the rejoin gossip's joiner half — a HOST obligation
-//! (`lease_sequencer::rejoin`, uvrr-core
-//! `docs/uvrr-rejoin-gossip-and-witnesses.md` §2: rejoining is a gossip
-//! protocol OUTSIDE the main uVRR protocol, and the joiner keeps its own
-//! resend timer). The core emits no `GossipRequest` — a `Joining` node's
+//! (`lease_sequencer::rejoin`): rejoining is a gossip protocol OUTSIDE the
+//! main uVRR protocol, and the joiner keeps its own
+//! resend timer. The core emits no `GossipRequest` — a `Joining` node's
 //! tick drives only an already-open fetch (`ext/uvrr-core/src/replica/
 //! mod.rs` `plan_tick`), and the fetch opens only through paths a fenced
 //! fresh boot never reaches — while the core HANDLES the message on
