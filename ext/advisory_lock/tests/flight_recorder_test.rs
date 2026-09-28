@@ -64,6 +64,7 @@ fn record_a_node(name: &str) -> (Vec<Value>, std::path::PathBuf) {
         dir.join("state").to_str().unwrap(),
         None,
         0,
+        lunet_advisory_lock::PRIMARY_TIMEOUT_MS,
     )
     .expect("the node boots");
     // The genesis primary self-promotes on its first tick, then one
@@ -195,6 +196,7 @@ fn the_recorder_captures_the_maybe_tripwire() {
         dir.join("state").to_str().unwrap(),
         None,
         0,
+        lunet_advisory_lock::PRIMARY_TIMEOUT_MS,
     )
     .expect("the node boots");
     let maybe = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

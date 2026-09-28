@@ -374,6 +374,7 @@ fn a_boot_fenced_voter_must_adopt_or_emit_actionable_evidence() {
                     &format!("{ROOT}/n{}.state", index + 1),
                     None,
                     0,
+                    lunet_advisory_lock::PRIMARY_TIMEOUT_MS,
                 )
                 .expect("node open"),
                 last_fire: 0,

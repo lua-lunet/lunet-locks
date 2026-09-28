@@ -416,6 +416,7 @@ impl NodeHost {
             options.state.to_str().expect("state path"),
             None,
             0,
+            lunet_advisory_lock::PRIMARY_TIMEOUT_MS,
         )
         .unwrap_or_else(|code| panic!("harness node boot failed with code {code}"));
         let own_id = node.own_id();

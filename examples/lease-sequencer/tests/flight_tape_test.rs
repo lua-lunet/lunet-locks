@@ -623,6 +623,7 @@ mod real_capture {
             dir.join("state").to_str().unwrap(),
             None,
             0,
+            lunet_advisory_lock::PRIMARY_TIMEOUT_MS,
         )
         .expect("the recorded node boots");
         assert_eq!(node.idle(), OK);

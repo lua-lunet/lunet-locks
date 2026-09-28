@@ -2029,6 +2029,7 @@ fn serve(options: &Options, nodes: &[ClusterNode], lifecycle: &Lifecycle) -> Ser
             &options.state,
             journal_dir,
             JOURNAL_ROLL_BYTES,
+            lunet_advisory_lock::PRIMARY_TIMEOUT_MS,
         )
         .unwrap_or_else(|code| {
             eprintln!("lease-sequencer: node boot failed with code {code}");
@@ -3186,6 +3187,7 @@ mod forward_tests {
             state.to_str().expect("path"),
             None,
             0,
+            lunet_advisory_lock::PRIMARY_TIMEOUT_MS,
         ) {
             Ok(node) => node,
             Err(_) => {
@@ -3197,6 +3199,7 @@ mod forward_tests {
                     state.to_str().expect("path"),
                     None,
                     0,
+                    lunet_advisory_lock::PRIMARY_TIMEOUT_MS,
                 )
                 .expect("node boots")
             }
@@ -3830,6 +3833,7 @@ mod reincarnation_remap_tests {
             state.to_str().expect("path"),
             None,
             0,
+            lunet_advisory_lock::PRIMARY_TIMEOUT_MS,
         ) {
             Ok(node) => node,
             Err(_) => {
@@ -3841,6 +3845,7 @@ mod reincarnation_remap_tests {
                     state.to_str().expect("path"),
                     None,
                     0,
+                    lunet_advisory_lock::PRIMARY_TIMEOUT_MS,
                 )
                 .expect("node boots")
             }

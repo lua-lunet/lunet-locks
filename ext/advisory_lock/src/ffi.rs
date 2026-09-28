@@ -92,10 +92,13 @@
 //!   A crashed boot reopens the
 //!   reincarnation way — a later life over the deployment's genesis
 //!   (`Replica::reincarnate` under the bumped identity; there is no
-//!   durable journal to carry forward) — and drives
-//!   `Input::Reincarnate { old }` immediately and on every later
-//!   fenced-boot drive (the §8 re-announce; the core self-gates: a
-//!   member already voting at weight ≥ 1 has nothing to announce).
+//!   durable journal to carry forward) — and announces
+//!   `Input::Reincarnate { old }` on the host's fenced-boot drives
+//!   (`recover` — the §8 re-announce; the core self-gates: a member
+//!   already voting at weight ≥ 1 has nothing to announce). The boot
+//!   itself emits nothing: a reopened node answers only what it is
+//!   driven with, and the announcement is the first fenced-boot
+//!   drive's work.
 //!   `lunet_lock_node_own_id` reports the live identity so the host can
 //!   compare leaders against it after a bump.
 //! - **Termination (the stop story).** The ENGINE owns the stop
@@ -223,7 +226,7 @@ use vrr::effects::{Effect, Stability};
 use vrr::ids::{
     Ballot, CrashCounter, Era, NodeId, Operation, OperationId, Slot, SystemId, Tick, View,
 };
-use vrr::journal::{Journal, LogEntry, Payload, SegmentedLog};
+use vrr::journal::{Journal, JournalView, LogEntry, Payload, SegmentedLog};
 use vrr::lifecycle::{self, BootError, BootOutcome, Bumped, Crashed, Marker, Running, Vouched};
 use vrr::message::{Body, Message};
 use vrr::observe::Diagnostic;
@@ -319,8 +322,11 @@ pub fn output_kind_name(kind: u32) -> &'static str {
 const MAX_DATAGRAM: usize = 65507;
 
 /// Ticks (milliseconds) of primary silence before a backup fences into the
-/// next view. Host policy; correctness never depends on it.
-const PRIMARY_TIMEOUT_MS: u64 = 5000;
+/// next view. Host policy; correctness never depends on it. The default
+/// every [`Node::open`] caller passes; a caller that pins its own policy
+/// passes its own value (the compliance suite's corpus clusters pass the
+/// case's provision timeout).
+pub const PRIMARY_TIMEOUT_MS: u64 = 5000;
 
 /// The host's evidence-and-transfer datagram budget (W5): the largest
 /// core-built suffix or chunk this host will put on one datagram. The
@@ -358,6 +364,32 @@ struct Queued {
 }
 
 type Core = Replica<SegmentedLog, WeightedMajority>;
+
+/// The compliance suite's harness rules (`docs/uvrr-host-compliance.md`),
+/// armed by [`Node::open_compliance`]. The executor drives the clock —
+/// every drive carries the executor's logical tick, never the wall
+/// clock — so the corpus replays byte-identically on every run. The
+/// boundary rules that ride the flag: the application boundary is the
+/// opaque acknowledge (the corpus's raw payloads journal without a
+/// Service decode and are never executed, the §11.1 acknowledgement the
+/// reference host never sends), and the peer gate accepts the corpus's
+/// outside identities (the gossip sender, the fabricated votes) — the
+/// core drops what it drops, by name.
+#[derive(Default)]
+struct Compliance {
+    /// The executor's logical tick, carried by every drive between the
+    /// executor's settings. `0` until the executor first advances it.
+    clock: u64,
+}
+
+/// The node construction's runtime policy: the view-change timeout the
+/// cluster plays by, and the compliance rules when the constructor is
+/// the compliance suite's (`None` is the prod shape — the wall clock,
+/// the Service boundary, the descriptor's address space).
+struct Construction {
+    primary_timeout: u64,
+    compliance: Option<Compliance>,
+}
 
 pub struct Node {
     replica: Core,
@@ -422,6 +454,16 @@ pub struct Node {
     /// stop, and refusing every further inbound entry while set — the
     /// mandatory obligation that makes the in-memory state final.
     stopped: bool,
+    /// The compliance suite's harness rules. `None` on every other
+    /// constructor (the prod shape: the wall clock, the Service
+    /// boundary, the descriptor's address space).
+    compliance: Option<Compliance>,
+    /// The boot gate's marker-round schedule (the machine's commits and
+    /// the drain between its rounds), shared with this boot's
+    /// `GateStore`. The handle outlives the node: the compliance
+    /// executor retains it across crash and halt, exactly like the
+    /// marker files themselves.
+    marker_log: Arc<Mutex<Vec<String>>>,
     /// The Flight Recorder's tape (the `flight-recorder` feature): the
     /// per-node internal trace. `None` without the feature (the field
     /// itself is compiled out) and whenever the env did not name a
@@ -440,9 +482,14 @@ impl Node {
     /// The next monotonic tick from the adapter-owned ms clock (never
     /// decreasing per node, even across a wall-clock regression). Ticks
     /// come from the clock only — the durable state file is the incarnation
-    /// marker, not a tick source.
+    /// marker, not a tick source. Under the compliance rules the tick is
+    /// the executor's logical clock instead: the executor sets it before
+    /// every drive, the corpus's determinism (no wall clock anywhere).
     fn tick(&mut self) -> Result<u64, i32> {
-        let now = unix_millis()?;
+        let now = match &self.compliance {
+            Some(compliance) => compliance.clock,
+            None => unix_millis()?,
+        };
         let next = self.last_tick.max(now);
         // Invariant (asserted, always): ticks are nondecreasing — the clamp
         // holds even across a wall-clock regression.
@@ -840,6 +887,15 @@ impl Node {
                 operation_id,
                 payload,
             } => {
+                // The compliance rules' opaque acknowledge: the corpus's
+                // payloads are raw bytes, never Service JSON, and the
+                // reference host never executes an apply — the effect is
+                // absorbed with no reply, no journal, and no §11.1
+                // acknowledgement (the applied frontier stays where the
+                // core's own system-op walk left it).
+                if self.compliance.is_some() {
+                    return Ok(());
+                }
                 let message_id = operation_id_bytes(operation_id);
                 let (response, transition) = if let Some(cached) = self.replies.get(&message_id) {
                     // Duplicate committed operation: replay the cached reply,
@@ -1088,6 +1144,7 @@ impl Node {
         state: &str,
         journal_dir: Option<&str>,
         roll_bytes: u32,
+        primary_timeout: u64,
     ) -> Result<Node, i32> {
         catch_unwind(AssertUnwindSafe(|| {
             node_from_parts(
@@ -1096,6 +1153,38 @@ impl Node {
                 state.as_bytes(),
                 journal_dir.filter(|dir| !dir.is_empty()),
                 roll_bytes,
+                primary_timeout,
+            )
+        }))
+        .unwrap_or(Err(PANIC))
+    }
+
+    /// The compliance suite's constructor (`docs/uvrr-host-compliance.md`):
+    /// [`Node::open`] over the same marker store with the lock-event
+    /// journal disabled and the corpus's deterministic harness rules
+    /// armed — the opaque-payload application boundary (the raw corpus
+    /// payloads commit without a Service decode), the unbounded
+    /// view-change suffix budget the corpus clusters run, and the
+    /// executor-driven clock (every drive carries the executor's logical
+    /// tick, never the wall clock).
+    pub fn open_compliance(
+        members: &str,
+        own: &str,
+        state: &str,
+        primary_timeout: u64,
+    ) -> Result<Node, i32> {
+        catch_unwind(AssertUnwindSafe(|| {
+            node_from_sink(
+                members.as_bytes(),
+                own.as_bytes(),
+                state.as_bytes(),
+                None,
+                None,
+                None,
+                Construction {
+                    primary_timeout,
+                    compliance: Some(Compliance::default()),
+                },
             )
         }))
         .unwrap_or(Err(PANIC))
@@ -1154,6 +1243,10 @@ impl Node {
                 journal,
                 Some((variant, PathBuf::from(scratch_dir))),
                 None,
+                Construction {
+                    primary_timeout: PRIMARY_TIMEOUT_MS,
+                    compliance: None,
+                },
             )
         }))
         .unwrap_or(Err(PANIC))
@@ -1185,6 +1278,10 @@ impl Node {
                 journal,
                 None,
                 Some(store_ctl),
+                Construction {
+                    primary_timeout: PRIMARY_TIMEOUT_MS,
+                    compliance: None,
+                },
             )
         }))
         .unwrap_or(Err(PANIC))
@@ -1255,13 +1352,15 @@ impl Node {
         }
         // A message attributed to an id outside the descriptor's
         // address space whose system half names no descriptor member is
-        // a maybe: unexpected, not provably impossible (a misconfigured
-        // or hostile sender), and survivable — the core drops it by
-        // name (Diagnostic::UnknownSender). A later life of a member
+        // a maybe (an unknown peer id). A later life of a member
         // (the crash counter advanced under the same system half — the
         // identity law's packing) is the reincarnation story's
-        // legitimate caller and exempt.
-        if !self.known_ids.contains(&from)
+        // legitimate caller and exempt. The compliance rules lift the
+        // gate: the corpus drives outside identities (the gossip
+        // sender, the fabricated votes) whose verdict is the core's,
+        // dropped by name.
+        if self.compliance.is_none()
+            && !self.known_ids.contains(&from)
             && !self
                 .known_ids
                 .iter()
@@ -1305,7 +1404,12 @@ impl Node {
             tag = ?message.header.tag,
             "datagram in"
         );
-        if !valid_message_payloads(&message) {
+        // The peer payload gate: the host re-checks every peer-carried
+        // operation entry with `Service` before the message reaches the
+        // core. The compliance rules lift it — the corpus's payloads are
+        // opaque bytes (B2), never Service JSON, and the reference host
+        // validates none of them.
+        if self.compliance.is_none() && !valid_message_payloads(&message) {
             warn!(
                 from,
                 era = message.header.view.era.0,
@@ -1611,6 +1715,24 @@ impl Node {
                 return SERVICE;
             }
         };
+        // The drain window's own durable write: the view record — the
+        // ballot the node held — strictly between the two rounds, so
+        // the next clean boot resumes at the view it stopped at. A
+        // failed write leaves the markers at the first round (the next
+        // boot reads crashed) and reports SERVICE, the same shape as a
+        // failed round.
+        let snapshot = self.replica.observer().read();
+        let record = ViewRecord {
+            era: snapshot.era,
+            view: snapshot.view,
+        };
+        if let Err(error) = write_view_record(&self.state_path, &record) {
+            eprintln!(
+                "lunet-advisory-lock: the stop's view-record write failed ({error}); \
+                        the markers hold the halt's first round"
+            );
+            return SERVICE;
+        }
         let draining = match halting.drain() {
             Ok(draining) => draining,
             Err((_, error)) => {
@@ -1722,6 +1844,115 @@ impl Node {
             message_id: queued.message_id,
             bytes: queued.bytes,
         })
+    }
+}
+
+impl Node {
+    /// The compliance executor's logical clock: every drive between the
+    /// executor's settings carries `at` as its tick. The corpus's
+    /// determinism — the wall clock is never read under the compliance
+    /// rules. Outside compliance this is a no-op (the wall clock is the
+    /// prod tick source).
+    pub fn set_compliance_clock(&mut self, at: u64) {
+        if let Some(compliance) = &mut self.compliance {
+            compliance.clock = at;
+        }
+    }
+
+    /// One opaque proposal (the compliance suite's `propose` op): the
+    /// payload is raw bytes the core carries opaque (B2) — no Service
+    /// decode, no reply correlation, the corpus's own `OperationId` the
+    /// executor assigns. Outside compliance this reports INVALID: the
+    /// prod boundary is the Service request.
+    ///
+    /// # Panics
+    ///
+    /// Never deliberately; a drive's boundary panic poisons the node and
+    /// reports `PANIC` through the usual path.
+    pub fn propose_opaque(&mut self, id: OperationId, payload: &[u8]) -> i32 {
+        if self.compliance.is_none() {
+            return INVALID;
+        }
+        self.drive(Input::Propose {
+            operation: Operation {
+                id,
+                payload: payload.to_vec().into_boxed_slice(),
+            },
+        })
+    }
+
+    /// One typed cluster operation over the ordinary consensus pipeline
+    /// (the compliance suite's `reconfigure` op), at the reference
+    /// host's pivot policy: `pivot: None`, the stop-the-world fallback
+    /// — a latency outcome, never an error. Outside compliance this
+    /// reports INVALID (the prod boundary derives the pivot itself).
+    pub fn reconfigure_opaque(&mut self, op: SystemOperation) -> i32 {
+        if self.compliance.is_none() {
+            return INVALID;
+        }
+        self.drive(Input::Reconfigure { op, pivot: None })
+    }
+
+    /// The published frontiers: `(accepted, committed, applied)` as the
+    /// observation carries them.
+    #[must_use]
+    pub fn frontiers(&self) -> (u64, u64, u64) {
+        let snapshot = self.replica.observer().read();
+        (snapshot.accepted, snapshot.committed, snapshot.applied)
+    }
+
+    /// The whole journal, from the void slot through the accepted
+    /// frontier: the entries the corpus's journal grammar renders.
+    ///
+    /// # Panics
+    ///
+    /// A journal whose retained window no longer covers the history
+    /// (a published checkpoint reclaimed the prefix) — the compliance
+    /// corpus never publishes one.
+    #[must_use]
+    pub fn journal_entries(&self) -> Vec<LogEntry> {
+        let view = self.replica.journal().view();
+        let Some(frontier) = view.accepted() else {
+            return Vec::new();
+        };
+        let mut entries = Vec::new();
+        match view.copy_out(VOID_SLOT, frontier, &mut entries) {
+            vrr::journal::RangeOutcome::Complete => entries,
+            other => panic!("the compliance journal is unreclaimed: {other:?}"),
+        }
+    }
+
+    /// The folded configuration's current record: the succession order
+    /// with each member's weight in the same order. `None` when the
+    /// node holds no era record (never in a provisioned cluster).
+    #[must_use]
+    pub fn membership(&self) -> Option<(Vec<NodeId>, Vec<u64>)> {
+        let current = self.replica.progress().config().current();
+        let order = current.config.order();
+        Some((
+            order.iter().map(|member| member.node).collect(),
+            order
+                .iter()
+                .map(|member| u64::from(member.weight.0))
+                .collect(),
+        ))
+    }
+
+    /// The gossip-witness list, in list order.
+    #[must_use]
+    pub fn witnesses(&self) -> Vec<NodeId> {
+        self.replica.witnesses().to_vec()
+    }
+
+    /// The boot gate's marker-round schedule handle: every machine
+    /// commit (`commit:<Marker>@<packed identity>`) and the halt's drain
+    /// (`drain`), in write order. The handle is this boot's own record —
+    /// it is shared with the store and outlives the node, so the
+    /// compliance executor retains a crashed or halted node's schedule
+    /// exactly as the marker files persist.
+    #[must_use]
+    pub fn marker_log(&self) -> Arc<Mutex<Vec<String>>> {
+        Arc::clone(&self.marker_log)
     }
 }
 
@@ -1927,6 +2158,92 @@ fn marker_line(system: u16, crash: u16, marker: Marker) -> String {
     )
 }
 
+/// The clean restart's view record: the view ballot the stop contract
+/// writes into its drain window, strictly between the halt's two marker
+/// rounds. The clean classification reads it back; the node resumes at
+/// the view it stopped at instead of re-fencing at the genesis view —
+/// a stale Prepare from below its own view then drops by name, exactly
+/// as the compliance corpus pins. The journal is not carried (the
+/// adapter's durable shape: a reopened node holds the deployment's
+/// genesis and catches up through the stream — its frontiers stay the
+/// genesis ones the journal covers), so only the ballot is restored:
+/// the one field the stream cannot hand back before the first answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ViewRecord {
+    pub era: u32,
+    pub view: u32,
+}
+
+impl ViewRecord {
+    /// The record's on-disk line: the two fields, space-separated.
+    fn line(&self) -> String {
+        format!("{} {}\n", self.era, self.view)
+    }
+
+    /// Parses the record's line. Anything else is unreadable.
+    pub(crate) fn parse(text: &str) -> Option<ViewRecord> {
+        let line = text.trim();
+        let mut fields = line.split(' ');
+        let era = fields.next()?.parse().ok()?;
+        let view = fields.next()?.parse().ok()?;
+        if fields.next().is_some() {
+            return None;
+        }
+        Some(ViewRecord { era, view })
+    }
+}
+
+/// The view record's path for a state path.
+fn view_record_path(state: &Path) -> PathBuf {
+    let mut os = state.as_os_str().to_os_string();
+    os.push(".view");
+    PathBuf::from(os)
+}
+
+/// Writes the view record durably (fsync+rename+dir-sync, the marker
+/// projection's crash-consistency idiom).
+pub(crate) fn write_view_record(path: &Path, record: &ViewRecord) -> std::io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let base = path.file_name().unwrap_or_default();
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    let mut temporary = OsString::from(".");
+    temporary.push(base);
+    temporary.push(format!(".view-tmp-{}-{unique}", std::process::id()));
+    let temporary = parent.join(temporary);
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        file.write_all(record.line().as_bytes())?;
+        file.sync_all()?;
+        fs::rename(&temporary, view_record_path(path))?;
+        sync_parent(path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+/// Reads the view record. `None` when the file does not exist (no stop
+/// ever wrote one); any existing-but-unreadable record is an error.
+pub(crate) fn read_view_record(path: &Path) -> std::io::Result<Option<ViewRecord>> {
+    let path = view_record_path(path);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let text = fs::read_to_string(&path)?;
+    ViewRecord::parse(&text).map(Some).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid view record: the line is not two fields",
+        )
+    })
+}
+
 /// Parses the marker line. Anything else is an unreadable marker: the boot
 /// refuses rather than guessing an identity. The file's words are the
 /// identity pair's halves (a zero half is refused — no identity) and the
@@ -2023,6 +2340,12 @@ struct BootDecision {
     /// The E2 experiment variant's flush outcome at the recovery
     /// boundary. The C ABI's boot never configures a variant.
     flush: Option<FlushOutcome>,
+    /// The clean classification's view record: the view the stop's
+    /// drain-window write carried, the ballot the resume continues at.
+    /// `None` on the other classifications (a first life and a
+    /// reincarnation open at the genesis view) and when no stop ever
+    /// wrote one (the genesis-view fallback).
+    restored: Option<ViewRecord>,
 }
 
 /// The boot gate (`vrr::lifecycle::boot` over the superblock quorum
@@ -2106,10 +2429,14 @@ fn boot_gate(
                 vouched: None,
                 pair: None,
                 flush: None,
+                restored: None,
             })
         }
         Ok(BootOutcome::Clean(clean)) => {
             let identity = clean.identity();
+            let restored = clean.store().view_record().map_err(|error| {
+                refuse(format!("the clean start's view record refused: {error}"))
+            })?;
             let (session, vouched) = match clean.latch() {
                 Ok(latched) => latched,
                 Err((_, error)) => {
@@ -2123,6 +2450,7 @@ fn boot_gate(
                 vouched: Some(vouched),
                 pair: None,
                 flush: None,
+                restored,
             })
         }
         Ok(BootOutcome::Crashed(crashed)) => {
@@ -2155,6 +2483,7 @@ fn boot_gate(
                 vouched: None,
                 pair: Some(pair),
                 flush,
+                restored: None,
             })
         }
     }
@@ -2223,9 +2552,21 @@ fn node_from_parts(
     state_data: &[u8],
     journal_dir: Option<&str>,
     roll_bytes: u32,
+    primary_timeout: u64,
 ) -> Result<Node, i32> {
     let journal = open_journal(journal_dir, roll_bytes);
-    node_from_sink(members_data, own_data, state_data, journal, None, None)
+    node_from_sink(
+        members_data,
+        own_data,
+        state_data,
+        journal,
+        None,
+        None,
+        Construction {
+            primary_timeout,
+            compliance: None,
+        },
+    )
 }
 
 /// The AOF-backed variant: the committed-transition hook enqueues to the
@@ -2252,7 +2593,18 @@ fn node_from_aof(
             None
         }
     };
-    node_from_sink(members_data, own_data, state_data, sink, None, None)
+    node_from_sink(
+        members_data,
+        own_data,
+        state_data,
+        sink,
+        None,
+        None,
+        Construction {
+            primary_timeout: PRIMARY_TIMEOUT_MS,
+            compliance: None,
+        },
+    )
 }
 
 fn node_from_sink(
@@ -2262,6 +2614,7 @@ fn node_from_sink(
     journal: Option<JournalSink>,
     recovery: Option<(RecoveryFlush, PathBuf)>,
     store_ctl: Option<&str>,
+    construction: Construction,
 ) -> Result<Node, i32> {
     // Member entries are "<u32-id>:<name>"; a post-genesis (joined)
     // entry is "<u32-id>:<name>:j". The plain-entry order is the
@@ -2320,8 +2673,15 @@ fn node_from_sink(
         None => return Err(CONFIG),
     };
     let knobs = ViewChangeKnobs {
-        primary_timeout: PRIMARY_TIMEOUT_MS,
-        view_change_budget: EVIDENCE_BUDGET,
+        primary_timeout: construction.primary_timeout,
+        // The compliance suite's clusters run the corpus's unbounded
+        // suffix budget; the host's own budget is the datagram-sized
+        // EVIDENCE_BUDGET (see the constant's note).
+        view_change_budget: if construction.compliance.is_some() {
+            usize::MAX
+        } else {
+            EVIDENCE_BUDGET
+        },
     };
     // The boot gate: the engine reads the durable markers, classifies
     // the start, and hands back the session whose type fixes the write
@@ -2334,24 +2694,41 @@ fn node_from_sink(
     // unchanged when no control socket is given.
     let state_path = PathBuf::from(state);
     let sink: SinkDoor = Arc::new(Mutex::new(journal));
+    // The boot gate's marker-round schedule: every machine commit and the
+    // drain between the halt's rounds, in write order. The executor of
+    // the compliance suite asserts the schedule through it; the store
+    // owns the record.
+    let marker_log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     #[cfg(unix)]
     let store = match store_ctl {
-        Some(ctl) => match GateStore::mem(Path::new(ctl), Arc::clone(&sink)) {
-            Ok(store) => store,
-            Err(error) => {
-                eprintln!(
-                    "lunet-advisory-lock: the bench store control socket is not \
+        Some(ctl) => {
+            match GateStore::mem(Path::new(ctl), Arc::clone(&sink), Arc::clone(&marker_log)) {
+                Ok(store) => store,
+                Err(error) => {
+                    eprintln!(
+                        "lunet-advisory-lock: the bench store control socket is not \
                      reachable ({error}); the boot refuses"
-                );
-                return Err(CONFIG);
+                    );
+                    return Err(CONFIG);
+                }
             }
-        },
-        None => GateStore::new(&state_path, Arc::clone(&sink), system.get()),
+        }
+        None => GateStore::new(
+            &state_path,
+            Arc::clone(&sink),
+            system.get(),
+            Arc::clone(&marker_log),
+        ),
     };
     #[cfg(not(unix))]
     let store = {
         let _ = store_ctl;
-        GateStore::new(&state_path, Arc::clone(&sink), system.get())
+        GateStore::new(
+            &state_path,
+            Arc::clone(&sink),
+            system.get(),
+            Arc::clone(&marker_log),
+        )
     };
     let decision = boot_gate(
         store,
@@ -2451,7 +2828,33 @@ fn node_from_sink(
     } else if let Some(vouched) = decision.vouched {
         // The clean classification: `Replica::resume` behind the
         // engine's `Vouched` token — the only same-identity constructor.
-        let (journal, persisted, config) = joiner_parts(genesis_order)?;
+        // The view record the stop's drain window wrote restores the
+        // stopped view; without one the node re-fences at the genesis
+        // view (the record is absent only when no stop ever wrote one).
+        // The restored era must be one the deployment's genesis era
+        // table covers — the adapter carries no durable journal, so a
+        // post-reconfiguration era is not reconstructible and the boot
+        // refuses rather than resuming over a table that cannot name
+        // the view.
+        let (journal, mut persisted, config) = joiner_parts(genesis_order)?;
+        if let Some(record) = decision.restored {
+            if record.era != config.current().era.0 {
+                eprintln!(
+                    "lunet-advisory-lock: the boot gate refuses to start \
+                     (the clean start's view record names era {}, which the \
+                     deployment's era table does not carry); no identity is \
+                     guessed from the durable state",
+                    record.era
+                );
+                return Err(CONFIG);
+            }
+            let ballot = Ballot {
+                era: Era(record.era),
+                view: View(record.view),
+            };
+            persisted.current = ballot;
+            persisted.retained = ballot;
+        }
         Replica::resume(
             vouched,
             own_id,
@@ -2487,7 +2890,7 @@ fn node_from_sink(
         )
     }
     .map_err(|_| CONFIG)?;
-    let mut node = Node {
+    let node = Node {
         replica,
         outputs: VecDeque::new(),
         service: Service::default(),
@@ -2506,25 +2909,19 @@ fn node_from_sink(
         session: decision.session,
         deferred: decision.deferred,
         stopped: false,
+        compliance: construction.compliance,
+        marker_log,
         #[cfg(feature = "flight-recorder")]
         flight: crate::flight::FlightRecorder::open_from_env(own_id.0),
     };
-    // The bumped node's entry ticket (§4): the wire phase always
-    // follows the bump. The announcement is emitted at boot; every
-    // later fenced-boot drive re-announces (§8) while the node stays
-    // fenced. A failure here is a boot failure: the node is destroyed
-    // and the error reported, never half-announced.
-    if let Some(old) = node.reincarnate_from {
-        let result = node.drive(Input::Reincarnate { old });
-        if result != OK {
-            return Err(result);
-        }
-    }
-    // Clean start otherwise: provision leaves the node fenced
-    // `Recovering` with an empty output queue. There is no boot
-    // recovery handshake; the host's fenced-boot drive
-    // (`lunet_lock_node_recover`, a tick) and the primary's messages
-    // bring the node into the protocol.
+    // The bumped node's entry ticket (§4) rides the fenced-boot drive
+    // (`recover`): the announcement is emitted on the host's first
+    // fenced-boot drive, never at the boot itself — a reopened node
+    // answers only what it is driven with, and the §8 re-announce
+    // cadence carries the pair until the node seats. The boot gate's
+    // classification is complete: the crash bump's durable round is
+    // already landed (the emission gate), so the drive's announcement
+    // vouches for a durable identity from the first wire emission.
     Ok(node)
 }
 
@@ -2565,7 +2962,14 @@ pub unsafe extern "C" fn lunet_lock_node_new(
                 .filter(|s| !s.is_empty())
         };
         match catch_unwind(AssertUnwindSafe(|| {
-            node_from_parts(members_data, own_data, state_data, journal_dir, roll_bytes)
+            node_from_parts(
+                members_data,
+                own_data,
+                state_data,
+                journal_dir,
+                roll_bytes,
+                PRIMARY_TIMEOUT_MS,
+            )
         })) {
             Ok(Ok(node)) => {
                 unsafe { *out = Box::into_raw(Box::new(node)).cast() };
@@ -2908,8 +3312,12 @@ mod tests {
         let path = state_path("marker");
         // The first life: one anchor round — `(system 1, counter 1,
         // Joining)` 4x, the projection's running sentinel.
-        let decision = boot_gate(GateStore::new(&path, test_sink(), 1), test_system(), None)
-            .expect("first boot");
+        let decision = boot_gate(
+            GateStore::new(&path, test_sink(), 1, Arc::new(Mutex::new(Vec::new()))),
+            test_system(),
+            None,
+        )
+        .expect("first boot");
         assert_eq!(decision.identity, test_identity(1));
         assert!(decision.session.is_some() && decision.deferred.is_none());
         drop(decision);
@@ -2918,8 +3326,12 @@ mod tests {
         // pair is decided (counter 1 -> 2) and THE EMISSION GATE lands
         // the bump's one durable round at boot — before the driver
         // releases the first announcement, seated or not.
-        let decision = boot_gate(GateStore::new(&path, test_sink(), 1), test_system(), None)
-            .expect("crashed boot");
+        let decision = boot_gate(
+            GateStore::new(&path, test_sink(), 1, Arc::new(Mutex::new(Vec::new()))),
+            test_system(),
+            None,
+        )
+        .expect("crashed boot");
         assert_eq!(decision.identity, test_identity(2));
         let pair = decision.pair.expect("the replacement pair");
         assert_eq!((pair.old, pair.new), (test_identity(1), test_identity(2)));
@@ -2933,8 +3345,12 @@ mod tests {
         // A re-boot over the landed round derives the strictly next
         // life: the identity law's counter never re-derives the same
         // identity.
-        let decision =
-            boot_gate(GateStore::new(&path, test_sink(), 1), test_system(), None).expect("replay");
+        let decision = boot_gate(
+            GateStore::new(&path, test_sink(), 1, Arc::new(Mutex::new(Vec::new()))),
+            test_system(),
+            None,
+        )
+        .expect("replay");
         assert_eq!(
             decision.pair.expect("the replayed pair").new,
             test_identity(3)
@@ -2948,8 +3364,12 @@ mod tests {
         // migration path the copy-free rig states boot through.
         fs::remove_file(superblock_path(&path)).unwrap();
         write_marker(&path, 1, 7, Marker::Stopped).unwrap();
-        let decision = boot_gate(GateStore::new(&path, test_sink(), 1), test_system(), None)
-            .expect("clean continue");
+        let decision = boot_gate(
+            GateStore::new(&path, test_sink(), 1, Arc::new(Mutex::new(Vec::new()))),
+            test_system(),
+            None,
+        )
+        .expect("clean continue");
         assert_eq!(decision.identity, test_identity(7));
         assert!(decision.session.is_some() && decision.pair.is_none());
         drop(decision);
@@ -2970,30 +3390,55 @@ mod tests {
         let path = state_path("marker-bad");
         fs::write(&path, "not a marker\n").unwrap();
         assert_eq!(
-            boot_gate(GateStore::new(&path, test_sink(), 1), test_system(), None).unwrap_err(),
+            boot_gate(
+                GateStore::new(&path, test_sink(), 1, Arc::new(Mutex::new(Vec::new()))),
+                test_system(),
+                None
+            )
+            .unwrap_err(),
             CONFIG
         );
         // The projection's three-word spelling: two halves and a state.
         // A two-word line is an old-format marker: unreadable, refused.
         fs::write(&path, "999 unflushed\n").unwrap();
         assert_eq!(
-            boot_gate(GateStore::new(&path, test_sink(), 1), test_system(), None).unwrap_err(),
+            boot_gate(
+                GateStore::new(&path, test_sink(), 1, Arc::new(Mutex::new(Vec::new()))),
+                test_system(),
+                None
+            )
+            .unwrap_err(),
             CONFIG
         );
         fs::write(&path, "3 stale\n").unwrap();
         assert_eq!(
-            boot_gate(GateStore::new(&path, test_sink(), 1), test_system(), None).unwrap_err(),
+            boot_gate(
+                GateStore::new(&path, test_sink(), 1, Arc::new(Mutex::new(Vec::new()))),
+                test_system(),
+                None
+            )
+            .unwrap_err(),
             CONFIG
         );
         // A zero half is no identity: refused at the projection's edge.
         fs::write(&path, "0 1 unflushed\n").unwrap();
         assert_eq!(
-            boot_gate(GateStore::new(&path, test_sink(), 1), test_system(), None).unwrap_err(),
+            boot_gate(
+                GateStore::new(&path, test_sink(), 1, Arc::new(Mutex::new(Vec::new()))),
+                test_system(),
+                None
+            )
+            .unwrap_err(),
             CONFIG
         );
         fs::write(&path, "1 0 unflushed\n").unwrap();
         assert_eq!(
-            boot_gate(GateStore::new(&path, test_sink(), 1), test_system(), None).unwrap_err(),
+            boot_gate(
+                GateStore::new(&path, test_sink(), 1, Arc::new(Mutex::new(Vec::new()))),
+                test_system(),
+                None
+            )
+            .unwrap_err(),
             CONFIG
         );
         // The bump refuses when the next life would not fit the packing's
@@ -3002,15 +3447,24 @@ mod tests {
         // at the emission gate's spelling).
         fs::write(&path, "1 65535 unflushed\n").unwrap();
         assert_eq!(
-            boot_gate(GateStore::new(&path, test_sink(), 1), test_system(), None).unwrap_err(),
+            boot_gate(
+                GateStore::new(&path, test_sink(), 1, Arc::new(Mutex::new(Vec::new()))),
+                test_system(),
+                None
+            )
+            .unwrap_err(),
             CONFIG
         );
         // The last spellable life still continues clean.
         fs::write(&path, "1 65535 flushed\n").unwrap();
         assert_eq!(
-            boot_gate(GateStore::new(&path, test_sink(), 1), test_system(), None)
-                .expect("the exhausted identity still continues")
-                .identity,
+            boot_gate(
+                GateStore::new(&path, test_sink(), 1, Arc::new(Mutex::new(Vec::new()))),
+                test_system(),
+                None
+            )
+            .expect("the exhausted identity still continues")
+            .identity,
             test_identity(65535)
         );
         fs::remove_file(&path).unwrap();
@@ -3027,13 +3481,18 @@ mod tests {
         let path = state_path("marker-flush");
         let scratch = state_path("marker-flush-scratch");
         fs::remove_dir_all(&scratch).ok();
-        boot_gate(GateStore::new(&path, test_sink(), 1), test_system(), None).expect("first boot");
+        boot_gate(
+            GateStore::new(&path, test_sink(), 1, Arc::new(Mutex::new(Vec::new()))),
+            test_system(),
+            None,
+        )
+        .expect("first boot");
         assert!(
             !scratch.exists(),
             "boot_gate with no variant writes nothing"
         );
         let decision = boot_gate(
-            GateStore::new(&path, test_sink(), 1),
+            GateStore::new(&path, test_sink(), 1, Arc::new(Mutex::new(Vec::new()))),
             test_system(),
             Some((&RecoveryFlush::SingleBlock, &scratch)),
         )
@@ -3049,7 +3508,7 @@ mod tests {
             "the marker discipline is unchanged by the flush: the emission gate's round stands"
         );
         let decision = boot_gate(
-            GateStore::new(&path, test_sink(), 1),
+            GateStore::new(&path, test_sink(), 1, Arc::new(Mutex::new(Vec::new()))),
             test_system(),
             Some((&RecoveryFlush::Diskless, &scratch)),
         )
@@ -3073,8 +3532,12 @@ mod tests {
     fn existing_unflushed_files_boot_the_emission_gate_round() {
         let path = state_path("marker-compat");
         fs::write(&path, "1 7 unflushed\n").unwrap();
-        let decision = boot_gate(GateStore::new(&path, test_sink(), 1), test_system(), None)
-            .expect("crashed classification");
+        let decision = boot_gate(
+            GateStore::new(&path, test_sink(), 1, Arc::new(Mutex::new(Vec::new()))),
+            test_system(),
+            None,
+        )
+        .expect("crashed classification");
         assert_eq!(
             decision.identity,
             test_identity(8),
@@ -3104,8 +3567,12 @@ mod tests {
     fn legacy_flushed_file_migrates_and_continues_clean() {
         let path = state_path("marker-compat-clean");
         fs::write(&path, "1 4 flushed\n").unwrap();
-        let decision = boot_gate(GateStore::new(&path, test_sink(), 1), test_system(), None)
-            .expect("migrated classification");
+        let decision = boot_gate(
+            GateStore::new(&path, test_sink(), 1, Arc::new(Mutex::new(Vec::new()))),
+            test_system(),
+            None,
+        )
+        .expect("migrated classification");
         assert_eq!(
             decision.identity,
             test_identity(4),
@@ -3134,10 +3601,19 @@ mod tests {
     #[test]
     fn an_unreadable_marker_quorum_refuses_the_boot() {
         let path = state_path("marker-lost");
-        boot_gate(GateStore::new(&path, test_sink(), 1), test_system(), None).expect("first boot");
+        boot_gate(
+            GateStore::new(&path, test_sink(), 1, Arc::new(Mutex::new(Vec::new()))),
+            test_system(),
+            None,
+        )
+        .expect("first boot");
         drop(
-            boot_gate(GateStore::new(&path, test_sink(), 1), test_system(), None)
-                .expect("crashed boot"),
+            boot_gate(
+                GateStore::new(&path, test_sink(), 1, Arc::new(Mutex::new(Vec::new()))),
+                test_system(),
+                None,
+            )
+            .expect("crashed boot"),
         );
         let superblock = superblock_path(&path);
         let geometry = lunet_locks_aof::marker::geometry().expect("geometry");
@@ -3150,7 +3626,12 @@ mod tests {
                 .expect("tear the copies file down to one zone");
         }
         assert_eq!(
-            boot_gate(GateStore::new(&path, test_sink(), 1), test_system(), None).unwrap_err(),
+            boot_gate(
+                GateStore::new(&path, test_sink(), 1, Arc::new(Mutex::new(Vec::new()))),
+                test_system(),
+                None
+            )
+            .unwrap_err(),
             CONFIG,
             "the unreadable quorum refuses the boot"
         );
@@ -3202,7 +3683,8 @@ mod tests {
         let state = path.to_str().expect("state path");
         let superblock = superblock_path(&path);
         let members = test_members(&TEST_IDS, None);
-        let mut node = Node::open(&members, "member655361", state, None, 0).expect("first boot");
+        let mut node = Node::open(&members, "member655361", state, None, 0, PRIMARY_TIMEOUT_MS)
+            .expect("first boot");
         assert_eq!(node.stop(), OK, "the stop leaves the copies at flushed");
         drop(node);
         assert_eq!(
@@ -3225,7 +3707,7 @@ mod tests {
         }
         let before = fs::read(&superblock).expect("the copies file");
 
-        let boot = Node::open(&members, "member655361", state, None, 0);
+        let boot = Node::open(&members, "member655361", state, None, 0, PRIMARY_TIMEOUT_MS);
         assert!(
             matches!(boot, Err(PANIC)),
             "the bad checksum panics the boot (the boundary reports PANIC), never a hang"
@@ -3248,7 +3730,8 @@ mod tests {
         let path = state_path("clean-stop");
         let state = path.to_str().expect("state path");
         let members = test_members(&TEST_IDS, None);
-        let mut node = Node::open(&members, "member655361", state, None, 0).expect("first boot");
+        let mut node = Node::open(&members, "member655361", state, None, 0, PRIMARY_TIMEOUT_MS)
+            .expect("first boot");
         let own_before = node.own_id();
         // The running sentinel the operating process leaves behind.
         assert_eq!(fs::read_to_string(&path).unwrap(), "10 1 unflushed\n");
@@ -3257,7 +3740,8 @@ mod tests {
         // write was atomically replaced at the drain point).
         assert_eq!(fs::read_to_string(&path).unwrap(), "10 1 flushed\n");
         drop(node);
-        let node = Node::open(&members, "member655361", state, None, 0).expect("clean continue");
+        let node = Node::open(&members, "member655361", state, None, 0, PRIMARY_TIMEOUT_MS)
+            .expect("clean continue");
         assert_eq!(
             node.own_id(),
             own_before,
@@ -3446,6 +3930,7 @@ mod tests {
             path.as_os_str().as_encoded_bytes(),
             None,
             0,
+            PRIMARY_TIMEOUT_MS,
         )
         .expect("provision")
     }
@@ -3847,8 +4332,15 @@ mod tests {
         let path = nodes[1].state_path.clone();
         let members = "655361:a\x001310721:b\x001966081:c";
         drop(nodes);
-        let node =
-            Node::open(members, "b", path.to_str().unwrap(), None, 0).expect("clean continue");
+        let node = Node::open(
+            members,
+            "b",
+            path.to_str().unwrap(),
+            None,
+            0,
+            PRIMARY_TIMEOUT_MS,
+        )
+        .expect("clean continue");
         assert_eq!(
             node.own_id(),
             TEST_IDS[1],
@@ -3875,6 +4367,7 @@ mod tests {
             state_path(name).as_os_str().as_encoded_bytes(),
             None,
             0,
+            PRIMARY_TIMEOUT_MS,
         )
         .expect("joiner boot")
     }
@@ -5521,17 +6014,27 @@ mod tests {
         let ids = [TEST_IDS[0], TEST_IDS[1], BUMPED_ID];
 
         // The bumped node reopens over the deployment's genesis and is
-        // fenced; its boot announcement (the §4 entry ticket) goes to every
-        // member of the configuration it can name.
+        // fenced; its boot emits nothing — the announcement (the §4
+        // entry ticket) rides the fenced-boot drive, and the drive's
+        // §8 re-announce goes to every member of the configuration it
+        // can name.
         assert_eq!(
             nodes[2].replica.progress().status(),
             vrr::progress::Status::Restarting,
             "the reincarnated node stays fenced"
         );
+        assert!(nodes[2].outputs.is_empty(), "the boot itself emits nothing");
+        assert_eq!(
+            nodes[2].drive(Input::Reincarnate {
+                old: NodeId(TEST_IDS[2])
+            }),
+            OK,
+            "the fenced-boot drive announces the replacement pair"
+        );
         let drained: VecDeque<Queued> = std::mem::take(&mut nodes[2].outputs);
         let mut announced_to: Vec<u32> = Vec::new();
         for output in &drained {
-            assert_eq!(output.kind, OUTPUT_SEND, "the boot announces only");
+            assert_eq!(output.kind, OUTPUT_SEND, "the drive announces only");
             let message = Message::unpack_from(&output.bytes).expect("wire round trip");
             assert_eq!(message.header.tag, vrr::wire::Tag::Reincarnation);
             let Body::Reincarnation { old, new, .. } = message.body else {
@@ -6132,12 +6635,26 @@ mod tests {
             .map(|id| format!("{id}:member{id}"))
             .collect::<Vec<_>>()
             .join("\0");
-        let first = Node::open(&members, "member655361", path.to_str().unwrap(), None, 0)
-            .expect("first boot");
+        let first = Node::open(
+            &members,
+            "member655361",
+            path.to_str().unwrap(),
+            None,
+            0,
+            PRIMARY_TIMEOUT_MS,
+        )
+        .expect("first boot");
         assert_eq!(first.own_id(), TEST_IDS[0]);
         drop(first);
-        let second = Node::open(&members, "member655361", path.to_str().unwrap(), None, 0)
-            .expect("dirty boot bumps");
+        let second = Node::open(
+            &members,
+            "member655361",
+            path.to_str().unwrap(),
+            None,
+            0,
+            PRIMARY_TIMEOUT_MS,
+        )
+        .expect("dirty boot bumps");
         let bumped = second.own_id();
         assert_ne!(bumped, TEST_IDS[0], "the old id is never reused");
         assert_eq!(

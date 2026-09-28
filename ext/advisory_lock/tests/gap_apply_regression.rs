@@ -24,6 +24,7 @@ impl TestNode {
             dir.join("state").to_str().expect("path"),
             None,
             0,
+            lunet_advisory_lock::PRIMARY_TIMEOUT_MS,
         )
         .expect("the node boots");
         TestNode { node }

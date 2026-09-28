@@ -75,7 +75,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use vrr::ids::{CrashCounter, NodeId, SystemId};
 use vrr::lifecycle::{CopyState, LifecycleStore, Marker, SuperblockCopies};
 
-use crate::ffi::{JournalSink, read_marker, write_marker};
+use crate::ffi::{JournalSink, ViewRecord, read_marker, read_view_record, write_marker};
 
 #[cfg(not(target_os = "windows"))]
 use lunet_locks_aof::marker;
@@ -268,25 +268,48 @@ enum Backend {
     Disk { state: PathBuf },
 }
 
+/// The engine marker's name, spelled as the engine's own vocabulary
+/// (`docs/uvrr-io-obligations.md`, the boot-gate chapter): the word the
+/// marker-round schedule records — never the on-disk projection's word.
+fn machine_word(marker: Marker) -> &'static str {
+    match marker {
+        Marker::Stopping => "Stopping",
+        Marker::Stopped => "Stopped",
+        Marker::Restarting => "Restarting",
+        Marker::Joining => "Joining",
+    }
+}
+
 /// The host's durable mechanics for the boot gate: the superblock quorum
 /// store plus the single-file projection, wired to the committed-
 /// transition sink for the halt's drain. The system identifier is the
 /// descriptor's own member's system half — the projection read is
-/// checked against it.
+/// checked against it. The `ops` log records every marker round the
+/// boot-gate machine wrote (`commit:<Marker>@<packed identity>`) and the
+/// drain the halt schedule forces between its rounds (`drain`), in write
+/// order — the schedule the compliance corpus asserts; the reads are the
+/// host's own business and are not listed.
 pub(crate) struct GateStore {
     backend: Backend,
     sink: SinkDoor,
     system: u16,
+    ops: Arc<Mutex<Vec<String>>>,
 }
 
 impl GateStore {
-    pub(crate) fn new(state: &Path, sink: SinkDoor, system: u16) -> GateStore {
+    pub(crate) fn new(
+        state: &Path,
+        sink: SinkDoor,
+        system: u16,
+        ops: Arc<Mutex<Vec<String>>>,
+    ) -> GateStore {
         GateStore {
             backend: Backend::Disk {
                 state: state.to_path_buf(),
             },
             sink,
             system,
+            ops,
         }
     }
 
@@ -297,11 +320,16 @@ impl GateStore {
     /// (`docs/src/bench-harness.md`). The connect failure refuses the
     /// boot exactly as a durable read failure does.
     #[cfg(unix)]
-    pub(crate) fn mem(ctl: &Path, sink: SinkDoor) -> io::Result<GateStore> {
+    pub(crate) fn mem(
+        ctl: &Path,
+        sink: SinkDoor,
+        ops: Arc<Mutex<Vec<String>>>,
+    ) -> io::Result<GateStore> {
         Ok(GateStore {
             backend: Backend::Mem(MemBackend::connect(ctl)?),
             sink,
             system: 0,
+            ops,
         })
     }
 
@@ -349,6 +377,24 @@ impl GateStore {
                 MemBackend::ack(&reply)
             }
         }
+    }
+
+    /// The clean classification's view record (the stop's drain-window
+    /// write): the view the node stopped at. `None` when no stop ever
+    /// wrote one. The mem backend carries none (the bench driver holds
+    /// the state in memory and answers its own discipline).
+    #[cfg(unix)]
+    pub(crate) fn view_record(&self) -> io::Result<Option<ViewRecord>> {
+        match &self.backend {
+            Backend::Disk { state } => read_view_record(state),
+            Backend::Mem(_) => Ok(None),
+        }
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn view_record(&self) -> io::Result<Option<ViewRecord>> {
+        let Backend::Disk { state } = &self.backend;
+        read_view_record(state)
     }
 }
 
@@ -548,7 +594,7 @@ impl LifecycleStore for GateStore {
             copies.copies.iter().all(|one| *one == copy),
             "the boot gate's rewrites are uniform 4x"
         );
-        match &self.backend {
+        let result = match &self.backend {
             Backend::Disk { state } => commit_disk(state, copy),
             #[cfg(unix)]
             Backend::Mem(mem) => {
@@ -559,16 +605,38 @@ impl LifecycleStore for GateStore {
                 }))?;
                 MemBackend::ack(&reply)
             }
+        };
+        if result.is_ok() {
+            self.ops
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(format!(
+                    "commit:{}@{}",
+                    machine_word(copy.marker),
+                    copy.identity.0
+                ));
         }
+        result
     }
 
     fn drain(&mut self) -> Result<(), Self::Error> {
-        drain_sink(&mut sink_guard(&self.sink))?;
-        #[cfg(unix)]
-        if let Backend::Mem(mem) = &self.backend {
-            let reply = mem.rpc(&serde_json::json!({"op": "drain"}))?;
-            return MemBackend::ack(&reply);
+        let result = drain_sink(&mut sink_guard(&self.sink));
+        let mem_result = result.and_then(|()| {
+            #[cfg(unix)]
+            {
+                if let Backend::Mem(mem) = &self.backend {
+                    let reply = mem.rpc(&serde_json::json!({"op": "drain"}))?;
+                    return MemBackend::ack(&reply);
+                }
+            }
+            Ok(())
+        });
+        if mem_result.is_ok() {
+            self.ops
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push("drain".to_string());
         }
-        Ok(())
+        mem_result
     }
 }

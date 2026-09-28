@@ -133,6 +133,7 @@ impl Scenario {
             state.to_str().expect("utf-8 scratch path"),
             None,
             0,
+            lunet_advisory_lock::PRIMARY_TIMEOUT_MS,
         )
     }
 }

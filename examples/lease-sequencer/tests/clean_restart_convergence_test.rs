@@ -183,6 +183,7 @@ fn clean_restart_while_the_cluster_advances_converges() {
                     &format!("{ROOT}/n{}.state", index + 1),
                     None,
                     0,
+                    lunet_advisory_lock::PRIMARY_TIMEOUT_MS,
                 )
                 .expect("node open"),
                 last_fire: 0,
@@ -211,6 +212,10 @@ fn clean_restart_while_the_cluster_advances_converges() {
     let leader_id = fabric.hosts[leader].own();
     let leader_view = fabric.hosts[leader].view();
     assert_eq!(fabric.hosts[leader].node.stop(), 0, "the clean stop");
+    eprintln!(
+        "PROBE: leader stopped at view {leader_view} (own {})",
+        fabric.hosts[leader].own()
+    );
 
     // The survivors keep running: the phi fires and the limbo poll walk
     // the view up past the stopped primary. The cluster must be at a
@@ -257,6 +262,7 @@ fn clean_restart_while_the_cluster_advances_converges() {
         &format!("{ROOT}/n{}.state", leader + 1),
         None,
         0,
+        lunet_advisory_lock::PRIMARY_TIMEOUT_MS,
     )
     .expect("the restart boots");
     assert_eq!(
@@ -296,25 +302,44 @@ fn clean_restart_while_the_cluster_advances_converges() {
         "the converged views agree: {views:?}"
     );
 
-    // The converged cluster serves again: a fresh proposal commits.
-    let json = format!(
-        "{{\"op\":\"get\",\"message_id\":\"{mid}\",\"client_id\":77,\"request_num\":1,\"lock_id\":1}}",
-        mid = uuid::Uuid::new_v4()
-    );
-    let server = fabric
+    // The converged cluster serves again: the chase's probe commits.
+    // The client submits through the leader's own request path and, on
+    // no echoed commit, re-probes with a FRESH message_id on the
+    // current leader (the embedded chase's shape: a lost reply is a new
+    // proposal, the duplicate id is never re-sent). The churn the idle
+    // cluster's detectors run advances the view between attempts; the
+    // probe chases the view up with it.
+    let before = fabric
         .hosts
         .iter()
-        .position(|h| h.state() == STATE_NORMAL && h.node.status().leader == h.own())
-        .expect("a Normal primary after convergence");
-    let before = fabric.hosts[server].last_commit_ms;
-    let code = fabric.hosts[server].node.request(json.as_bytes());
-    assert_eq!(code, 0, "the fresh proposal was refused: {code}");
+        .map(|h| h.last_commit_ms)
+        .collect::<Vec<_>>();
+    let mut committed = false;
     for _ in 0..16 {
-        step(&mut fabric, POLL_MS);
-        fabric.pump();
+        let server = fabric
+            .hosts
+            .iter()
+            .position(|h| h.state() == STATE_NORMAL && h.node.status().leader == h.own())
+            .expect("a Normal primary while serving");
+        let json = format!(
+            "{{\"op\":\"get\",\"message_id\":\"{mid}\",\"client_id\":77,\"request_num\":1,\"lock_id\":1}}",
+            mid = uuid::Uuid::new_v4()
+        );
+        let code = fabric.hosts[server].node.request(json.as_bytes());
+        assert_eq!(code, 0, "the probe proposal was refused: {code}");
+        for _ in 0..3 {
+            step(&mut fabric, POLL_MS);
+            fabric.pump();
+        }
+        let after = fabric
+            .hosts
+            .iter()
+            .map(|h| h.last_commit_ms)
+            .collect::<Vec<_>>();
+        if after.iter().zip(&before).any(|(now, was)| now > was) {
+            committed = true;
+            break;
+        }
     }
-    assert!(
-        fabric.hosts[server].last_commit_ms > before,
-        "the fresh proposal never committed"
-    );
+    assert!(committed, "the fresh proposal never committed");
 }

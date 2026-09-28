@@ -53,6 +53,7 @@ impl TestNode {
             dir.join("state").to_str().expect("path"),
             None,
             0,
+            lunet_advisory_lock::PRIMARY_TIMEOUT_MS,
         )
         .expect("the node boots");
         TestNode { node, dir }
@@ -246,7 +247,14 @@ fn a_corrupted_copy_panics_the_next_boot_and_is_never_healed() {
 
     let members = ["65537:a", "131073:b", "196609:c"].join("\0");
     for attempt in 0..2 {
-        let boot = Node::open(&members, "a", &state, None, 0);
+        let boot = Node::open(
+            &members,
+            "a",
+            &state,
+            None,
+            0,
+            lunet_advisory_lock::PRIMARY_TIMEOUT_MS,
+        );
         assert!(
             matches!(boot, Err(PANIC)),
             "attempt {attempt}: the corrupt copy panics the boot, never hangs"

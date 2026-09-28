@@ -80,6 +80,7 @@ impl Harness {
             root.join("a-state").to_str().expect("path"),
             None,
             0,
+            lunet_advisory_lock::PRIMARY_TIMEOUT_MS,
         )
         .expect("node a boots");
         let node_b = Node::open(
@@ -88,6 +89,7 @@ impl Harness {
             root.join("b-state").to_str().expect("path"),
             None,
             0,
+            lunet_advisory_lock::PRIMARY_TIMEOUT_MS,
         )
         .expect("node b boots");
         let mut harness = Harness { node_a, node_b };

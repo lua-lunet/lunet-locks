@@ -249,12 +249,41 @@ snapshot. Every wipe step (`tools/smoke.lua`, the
 directory it is about to remove and wipes only on its success; a failed
 snapshot refuses the wipe loudly and leaves the state in place.
 
+## The uVRR compliance suite
+
+`cargo test --quiet` in `ext/advisory_lock` runs the uVRR compliance
+suite: uvrr-core's corpus of 73 cases in ten families
+(`ext/uvrr-core/tests/compliance/corpus/*.json`, the pinned submodule
+tag — the corpus is read from the submodule, never copied), replayed by
+`ext/advisory_lock/tests/compliance.rs` through the abstract host
+interface of
+[uvrr-host-compliance.md](../../ext/uvrr-core/docs/uvrr-host-compliance.md)
+against OUR host: the adapter's `Node` over the real marker store. The
+executor (`ext/advisory_lock/tests/compliance/`) drives the corpus's ops
+over the adapter's entry points — provision over
+`Node::open_compliance` (the case's primary-timeout knob, the corpus's
+unbounded suffix budget, the executor's logical clock instead of the
+wall clock), settle/tick/tick_all over `idle`, propose over the opaque
+application boundary (the corpus's raw payloads journal without a
+Service decode), deliver/gossip over `receive` with the hex-decoded
+bytes, reconfigure at the reference host's pivot policy, crash as a
+drop without the stop contract, restart as a reopen over the same
+markers (the clean classification restores the view record the stop's
+drain window wrote), halt as the stop contract, boot as the joiner
+open, announce as the fenced-boot drive — and asserts every case's
+byte-exact named deliveries plus the full post-state record
+(status/era/view, frontiers, journal, members/weights, the boot gate's
+marker schedule, witnesses). Emissions beyond the named multiset fail
+the case; no host-loop autonomous drive ever runs inside the executor.
+
 ## Relevant files
 
 | File | Responsibility |
 |---|---|
 | `ext/advisory_lock/src/locks.rs` | JSON lock protocol and lock state machine |
 | `ext/advisory_lock/src/ffi.rs` | uvrr-core adapter, C ABI, tick clock, incarnation marker |
+| `ext/advisory_lock/tests/compliance.rs` | the uVRR compliance suite's runner: the corpus target |
+| `ext/advisory_lock/tests/compliance/` | the compliance executor: the abstract host interface over the adapter |
 | `src/advisory_lock.tl` | Teal wrapper and owned output draining |
 | `src/cluster_config.tl` | JSONL deployment descriptor: parse, encode, genesis succession |
 | `src/admin.tl` | Admin verb decode, ADMIN peer payload, acknowledgments, dedup cache |

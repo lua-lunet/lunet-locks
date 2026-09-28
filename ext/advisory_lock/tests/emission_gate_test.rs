@@ -74,7 +74,14 @@ fn a_failed_marker_write_at_the_crash_bump_emits_nothing() {
     permissions.set_mode(0o555);
     fs::set_permissions(&store_dir, permissions).expect("chmod");
 
-    let boot = Node::open(&members, "n1", &state_str, None, 0);
+    let boot = Node::open(
+        &members,
+        "n1",
+        &state_str,
+        None,
+        0,
+        lunet_advisory_lock::PRIMARY_TIMEOUT_MS,
+    );
     assert!(
         boot.is_err(),
         "the crash bump's marker write failure refuses the boot: no node, \
@@ -99,7 +106,15 @@ fn a_failed_marker_write_at_the_crash_bump_emits_nothing() {
     let mut permissions = fs::metadata(&store_dir).expect("stat").permissions();
     permissions.set_mode(0o755);
     fs::set_permissions(&store_dir, permissions).expect("chmod");
-    let node = Node::open(&members, "n1", &state_str, None, 0).expect("the boot opens");
+    let node = Node::open(
+        &members,
+        "n1",
+        &state_str,
+        None,
+        0,
+        lunet_advisory_lock::PRIMARY_TIMEOUT_MS,
+    )
+    .expect("the boot opens");
     assert_eq!(node.own_id(), 65538, "the next life of the crashed pair");
     let classified =
         marker_ffi::classify(&store_dir.join("state.superblock")).expect("the marker reads");
@@ -126,11 +141,27 @@ fn a_double_crash_never_rederives_the_same_identity() {
     let members = members_string(&[1, 2, 3]);
     let state_str = state.to_str().expect("utf8 path").to_owned();
 
-    let first_boot = Node::open(&members, "n2", &state_str, None, 0).expect("first crash boot");
+    let first_boot = Node::open(
+        &members,
+        "n2",
+        &state_str,
+        None,
+        0,
+        lunet_advisory_lock::PRIMARY_TIMEOUT_MS,
+    )
+    .expect("first crash boot");
     let first = NodeId::from(first_boot.own_id());
     drop(first_boot);
 
-    let second_boot = Node::open(&members, "n2", &state_str, None, 0).expect("second crash boot");
+    let second_boot = Node::open(
+        &members,
+        "n2",
+        &state_str,
+        None,
+        0,
+        lunet_advisory_lock::PRIMARY_TIMEOUT_MS,
+    )
+    .expect("second crash boot");
     let second = NodeId::from(second_boot.own_id());
     assert!(first.is_lawful(), "the first announced identity is lawful");
     assert!(
@@ -159,7 +190,15 @@ fn the_announced_identity_names_the_descriptor_system_and_the_markers_next_life(
     let members = members_string(&[3, 2, 1]);
     let state_str = state.to_str().expect("utf8 path").to_owned();
 
-    let node = Node::open(&members, "n1", &state_str, None, 0).expect("the boot opens");
+    let node = Node::open(
+        &members,
+        "n1",
+        &state_str,
+        None,
+        0,
+        lunet_advisory_lock::PRIMARY_TIMEOUT_MS,
+    )
+    .expect("the boot opens");
     let announced = NodeId::from(node.own_id());
     assert_eq!(
         announced.system_id().map(SystemId::get),

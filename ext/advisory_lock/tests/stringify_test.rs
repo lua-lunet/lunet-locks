@@ -62,6 +62,7 @@ fn the_booted_status_spells_its_state_name() {
         dir.join("state").to_str().unwrap(),
         None,
         0,
+        lunet_advisory_lock::PRIMARY_TIMEOUT_MS,
     )
     .expect("the node boots");
     assert_eq!(node.idle(), OK);

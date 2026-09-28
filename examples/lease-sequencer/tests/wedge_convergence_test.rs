@@ -214,6 +214,7 @@ fn leader_kill_restart_converges_through_the_limbos_poll() {
                     &format!("{ROOT}/n{}.state", index + 1),
                     None,
                     0,
+                    lunet_advisory_lock::PRIMARY_TIMEOUT_MS,
                 )
                 .expect("node open"),
                 watch: None,
@@ -264,6 +265,7 @@ fn leader_kill_restart_converges_through_the_limbos_poll() {
         &format!("{ROOT}/n{}.state", leader + 1),
         None,
         0,
+        lunet_advisory_lock::PRIMARY_TIMEOUT_MS,
     )
     .expect("the restart boots");
     fabric.hosts[leader].node = fresh;

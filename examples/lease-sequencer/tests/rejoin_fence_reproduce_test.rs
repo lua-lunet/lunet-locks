@@ -145,8 +145,15 @@ fn open_crashed_n3(dir: &std::path::Path) -> Node {
     let state = dir.join("n3.state");
     std::fs::write(&state, "3 1 unflushed\n").expect("the captured boot state");
     let members = ["65537:n1", "131073:n2", "196609:n3"].join("\0");
-    Node::open(&members, "n3", state.to_str().expect("utf8 path"), None, 0)
-        .expect("the boot gate classifies the crashed marker and the node opens")
+    Node::open(
+        &members,
+        "n3",
+        state.to_str().expect("utf8 path"),
+        None,
+        0,
+        lunet_advisory_lock::PRIMARY_TIMEOUT_MS,
+    )
+    .expect("the boot gate classifies the crashed marker and the node opens")
 }
 
 /// The fenced node's host loop (`main.rs::timers`, reduced to what a
