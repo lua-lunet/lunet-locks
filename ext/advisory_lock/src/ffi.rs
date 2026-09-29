@@ -1,5 +1,5 @@
 //! Host-side FFI adapter between the LuaJIT host and the uVRR core
-//! (vrr-core, uvrr-core tag v0.8.0 @ 450dcab — the lifecycle boot gate; the core's constructors all sit in `node_from_sink` in this file: `lifecycle::boot` :2035, `Replica::reincarnate` :2379, `Replica::resume` :2393, `Replica::join` :2407, `Replica::provision` :2418).
+//! (uvrr-core tag v0.11.0 @ bef2d42 — the lifecycle boot gate; the core's constructors all sit in `node_from_sink` in this file: `lifecycle::boot` :2035, `Replica::reincarnate` :2379, `Replica::resume` :2393, `Replica::join` :2407, `Replica::provision` :2418).
 //!
 //! Concrete core: `Replica<SegmentedLog, WeightedMajority>` running
 //! `Stability::Volatile` — nothing is persisted but the boot gate's
@@ -124,7 +124,7 @@
 //!   sequence/parent, quorum write with forced I/O verified at the 3/4
 //!   threshold, quorum read resolving by highest sequence at the 2/4
 //!   threshold, through the AOF C ABI's marker exports and linked
-//!   statically so this cdylib stays self-contained); the item08 single
+//!   statically so this cdylib stays self-contained); the single
 //!   fsynced flag file remains as the compatibility projection — written
 //!   after every quorum write, never a classification input. An
 //!   unreadable marker quorum refuses the boot
@@ -269,8 +269,7 @@ use crate::marker_store::{GateStore, SinkDoor, drain_sink, sink_guard};
 /// Upstream (`uvrr-core`) has no equivalent helper — its
 /// `src/invariant.rs` names drops through the `Diagnostic` observation and
 /// faults impossible local transitions, but neither asserts nor warns; the
-/// convention is proposed upstream in the drafted issue (see
-/// `.tmp/delegation/item13-upstream-invariant-issue.md`) and this macro is
+/// convention is proposed upstream and this macro is
 /// the reference implementation. It is exported so downstream embedders
 /// (e.g. the `lease-sequencer` example) report their host-side maybes under
 /// the same convention.
@@ -3086,7 +3085,7 @@ pub unsafe extern "C" fn lunet_lock_node_recover(node: *mut c_void) -> i32 {
 /// reports STOPPED and processes nothing — then the `stopped` marker, the
 /// sink drain to quiescence, and the `flushed` marker, in the contract's
 /// §2 write order. Synchronous on the caller's thread: no thread spawn,
-/// no callback, no yield (the item07 invariants). Idempotent.
+/// no callback, no yield — the stop-contract invariants. Idempotent.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lunet_lock_node_stop(node: *mut c_void) -> i32 {
     guarded(|| unsafe { node.cast::<Node>().as_mut().map_or(INVALID, Node::stop) })
@@ -3232,57 +3231,345 @@ pub unsafe extern "C" fn lunet_lock_node_next(
 
 #[cfg(test)]
 mod tests {
-    #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
+    use super::*;
+    use lunet_locks_aof::marker;
+    use std::fs;
+    use std::sync::PoisonError;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// The two-member descriptor: the smallest cluster whose client
+    /// proposals round-trip the wire (the leader's phase-2 needs the
+    /// follower's ack). Each member's id is its provisioned identity —
+    /// its own system half, crash counter 1.
+    const MEMBERS_TWO: &str = "65537:n1\0131073:n2";
+
+    /// One full exchange: every queued send is delivered to the member
+    /// whose live identity carries the addressed system half (the
+    /// transport's remap: a bumped life answers its old address), and the
+    /// cascade repeats until the wire goes quiet, inside a bound. The
+    /// outputs a node queues for its own caller (the replies) are NOT
+    /// wire traffic: they are returned in arrival order.
+    #[allow(clippy::type_complexity)]
+    fn exchange_all(nodes: &mut [&mut Node], rounds: usize) -> Vec<(u32, [u8; 16], Vec<u8>)> {
+        let mut replies = Vec::new();
+        for _ in 0..rounds {
+            let mut wire: Vec<(u32, u32, Vec<u8>)> = Vec::new();
+            for node in nodes.iter_mut() {
+                while let Some(output) = node.next_output() {
+                    if output.kind == OUTPUT_SEND {
+                        wire.push((node.own_id(), output.to, output.bytes));
+                    } else {
+                        replies.push((node.own_id(), output.message_id, output.bytes));
+                    }
+                }
+            }
+            if wire.is_empty() {
+                return replies;
+            }
+            for (from, to, bytes) in wire {
+                let target = nodes
+                    .iter_mut()
+                    .find(|node| node.own_id() >> SYSTEM_HALF_SHIFT == to >> SYSTEM_HALF_SHIFT);
+                if let Some(target) = target {
+                    target.receive(from, &bytes);
+                }
+            }
+        }
+        replies
+    }
+
+    /// The two-node prod-shape cluster settles: both members drive ticks
+    /// (the wall clock given its next millisecond), the wire exchanges,
+    /// and both report Normal.
+    fn settle_two(primary: &mut Node, follower: &mut Node) {
+        for _ in 0..1_000 {
+            std::thread::sleep(Duration::from_millis(1));
+            primary.idle();
+            follower.idle();
+            let _ = exchange_all(&mut [primary, follower], 64);
+            if primary.status().state == 0
+                && follower.status().state == 0
+                && primary.status().leader == primary.own_id()
+            {
+                return;
+            }
+        }
+        panic!("the two-node cluster did not settle inside the bound");
+    }
+
+    /// The single-member descriptor: a one-node cluster elects its own
+    /// leader, so every lifecycle shape is drivable alone.
+    const MEMBERS_ONE: &str = "65537:n1";
+    const OWN_ONE: &str = "n1";
+    /// The genesis pair (system 1, life 1) as the wire names it.
+    const GENESIS_ID: u32 = 65_537;
+
+    /// The scratch tree, inside the repo (`.tmp` is scratch).
+    fn scratch(name: &str) -> PathBuf {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.tmp/ffi-state-machine");
+        fs::create_dir_all(&root).expect("the scratch root creates");
+        let dir = root.join(format!(
+            "{name}-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::SeqCst)
+        ));
+        fs::create_dir_all(&dir).expect("the case directory creates");
+        dir
+    }
+
+    /// The single-node compliance boot over a scratch state path: the
+    /// executor's logical clock, the corpus's opaque boundary.
+    fn one_node_compliance(state: &Path) -> Node {
+        Node::open_compliance(MEMBERS_ONE, OWN_ONE, &state.to_string_lossy(), 50)
+            .expect("the first life boots")
+    }
+
+    /// The settle loop: tick under the logical clock and drain the wire
+    /// until the node reports Normal, inside a bound that a stuck node
+    /// exceeds and fails. Returns the clock it left off at.
+    fn settle(node: &mut Node) -> u64 {
+        let mut clock = 0u64;
+        for _ in 0..1_000 {
+            clock += 1;
+            node.set_compliance_clock(clock);
+            node.idle();
+            while node.next_output().is_some() {}
+            if node.status().state == 0 {
+                return clock;
+            }
+        }
+        panic!("the single node did not settle inside the bound");
+    }
+
+    /// The superblock file a state path carries.
+    fn superblock_of(state: &Path) -> PathBuf {
+        let mut os = state.as_os_str().to_os_string();
+        os.push(".superblock");
+        PathBuf::from(os)
+    }
+
+    /// The quorum copies' verdict: the identity pair and the engine state.
+    fn copies(state: &Path) -> (u16, u16, marker::MarkerState) {
+        marker::classify(&superblock_of(state))
+            .map(|classified| {
+                (
+                    classified.identity.system_identifier(),
+                    classified.identity.crash_counter(),
+                    classified.state,
+                )
+            })
+            .expect("the quorum copies read")
+    }
+
+    /// The compatibility projection's line: `system crash word`.
+    fn projection(state: &Path) -> String {
+        fs::read_to_string(state).expect("the projection reads")
+    }
+
+    /// The boot gate's marker-round schedule, in write order.
+    fn marker_schedule(node: &Node) -> Vec<String> {
+        node.marker_log()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// The first life anchors the genesis pair (the descriptor's system
+    /// half, crash counter 1) and the boot itself emits nothing; after a
+    /// crash (the drop without the stop contract) the NEXT boot's decided
+    /// identity is the bumped life, durable before any emission — the
+    /// emission gate's round already landed by the time `Node::open`
+    /// returns.
     #[test]
     fn first_boot_anchors_the_genesis_life_and_the_crash_bump_is_durable_at_boot() {
-        panic!(
-            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
-        )
+        let dir = scratch("first-boot");
+        let state = dir.join("node.state");
+        // The first boot: no marker anywhere. The genesis life is anchored.
+        let mut node = one_node_compliance(&state);
+        assert_eq!(
+            node.own_id(),
+            GENESIS_ID,
+            "the genesis pair (system 1, life 1)"
+        );
+        assert!(
+            node.next_output().is_none(),
+            "the boot itself emits nothing: a reopened node answers only what it is driven with"
+        );
+        assert_eq!(
+            copies(&state),
+            (1, 1, marker::MarkerState::Unflushed),
+            "the first latch anchors the running sentinel"
+        );
+        assert_eq!(projection(&state), "1 1 unflushed\n");
+        // The crash: dropped without the stop contract — the running
+        // sentinel stands for the next boot's classification.
+        drop(node);
+        // The bumped boot: the identity is the strict next life, and the
+        // emission gate's round is already durable when open returns.
+        let mut life_two = one_node_compliance(&state);
+        assert_eq!(life_two.own_id(), 65_538, "the crash counter bumped");
+        assert_eq!(
+            copies(&state),
+            (1, 2, marker::MarkerState::Unflushed),
+            "the emission gate's round: the next life at the running sentinel, durable before any emission"
+        );
+        assert_eq!(projection(&state), "1 2 unflushed\n");
+        assert!(
+            life_two.next_output().is_none(),
+            "the announcement waits for the fenced-boot drive, never the boot"
+        );
     }
 
-    #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
+    /// The dirty restart's announced identity is the marker pair's strict
+    /// next life: it never reuses the old id, and a chain of crashes walks
+    /// the counter one life at a time — no value is ever revisited.
     #[test]
-    fn the_boot_gate_refuses_malformed_identities_and_exhausted_counters() {
-        panic!(
-            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
-        )
-    }
-
-    /// The recovery boundary executes the configured variant's flush exactly
-    /// at the crashed classification: its latency is reported, a re-crash
-    /// replay reports it again (the pair is re-decided from the landed
-    /// round), and a clean continue never flushes.
-    #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
-    #[test]
-    fn dirty_boot_executes_the_recovery_flush_clean_continue_does_not() {
-        panic!(
-            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
-        )
+    fn reincarnated_identity_never_reuses_the_old_id() {
+        let dir = scratch("no-reuse");
+        let state = dir.join("node.state");
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            let node = one_node_compliance(&state);
+            let live = node.own_id();
+            assert!(
+                !seen.contains(&live),
+                "the identity {live} was already used by an earlier life"
+            );
+            let counter = NodeId(live).crash_counter().expect("a lawful life").get();
+            assert_eq!(
+                counter as usize,
+                seen.len() + 1,
+                "each life is one counter advance past the last identity the disk saw"
+            );
+            seen.push(live);
+            // The running sentinel is a crash: the drop walks the counter.
+            drop(node);
+        }
     }
 
     /// The crash bump's marker round lands at the crashed classification
     /// (the emission gate), copy-free rig state included: a single-file
     /// projection in the running sentinel's spelling classifies crashed,
     /// the bump round writes the quorum copies and the projection.
-    #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
     #[test]
     fn existing_unflushed_files_boot_the_emission_gate_round() {
-        panic!(
-            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
-        )
+        let dir = scratch("emission-gate");
+        let state = dir.join("node.state");
+        // The copy-free rig state: the projection alone, at the running
+        // sentinel — a crash by classification, no superblock anywhere.
+        fs::write(&state, "1 1 unflushed\n").expect("the projection writes");
+        assert!(!superblock_of(&state).exists(), "no quorum copies yet");
+        // The crashed classification: the bump is decided at boot and the
+        // emission gate lands its one durable round — the quorum copies
+        // AND the projection — before the driver releases the first
+        // announcement.
+        let mut node = one_node_compliance(&state);
+        assert_eq!(node.own_id(), 65_538, "the strict next life");
+        assert_eq!(copies(&state), (1, 2, marker::MarkerState::Unflushed));
+        assert_eq!(projection(&state), "1 2 unflushed\n");
+        assert!(
+            node.next_output().is_none(),
+            "the round is durable before any announcement the drive releases"
+        );
+        // The unseated window's stop: the wire closes, the sink drains,
+        // and NO marker round is lawful — the markers hold the emission
+        // gate's round for the next boot's derivation.
+        let before = marker_schedule(&node);
+        assert_eq!(node.stop(), OK, "the unseated stop drains and exits");
+        assert!(
+            !before.iter().any(|op| op.starts_with("commit:Stopping")),
+            "no halt round runs: the session is not latched in the unseated window"
+        );
+        assert_eq!(copies(&state), (1, 2, marker::MarkerState::Unflushed));
+        let next_life = one_node_compliance(&state);
+        assert_eq!(
+            next_life.own_id(),
+            65_539,
+            "the next boot derives the next life"
+        );
     }
 
-    /// The migration path, the clean-stop spelling: a copy-free rig
-    /// state whose single file reads `flushed` (the pre-routing boot's
-    /// end state) migrates at boot — the classification reads the file,
-    /// the first routed write seeds the copies, and the boot continues
-    /// under the SAME identity.
-    #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
+    /// The migration path, the clean-stop spelling: a copy-free rig state
+    /// whose single file reads `flushed` (the pre-routing boot's end
+    /// state) migrates at boot — the classification reads the file, the
+    /// first routed write seeds the copies, and the boot continues under
+    /// the SAME identity.
     #[test]
     fn legacy_flushed_file_migrates_and_continues_clean() {
-        panic!(
-            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        let dir = scratch("legacy-migration");
+        let state = dir.join("node.state");
+        fs::write(&state, "1 1 flushed\n").expect("the legacy projection writes");
+        // The clean classification reads the file (no copies to read): the
+        // same identity resumes, and the clean latch's one round — the
+        // first routed write — seeds the quorum copies from the file's
+        // own state.
+        let mut node = one_node_compliance(&state);
+        assert_eq!(node.own_id(), GENESIS_ID, "the migration never bumps");
+        assert_eq!(
+            copies(&state),
+            (1, 1, marker::MarkerState::Unflushed),
+            "the clean latch seeded the copies at the file's identity"
+        );
+        assert_eq!(projection(&state), "1 1 unflushed\n");
+        // The migrated node serves the ordinary lifecycle: settle, stop,
+        // and the next boot continues under the same identity.
+        settle(&mut node);
+        assert_eq!(node.stop(), OK);
+        assert_eq!(copies(&state), (1, 1, marker::MarkerState::Flushed));
+        let resumed = one_node_compliance(&state);
+        assert_eq!(
+            resumed.own_id(),
+            GENESIS_ID,
+            "the clean continue never bumps"
+        );
+    }
+
+    /// The boot gate refuses every marker it cannot classify: a zero half
+    /// is no identity (the projection's parser refuses it, no identity is
+    /// guessed), an unreadable line is no marker, and a full crash counter
+    /// cannot be bumped — the exhausted identity refuses the boot rather
+    /// than serving under a recycled value.
+    #[test]
+    fn the_boot_gate_refuses_malformed_identities_and_exhausted_counters() {
+        let dir = scratch("boot-refusals");
+        let cases: &[(&str, &str)] = &[
+            ("zero-system", "0 1 unflushed\n"),
+            ("zero-counter", "1 0 flushed\n"),
+            ("garbage", "not a marker line\n"),
+            ("one-field", "65537\n"),
+            ("unknown-word", "1 1 ancient\n"),
+        ];
+        for (name, line) in cases {
+            let state = dir.join(format!("{name}.state"));
+            fs::write(&state, line).expect("the malformed marker writes");
+            assert_eq!(
+                Node::open_compliance(MEMBERS_ONE, OWN_ONE, &state.to_string_lossy(), 50).err(),
+                Some(CONFIG),
+                "the boot refuses the malformed marker {name}"
+            );
+            assert_eq!(
+                projection(&state),
+                *line,
+                "the refused boot rewrites nothing"
+            );
+        }
+        // The exhausted counter: the marker names the last lawful life
+        // (crash counter 65535, the u16 ceiling), so the replacement pair
+        // cannot be spelled — the boot refuses.
+        let state = dir.join("exhausted.state");
+        marker::write(
+            &superblock_of(&state),
+            marker::NodeIdentity::new(1, u16::MAX).expect("the ceiling pair spells"),
+            marker::MarkerState::Unflushed,
         )
+        .expect("the ceiling round writes");
+        fs::write(&state, format!("1 {} unflushed\n", u16::MAX)).expect("the projection writes");
+        assert_eq!(
+            Node::open_compliance(MEMBERS_ONE, OWN_ONE, &state.to_string_lossy(), 50).err(),
+            Some(CONFIG),
+            "the exhausted identity refuses the boot"
+        );
     }
 
     /// The purge's law at the boot gate: copies that exist but cannot be
@@ -3291,126 +3578,673 @@ mod tests {
     /// torn-away shape: three copies' zones read short (never fully
     /// written), so only one readable copy stands — below the 2/4 open
     /// threshold, no verdict, the boot refuses.
-    #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
     #[test]
     fn an_unreadable_marker_quorum_refuses_the_boot() {
-        panic!(
-            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
-        )
+        let dir = scratch("unreadable-quorum");
+        let state = dir.join("node.state");
+        // The clean-stop artifact: flushed at the genesis pair.
+        let mut node = one_node_compliance(&state);
+        settle(&mut node);
+        assert_eq!(node.stop(), OK);
+        assert_eq!(copies(&state), (1, 1, marker::MarkerState::Flushed));
+        // The tear: the file is cut inside copy 1's zone (the zones are
+        // the file's four uniform spans), so copy 0 is the only fully
+        // readable copy — below the 2/4 open threshold.
+        let full = fs::read(&superblock_of(&state)).expect("the store reads");
+        let zone = full.len() / marker::geometry().expect("the geometry reports").copies;
+        let torn = &full[..zone + zone / 2];
+        fs::write(&superblock_of(&state), torn).expect("the tear writes");
+        let projection_before = projection(&state);
+        // The boot refuses: no quorum, no verdict, no identity guessed —
+        // and the projection never rescues the unreadable quorum.
+        assert_eq!(
+            Node::open_compliance(MEMBERS_ONE, OWN_ONE, &state.to_string_lossy(), 50).err(),
+            Some(CONFIG),
+            "the unreadable quorum refuses the boot"
+        );
+        assert_eq!(
+            fs::read(&superblock_of(&state)).expect("the store reads"),
+            torn,
+            "the refused boot rewrites nothing"
+        );
+        assert_eq!(projection(&state), projection_before);
     }
 
     /// THE BOOT-READ SAFETY LAW: a bad checksum on ANY copy is a loud log
     /// and a panic — the boot refuses loudly and the store never clears,
     /// repairs, or falls back from a bad block. The lifecycle reaches its
-    /// clean-stop end state, one copy's zone is rotted (garbage over its
-    /// leading sector), and the next boot panics inside the boot gate —
+    /// clean-stop end state, one copy's zone is rotted (garbage over the
+    /// whole zone), and the next boot panics inside the boot gate —
     /// `Node::open`'s boundary reports it as the PANIC code — with the
     /// corrupted bytes standing exactly as they were: no self-heal.
-    #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
     #[test]
     fn a_rotted_marker_copy_panics_the_boot_and_is_never_healed() {
-        panic!(
-            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
-        )
+        let dir = scratch("rotted-copy");
+        let state = dir.join("node.state");
+        let mut node = one_node_compliance(&state);
+        settle(&mut node);
+        assert_eq!(node.stop(), OK);
+        assert_eq!(copies(&state), (1, 1, marker::MarkerState::Flushed));
+        // The rot: garbage over copy 2's whole zone — a checksum failure
+        // on a readable copy, not a tear. The zones are the file's four
+        // uniform spans.
+        let record = superblock_of(&state);
+        let before = fs::read(&record).expect("the store reads");
+        let zone_count = marker::geometry().expect("the geometry reports").copies;
+        let zone = before.len() / zone_count;
+        let mut rotted = before.clone();
+        let start = 2 * zone;
+        for byte in &mut rotted[start..start + zone] {
+            *byte = 0xA5;
+        }
+        fs::write(&record, &rotted).expect("the rot writes");
+        let inspected = marker::inspect(&record).expect("the store inspects");
+        assert_eq!(inspected[2].valid_checksum, 0, "copy 2 rotted");
+        assert!(
+            inspected
+                .iter()
+                .enumerate()
+                .all(|(index, one)| index == 2 || one.valid_checksum != 0),
+            "the other three copies stand"
+        );
+        // The next boot panics inside the boot gate; the boundary reports
+        // the PANIC code — the call returns, it never hangs.
+        assert_eq!(
+            Node::open_compliance(MEMBERS_ONE, OWN_ONE, &state.to_string_lossy(), 50).err(),
+            Some(PANIC),
+            "the boot refuses loudly, never hangs"
+        );
+        // The rot stands after the refused boot: no self-heal.
+        assert_eq!(
+            fs::read(&record).expect("the store reads"),
+            rotted,
+            "the corrupt bytes stand exactly as written"
+        );
+        assert_eq!(
+            marker::classify(&superblock_of(&state)),
+            Err(marker::CORRUPT),
+            "the read refuses again: nothing was healed"
+        );
     }
 
     /// The clean-stop lifecycle end to end through `Node::open` and
     /// `Node::stop`: the stopped node's marker reads clean on the next
     /// boot — same identity, no bump, no reincarnation announcement, the
-    /// running sentinel rewritten as operating begins.
-    #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
+    /// running sentinel rewritten as operating begins. The drain-window
+    /// view record comes back: the node resumes at the view it stopped
+    /// at, not the genesis view.
     #[test]
     fn clean_stop_boot_continues_the_same_incarnation_no_bump() {
-        panic!(
-            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
-        )
+        let dir = scratch("clean-stop");
+        let state = dir.join("node.state");
+        // The first life: settle, then advance the view — the balloted
+        // force view is the host's own detector conclusion (§14.2). The
+        // drives stay inside the primary-timeout window: the loop breaks
+        // the moment the new view installs Normal.
+        let mut node = one_node_compliance(&state);
+        let mut clock = settle(&mut node);
+        assert_eq!(node.force_view(1, 2), OK, "the forced view advances");
+        let mut installed = false;
+        for _ in 0..40 {
+            clock += 1;
+            node.set_compliance_clock(clock);
+            node.idle();
+            while node.next_output().is_some() {}
+            if node.status().view == 2 && node.status().state == 0 {
+                installed = true;
+                break;
+            }
+        }
+        assert!(installed, "the new view installs Normal inside the bound");
+        assert_eq!(node.status().view, 2, "the new view installs");
+        // The graceful stop: the halt's two rounds with the drain between.
+        assert_eq!(node.stop(), OK);
+        assert_eq!(copies(&state), (1, 1, marker::MarkerState::Flushed));
+        // The drain window's own durable write: the view record.
+        assert_eq!(
+            fs::read_to_string(view_record_path(&state)).expect("the view record reads"),
+            "1 2\n",
+            "the drain window wrote the ballot the node held"
+        );
+        // The clean start: the same identity, the stopped view restored.
+        let mut resumed = one_node_compliance(&state);
+        assert_eq!(resumed.own_id(), GENESIS_ID, "the clean start never bumps");
+        assert_eq!(resumed.status().view, 2, "the view record restores");
+        assert!(!resumed.status().poisoned);
+        // No reincarnation announcement: the resumed node's first drives
+        // announce nothing — a clean resume carries no pair.
+        assert!(resumed.next_output().is_none(), "no announcement at boot");
+        resumed.set_compliance_clock(20_000);
+        assert_eq!(resumed.recover(), OK, "the resumed node drives");
+        while resumed.next_output().is_some() {}
+        assert!(
+            !marker_schedule(&resumed)
+                .iter()
+                .any(|op| op.contains("Joining@") && op.ends_with("@131074")),
+            "no bump round: the same incarnation continues"
+        );
     }
 
-    /// The mandatory obligation's proof: once stopped, NO
-    /// further inbound entry is picked up — request, receive, ticks, and
-    /// the admin drives all refuse, and the node's state stays exactly as
-    /// the drain point left it. RED before the lifecycle landed: there
-    /// was no stop and no refusal.
-    #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
+    /// The mandatory obligation's proof: once stopped, NO further inbound
+    /// entry is picked up — request, receive, ticks, and the admin drives
+    /// all refuse, and the node's state stays exactly as the drain point
+    /// left it.
     #[test]
     fn stopped_node_refuses_every_inbound_entry_and_the_state_is_final() {
-        panic!(
-            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
-        )
+        let dir = scratch("stopped-refusals");
+        let state = dir.join("node.state");
+        let mut node = one_node_compliance(&state);
+        settle(&mut node);
+        assert_eq!(node.stop(), OK, "the graceful stop");
+        let final_status = node.status();
+        // Every inbound entry refuses with the drain point's code.
+        assert_eq!(node.request(b"{\"op\":\"get\",\"message_id\":\"00000000-0000-0000-0000-000000000001\",\"client_id\":1,\"request_num\":1,\"lock_id\":1}"), STOPPED);
+        assert_eq!(node.receive(GENESIS_ID, &[0, 1, 2]), STOPPED);
+        assert_eq!(node.idle(), STOPPED);
+        assert_eq!(node.leader_timeout(), STOPPED);
+        assert_eq!(node.force_view(1, 3), STOPPED);
+        assert_eq!(
+            node.reconfigure(RECONFIGURE_JOIN, 131_074, POSITION_APPEND),
+            STOPPED
+        );
+        assert_eq!(node.recover(), STOPPED);
+        // The state is final: exactly as the drain point left it.
+        let after = node.status();
+        assert_eq!(after.era, final_status.era);
+        assert_eq!(after.view, final_status.view);
+        assert_eq!(after.state, final_status.state);
+        assert_eq!(after.leader, final_status.leader);
+        assert!(node.next_output().is_none(), "the refusals queue nothing");
+        // The stop is idempotent: a second stop reports OK, writes nothing.
+        let schedule = marker_schedule(&node);
+        assert_eq!(node.stop(), OK);
+        assert_eq!(marker_schedule(&node), schedule);
     }
 
     /// The stop path's write ordering with the async AOF sink (§2): the
-    /// `flushed` marker is written only after the writer drained, so
-    /// every event enqueued before the stop is durable on disk by the
-    /// time the marker lands. RED before the drain existed (no stop, no
-    /// marker writes at all).
-    #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
+    /// `flushed` marker is written only after the writer drained, so every
+    /// event enqueued before the stop is durable on disk by the time the
+    /// marker lands. The contract's failure arm is the mirror: a failed
+    /// drain-window write reports SERVICE with the markers standing at the
+    /// halt's first round — a death past the first round reads crashed, the
+    /// purge's law: nothing vouches before the drain.
     #[test]
     fn stop_drains_the_aof_writer_before_the_flushed_marker() {
-        panic!(
-            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        let dir = scratch("aof-drain");
+        // The AOF-backed leader over the two-member cluster: the
+        // committed-transition hook enqueues to the write-behind writer.
+        let aof_dir = dir.join("aof");
+        let mut primary = Node::open_aof(
+            MEMBERS_TWO,
+            OWN_ONE,
+            &dir.join("n1.state").to_string_lossy(),
+            &aof_dir.to_string_lossy(),
+            None,
         )
+        .expect("the AOF-backed boot");
+        let mut follower = Node::open(
+            MEMBERS_TWO,
+            "n2",
+            &dir.join("n2.state").to_string_lossy(),
+            None,
+            0,
+            PRIMARY_TIMEOUT_MS,
+        )
+        .expect("the follower boots");
+        settle_two(&mut primary, &mut follower);
+        // A holder-changing SET: the Hold transition enqueues to the AOF.
+        let set = b"{\"op\":\"set\",\"message_id\":\"00000001-0000-0000-0000-0000000000aa\",\"client_id\":1,\"request_num\":1,\"lock_id\":1,\"lease\":{\"lease_id\":1,\"holder\":\"00000001-0000-0000-0000-0000000000bb\",\"lease_ms\":1000}}";
+        assert_eq!(primary.request(set), OK, "the SET proposes");
+        let committed_before = primary.frontiers().1;
+        let mut committed = false;
+        for _ in 0..1_000 {
+            std::thread::sleep(Duration::from_millis(1));
+            primary.idle();
+            follower.idle();
+            let _ = exchange_all(&mut [&mut primary, &mut follower], 64);
+            if primary.frontiers().1 > committed_before {
+                committed = true;
+                break;
+            }
+        }
+        assert!(committed, "the SET commits inside the bound");
+        // The graceful stop: the schedule is the halt's two rounds with
+        // the drain strictly between them.
+        assert_eq!(primary.stop(), OK);
+        let schedule = marker_schedule(&primary);
+        let tail = &schedule[schedule.len() - 3..];
+        assert!(
+            tail[0].starts_with("commit:Stopping@")
+                && tail[1] == "drain"
+                && tail[2].starts_with("commit:Stopped@"),
+            "the halt schedule is first round, drain, second round; got {tail:?}"
+        );
+        // Every event enqueued before the stop is durable on disk: the
+        // AOF series carries the Hold record the drain flushed.
+        let mut durable = Vec::new();
+        for entry in fs::read_dir(&aof_dir).expect("the AOF series reads") {
+            let path = entry.expect("the entry reads").path();
+            if path.extension().map_or(false, |ext| ext == "bin") {
+                durable.extend(journal::parse_file(
+                    &fs::read(&path).expect("the file reads"),
+                ));
+            }
+        }
+        assert!(
+            durable
+                .iter()
+                .any(|event| event.kind == journal::KIND_HOLD && event.lock_id == 1),
+            "the Hold event is durable in the AOF series: {durable:?}"
+        );
     }
 
-    #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
+    /// The StoppingNotFlushed shape, as the adapter returns it TODAY: the
+    /// drain-window write failing reports SERVICE with the markers at the
+    /// halt's first round (`Stopping`), and the next boot classifies
+    /// crashed — nothing vouches before the drain. The operator-surface
+    /// Sorry{runbook} verdict is the matcher's opinion; the adapter's
+    /// contract here is the SERVICE refusal and the crashed next boot.
     #[test]
-    fn status_and_leader_report_the_published_view() {
-        panic!(
-            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
-        )
+    fn a_failed_drain_window_write_reports_service_and_the_markers_stand_at_the_first_round() {
+        let dir = scratch("stopping-not-flushed");
+        let state = dir.join("node.state");
+        let mut node = one_node_compliance(&state);
+        settle(&mut node);
+        // The obstruction: a DIRECTORY where the drain window's view
+        // record would land — the rename fails, the drain never runs.
+        fs::create_dir(view_record_path(&state)).expect("the obstruction places");
+        assert_eq!(node.stop(), SERVICE, "the failed write reports SERVICE");
+        // The markers stand at the halt's first round: the projection
+        // spells the first round's word, the schedule has no second round.
+        assert_eq!(projection(&state), "1 1 stopped\n");
+        let schedule = marker_schedule(&node);
+        let last = schedule.last().expect("a schedule");
+        assert!(
+            last.starts_with("commit:Stopping@"),
+            "the halt's first round is the last completed transition: {schedule:?}"
+        );
+        // The next boot re-classifies crashed: the strictly next life.
+        let life_two = one_node_compliance(&state);
+        assert_eq!(
+            life_two.own_id(),
+            65_538,
+            "nothing vouches before the drain"
+        );
     }
 
-    #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
-    #[test]
-    fn abi_new_status_next_and_free_round_trip() {
-        panic!(
-            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
-        )
-    }
-
-    #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
+    /// The member buffer's grammar is the descriptor: every violation is a
+    /// CONFIG refusal at `Node::open` — no members, an unparseable entry,
+    /// an empty name, duplicate ids, duplicate names, an `own` that names
+    /// no member, a `:j` entry in the founding succession.
     #[test]
     fn node_new_refuses_bad_membership() {
-        panic!(
-            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
-        )
+        let dir = scratch("bad-membership");
+        let state = dir.join("node.state");
+        let empty = "";
+        let cases: &[(&str, &str)] = &[
+            ("no-members", empty),
+            ("unparseable", "65537"),
+            ("empty-name", "65537:"),
+            ("duplicate-id", "65537:n1\0:-"),
+            ("duplicate-ids", "65537:n1\065537:n2"),
+            ("duplicate-names", "65537:n1\065538:n1"),
+            ("own-absent", "65537:n1\065538:n2"),
+        ];
+        for (name, members) in cases {
+            assert_eq!(
+                Node::open(
+                    members,
+                    OWN_ONE,
+                    &state.to_string_lossy(),
+                    None,
+                    0,
+                    PRIMARY_TIMEOUT_MS,
+                )
+                .err(),
+                Some(CONFIG),
+                "the descriptor refuses {name}"
+            );
+        }
+        // The absent `own` by name: ids and names both unique, but `own`
+        // names neither member.
+        assert_eq!(
+            Node::open(
+                "65537:n1\065538:n2",
+                "n3",
+                &state.to_string_lossy(),
+                None,
+                0,
+                PRIMARY_TIMEOUT_MS,
+            )
+            .err(),
+            Some(CONFIG),
+            "the descriptor refuses an own that names no member"
+        );
     }
 
-    /// Mirrors upstream's `tests/reincarnation.rs::reincarnate_backup`
-    /// (class B) plus the membership-discard (class E) and learner (class
-    /// F) classes, through the adapter ABI: a backup crashed while running
-    /// — the durable marker holds the running sentinel, so the restart is
-    /// dirty by construction — bumps its identity, announces the
-    /// `(old, new)` pair, and the leader drives the forced sequence one
-    /// batch per era until the new identity sits at weight 1 in the old
-    /// succession position and the old identity is evicted. The
-    /// reincarnated node reopens over the deployment's genesis (the honest
-    /// Volatile `restart_as`), stays fenced, and acquires nothing — the
-    /// learner's streamed catch-up is upstream §10 future work, so the
-    /// named drops are the proof of arrival and no lock state is
-    /// fabricated.
-    #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
-    #[test]
-    fn reincarnation_abi_runs_the_two_era_resurrection() {
-        panic!(
-            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
-        )
-    }
-
-    #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
+    /// The descriptor's provisioned-identity law, through the C ABI: a
+    /// member id whose system half is zero (no system assigned) or whose
+    /// crash half is not the genesis life (not a provisioned identity)
+    /// refuses `lunet_lock_node_new` — the marker's counter carries the
+    /// life, the descriptor's ids are all counter 1.
     #[test]
     fn abi_refuses_unlawful_descriptor_ids() {
-        panic!(
-            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
-        )
+        let dir = scratch("unlawful-ids");
+        let state = dir.join("node.state");
+        let state_text = state.to_string_lossy().into_owned();
+        let journal = "";
+        let cases: &[(&str, &str)] = &[
+            ("zero-system-half", "1:n1"),
+            ("crash-half-not-one", "65539:n1"),
+            ("zero-id", "0:n1"),
+        ];
+        for (name, members) in cases {
+            let mut out: *mut c_void = std::ptr::null_mut();
+            let code = unsafe {
+                lunet_lock_node_new(
+                    members.len(),
+                    members.as_ptr(),
+                    OWN_ONE.len(),
+                    OWN_ONE.as_ptr(),
+                    state_text.len(),
+                    state_text.as_ptr(),
+                    journal.len(),
+                    journal.as_ptr(),
+                    0,
+                    &raw mut out,
+                )
+            };
+            assert_eq!(code, CONFIG, "the ABI refuses {name}");
+        }
     }
 
-    #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
+    /// The lock-event journal records the committed transitions in order
+    /// (the Hold, the Release), rolls the event file at the configured
+    /// threshold, and writes the atomic metafile per rolled file — the
+    /// observability replay surface reads every record back.
     #[test]
     fn journal_records_committed_transitions_with_roll_and_meta() {
-        panic!(
-            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        let dir = scratch("journal-roll");
+        let journal_dir = dir.join("journal");
+        // The two-node prod rig: the leader executes the Service and the
+        // blocking journal records the transitions. The roll threshold is
+        // two records and a bit: the third record rolls the file.
+        let mut primary = Node::open(
+            MEMBERS_TWO,
+            OWN_ONE,
+            &dir.join("n1.state").to_string_lossy(),
+            Some(&journal_dir.to_string_lossy()),
+            128,
+            PRIMARY_TIMEOUT_MS,
         )
+        .expect("the journaling boot");
+        let mut follower = Node::open(
+            MEMBERS_TWO,
+            "n2",
+            &dir.join("n2.state").to_string_lossy(),
+            None,
+            0,
+            PRIMARY_TIMEOUT_MS,
+        )
+        .expect("the follower boots");
+        settle_two(&mut primary, &mut follower);
+        // The client conversation: SET (a Hold), RELEASE, SET again (a
+        // second Hold) — the reply carries the granted lease.
+        let set1 = b"{\"op\":\"set\",\"message_id\":\"00000001-0000-0000-0000-0000000000aa\",\"client_id\":1,\"request_num\":1,\"lock_id\":1,\"lease\":{\"lease_id\":1,\"holder\":\"00000001-0000-0000-0000-0000000000bb\",\"lease_ms\":60000}}";
+        let release1 = b"{\"op\":\"release\",\"message_id\":\"00000001-0000-0000-0000-0000000000cc\",\"client_id\":1,\"request_num\":2,\"lock_id\":1,\"holder\":\"00000001-0000-0000-0000-0000000000bb\",\"lease_id\":1}";
+        let set2 = b"{\"op\":\"set\",\"message_id\":\"00000001-0000-0000-0000-0000000000dd\",\"client_id\":1,\"request_num\":3,\"lock_id\":2,\"lease\":{\"lease_id\":1,\"holder\":\"00000001-0000-0000-0000-0000000000bb\",\"lease_ms\":60000}}";
+        let mut kinds = Vec::new();
+        for request in [&set1[..], &release1[..], &set2[..]] {
+            let committed_before = primary.frontiers().1;
+            assert_eq!(primary.request(request), OK, "the request proposes");
+            let mut committed = false;
+            for _ in 0..1_000 {
+                std::thread::sleep(Duration::from_millis(1));
+                primary.idle();
+                follower.idle();
+                let replies = exchange_all(&mut [&mut primary, &mut follower], 64);
+                for (owner, _, bytes) in replies {
+                    assert_eq!(owner, primary.own_id(), "the reply queues on the proposer");
+                    kinds.push(bytes.len());
+                }
+                if primary.frontiers().1 > committed_before {
+                    committed = true;
+                    break;
+                }
+            }
+            assert!(committed, "the request commits inside the bound");
+        }
+        assert_eq!(kinds.len(), 3, "every request draws its reply: {kinds:?}");
+        // The journal's replay: every record parses back, the transition
+        // kinds ride in commit order, the roll left the metafile.
+        let mut events = Vec::new();
+        let mut metas = 0;
+        for entry in fs::read_dir(&journal_dir).expect("the journal dir reads") {
+            let path = entry.expect("the entry reads").path();
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("");
+            if name.ends_with(".meta") {
+                metas += 1;
+                let bytes = fs::read(&path).expect("the metafile reads");
+                assert_eq!(&bytes[0..4], b"LKM1", "the metafile's magic");
+            } else if name.ends_with(".bin") {
+                events.extend(journal::parse_file(
+                    &fs::read(&path).expect("the file reads"),
+                ));
+            }
+        }
+        assert!(metas >= 1, "the roll wrote a metafile");
+        let logged: Vec<u8> = events.iter().map(|event| event.kind).collect();
+        assert_eq!(
+            logged,
+            vec![
+                journal::KIND_HOLD,
+                journal::KIND_RELEASE,
+                journal::KIND_HOLD
+            ],
+            "the transitions replay in commit order: {logged:?}"
+        );
+        assert_eq!(events[0].lock_id, 1);
+        assert_eq!(events[2].lock_id, 2, "the second SET's lock");
+    }
+
+    /// The duplicate-request path replays the cached reply without
+    /// re-proposing: the second `request` queues exactly one reply output
+    /// (identical bytes) and zero send outputs — the Service is never
+    /// re-executed and never re-proposed.
+    #[test]
+    fn duplicate_request_replays_the_cached_reply_without_reproposing() {
+        let dir = scratch("duplicate-replay");
+        let mut primary = Node::open(
+            MEMBERS_TWO,
+            OWN_ONE,
+            &dir.join("n1.state").to_string_lossy(),
+            None,
+            0,
+            PRIMARY_TIMEOUT_MS,
+        )
+        .expect("the boot");
+        let mut follower = Node::open(
+            MEMBERS_TWO,
+            "n2",
+            &dir.join("n2.state").to_string_lossy(),
+            None,
+            0,
+            PRIMARY_TIMEOUT_MS,
+        )
+        .expect("the follower boots");
+        settle_two(&mut primary, &mut follower);
+        let get = b"{\"op\":\"get\",\"message_id\":\"00000001-0000-0000-0000-0000000000aa\",\"client_id\":1,\"request_num\":1,\"lock_id\":1}";
+        // The first request: the proposal commits and the correlated
+        // reply arrives as a kind-2 output on the proposer.
+        assert_eq!(primary.request(get), OK);
+        let mut first_reply = None;
+        for _ in 0..1_000 {
+            std::thread::sleep(Duration::from_millis(1));
+            primary.idle();
+            follower.idle();
+            let replies = exchange_all(&mut [&mut primary, &mut follower], 64);
+            for (owner, message_id, bytes) in replies {
+                assert_eq!(owner, primary.own_id(), "the reply queues on the proposer");
+                if message_id[15] == 0xaa {
+                    first_reply = Some(bytes);
+                }
+            }
+            if first_reply.is_some() {
+                break;
+            }
+        }
+        let first_reply = first_reply.expect("the reply correlates inside the bound");
+        // The duplicate: the cached bytes replay, the state never moves.
+        let settled = primary.frontiers();
+        assert_eq!(primary.request(get), OK);
+        let mut replies = Vec::new();
+        for (owner, _, bytes) in exchange_all(&mut [&mut primary, &mut follower], 64) {
+            assert_eq!(owner, primary.own_id());
+            replies.push(bytes);
+        }
+        assert_eq!(replies.len(), 1, "exactly one replayed reply");
+        assert_eq!(replies[0], first_reply, "the identical bytes replay");
+        assert_eq!(
+            primary.frontiers(),
+            settled,
+            "the Service was never re-proposed: no slot moved"
+        );
+    }
+
+    /// The status snapshot reports the published view: the state word, the
+    /// current view's primary (this single node is its own leader), the
+    /// era and the view the node serves, and the folded configuration
+    /// era beside them.
+    #[test]
+    fn status_and_leader_report_the_published_view() {
+        let dir = scratch("published-view");
+        let state = dir.join("node.state");
+        let mut node = one_node_compliance(&state);
+        settle(&mut node);
+        let status = node.status();
+        assert_eq!(status.state, 0, "Normal");
+        assert_eq!(status.leader, node.own_id(), "the node is its own leader");
+        assert_eq!(status.era, 1, "the genesis era");
+        assert_eq!(status.config_era, 1, "the folded configuration era");
+        assert!(!status.poisoned);
+        assert_eq!(status.fault_note, None);
+        // The view the node serves is published beside the era: the
+        // genesis view's number, before any fence moves it.
+        assert_eq!(status.view, 0, "the genesis serve view");
+        // The ballot moves and the published view follows.
+        assert_eq!(node.force_view(1, 2), OK);
+        let mut clock = settle(&mut node);
+        let mut advanced = false;
+        for _ in 0..40 {
+            clock += 1;
+            node.set_compliance_clock(clock);
+            node.idle();
+            while node.next_output().is_some() {}
+            if node.status().view == 2 && node.status().state == 0 {
+                advanced = true;
+                break;
+            }
+        }
+        assert!(advanced, "the forced view installs");
+        assert_eq!(
+            node.status().view,
+            2,
+            "the published view follows the ballot"
+        );
+        assert_eq!(
+            node.status().leader,
+            node.own_id(),
+            "still this node's primary"
+        );
+    }
+
+    /// The C ABI round trip: `new` builds the node, `status` reads the
+    /// published view, `next` drains the queued datagrams (1 when one is
+    /// produced, 0 when the queue empties), `free` retires it.
+    #[test]
+    fn abi_new_status_next_and_free_round_trip() {
+        let dir = scratch("abi-roundtrip");
+        let state = dir.join("node.state");
+        let state_text = state.to_string_lossy().into_owned();
+        let members = MEMBERS_ONE;
+        let own = OWN_ONE;
+        let journal = "";
+        let mut out: *mut c_void = std::ptr::null_mut();
+        let code = unsafe {
+            lunet_lock_node_new(
+                members.len(),
+                members.as_ptr(),
+                own.len(),
+                own.as_ptr(),
+                state_text.len(),
+                state_text.as_ptr(),
+                journal.len(),
+                journal.as_ptr(),
+                0,
+                &raw mut out,
+            )
+        };
+        assert_eq!(code, OK, "the ABI builds the node");
+        assert!(!out.is_null());
+        // The status: the published view at boot.
+        let mut status = 0u32;
+        let mut leader = 0u32;
+        let mut era = 0u32;
+        let mut view = 0u32;
+        let code = unsafe {
+            lunet_lock_node_status(
+                out,
+                &raw mut status,
+                &raw mut leader,
+                &raw mut era,
+                &raw mut view,
+            )
+        };
+        assert_eq!(code, OK);
+        assert_eq!(leader, GENESIS_ID, "the single member is its own primary");
+        assert_eq!(era, 1);
+        // The next: the boot queued nothing; the fenced-boot drive queues
+        // sends; the queue drains to zero.
+        let mut drained = 0;
+        loop {
+            let mut kind = 0u32;
+            let mut to = 0u32;
+            let mut out_era = 0u32;
+            let mut out_view = 0u32;
+            let mut slot_hi = 0u32;
+            let mut slot_lo = 0u32;
+            let mut message_id = [0u8; 16];
+            let mut len = 0usize;
+            let mut data = [0u8; 1024];
+            let code = unsafe {
+                lunet_lock_node_next(
+                    out,
+                    &raw mut kind,
+                    &raw mut to,
+                    &raw mut out_era,
+                    &raw mut out_view,
+                    &raw mut slot_hi,
+                    &raw mut slot_lo,
+                    message_id.as_mut_ptr(),
+                    data.len(),
+                    &raw mut len,
+                    data.as_mut_ptr(),
+                )
+            };
+            if code == 0 {
+                break;
+            }
+            assert_eq!(code, 1, "next reports one output or an empty queue");
+            drained += 1;
+            assert!(kind == OUTPUT_SEND || kind == OUTPUT_REPLY);
+            if drained > 10_000 {
+                panic!("the output queue never empties");
+            }
+        }
+        unsafe { lunet_lock_node_free(out) };
     }
 
     // ------------------------------------------------------------------
@@ -3420,91 +4254,550 @@ mod tests {
     // maybe_invariant! call sites landed.
     // ------------------------------------------------------------------
 
-    /// The duplicate-request path replays the cached reply without
-    /// re-proposing: the second `request` queues exactly one reply output
-    /// (identical bytes) and zero send outputs — the Service is never
-    /// re-executed and never re-proposed.
-    #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
-    #[test]
-    fn duplicate_request_replays_the_cached_reply_without_reproposing() {
-        panic!(
-            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
-        )
+    /// The two-member compliance descriptor plus a joined-later entry for
+    /// the reconfiguration leg.
+    const MEMBERS_THREE_J: &str = "65537:n1\0131073:n2\0196609:n3:j";
+
+    /// The two-node compliance cluster settles: both members tick under
+    /// the shared logical clock, the wire exchanges, and both report
+    /// Normal behind the primary.
+    fn settle_compliance_pair(primary: &mut Node, follower: &mut Node) {
+        let mut clock = 0u64;
+        for _ in 0..1_000 {
+            clock += 1;
+            primary.set_compliance_clock(clock);
+            follower.set_compliance_clock(clock);
+            primary.idle();
+            follower.idle();
+            let _ = exchange_all(&mut [primary, follower], 64);
+            if primary.status().state == 0
+                && follower.status().state == 0
+                && primary.status().leader == primary.own_id()
+            {
+                return;
+            }
+        }
+        panic!("the compliance pair did not settle inside the bound");
     }
 
     /// Every output the adapter ever queues carries kind 1 (send) or 2
     /// (reply) — drained across a boot, a stream, a fence, and a
     /// reconfiguration.
-    #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
     #[test]
     fn output_queue_carries_only_send_and_reply_kinds() {
-        panic!(
-            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        let dir = scratch("output-kinds");
+        let mut primary = Node::open_compliance(
+            MEMBERS_THREE_J,
+            OWN_ONE,
+            &dir.join("n1.state").to_string_lossy(),
+            50,
         )
-    }
-
-    /// The dirty restart announces the marker pair's next life: the
-    /// reincarnated identity never reuses the old id (the asserted boot
-    /// invariant, exercised through `Node::open`).
-    #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
-    #[test]
-    fn reincarnated_identity_never_reuses_the_old_id() {
-        panic!(
-            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        .expect("the primary boots");
+        let mut follower = Node::open_compliance(
+            MEMBERS_THREE_J,
+            "n2",
+            &dir.join("n2.state").to_string_lossy(),
+            50,
         )
+        .expect("the follower boots");
+        // The boot: no output. The drives that follow queue sends; the
+        // drain asserts every kind the queue ever carries.
+        assert!(primary.next_output().is_none(), "the boot emits nothing");
+        assert!(follower.next_output().is_none(), "the boot emits nothing");
+        // One round: tick both under the shared clock, then cascade the
+        // wire, recording every output kind along the way.
+        let mut kinds: Vec<u32> = Vec::new();
+        let round = |nodes: &mut [&mut Node], kinds: &mut Vec<u32>, clock: u64| {
+            for node in nodes.iter_mut() {
+                node.set_compliance_clock(clock);
+                node.idle();
+            }
+            for _ in 0..64 {
+                let mut wire: Vec<(u32, u32, Vec<u8>)> = Vec::new();
+                for node in nodes.iter_mut() {
+                    while let Some(output) = node.next_output() {
+                        kinds.push(output.kind);
+                        if output.kind == OUTPUT_SEND {
+                            wire.push((node.own_id(), output.to, output.bytes));
+                        }
+                    }
+                }
+                if wire.is_empty() {
+                    break;
+                }
+                for (from, to, bytes) in wire {
+                    let target = nodes
+                        .iter_mut()
+                        .find(|node| node.own_id() >> SYSTEM_HALF_SHIFT == to >> SYSTEM_HALF_SHIFT);
+                    if let Some(target) = target {
+                        target.receive(from, &bytes);
+                    }
+                }
+            }
+        };
+        // The settle: the election's sends flow.
+        let mut clock = 0u64;
+        let mut settled = false;
+        for _ in 0..1_000 {
+            clock += 1;
+            round(&mut [&mut primary, &mut follower], &mut kinds, clock);
+            if primary.status().state == 0
+                && follower.status().state == 0
+                && primary.status().leader == primary.own_id()
+            {
+                settled = true;
+                break;
+            }
+        }
+        assert!(settled, "the pair settles");
+        // The fence: the follower's forced view drives its evidence flow.
+        assert_eq!(follower.force_view(1, 2), OK, "the follower fences");
+        let mut fenced = false;
+        for _ in 0..1_000 {
+            clock += 1;
+            round(&mut [&mut primary, &mut follower], &mut kinds, clock);
+            if primary.status().view == 2
+                && follower.status().view == 2
+                && primary.status().state == 0
+            {
+                fenced = true;
+                break;
+            }
+        }
+        assert!(fenced, "the fence installs on both");
+        // The stream: the opaque proposals commit through the new view.
+        for index in 0..8u64 {
+            assert_eq!(
+                primary.propose_opaque(
+                    OperationId {
+                        msb: 0x100 + index,
+                        lsb: index
+                    },
+                    b"the output-kind stream's operation",
+                ),
+                OK,
+                "the stream proposes"
+            );
+        }
+        let mut streamed = false;
+        for _ in 0..1_000 {
+            clock += 1;
+            round(&mut [&mut primary, &mut follower], &mut kinds, clock);
+            // The compliance boundary absorbs the applies (the opaque
+            // acknowledge): the committed frontier is the stream's proof.
+            if primary.frontiers().1 >= 10 && follower.frontiers().1 >= 10 {
+                streamed = true;
+                break;
+            }
+        }
+        assert!(
+            streamed,
+            "the stream commits on both: p{:?} f{:?} k{}",
+            primary.frontiers(),
+            follower.frontiers(),
+            kinds.len()
+        );
+        // The reconfiguration: the join folds a new configuration era.
+        assert_eq!(
+            primary.reconfigure(RECONFIGURE_JOIN, 196_609, POSITION_APPEND),
+            OK,
+            "the join drives"
+        );
+        let mut joined = false;
+        for _ in 0..1_000 {
+            clock += 1;
+            round(&mut [&mut primary, &mut follower], &mut kinds, clock);
+            if primary.status().config_era > 1 && primary.status().state == 0 {
+                joined = true;
+                break;
+            }
+        }
+        assert!(joined, "the join folds");
+        // THE INVARIANT: every output the queue ever carried is a send or
+        // a reply.
+        assert!(
+            kinds.len() >= 8,
+            "the queue carried outputs: {}",
+            kinds.len()
+        );
+        assert!(
+            kinds
+                .iter()
+                .all(|kind| *kind == OUTPUT_SEND || *kind == OUTPUT_REPLY),
+            "every queued output carries kind 1 or 2"
+        );
     }
 
     /// Ticks are nondecreasing: the clamp holds a wall-clock regression
-    /// back to the last tick.
-    #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
+    /// back to the last tick — the drives keep working across it and the
+    /// tick invariant's assertion never fires.
     #[test]
     fn ticks_are_nondecreasing_and_clamped() {
-        panic!(
-            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
-        )
+        let dir = scratch("tick-clamp");
+        let state = dir.join("node.state");
+        let mut node = one_node_compliance(&state);
+        // The clock runs forward, then regresses hard. A tick past the
+        // regression samples the clamped value: the drive succeeds and
+        // the invariant's assert (next >= last) never trips.
+        node.set_compliance_clock(10_000);
+        assert_eq!(node.idle(), OK);
+        node.set_compliance_clock(5);
+        assert_eq!(
+            node.idle(),
+            OK,
+            "the regressed clock clamps to the last tick"
+        );
+        assert_eq!(node.leader_timeout(), OK);
+        assert_eq!(node.recover(), OK);
+        assert!(!node.status().poisoned, "the clamp kept the drives clean");
+        // The clock runs forward again and the drives continue.
+        node.set_compliance_clock(10_001);
+        assert_eq!(node.idle(), OK);
     }
 
     /// Poison means poisoned: a poisoned node executes nothing — every
-    /// entry reports SERVICE and the queues stay empty.
-    #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
+    /// entry reports SERVICE and the queues stay empty. The poison is
+    /// planted directly (the same state the drive's fault arms leave) —
+    /// a genuine core fault cannot be manufactured through the public
+    /// API, and the invariant holds however the poison arrived.
     #[test]
     fn poisoned_node_executes_nothing() {
-        panic!(
-            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
-        )
+        let dir = scratch("poisoned");
+        let state = dir.join("node.state");
+        let mut node = one_node_compliance(&state);
+        settle(&mut node);
+        node.poisoned = true;
+        assert_eq!(node.request(b"{\"op\":\"get\",\"message_id\":\"00000001-0000-0000-0000-0000000000aa\",\"client_id\":1,\"request_num\":1,\"lock_id\":1}"), SERVICE);
+        // A garbage datagram is refused at the wire's decode gate before
+        // any drive — the poisoned node executes nothing either way.
+        assert_eq!(node.receive(GENESIS_ID, &[0, 1, 2]), VRR_MESSAGE);
+        assert_eq!(node.idle(), SERVICE);
+        assert_eq!(node.leader_timeout(), SERVICE);
+        assert_eq!(node.force_view(1, 2), SERVICE);
+        assert_eq!(
+            node.reconfigure(RECONFIGURE_JOIN, 131_073, POSITION_APPEND),
+            SERVICE
+        );
+        assert_eq!(node.recover(), SERVICE);
+        assert!(
+            node.next_output().is_none(),
+            "the poisoned node queues nothing"
+        );
     }
+
+    /// Every output the adapter ever queues carries kind 1 (send) or 2
 
     /// The unknown-peer-id maybe: a datagram attributed to a low-band id
     /// outside the descriptor address space crashes a test build (the
     /// maybe fires) and passes silently in release (warn-and-continue).
     /// Red was demonstrated against the unwired `receive` (the call
     /// returned OK under `catch_unwind` in a debug build).
-    #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
     #[test]
     fn maybe_unknown_low_band_peer_id_fires_in_test_builds() {
-        panic!(
-            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        let dir = scratch("unknown-peer");
+        let state = dir.join("node.state");
+        // The PROD shape: the compliance rules lift the peer gate, so the
+        // maybe only exists where the host's own address space rules.
+        let mut node = Node::open(
+            MEMBERS_ONE,
+            OWN_ONE,
+            &state.to_string_lossy(),
+            None,
+            0,
+            PRIMARY_TIMEOUT_MS,
         )
+        .expect("the boot");
+        // The descriptor knows 65537 (system 1) alone: a low-band id (its
+        // system half names no member) is the unknown-peer shape.
+        let result = catch_unwind(AssertUnwindSafe(|| node.receive(2, &[1, 2, 3])));
+        assert!(
+            result.is_err(),
+            "the maybe fires in test builds: the unknown peer id panics"
+        );
+        // The node itself survives the caught boundary panic (the test
+        // caught it) and keeps its state: no poison was armed by the
+        // maybe outside the drive.
+        assert!(!node.status().poisoned);
     }
 
     /// The folded-era regression helper: true exactly when the folded
     /// configuration era moved backwards. Wired as a maybe in `report`.
-    #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
     #[test]
     fn folded_era_regression_is_detected() {
-        panic!(
-            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        // The first observation arms no regression.
+        assert!(!folded_era_regressed(None, 1));
+        // Same era, forward era: no regression.
+        assert!(!folded_era_regressed(Some(1), 1));
+        assert!(!folded_era_regressed(Some(1), 2));
+        assert!(!folded_era_regressed(Some(2), 5));
+        // A move backwards is the regression.
+        assert!(folded_era_regressed(Some(2), 1));
+        assert!(folded_era_regressed(Some(5), 4));
+    }
+
+    /// The recovery boundary executes the configured variant's flush exactly
+    /// at the crashed classification: its write lands in the variant's
+    /// scratch (variant 1's block file), a re-crash replay reports it again
+    /// (the pair is re-decided from the landed round), and a clean continue
+    /// never flushes — no first boot, no clean restart.
+    #[test]
+    fn dirty_boot_executes_the_recovery_flush_clean_continue_does_not() {
+        let dir = scratch("recovery-flush");
+        let state = dir.join("node.state");
+        let flush_scratch = dir.join("flush-scratch");
+        let members = MEMBERS_ONE;
+        let own = OWN_ONE;
+        // The first life: no classification boundary has run — no flush.
+        let mut node = Node::open_with_recovery_flush(
+            members,
+            own,
+            &state.to_string_lossy(),
+            None,
+            0,
+            RecoveryFlush::SingleBlock,
+            &flush_scratch.to_string_lossy(),
         )
+        .expect("the first life boots");
+        assert_eq!(node.own_id(), GENESIS_ID);
+        assert!(
+            !flush_scratch.join("recovery-flush-single.bin").exists(),
+            "the first boot is not the recovery boundary: no flush"
+        );
+        // The clean restart path is armed the same way: settle, stop — the
+        // clean continue never flushes.
+        for _ in 0..50 {
+            std::thread::sleep(Duration::from_millis(1));
+            node.idle();
+            while node.next_output().is_some() {}
+            if node.status().state == 0 {
+                break;
+            }
+        }
+        assert_eq!(node.stop(), OK);
+        assert!(
+            !flush_scratch.join("recovery-flush-single.bin").exists(),
+            "the clean continue never flushes"
+        );
+        let clean = Node::open_with_recovery_flush(
+            members,
+            own,
+            &state.to_string_lossy(),
+            None,
+            0,
+            RecoveryFlush::SingleBlock,
+            &flush_scratch.to_string_lossy(),
+        )
+        .expect("the clean continue boots");
+        assert_eq!(clean.own_id(), GENESIS_ID, "the clean continue never bumps");
+        assert!(
+            !flush_scratch.join("recovery-flush-single.bin").exists(),
+            "the clean classification is not the recovery boundary"
+        );
+        drop(clean);
+        // The crash: the running sentinel stands, so the reopen is dirty
+        // by construction — the boundary executes the variant's flush.
+        let dirty = Node::open_with_recovery_flush(
+            members,
+            own,
+            &state.to_string_lossy(),
+            None,
+            0,
+            RecoveryFlush::SingleBlock,
+            &flush_scratch.to_string_lossy(),
+        )
+        .expect("the crashed boot executes the boundary flush");
+        assert_eq!(dirty.own_id(), 65_538, "the crashed classification bumps");
+        let flush_file = flush_scratch.join("recovery-flush-single.bin");
+        assert!(flush_file.exists(), "the boundary flush wrote the block");
+        assert_eq!(
+            fs::metadata(&flush_file)
+                .expect("the flush file reads")
+                .len(),
+            4096,
+            "variant 1's block is exactly one 4 KiB block"
+        );
+        // The re-crash replay: dropped dirty again, the pair is re-decided
+        // from the landed round and the flush reports again.
+        drop(dirty);
+        let replay = Node::open_with_recovery_flush(
+            members,
+            own,
+            &state.to_string_lossy(),
+            None,
+            0,
+            RecoveryFlush::SingleBlock,
+            &flush_scratch.to_string_lossy(),
+        )
+        .expect("the re-crash boot re-runs the boundary");
+        assert_eq!(
+            replay.own_id(),
+            65_539,
+            "the re-crash derives the next life"
+        );
+        assert!(flush_file.exists(), "the replay's flush stands");
     }
 
     /// A full protocol run — boot, stream, fence, join, promote — trips no
     /// maybe and no invariant: the green run the wired paths must survive.
-    #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
     #[test]
     fn protocol_run_trips_no_maybe() {
-        panic!(
-            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        let dir = scratch("protocol-run");
+        let mut primary = Node::open_compliance(
+            MEMBERS_THREE_J,
+            OWN_ONE,
+            &dir.join("n1.state").to_string_lossy(),
+            50,
         )
+        .expect("the primary boots");
+        let mut follower = Node::open_compliance(
+            MEMBERS_THREE_J,
+            "n2",
+            &dir.join("n2.state").to_string_lossy(),
+            50,
+        )
+        .expect("the follower boots");
+        let mut kinds: Vec<u32> = Vec::new();
+        let round = |nodes: &mut [&mut Node], kinds: &mut Vec<u32>, clock: u64| {
+            for node in nodes.iter_mut() {
+                node.set_compliance_clock(clock);
+                node.idle();
+            }
+            for _ in 0..64 {
+                let mut wire: Vec<(u32, u32, Vec<u8>)> = Vec::new();
+                for node in nodes.iter_mut() {
+                    while let Some(output) = node.next_output() {
+                        kinds.push(output.kind);
+                        if output.kind == OUTPUT_SEND {
+                            wire.push((node.own_id(), output.to, output.bytes));
+                        }
+                    }
+                }
+                if wire.is_empty() {
+                    break;
+                }
+                for (from, to, bytes) in wire {
+                    let target = nodes
+                        .iter_mut()
+                        .find(|node| node.own_id() >> SYSTEM_HALF_SHIFT == to >> SYSTEM_HALF_SHIFT);
+                    if let Some(target) = target {
+                        target.receive(from, &bytes);
+                    }
+                }
+            }
+        };
+        let mut clock = 0u64;
+        let mut settled = false;
+        for _ in 0..1_000 {
+            clock += 1;
+            round(&mut [&mut primary, &mut follower], &mut kinds, clock);
+            if primary.status().state == 0 && follower.status().state == 0 {
+                settled = true;
+                break;
+            }
+        }
+        assert!(settled, "the cluster serves");
+        // The stream.
+        for index in 0..4u64 {
+            assert_eq!(
+                primary.propose_opaque(
+                    OperationId {
+                        msb: 0x200 + index,
+                        lsb: index
+                    },
+                    b"the protocol run's client stream",
+                ),
+                OK
+            );
+        }
+        let mut streamed = false;
+        for _ in 0..1_000 {
+            clock += 1;
+            round(&mut [&mut primary, &mut follower], &mut kinds, clock);
+            if primary.frontiers().1 >= 6 && follower.frontiers().1 >= 6 {
+                streamed = true;
+                break;
+            }
+        }
+        assert!(
+            streamed,
+            "the stream commits: p{:?} f{:?}",
+            primary.frontiers(),
+            follower.frontiers()
+        );
+        // The fence.
+        assert_eq!(follower.force_view(1, 2), OK);
+        let mut fenced = false;
+        for _ in 0..1_000 {
+            clock += 1;
+            round(&mut [&mut primary, &mut follower], &mut kinds, clock);
+            if primary.status().view == 2 && primary.status().state == 0 {
+                fenced = true;
+                break;
+            }
+        }
+        assert!(fenced, "the fence installs");
+        // The join, then the promote: two more configuration eras fold.
+        // A transition is complete only when the view has ENTERED the
+        // folded era (the serving era caught the config era) — a
+        // reconfiguration driven inside an establishing era refuses.
+        assert_eq!(
+            primary.reconfigure(RECONFIGURE_JOIN, 196_609, POSITION_APPEND),
+            OK
+        );
+        let mut joined = false;
+        for _ in 0..1_000 {
+            clock += 1;
+            round(&mut [&mut primary, &mut follower], &mut kinds, clock);
+            if primary.status().era == primary.status().config_era
+                && primary.status().era > 1
+                && primary.status().state == 0
+            {
+                joined = true;
+                break;
+            }
+        }
+        assert!(joined, "the join's era establishes");
+        // The promote drives on the published leader (NOT_LEADER is the
+        // actionable code: re-forward to the named primary — the view the
+        // establishing era entered may seat a different member).
+        let leader_is_primary = primary.status().leader == primary.own_id();
+        let (driver, rider) = if leader_is_primary {
+            (&mut primary, &mut follower)
+        } else {
+            (&mut follower, &mut primary)
+        };
+        assert_eq!(
+            driver.status().leader,
+            driver.own_id(),
+            "the leader is one of ours"
+        );
+        assert_eq!(driver.reconfigure(RECONFIGURE_INCREMENT, 196_609, 0), OK);
+        let mut promoted = false;
+        for _ in 0..1_000 {
+            clock += 1;
+            round(&mut [driver, rider], &mut kinds, clock);
+            if driver.status().era == driver.status().config_era
+                && driver.status().era > 2
+                && driver.status().state == 0
+            {
+                promoted = true;
+                break;
+            }
+        }
+        assert!(promoted, "the promote's era establishes");
+        // THE GREEN RUN: no maybe, no invariant, no arrest anywhere.
+        for node in [&primary, &follower] {
+            let status = node.status();
+            assert!(!status.poisoned, "no member self-arrests");
+            assert_eq!(status.fault_note, None, "no fault was recorded");
+            assert_eq!(status.state, 0, "every member serves Normal");
+        }
+        assert!(
+            kinds
+                .iter()
+                .all(|kind| *kind == OUTPUT_SEND || *kind == OUTPUT_REPLY),
+            "the run's outputs are all lawful kinds"
+        );
     }
 
     /// A self-arrested node names its fault. The never-repair contract is
@@ -3520,12 +4813,217 @@ mod tests {
     /// rig's own lesson), so the recording seam is driven directly:
     /// the observation path it serves is the drive's plan/publish
     /// fault arms.
-    #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
     #[test]
     fn a_self_arrested_node_names_its_fault() {
-        panic!(
-            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        let dir = scratch("self-arrest");
+        let state = dir.join("node.state");
+        let mut node = one_node_compliance(&state);
+        settle(&mut node);
+        // The arrest: the drive's fault arms record the reason, then
+        // poison. The seam is driven exactly as the arms drive it.
+        node.record_fault("sticky fault: the manufactured breach".to_string());
+        node.poisoned = true;
+        // The first observation stands: a later observation of the same
+        // sticky fault does not overwrite it.
+        node.record_fault("a later observation never overwrites".to_string());
+        assert_eq!(
+            node.fault_note.as_deref(),
+            Some("sticky fault: the manufactured breach"),
+            "the FIRST observation is the recorded one"
+        );
+        // The status reports the arrest and the reason.
+        let status = node.status();
+        assert!(status.poisoned);
+        assert_eq!(
+            status.fault_note.as_deref(),
+            Some("sticky fault: the manufactured breach")
+        );
+        // The fault ABI returns the recorded reason: the len-then-bytes
+        // contract, the TOO_LARGE mirror of next's. Observation only:
+        // valid on a poisoned node by design.
+        let out = &mut node as *mut Node as *mut c_void;
+        let note = b"sticky fault: the manufactured breach";
+        unsafe {
+            let mut len = 0usize;
+            // The length is written before the capacity verdict: capacity
+            // zero reports TOO_LARGE and still names the needed size.
+            assert_eq!(
+                lunet_lock_node_fault(out, std::ptr::null_mut(), 0, &raw mut len),
+                TOO_LARGE
+            );
+            assert_eq!(len, note.len());
+            assert_eq!(
+                lunet_lock_node_fault(out, std::ptr::null_mut(), len, &raw mut len),
+                TOO_LARGE,
+                "one short of the note + NUL is TOO_LARGE"
+            );
+            let mut buffer = vec![0u8; len + 1];
+            assert_eq!(
+                lunet_lock_node_fault(out, buffer.as_mut_ptr(), len + 1, &raw mut len),
+                OK
+            );
+            assert_eq!(len, note.len());
+            assert_eq!(buffer[len], 0, "the NUL terminator");
+            buffer.truncate(len);
+            assert_eq!(buffer, note);
+        }
+        // Every further entry reports SERVICE: the poison is sticky.
+        assert_eq!(node.idle(), SERVICE);
+        assert_eq!(node.recover(), SERVICE);
+        assert!(
+            node.next_output().is_none(),
+            "the arrested node queues nothing"
+        );
+    }
+
+    /// Mirrors upstream's `tests/reincarnation.rs::reincarnate_backup`
+    /// (class B) plus the membership-discard (class E) and learner (class
+    /// F) classes, through the adapter ABI: a backup crashed while running
+    /// — the durable marker holds the running sentinel, so the restart is
+    /// dirty by construction — bumps its identity, announces the
+    /// `(old, new)` pair, and the leader drives the forced sequence one
+    /// batch per era until the new identity sits at weight 1 in the old
+    /// succession position and the old identity is evicted. The
+    /// reincarnated node reopens over the deployment's genesis (the honest
+    /// Volatile `restart_as`), stays fenced, and acquires nothing — the
+    /// learner's streamed catch-up is upstream §10 future work, so the
+    /// named drops are the proof of arrival and no lock state is
+    /// fabricated.
+    #[test]
+    fn reincarnation_abi_runs_the_two_era_resurrection() {
+        let dir = scratch("reincarnation");
+        // The triad: the corpus's shape (the forced walk's commits need
+        // the surviving pair's quorum while the crashed member is dead).
+        const MEMBERS: &str = "65537:n1\0131073:n2\0196609:n3";
+        let mut primary = Node::open_compliance(
+            MEMBERS,
+            OWN_ONE,
+            &dir.join("n1.state").to_string_lossy(),
+            50,
         )
+        .expect("the primary boots");
+        let mut second =
+            Node::open_compliance(MEMBERS, "n2", &dir.join("n2.state").to_string_lossy(), 50)
+                .expect("the second boots");
+        let mut third =
+            Node::open_compliance(MEMBERS, "n3", &dir.join("n3.state").to_string_lossy(), 50)
+                .expect("the third boots");
+        let round = |nodes: &mut [&mut Node], clock: u64| {
+            for node in nodes.iter_mut() {
+                node.set_compliance_clock(clock);
+                node.idle();
+            }
+            for _ in 0..64 {
+                let mut wire: Vec<(u32, u32, Vec<u8>)> = Vec::new();
+                for node in nodes.iter_mut() {
+                    while let Some(output) = node.next_output() {
+                        if output.kind == OUTPUT_SEND {
+                            wire.push((node.own_id(), output.to, output.bytes));
+                        }
+                    }
+                }
+                if wire.is_empty() {
+                    break;
+                }
+                for (from, to, bytes) in wire {
+                    let target = nodes
+                        .iter_mut()
+                        .find(|node| node.own_id() >> SYSTEM_HALF_SHIFT == to >> SYSTEM_HALF_SHIFT);
+                    if let Some(target) = target {
+                        target.receive(from, &bytes);
+                    }
+                }
+            }
+        };
+        let mut clock = 0u64;
+        let mut settled = false;
+        for _ in 0..1_000 {
+            clock += 1;
+            round(&mut [&mut primary, &mut second, &mut third], clock);
+            if primary.status().state == 0
+                && second.status().state == 0
+                && third.status().state == 0
+            {
+                settled = true;
+                break;
+            }
+        }
+        assert!(settled, "the triad serves");
+        // THE CRASH: the third member is dropped without the stop
+        // contract — the running sentinel is the durable crash evidence.
+        drop(third);
+        // The restart is dirty by construction: the bumped identity is
+        // decided at the boot gate, durable before any emission.
+        let mut risen =
+            Node::open_compliance(MEMBERS, "n3", &dir.join("n3.state").to_string_lossy(), 50)
+                .expect("the crashed member reopens");
+        assert_eq!(risen.own_id(), 196_610, "the strict next life of system 3");
+        assert!(
+            risen.next_output().is_none(),
+            "no emission before the drive"
+        );
+        // The fenced-boot drive: the §8 re-announce rides it. The first
+        // copy names the leader; the second rides the old row (the
+        // transport's remap).
+        clock += 1;
+        risen.set_compliance_clock(clock);
+        assert_eq!(risen.recover(), OK, "the announcement drives");
+        let mut announced: Vec<(u32, Vec<u8>)> = Vec::new();
+        while let Some(output) = risen.next_output() {
+            assert_eq!(output.kind, OUTPUT_SEND, "the announcement is a send");
+            announced.push((output.to, output.bytes));
+        }
+        assert!(
+            announced.iter().any(|(to, _)| *to == 65_537),
+            "the (old, new) pair is announced to the leader"
+        );
+        let leader_copy = announced
+            .iter()
+            .find(|(to, _)| *to == 65_537)
+            .expect("the leader's copy");
+        // `receive` attributes the datagram to the SENDER: the live
+        // identity the transport's remap carries.
+        assert_eq!(
+            primary.receive(196_610, &leader_copy.1),
+            OK,
+            "the leader takes the ticket"
+        );
+        // The leader drives the forced sequence: one batch per era, tick
+        // driven, with the re-announce cadence carrying the pair until
+        // the new life seats.
+        let mut walked = false;
+        for _ in 0..4_000 {
+            clock += 1;
+            round(&mut [&mut primary, &mut second, &mut risen], clock);
+            if risen.voting_weight() != Some(1) {
+                risen.set_compliance_clock(clock);
+                risen.recover();
+            }
+            if let Some((members, weights)) = primary.membership() {
+                let ids: Vec<u32> = members.iter().map(|id| id.0).collect();
+                let risen_position = ids.iter().position(|id| *id == 196_610);
+                if !ids.contains(&196_609)
+                    && risen_position == Some(2)
+                    && weights.get(2) == Some(&1)
+                    && risen.voting_weight() == Some(1)
+                {
+                    walked = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            walked,
+            "the forced walk seats the new life and evicts the old: p{:?} w{:?}",
+            primary.membership(),
+            risen.voting_weight()
+        );
+        // The resurrection is clean: no member self-arrests.
+        for node in [&primary, &second, &risen] {
+            let status = node.status();
+            assert!(!status.poisoned, "no member self-arrests in the walk");
+            assert_eq!(status.fault_note, None);
+        }
     }
 
     /// THE run-4 kill#3 shape (locks2, 2026-09-15): a voter triad with a
@@ -3538,11 +5036,198 @@ mod tests {
     /// views churned 15→510 with zero commits, and the wire went silent.
     /// The regression: every forced view installs Normal, no member
     /// self-arrests, and the client stream commits through each new view.
-    #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
     #[test]
     fn rapid_fences_with_learners_keep_the_voters_serving() {
-        panic!(
-            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        let dir = scratch("rapid-fences");
+        // The voter triad plus the joined-later learner's entry.
+        const MEMBERS: &str = "65537:n1\0131073:n2\0196609:n3\0262145:n4:j";
+        let mut n1 = Node::open_compliance(
+            MEMBERS,
+            OWN_ONE,
+            &dir.join("n1.state").to_string_lossy(),
+            50,
         )
+        .expect("the primary boots");
+        let mut n2 =
+            Node::open_compliance(MEMBERS, "n2", &dir.join("n2.state").to_string_lossy(), 50)
+                .expect("the second boots");
+        let mut n3 =
+            Node::open_compliance(MEMBERS, "n3", &dir.join("n3.state").to_string_lossy(), 50)
+                .expect("the third boots");
+        let round = |nodes: &mut [&mut Node], clock: u64| {
+            for node in nodes.iter_mut() {
+                node.set_compliance_clock(clock);
+                node.idle();
+            }
+            for _ in 0..64 {
+                let mut wire: Vec<(u32, u32, Vec<u8>)> = Vec::new();
+                for node in nodes.iter_mut() {
+                    while let Some(output) = node.next_output() {
+                        if output.kind == OUTPUT_SEND {
+                            wire.push((node.own_id(), output.to, output.bytes));
+                        }
+                    }
+                }
+                if wire.is_empty() {
+                    break;
+                }
+                for (from, to, bytes) in wire {
+                    let target = nodes
+                        .iter_mut()
+                        .find(|node| node.own_id() >> SYSTEM_HALF_SHIFT == to >> SYSTEM_HALF_SHIFT);
+                    if let Some(target) = target {
+                        target.receive(from, &bytes);
+                    }
+                }
+            }
+        };
+        let mut clock = 0u64;
+        let mut settled = false;
+        for _ in 0..1_000 {
+            clock += 1;
+            round(&mut [&mut n1, &mut n2, &mut n3], clock);
+            if n1.status().state == 0 && n2.status().state == 0 && n3.status().state == 0 {
+                settled = true;
+                break;
+            }
+        }
+        assert!(settled, "the triad serves");
+        // The weight-0 learner joins (the run-4 rig's post-join shape):
+        // the establishing era completes.
+        let leader_id = serving_leader_id(&[&n1, &n2, &n3]);
+        assert_eq!(
+            member(&mut [&mut n1, &mut n2, &mut n3], leader_id).reconfigure(
+                RECONFIGURE_JOIN,
+                262_145,
+                POSITION_APPEND
+            ),
+            OK,
+            "the join drives on the leader"
+        );
+        let mut joined = false;
+        for _ in 0..1_000 {
+            clock += 1;
+            round(&mut [&mut n1, &mut n2, &mut n3], clock);
+            if triad_established(&n1, &n2, &n3) {
+                joined = true;
+                break;
+            }
+        }
+        assert!(joined, "the learner's join establishes");
+        // The FIRST post-join view change, then the phi warm-up's
+        // ping-pong: three rapid forced views, a client operation through
+        // each, one committed per view. The (era, view) balloted target is
+        // the leader's own published view, one view ahead.
+        for fence in 0..3 {
+            let (era, view) = {
+                let status = serving_leader(&[&n1, &n2, &n3]).status();
+                (status.era, status.view)
+            };
+            let leader_id = serving_leader_id(&[&n1, &n2, &n3]);
+            assert_eq!(
+                member(&mut [&mut n1, &mut n2, &mut n3], leader_id).force_view(era, view + 1),
+                OK,
+                "the fence {fence} drives (era {era}, view {view})"
+            );
+            let mut installed = false;
+            for _ in 0..1_000 {
+                clock += 1;
+                round(&mut [&mut n1, &mut n2, &mut n3], clock);
+                if triad_serving(&n1, &n2, &n3, era, view + 1) {
+                    installed = true;
+                    break;
+                }
+            }
+            assert!(
+                installed,
+                "the forced view {} installs Normal on every voter: {:?} {:?} {:?}",
+                view + 1,
+                n1.status(),
+                n2.status(),
+                n3.status()
+            );
+            // The stream commits through the new view.
+            let leader_id = serving_leader_id(&[&n1, &n2, &n3]);
+            let trio = &mut [&mut n1, &mut n2, &mut n3];
+            let leader = member(trio, leader_id);
+            let committed_before = leader.frontiers().1;
+            assert_eq!(
+                leader.propose_opaque(
+                    OperationId {
+                        msb: 0x300 + u64::try_from(fence).expect("the fence count fits"),
+                        lsb: u64::try_from(fence).expect("the fence count fits"),
+                    },
+                    b"the rapid-fence stream's client operation",
+                ),
+                OK,
+                "the stream proposes through view {}",
+                view + 1
+            );
+            drop(leader);
+            let mut committed = false;
+            for _ in 0..1_000 {
+                clock += 1;
+                let trio = &mut [&mut n1, &mut n2, &mut n3];
+                round(trio, clock);
+                if member(trio, leader_id).frontiers().1 > committed_before {
+                    committed = true;
+                    break;
+                }
+            }
+            assert!(
+                committed,
+                "the client stream commits through view {}",
+                view + 1
+            );
+        }
+        // THE REGRESSION: no member self-arrests (the silent
+        // FAULTED→SERVICE poison is the defect this test refuses).
+        for node in [&n1, &n2, &n3] {
+            let status = node.status();
+            assert!(!status.poisoned, "no voter self-arrests");
+            assert_eq!(status.fault_note, None, "no fault recorded");
+            assert_eq!(status.state, 0, "every voter serves Normal");
+        }
+    }
+
+    /// The current leader's id among the members, by the published view.
+    fn serving_leader_id(nodes: &[&Node]) -> u32 {
+        nodes
+            .iter()
+            .find(|node| node.status().leader == node.own_id() && node.status().state == 0)
+            .expect("a serving leader exists")
+            .own_id()
+    }
+
+    /// The current leader among the members, by the published view.
+    fn serving_leader<'a>(nodes: &[&'a Node]) -> &'a Node {
+        nodes
+            .iter()
+            .find(|node| node.status().leader == node.own_id() && node.status().state == 0)
+            .expect("a serving leader exists")
+    }
+
+    /// The member with the named live id.
+    fn member<'a>(nodes: &'a mut [&mut Node], id: u32) -> &'a mut Node {
+        nodes
+            .iter_mut()
+            .find(|node| node.own_id() == id)
+            .expect("the member is one of ours")
+    }
+
+    /// Whether every voter serves Normal in the named view.
+    fn triad_serving(a: &Node, b: &Node, c: &Node, era: u32, view: u32) -> bool {
+        [a, b, c].iter().all(|node| {
+            node.status().state == 0 && node.status().era == era && node.status().view == view
+        })
+    }
+
+    /// Whether the triad's serving era has caught its folded configuration
+    /// era (a transition's establishing era completed).
+    fn triad_established(a: &Node, b: &Node, c: &Node) -> bool {
+        [a, b, c].iter().all(|node| {
+            let status = node.status();
+            status.state == 0 && status.era == status.config_era
+        })
     }
 }
