@@ -46,181 +46,6 @@
 //! voting weight by the leader's forced sequence. Both tests are RED: the
 //! fence holds.
 
-use lunet_advisory_lock::Node;
-
-/// The host loop's tick (`main.rs::TICK_MS`).
-const TICK_MS: u64 = 5;
-/// The fenced-boot drive's cadence (`main.rs::recovery_ms`'s default): the
-/// recorded announcements land one per second per peer.
-const RECOVERY_MS: u64 = 1000;
-
-/// `Status::Restarting`'s snapshot word (`vrr::progress::Status::to_word`).
-const STATE_RESTARTING: u32 = 2;
-/// `Status::Normal`'s snapshot word.
-const STATE_NORMAL: u32 = 0;
-
-const ROOT: &str = "/Users/Shared/lua-lunet/lunet-locks/.tmp/rejoin-fence-reproduce-test";
-
-/// The committed capture this test replays.
-const CAPTURE: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../docs/src/fenced-crash-restart/messages.jsonl"
-);
-
-/// One captured inbound frame: the recorded bytes, the offset from the
-/// fenced node's boot, and the sender identity the fenced node's transport
-/// attributed (the capture's `received_as_from`: the descriptor row, never
-/// the bump — the remap rows die with the crashed process). The recorded
-/// run predates the identity-law packing, so the attribution's raw id
-/// translates to the lawful provisioned identity: (system half << 16) | 1.
-struct CapturedFrame {
-    from: u32,
-    at_ms: u64,
-    bytes: Vec<u8>,
-}
-
-/// The lawful re-seat of a recorded old-band descriptor id.
-fn provisioned(system: u32) -> u32 {
-    (system << 16) | 1
-}
-
-fn unhex(hex: &str) -> Vec<u8> {
-    hex.as_bytes()
-        .chunks(2)
-        .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).expect("ascii hex"), 16))
-        .collect::<Result<Vec<u8>, _>>()
-        .expect("the committed capture's hex parses")
-}
-
-/// Reads the capture's `in` records for one case, oldest first, with the
-/// offsets rebased on the case's boot ts (the summary record's window).
-fn load_capture(case: &str) -> (u64, Vec<CapturedFrame>) {
-    let text = std::fs::read_to_string(CAPTURE).expect("the committed capture reads");
-    let mut boot_ts = None;
-    let mut frames = Vec::new();
-    for line in text.lines() {
-        let value: serde_json::Value = serde_json::from_str(line).expect("jsonl record");
-        if value.get("case").and_then(|c| c.as_str()) != Some(case) {
-            continue;
-        }
-        if value.get("kind").and_then(|k| k.as_str()) == Some("summary") {
-            boot_ts = Some(
-                value["window_ts_ms"][0]
-                    .as_u64()
-                    .expect("the summary carries the window"),
-            );
-            continue;
-        }
-        if value.get("direction").and_then(|d| d.as_str()) != Some("in") {
-            continue;
-        }
-        let from = value
-            .get("received_as_from")
-            .or_else(|| value.get("from"))
-            .and_then(|f| f.as_u64())
-            .map(|f| provisioned(f as u32))
-            .expect("the record names its sender");
-        frames.push(CapturedFrame {
-            from,
-            at_ms: value["source"]["ts_ms"].as_u64().expect("ts"),
-            bytes: unhex(value["hex"].as_str().expect("hex")),
-        });
-    }
-    let boot_ts = boot_ts.expect("the capture carries the case's summary");
-    frames.sort_by_key(|frame| frame.at_ms);
-    for frame in &mut frames {
-        frame.at_ms -= boot_ts;
-    }
-    (boot_ts, frames)
-}
-
-/// The crashed boot: the marker file the gate reads is the running
-/// sentinel at the genesis life (`3 1 unflushed` — a SIGKILLed voter's
-/// durable state; system 3, crash counter 1, the projection's spelling);
-/// no stopped quorum classifies the boot crashed, the emission gate
-/// lands the next life's round at the boot gate, and the replica reopens
-/// clean over the genesis descriptor.
-fn open_crashed_n3(dir: &std::path::Path) -> Node {
-    std::fs::create_dir_all(dir).expect("scratch dir");
-    let state = dir.join("n3.state");
-    std::fs::write(&state, "3 1 unflushed\n").expect("the captured boot state");
-    let members = ["65537:n1", "131073:n2", "196609:n3"].join("\0");
-    Node::open(
-        &members,
-        "n3",
-        state.to_str().expect("utf8 path"),
-        None,
-        0,
-        lunet_advisory_lock::PRIMARY_TIMEOUT_MS,
-    )
-    .expect("the boot gate classifies the crashed marker and the node opens")
-}
-
-/// The fenced node's host loop (`main.rs::timers`, reduced to what a
-/// fenced restarting node ever drives): the heartbeat tick, the
-/// fenced-boot `recover()` on its resend cadence, the captured inbound
-/// frames at their recorded offsets, and the self-loop the transport's
-/// remap row produces (a send to the past-life id — the descriptor row —
-/// lands back on the node's own socket; its journal's
-/// `ReincarnationRefused` drops).
-struct Host {
-    node: Node,
-    /// The node's outbound `Reincarnation` frames so far.
-    announcements: u64,
-    /// Frames delivered into the node.
-    received: u64,
-}
-
-impl Host {
-    fn drain(&mut self) {
-        while let Some(out) = self.node.next_output() {
-            if out.kind != 1 {
-                continue;
-            }
-            if u32::from_be_bytes(out.bytes[0..4].try_into().expect("tag")) == 13 {
-                self.announcements += 1;
-            }
-            if out.to == 196609 {
-                let _ = self.node.receive(self.node.own_id(), &out.bytes);
-            }
-        }
-    }
-}
-
-/// Drives the fenced node through the recorded window and one
-/// announcement-cadence margin, then answers whether it seated.
-fn drive(case: &str, dir: &std::path::Path) -> (Host, Vec<CapturedFrame>) {
-    let (_boot_ts, frames) = load_capture(case);
-    let window_ms = frames.last().map(|frame| frame.at_ms).unwrap_or(0);
-    let deadline = window_ms + 2 * RECOVERY_MS;
-    let mut host = Host {
-        node: open_crashed_n3(dir),
-        announcements: 0,
-        received: 0,
-    };
-    // The boot's wire phase: the announcement is emitted at boot, ahead of
-    // the first drive (the capture's first received announcements land 2-7
-    // ms after the boot ts).
-    host.drain();
-    let mut next_frame = 0;
-    let mut now = 0;
-    while now <= deadline {
-        while next_frame < frames.len() && frames[next_frame].at_ms <= now {
-            let frame = &frames[next_frame];
-            let _ = host.node.receive(frame.from, &frame.bytes);
-            host.received += 1;
-            next_frame += 1;
-        }
-        if now % RECOVERY_MS == 0 {
-            let _ = host.node.recover();
-        }
-        let _ = host.node.idle();
-        host.drain();
-        now += TICK_MS;
-    }
-    (host, frames)
-}
-
 /// The shallow family (the view-churn fence): the restarted node's only
 /// inbound for 151 s is the era-5 churn's fence votes addressed to its
 /// past-life id; every one drops `UnevaluableEra` at the era-1 table and
@@ -229,9 +54,10 @@ fn drive(case: &str, dir: &std::path::Path) -> (Host, Vec<CapturedFrame>) {
 /// weight; the recorded exchange never seats it.
 #[test]
 fn reincarnating_into_the_view_churn_must_seat() {
-    panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+    panic!(
+        "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+    )
 }
-
 /// The deep family (the install that never lands): the forced sequence
 /// committed the node's promotion, then the era-5 view-126 install and the
 /// memo stream arrived under the descriptor id 1 the restarted node's
@@ -243,5 +69,7 @@ fn reincarnating_into_the_view_churn_must_seat() {
 /// the same: the announced restart must seat.
 #[test]
 fn reincarnating_under_the_stale_sender_attribution_must_seat() {
-    panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+    panic!(
+        "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+    )
 }

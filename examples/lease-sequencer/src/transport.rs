@@ -198,11 +198,6 @@ fn sha256_hex(data: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use vrr::ids::{Ballot, Era, NodeId, Slot, View};
-    use vrr::message::{Body, Message};
-    use vrr::wire::{Header, Pack, Tag};
-
     /// The frame this parser accepts IS the frame the core's own `pack`
     /// emits — the contract is derived from the wire, not hand-copied
     /// constants. A body-layout change upstream fails here before it can
@@ -210,16 +205,17 @@ mod tests {
     /// announcement to its bumped identity.
     /// The lawful identity pair the fixture announces: node 2's provisioned
     /// id (system 2, crash counter 1) and its next life.
-    const OLD_ID: u32 = (2 << 16) | 1;
-    const NEW_ID: u32 = (2 << 16) | 2;
-
     #[test]
     fn reincarnation_pair_reads_the_cores_packed_frame() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 
     #[test]
     fn reincarnation_pair_refuses_everything_else() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 }

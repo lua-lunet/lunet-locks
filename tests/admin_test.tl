@@ -1,7 +1,4 @@
-local admin = require("admin")
 local tested = require("tested")
-
-local UUID = "018f3f2a-7b1c-4c50-9f2a-3f4b5c6d7e8f"
 
 tested.test(
     "admin decodes the four membership verbs strictly",

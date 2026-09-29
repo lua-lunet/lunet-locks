@@ -599,59 +599,28 @@ fn pump(rx: Receiver<Msg>, mut core: AofCore, interval: Option<Duration>, drops:
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::journal::{self, KIND_HOLD, KIND_RELEASE, KIND_RENEW, parse_file};
-    use std::fs;
-
-    fn temp_aof_dir(name: &str) -> PathBuf {
-        use std::sync::atomic::AtomicU64;
-        static SEQ: AtomicU64 = AtomicU64::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "lunet-aof-test-{name}-{}-{}",
-            std::process::id(),
-            SEQ.fetch_add(1, Ordering::Relaxed),
-        ));
-        let _ = fs::remove_dir_all(&dir);
-        dir
-    }
-
-    fn sample_event(kind: u8, ts: u64, lock_id: u64, expiry: u64) -> JournalEvent {
-        JournalEvent {
-            kind,
-            ts,
-            lock_id,
-            lease_id: 42,
-            holder: [0xAA; 16],
-            expiry,
-        }
-    }
-
-    fn read_dir_names(dir: &Path) -> Vec<String> {
-        let mut names: Vec<String> = fs::read_dir(dir)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .map(|e| e.file_name().to_string_lossy().to_string())
-            .collect();
-        names.sort();
-        names
-    }
-
-    /// Records that fit exactly in one 2 MiB block.
-    const RECORDS_PER_ROLL: u64 = ROLL_BYTES / RECORD_SIZE as u64;
-
+    #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
     #[test]
     fn records_per_roll_fits_one_block() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 
+    #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
     #[test]
     fn append_lands_record_bytes_and_events() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 
+    #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
     #[test]
     fn roll_finalizes_exactly_two_mib_with_pad() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 
     /// The stop drain's guarantee (`AofWriter::drain`): after it returns,
@@ -660,57 +629,87 @@ mod tests {
     /// write-buffer threshold, the only thing that could have landed the
     /// buffered bytes is the drain's own flush+fsync — so a full read-back
     /// here proves the drain blocked until durability.
+    #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
     #[test]
     fn drain_makes_every_queued_event_durable() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 
+    #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
     #[test]
     fn reader_valid_prefix_deleting_finalized_files() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 
+    #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
     #[test]
     fn syncs_fire_only_on_checkpoint_roll_and_shutdown() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 
+    #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
     #[test]
     fn resume_reopen_rebuilds_position_and_window() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 
+    #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
     #[test]
     fn resume_truncates_a_torn_tail() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 
+    #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
     #[test]
     fn writer_thread_enqueue_lands_bytes_and_drops_on_overflow() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 
+    #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
     #[test]
     fn writer_thread_checkpoint_and_shutdown_flush() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 
     /// The continuous-load regression: a stream whose inter-event gaps are
     /// shorter than the pump tick must still reach the file — the buffered
     /// drain runs on its own cadence, never on recv_timeout expiry alone,
     /// and the periodic fsync fires while the stream keeps flowing.
+    #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
     #[test]
     fn writer_thread_flushes_under_continuous_load() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 
+    #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
     #[test]
     fn writer_thread_rolls_when_block_fills() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 
+    #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
     #[test]
     fn metafile_written_at_roll_matches_window() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 }

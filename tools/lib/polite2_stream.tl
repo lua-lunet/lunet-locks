@@ -68,7 +68,6 @@ function M.main(): integer
 
     local boot_ms = clock.now_ms()
     local request_num = 0
-    local cursor = 0
     -- The live connection in a one-element list (a typed nil-able slot).
     local held: {Tcp} = {}
 

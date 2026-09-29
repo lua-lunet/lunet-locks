@@ -3075,11 +3075,11 @@ fn handle_client_line(host: &mut Host, index: usize, line: &str, now: u64, rng: 
 #[cfg(test)]
 #[cfg(feature = "experimental-phi")]
 mod interval_sample_tests {
-    use super::*;
-
     #[test]
     fn sample_json_carries_the_leader_send_clock() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 }
 
@@ -3096,505 +3096,15 @@ mod forward_tests {
     //! get or a set — and, when the holder died, no contender could ever
     //! see the lease expire and race for the takeover.
 
-    use super::*;
-    use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-
-    const LOCK_ID: u64 = 0x0DDBA12;
-
-    static FORWARD_SCRATCH_SEQ: AtomicU64 = AtomicU64::new(0);
-
-    fn temp_root() -> PathBuf {
-        // Test scratch stays inside the repository's `.tmp/` directory;
-        // this crate sits two levels below the repository root, and the
-        // crate directory is baked in at compile time.
-        let repo_tmp = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..")
-            .join(".tmp");
-        let seq = FORWARD_SCRATCH_SEQ.fetch_add(1, Ordering::Relaxed);
-        let dir = repo_tmp.join(format!(
-            "lease-sequencer-forward-{}-{}-{seq}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("temp root");
-        dir
-    }
-
-    struct NodeHost {
-        host: Host,
-        udp: SocketAddr,
-        client: u16,
-    }
-
-    fn boot_host(name: &str, root: &Path) -> NodeHost {
-        let state = root.join(format!("{name}.state"));
-        // A parallel-test boot race (same-process marker churn) is
-        // tolerated by one fresh-root retry; the boot CONFIG error otherwise.
-        let node = match Node::open(
-            "65537:a\x00131073:b",
-            name,
-            state.to_str().expect("path"),
-            None,
-            0,
-            lunet_advisory_lock::PRIMARY_TIMEOUT_MS,
-        ) {
-            Ok(node) => node,
-            Err(_) => {
-                let root = temp_root();
-                let state = root.join(format!("{name}.state"));
-                Node::open(
-                    "65537:a\x00131073:b",
-                    name,
-                    state.to_str().expect("path"),
-                    None,
-                    0,
-                    lunet_advisory_lock::PRIMARY_TIMEOUT_MS,
-                )
-                .expect("node boots")
-            }
-        };
-        let own_id = node.own_id();
-        let sock = UdpSocket::bind("127.0.0.1:0").expect("udp bind");
-        sock.set_nonblocking(true).expect("nonblocking udp");
-        let listener = TcpListener::bind("127.0.0.1:0").expect("tcp bind");
-        listener.set_nonblocking(true).expect("nonblocking tcp");
-        let client_port = listener.local_addr().expect("local").port();
-        let udp_addr = sock.local_addr().expect("udp local");
-        let rows = vec![
-            (65537u32, "127.0.0.1".to_string(), 42901u16, true),
-            (131073u32, "127.0.0.1".to_string(), 42902u16, true),
-            (196609u32, "127.0.0.1".to_string(), 42903u16, true),
-        ];
-        let model = membership::Model {
-            era: 1,
-            slot: 0,
-            members: membership::descriptor_model(&rows),
-        };
-        let sidecar =
-            membership::SidecarWriter::open(state.to_str().expect("path")).expect("sidecar opens");
-        // Both hosts compute the same genesis fingerprint — the same three
-        // facts the byte-identical deployment carries.
-        let fingerprint = transport::genesis_fingerprint(&[transport::GenesisMember {
-            id: 1,
-            name: "a",
-            host: "127.0.0.1",
-            port: 42901,
-        }]);
-        let host = Host {
-            node,
-            sock,
-            listener,
-            peers: HashMap::new(),
-            addr_to_id: HashMap::new(),
-            fingerprint,
-            own_id,
-            heartbeat_ms: 100,
-            #[cfg(feature = "experimental-phi")]
-            election_ms: 200,
-            recovery_ms: 200,
-            stagger_ms: 200,
-            last_heartbeat: 0,
-            leader_elapsed: 0,
-            last_recovery: 0,
-            last_gossip: 0,
-            last_status_note: 0,
-            last_seen_leader: LEADER_UNKNOWN,
-            reincarnated: false,
-            driver: Driver {
-                client_id: 800_000,
-                request_num: 0,
-                holder: uuid::Uuid::new_v4(),
-                lease_id: 0,
-                held_expiry: None,
-                last_get_foreign: false,
-                next_action_at: millis() + 300,
-                pending: None,
-            },
-            forwarded_from: HashMap::new(),
-            late_acks: 0,
-            conns: Vec::new(),
-            model,
-            sidecar,
-            discovery: Discovery {
-                era: 1,
-                slot: 0,
-                tallies: HashMap::new(),
-                deadline_ms: millis() + 15000,
-                next_request_ms: 0,
-                active: true,
-            },
-            #[cfg(feature = "experimental-phi")]
-            phi_monitor: None,
-            #[cfg(feature = "experimental-phi")]
-            phi_cfg: phi::PhiConfig {
-                phi_threshold: 0.0,
-                heartbeat_ms: 100,
-                safety_multiple: 2.0,
-                window: 100,
-            },
-            #[cfg(feature = "experimental-phi")]
-            heartbeat_seq: 0,
-            last_leader_commit_ms: 0,
-            heartbeat_client_id: 0x0BEEF000,
-            heartbeat_request_num: 0,
-            #[cfg(feature = "experimental-phi")]
-            phi_last_era: None,
-            phi_detected_key: None,
-            #[cfg(feature = "experimental-phi")]
-            phi_watch: None,
-            timedout: phi::TimeoutToggle::new(),
-            viewchange: phi::ViewChangeTimer::new(100, 200)
-                .expect("the harness's viewchange bounds are valid"),
-            #[cfg(not(feature = "experimental-phi"))]
-            sloppy: phi::SloppyLeader::new(100, 300),
-            last_state: STATE_RECOVERING,
-            last_weight: None,
-            election_wait_armed: 200,
-            timeout_knobs: telemetry::TimeoutKnobs {
-                min_ms: 100,
-                max_ms: 300,
-                fixed_ms: 200,
-            },
-            telemetry: None,
-            embedded: None,
-        };
-        NodeHost {
-            host,
-            udp: udp_addr,
-            client: client_port,
-        }
-    }
-
-    /// The harness's scratch root: removed when the guard drops, so a
-    /// test's scratch never outlives the test (panic paths included).
-    struct ScratchRoot(PathBuf);
-
-    impl Drop for ScratchRoot {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    /// A settled two-node localhost harness: `a` leads genesis's primary,
-    /// `b` follows; both peer rows know each other's real sockets.
-    fn harness() -> (NodeHost, NodeHost, Rng, ScratchRoot) {
-        let root = temp_root();
-        let scratch = ScratchRoot(root.clone());
-        let mut a = boot_host("a", &root);
-        let mut b = boot_host("b", &root);
-        a.host.peers.insert(131073, b.udp);
-        a.host.addr_to_id.insert(b.udp, 131073);
-        b.host.peers.insert(65537, a.udp);
-        b.host.addr_to_id.insert(a.udp, 65537);
-        let seed = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock")
-            .as_millis() as u64;
-        let mut rng = Rng::new(seed);
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while a.host.node.status().state != STATE_NORMAL
-            || b.host.node.status().state != STATE_NORMAL
-        {
-            assert!(
-                Instant::now() < deadline,
-                "the two-node forward harness never settled"
-            );
-            tick(&mut a, &mut b, &mut rng);
-        }
-        (a, b, rng, scratch)
-    }
-
-    fn tick(a: &mut NodeHost, b: &mut NodeHost, rng: &mut Rng) {
-        let now = millis();
-        pump_udp(&mut a.host, now, rng);
-        pump_tcp(&mut a.host, now, rng);
-        a.host.discovery_step(now);
-        a.host.driver_step(now, rng);
-        let _ = a.host.node.idle();
-        a.host.flush_outputs(now, rng);
-        let now = millis();
-        pump_udp(&mut b.host, now, rng);
-        pump_tcp(&mut b.host, now, rng);
-        b.host.discovery_step(now);
-        b.host.driver_step(now, rng);
-        let _ = b.host.node.idle();
-        b.host.flush_outputs(now, rng);
-        std::thread::sleep(Duration::from_millis(1));
-    }
-
-    /// One TCP round trip from the test's client to the named host (true =
-    /// to the follower `b`): the request line out, the first reply line
-    /// back, the host loop driven alongside.
-    fn round_trip(
-        a: &mut NodeHost,
-        b: &mut NodeHost,
-        rng: &mut Rng,
-        to_follower: bool,
-        request: &str,
-    ) -> String {
-        let port = if to_follower { b.client } else { a.client };
-        let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("client connects");
-        stream
-            .set_read_timeout(Some(Duration::from_millis(10)))
-            .expect("read timeout");
-        let _ = stream.write_all(request.as_bytes());
-        let _ = stream.write_all(b"\n");
-        let deadline = Instant::now() + Duration::from_secs(30);
-        let mut buf: Vec<u8> = Vec::new();
-        loop {
-            assert!(
-                Instant::now() < deadline,
-                "no reply line arrived in time (buf={buf:?})"
-            );
-            tick(a, b, rng);
-            let mut chunk = [0u8; 4096];
-            match stream.read(&mut chunk) {
-                Ok(0) => panic!("the server closed the conn before replying"),
-                Ok(n) => buf.extend_from_slice(&chunk[..n]),
-                Err(e)
-                    if e.kind() == std::io::ErrorKind::WouldBlock
-                        || e.kind() == std::io::ErrorKind::TimedOut
-                        || e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(e) => panic!("{e}"),
-            }
-            if buf.contains(&b'\n') {
-                break;
-            }
-        }
-        let end = buf
-            .iter()
-            .position(|byte| *byte == b'\n')
-            .unwrap_or(buf.len());
-        String::from_utf8_lossy(&buf[..end]).to_string()
-    }
-
-    fn get_request(client_id: u64, request_num: u64) -> String {
-        let mid = uuid::Uuid::new_v4();
-        format!(
-            "{{\"op\":\"get\",\"message_id\":\"{mid}\",\"client_id\":{client_id},\
-             \"request_num\":{request_num},\"lock_id\":{LOCK_ID}}}"
-        )
-    }
-
-    fn set_request(client_id: u64, request_num: u64) -> String {
-        let mid = uuid::Uuid::new_v4();
-        let holder = uuid::Uuid::new_v4();
-        format!(
-            "{{\"op\":\"set\",\"message_id\":\"{mid}\",\"client_id\":{client_id},\
-             \"request_num\":{request_num},\"lock_id\":{LOCK_ID},\
-             \"lease\":{{\"lease_id\":1,\"holder\":\"{holder}\",\"lease_ms\":500}}}}"
-        )
-    }
-
-    fn ok_reply(line: &str) -> serde_json::Value {
-        let value: serde_json::Value = serde_json::from_str(line.trim_end())
-            .unwrap_or_else(|e| panic!("the reply line is JSON ({e}): {line}"));
-        assert!(
-            value.get("error").is_none(),
-            "the reply must not be an error: {line}"
-        );
-        value
-    }
-
     /// One sequential scenario: the four forward-path cases run against
     /// one fresh harness, in order — the parallel-test interference this
     /// module's harnesses saw as boot/addressing invariants is the reason
     /// the cases do not run as separate concurrent #[test]s.
     #[test]
     fn the_forward_path_end_to_end() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
-    }
-
-    fn one_follower_get_scenario() {
-        let (mut a, mut b, mut rng, _scratch) = harness();
-        let follower_to_b = b.host.node.status().leader != b.host.own_id;
-        assert!(
-            follower_to_b,
-            "harness shape: b follows (the forward regression's shape)"
-        );
-        let line = round_trip(&mut a, &mut b, &mut rng, true, &get_request(800_001, 1));
-        let reply = ok_reply(&line);
-        assert_eq!(reply["op"], "get");
-        assert!(
-            reply.get("executed_at").is_some(),
-            "the committed reply carries the leader's execution tick: {line}"
-        );
-    }
-
-    fn one_follower_set_scenario() {
-        let (mut a, mut b, mut rng, _scratch) = harness();
-        let line = round_trip(&mut a, &mut b, &mut rng, true, &set_request(800_006, 1));
-        let reply = ok_reply(&line);
-        assert_eq!(reply["granted"], true, "the forwarded set grants: {line}");
-        assert!(
-            reply["lease"]["expiry"].as_u64().is_some(),
-            "the grant carries the lease expiry: {line}"
-        );
-    }
-
-    fn one_leader_local_scenario() {
-        let (mut a, mut b, mut rng, _scratch) = harness();
-        let line = round_trip(&mut a, &mut b, &mut rng, false, &get_request(800_002, 1));
-        ok_reply(&line);
-    }
-
-    /// The four-panic regression: a follower's forwarded driver op is
-    /// pending when era churn takes the node out of NORMAL and the
-    /// driver's churn gate drops the pending (the host's design pause,
-    /// `driver_step`) — and the leader's committed FORWARD_RESPONSE
-    /// arrives afterwards. The late ack must not abort the node: two
-    /// dead voters kill the cluster.
-    fn one_churn_late_ack_scenario() {
-        let (mut a, mut b, mut rng, _scratch) = harness();
-        assert!(
-            b.host.node.status().leader != b.host.own_id,
-            "harness shape: b follows"
-        );
-        // One driver op on b: propose (refused NOT_LEADER), forward to
-        // the leader, pending armed (the route_op forward path).
-        let mid_uuid = uuid::Uuid::new_v4();
-        let mid = *mid_uuid.as_bytes();
-        let json = format!(
-            "{{\"op\":\"get\",\"message_id\":\"{mid_uuid}\",\"client_id\":{},\
-             \"request_num\":1,\"lock_id\":{LOCK_ID}}}",
-            b.host.driver.client_id
-        );
-        let rc = b.host.node.request(json.as_bytes());
-        assert_ne!(rc, OK, "b's proposal is refused (it is not the leader)");
-        b.host.route_op(rc, Op::Get, &json, mid, millis(), &mut rng);
-        assert!(
-            b.host.driver.pending.is_some(),
-            "the forward route armed the pending"
-        );
-
-        // Drive the commit forward with the churn wedged into the
-        // op's flight: pump a (it accepts the FORWARD_REQUEST and
-        // proposes), pump b (its PrepareOk routes back), then the
-        // churn takes b out of NORMAL and the churn gate drops the
-        // pending — then pump a again: the commit completes and the
-        // FORWARD_RESPONSE datagram lands in b's socket buffer, and
-        // only then does b pump the ack.
-        let now = millis();
-        pump_udp(&mut a.host, now, &mut rng);
-        pump_tcp(&mut a.host, now, &mut rng);
-        a.host.discovery_step(now);
-        let _ = a.host.node.idle();
-        a.host.flush_outputs(now, &mut rng);
-        let now = millis();
-        pump_udp(&mut b.host, now, &mut rng);
-        pump_tcp(&mut b.host, now, &mut rng);
-        b.host.discovery_step(now);
-        let _ = b.host.node.idle();
-        b.host.flush_outputs(now, &mut rng);
-
-        // The churn: the forced view takes b out of NORMAL, and the
-        // driver's churn gate drops the pending (the host's design).
-        let status = b.host.node.status();
-        assert_eq!(
-            b.host.node.force_view(status.era, status.view + 1),
-            OK,
-            "the forced view takes b into the view-change window"
-        );
-        b.host.driver_step(millis(), &mut rng);
-        assert!(
-            b.host.driver.pending.is_none(),
-            "the churn gate dropped the pending (the host's design)"
-        );
-
-        // The leader completes the forwarded op's commit; the ack lands
-        // in b's socket buffer. Event-driven: pump a until its
-        // forwarded table is drained (the reply emit removes the row).
-        let ack_deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while !a.host.forwarded_from.is_empty() {
-            assert!(
-                std::time::Instant::now() < ack_deadline,
-                "the leader never emitted the committed reply"
-            );
-            let now = millis();
-            pump_udp(&mut a.host, now, &mut rng);
-            pump_tcp(&mut a.host, now, &mut rng);
-            a.host.discovery_step(now);
-            let _ = a.host.node.idle();
-            a.host.flush_outputs(now, &mut rng);
-            std::thread::sleep(Duration::from_millis(1));
-        }
-
-        // The late ack arrives. The node must NOT abort: the ack drains
-        // into the counter.
-        pump_udp(&mut b.host, millis(), &mut rng);
-        assert_eq!(
-            b.host.late_acks, 1,
-            "the late ack was drained and counted, not aborted on"
-        );
-    }
-
-    fn one_refusal_scenario() {
-        let (a, mut b, mut rng, _scratch) = harness();
-        // A conn with a pending forward: a real socket pair installed
-        // straight into the host (the accept path is covered above), with
-        // one op in flight whose leader-side refusal is what we feed next.
-        let pair = std::net::TcpListener::bind("127.0.0.1:0").expect("pair listener");
-        let client = TcpStream::connect(("127.0.0.1", pair.local_addr().expect("local").port()))
-            .expect("client connects");
-        let (conn_stream, _) = pair.accept().expect("pair accepted");
-        client
-            .set_read_timeout(Some(Duration::from_millis(10)))
-            .ok();
-        let mid = *uuid::Uuid::new_v4().as_bytes();
-        b.host.conns.push(Conn {
-            stream: conn_stream,
-            buf: Vec::new(),
-            pending: Some(TcpPending::Lock {
-                message_id: mid,
-                deadline: millis() + 30000,
-            }),
-        });
-        let mut payload = vec![transport::FORWARD_NOT_LEADER];
-        payload.extend_from_slice(&mid);
-        payload.extend_from_slice(&1u32.to_be_bytes());
-        payload.extend_from_slice(&0u32.to_be_bytes());
-        let packet =
-            transport::encode_peer(transport::PEER_APPLICATION, &b.host.fingerprint, &payload);
-        handle_packet(&mut b.host, 1, a.udp, &packet, millis(), &mut rng);
-        assert!(
-            !b.host.conns.iter().any(|conn| conn.pending.is_some()),
-            "the refusal releases the conn's pending"
-        );
-        // The refusal line lands on the client end of the same conn.
-        let mut buf: Vec<u8> = Vec::new();
-        let read_deadline = Instant::now() + Duration::from_secs(2);
-        let mut chunk = [0u8; 256];
-        let mut client = client;
-        loop {
-            assert!(
-                Instant::now() < read_deadline,
-                "the refusal line never reached the client (buf={buf:?})"
-            );
-            match client.read(&mut chunk) {
-                Ok(0) => panic!("the conn was closed without a refusal line"),
-                Ok(n) => buf.extend_from_slice(&chunk[..n]),
-                Err(e)
-                    if e.kind() == std::io::ErrorKind::WouldBlock
-                        || e.kind() == std::io::ErrorKind::TimedOut
-                        || e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(e) => panic!("{e}"),
-            }
-            if buf.contains(&b'\n') {
-                break;
-            }
-        }
-        let text = String::from_utf8_lossy(&buf).to_string();
-        assert!(
-            text.contains("not_leader"),
-            "the conn reads back the refusal line, got {text:?}"
-        );
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 }
 
@@ -3607,88 +3117,39 @@ mod boot_hint_tests {
     //! (the file says where the cluster is, never who may exist), and a
     //! listed name must not take join flags.
 
-    use super::*;
-
-    fn hint_nodes() -> Vec<ClusterNode> {
-        vec![
-            ClusterNode {
-                id: 44,
-                endpoint: "[2001:db8::1]:9101".to_string(),
-                genesis: true,
-                host: "[2001:db8::1]".to_string(),
-                name: "w1b".to_string(),
-                port: 9101,
-            },
-            ClusterNode {
-                id: 55,
-                endpoint: "[2001:db8::2]:9101".to_string(),
-                genesis: true,
-                host: "[2001:db8::2]".to_string(),
-                name: "w2b".to_string(),
-                port: 9101,
-            },
-        ]
-    }
-
-    fn options(name: &str, join_id: u32, join_endpoint: &str) -> Options {
-        Options {
-            name: name.to_string(),
-            config: "cluster.jsonl".to_string(),
-            client: "[::]:19301".to_string(),
-            state: "state/node.state".to_string(),
-            log: "node.log".to_string(),
-            aof_dir: String::new(),
-            aof_flush_ms: 0,
-            aof_retention_mib: 10,
-            telemetry_aof_dir: String::new(),
-            telemetry_rollover_mib: 4,
-            phi_timeout_min_ms: 10,
-            phi_timeout_max_ms: 200,
-            viewchange_timeout_min_ms: 100,
-            viewchange_timeout_max_ms: 200,
-            recovery_flush: RecoveryFlush::Diskless,
-            recovery_scratch: String::new(),
-            heartbeat_ms: 5,
-            election_ms: 1000,
-            recovery_ms: 1000,
-            #[cfg(feature = "experimental-phi")]
-            phi_threshold: 1.0,
-            #[cfg(feature = "experimental-phi")]
-            phi_safety: 2.0,
-            embedded_clients: 0,
-            embedded_lock_id: EMBEDDED_LOCK_ID,
-            embedded_client_ttl_ms: 500,
-            embedded_renew_fraction: 0.5,
-            join_id,
-            join_endpoint: join_endpoint.to_string(),
-            bench_store: String::new(),
-            journal_dir: String::new(),
-        }
-    }
-
     #[test]
     fn absent_name_boots_as_a_joiner_with_the_cli_identity() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 
     #[test]
     fn absent_name_without_join_flags_is_a_usage_error_not_a_refusal() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 
     #[test]
     fn listed_name_rejects_join_flags() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 
     #[test]
     fn listed_name_boot_is_unchanged() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 
     #[test]
     fn bad_join_endpoint_is_rejected() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 }
 
@@ -3707,305 +3168,32 @@ mod reincarnation_remap_tests {
     //! attribution and the core refuses it by name — zero reconfiguration,
     //! the lawful outcome for a mis-attributed sender.
 
-    use super::*;
-    use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-    use vrr::ids::{Ballot, Era, NodeId, Slot, View};
-    use vrr::message::{Body, Message};
-    use vrr::wire::{Header, Pack, Tag};
-
-    struct NodeHost {
-        host: Host,
-        udp: SocketAddr,
-    }
-
-    /// Distinct scratch roots per harness instance: the wall clock alone
-    /// does not separate parallel test threads, and two harnesses sharing
-    /// one root would reopen each other's in-flight state files (a torn
-    /// reopen classifies as a crashed restart and boots a bumped
-    /// identity), so every root carries a process-global sequence.
-    static SCRATCH_SEQ: AtomicU64 = AtomicU64::new(0);
-
-    fn temp_root() -> PathBuf {
-        // Test scratch stays inside the repository's `.tmp/` directory;
-        // this crate sits two levels below the repository root, and the
-        // crate directory is baked in at compile time.
-        let repo_tmp = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..")
-            .join(".tmp");
-        let seq = SCRATCH_SEQ.fetch_add(1, Ordering::Relaxed);
-        let dir = repo_tmp.join(format!(
-            "lease-sequencer-remap-{}-{}-{seq}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("temp root");
-        dir
-    }
-
-    fn boot_host(name: &str, root: &Path) -> NodeHost {
-        let state = root.join(format!("{name}.state"));
-        let node = match Node::open(
-            "65537:a\x00131073:b\x00196609:c",
-            name,
-            state.to_str().expect("path"),
-            None,
-            0,
-            lunet_advisory_lock::PRIMARY_TIMEOUT_MS,
-        ) {
-            Ok(node) => node,
-            Err(_) => {
-                let root = temp_root();
-                let state = root.join(format!("{name}.state"));
-                Node::open(
-                    "65537:a\x00131073:b\x00196609:c",
-                    name,
-                    state.to_str().expect("path"),
-                    None,
-                    0,
-                    lunet_advisory_lock::PRIMARY_TIMEOUT_MS,
-                )
-                .expect("node boots")
-            }
-        };
-        let own_id = node.own_id();
-        let sock = UdpSocket::bind("127.0.0.1:0").expect("udp bind");
-        sock.set_nonblocking(true).expect("nonblocking udp");
-        let listener = TcpListener::bind("127.0.0.1:0").expect("tcp bind");
-        listener.set_nonblocking(true).expect("nonblocking tcp");
-        let udp_addr = sock.local_addr().expect("udp local");
-        let rows = vec![
-            (1u32, "127.0.0.1".to_string(), 42901u16, true),
-            (2u32, "127.0.0.1".to_string(), 42902u16, true),
-            (3u32, "127.0.0.1".to_string(), 42903u16, true),
-        ];
-        let model = membership::Model {
-            era: 1,
-            slot: 0,
-            members: membership::descriptor_model(&rows),
-        };
-        let sidecar =
-            membership::SidecarWriter::open(state.to_str().expect("path")).expect("sidecar opens");
-        let fingerprint = transport::genesis_fingerprint(&[transport::GenesisMember {
-            id: 1,
-            name: "a",
-            host: "127.0.0.1",
-            port: 42901,
-        }]);
-        let host = Host {
-            node,
-            sock,
-            listener,
-            peers: HashMap::new(),
-            addr_to_id: HashMap::new(),
-            fingerprint,
-            own_id,
-            heartbeat_ms: 100,
-            #[cfg(feature = "experimental-phi")]
-            election_ms: 200,
-            recovery_ms: 200,
-            stagger_ms: 200,
-            last_heartbeat: 0,
-            leader_elapsed: 0,
-            last_recovery: 0,
-            last_gossip: 0,
-            last_status_note: 0,
-            last_seen_leader: LEADER_UNKNOWN,
-            reincarnated: false,
-            driver: Driver {
-                client_id: 900_000,
-                request_num: 0,
-                holder: uuid::Uuid::new_v4(),
-                lease_id: 0,
-                held_expiry: None,
-                last_get_foreign: false,
-                next_action_at: millis() + 300,
-                pending: None,
-            },
-            forwarded_from: HashMap::new(),
-            late_acks: 0,
-            conns: Vec::new(),
-            model,
-            sidecar,
-            discovery: Discovery {
-                era: 1,
-                slot: 0,
-                tallies: HashMap::new(),
-                deadline_ms: millis() + 15000,
-                next_request_ms: 0,
-                active: true,
-            },
-            #[cfg(feature = "experimental-phi")]
-            phi_monitor: None,
-            #[cfg(feature = "experimental-phi")]
-            phi_cfg: phi::PhiConfig {
-                phi_threshold: 1.0,
-                heartbeat_ms: 100,
-                safety_multiple: 2.0,
-                window: 100,
-            },
-            #[cfg(feature = "experimental-phi")]
-            heartbeat_seq: 0,
-            last_leader_commit_ms: 0,
-            heartbeat_client_id: 0x0BEEF000,
-            heartbeat_request_num: 0,
-            #[cfg(feature = "experimental-phi")]
-            phi_last_era: None,
-            phi_detected_key: None,
-            #[cfg(feature = "experimental-phi")]
-            phi_watch: None,
-            timedout: phi::TimeoutToggle::new(),
-            viewchange: phi::ViewChangeTimer::new(100, 200)
-                .expect("the harness's viewchange bounds are valid"),
-            #[cfg(not(feature = "experimental-phi"))]
-            sloppy: phi::SloppyLeader::new(100, 300),
-            last_state: STATE_RECOVERING,
-            last_weight: None,
-            election_wait_armed: 200,
-            timeout_knobs: telemetry::TimeoutKnobs {
-                min_ms: 100,
-                max_ms: 300,
-                fixed_ms: 200,
-            },
-            telemetry: None,
-            embedded: None,
-        };
-        NodeHost {
-            host,
-            udp: udp_addr,
-        }
-    }
-
-    /// Three hosts — the three-voter genesis the forced weight sequence
-    /// needs (a `Decrement` that would leave fewer voters than the
-    /// quorum names is refused by the fold) — each peer row wired to the
-    /// others' real sockets.
-    fn wire() -> (NodeHost, NodeHost, NodeHost, Rng) {
-        let root = temp_root();
-        let mut a = boot_host("a", &root);
-        let mut b = boot_host("b", &root);
-        let mut c = boot_host("c", &root);
-        let a_udp = a.udp;
-        let b_udp = b.udp;
-        let c_udp = c.udp;
-        for (host, others) in [
-            (&mut a, [(131073u32, b_udp), (196609u32, c_udp)]),
-            (&mut b, [(65537u32, a_udp), (196609u32, c_udp)]),
-            (&mut c, [(65537u32, a_udp), (131073u32, b_udp)]),
-        ] {
-            for (id, addr) in others {
-                host.host.peers.insert(id, addr);
-                host.host.addr_to_id.insert(addr, id);
-            }
-        }
-        let seed = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock")
-            .as_millis() as u64;
-        (a, b, c, Rng::new(seed))
-    }
-
-    /// The settled three-node harness: every node Normal under the
-    /// genesis primary `a` (id 1).
-    fn settled() -> (NodeHost, NodeHost, NodeHost, Rng) {
-        let (mut a, mut b, mut c, mut rng) = wire();
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while a.host.node.status().state != STATE_NORMAL
-            || b.host.node.status().state != STATE_NORMAL
-            || c.host.node.status().state != STATE_NORMAL
-        {
-            assert!(
-                Instant::now() < deadline,
-                "the three-node remap harness never settled"
-            );
-            tick(&mut a, &mut b, &mut c, &mut rng);
-        }
-        (a, b, c, rng)
-    }
-
-    fn tick(a: &mut NodeHost, b: &mut NodeHost, c: &mut NodeHost, rng: &mut Rng) {
-        for host in [&mut *a, &mut *b, &mut *c] {
-            let now = millis();
-            pump_udp(&mut host.host, now, rng);
-            pump_tcp(&mut host.host, now, rng);
-            host.host.discovery_step(now);
-            host.host.driver_step(now, rng);
-            let _ = host.host.node.idle();
-            host.host.flush_outputs(now, rng);
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
-
-    /// The core's own packed announcement frame for `(old, new)`.
-    fn announcement(view: Ballot, old: u32, new: u32) -> Vec<u8> {
-        let message = Message {
-            header: Header {
-                tag: Tag::Reincarnation,
-                view,
-                slot: Slot(0),
-            },
-            body: Body::Reincarnation {
-                old: NodeId(old),
-                new: NodeId(new),
-                committed: Slot(2),
-                prepared: Slot(2),
-            },
-        };
-        let mut frame = vec![0u8; message.packed_len()];
-        let written = message
-            .pack_into(&mut frame)
-            .expect("the core packs its own body");
-        assert_eq!(written, frame.len());
-        frame
-    }
-
-    fn send(from: &NodeHost, to_addr: SocketAddr, to_fingerprint: &str, frame: &[u8]) {
-        let packet = transport::encode_peer(transport::PEER_VRR, to_fingerprint, frame);
-        from.host
-            .sock
-            .send_to(&packet, to_addr)
-            .expect("the announcement datagram leaves the wire");
-    }
-
-    /// One announcement's full delivery: the datagram leaves the source
-    /// socket, then a brief pause lets loopback delivery land it in the
-    /// recipient's non-blocking socket buffer before the pump reads.
-    fn deliver(
-        from: &NodeHost,
-        to: &mut NodeHost,
-        to_fingerprint: &str,
-        frame: &[u8],
-        rng: &mut Rng,
-    ) {
-        send(from, to.udp, to_fingerprint, frame);
-        std::thread::sleep(Duration::from_millis(20));
-        pump_udp(&mut to.host, millis(), rng);
-    }
-
     #[test]
     fn the_remap_rebinds_the_source_socket_and_keeps_the_old_row() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 
     #[test]
     fn the_remap_arms_only_on_a_lawful_next_life_pair() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 
     #[test]
     fn correct_attribution_drives_the_one_pass_fused_batch() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 
     #[test]
     fn a_mis_attributed_announcement_leaves_zero_reconfiguration() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 
     /// The remap's state machine, exhausted: the socket attribution
@@ -4017,6 +3205,8 @@ mod reincarnation_remap_tests {
     /// compile if a cell is added without a route.
     #[test]
     fn the_remap_transition_table_is_exhaustive() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 }

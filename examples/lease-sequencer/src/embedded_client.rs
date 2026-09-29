@@ -682,112 +682,62 @@ impl Runner {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use serde_json::json;
-
-    fn config() -> Config {
-        Config {
-            lock_id: 0x0DDBA12,
-            client_id: 800_000,
-            lease_ms: 500,
-            renew_fraction: 0.5,
-            probe_floor_ms: 0,
-        }
-    }
-
-    fn contender() -> Contender {
-        Contender::new(config(), 0xDEAD_BEEF)
-    }
-
-    fn started(contender: &mut Contender) {
-        client_gate::start(contender.gate(), 1000);
-    }
-
-    fn probe_action(contender: &mut Contender) -> Action {
-        started(contender);
-        contender
-            .next_action(1000)
-            .expect("a started contender probes")
-    }
-
-    /// A GET reply naming `holder` with `remaining` ms left on the
-    /// leader's timeline.
-    fn get_reply(remaining: u64, holder: &str) -> Value {
-        json!({
-            "op": "get",
-            "lease": {"lease_id": 5, "holder": holder, "expiry": 10_000 + remaining},
-            "executed_at": 10_000,
-        })
-    }
-
-    /// A granted SET reply (the race or a renewal) for `holder`.
-    fn set_reply(granted: bool, holder: &str) -> Value {
-        json!({
-            "op": "set",
-            "granted": granted,
-            "lease": {"lease_id": 6, "holder": holder, "expiry": 10_500},
-            "executed_at": 10_000,
-        })
-    }
-
     // ------------------------------------------------------------ Contender ----
 
     #[test]
     fn contender_boots_silent_and_schedules_nothing() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 
     #[test]
     fn started_contender_probes_with_a_get_request() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 
     #[test]
     fn polite_floor_thins_the_foreign_probe_but_never_the_holder_renewal() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 
     #[test]
     fn free_probe_races_inline_with_a_set() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 
     #[test]
     fn set_reply_adopts_holdership_and_schedules_the_renewal() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 
     #[test]
     fn foreign_incumbent_polls_past_expiry_with_jitter() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 
     #[test]
     fn own_live_lease_probe_reschedules_a_tight_renewal() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 
     #[test]
     fn renewal_reply_schedules_the_next_renewal_inside_the_window() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
-    }
-
-    /// A renewal the leader DENIED, in the rig's exact reply shape: no
-    /// error field, the foreign incumbent's live lease echoed with the
-    /// leader's execution tick — the reply the run-2 leader sent the
-    /// two race losers' extensions for the whole run (locks2-2026-09-15).
-    fn denied_renewal_reply(remaining: u64, holder: &str) -> Value {
-        json!({
-            "op": "set",
-            "granted": false,
-            "lease": {
-                "lease_id": 1594,
-                "holder": holder,
-                "expiry": 10_000 + remaining,
-                "lease_ms": 500,
-            },
-            "executed_at": 10_000,
-        })
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 
     /// THE run-2 regression: a staked contender whose renewal is denied
@@ -798,7 +748,9 @@ mod tests {
     /// as an acked extension.
     #[test]
     fn denied_renewal_withdraws_the_stake_and_reprobes() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 
     /// A contender that genuinely held its lease and then lost it (the
@@ -806,7 +758,9 @@ mod tests {
     /// same denial shape on its next renewal — it must re-probe too.
     #[test]
     fn holder_denied_a_renewal_also_reprobes() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 
     /// The stats layer's granted-outcome semantics: a completed round
@@ -814,7 +768,9 @@ mod tests {
     /// (no error field) yet must never count as an acked extension or set.
     #[test]
     fn granted_outcome_semantics_separate_completions_from_grants() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 
     /// THE sustain regression (the locks2 rotation line): a holder's
@@ -828,43 +784,53 @@ mod tests {
     /// this test refuses.
     #[test]
     fn the_holder_sustains_renewals_against_the_real_service() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 
     #[test]
     fn error_or_unparseable_reply_backs_off_and_reprobes() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 
     #[test]
     fn silence_mid_holdership_forgets_and_restarts_with_a_probe() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 
     // -------------------------------------------------------------- Runner ----
 
-    fn runner(count: usize) -> Runner {
-        Runner::new(count, config(), Signals::register(), 1000, 0x5EED_BA5E)
-    }
-
     #[test]
     fn runner_boots_every_client_silent() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 
     #[test]
     fn runner_start_probes_for_every_client() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 
     #[test]
     fn runner_absorb_routes_the_free_probe_race_inline() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 
     #[test]
     fn runner_reply_for_an_unknown_message_id_is_not_claimed() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 
     /// The runner path (the sequencer host's embedded clients): a denied
@@ -875,27 +841,37 @@ mod tests {
     /// submitted extensions forever.
     #[test]
     fn runner_denied_renewal_returns_to_probing() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 
     #[test]
     fn runner_pending_deadline_expires_into_a_backoff() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 
     #[test]
     fn runner_holds_one_op_in_flight_at_a_time() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 
     #[test]
     fn runner_not_leader_drops_the_pending_and_backs_off() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 
     #[test]
     fn runner_silence_stops_every_client_and_abandons_in_flight_ops() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 
     // ------------------------------------------------------------- Signals ----
@@ -907,14 +883,18 @@ mod tests {
     /// starve the second gate.
     #[test]
     fn one_silence_signal_reaches_every_gate_not_just_the_first_drainer() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 
     /// Repeated signals in the same mode are level no-ops: a gate
     /// already in the process mode is untouched by a later apply.
     #[test]
     fn repeated_signals_in_the_same_mode_leave_a_matching_gate_untouched() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 }
 
@@ -927,35 +907,31 @@ mod wire_uuid_form_tests {
     //! The format guard makes that shape a loud failure at the draw and
     //! at both sides of the comparison.
 
-    use super::*;
-
     #[test]
     fn the_drawn_identity_is_the_wires_canonical_form() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 
     #[test]
     fn the_bare_hex_form_the_contender_once_drew_is_not_the_wires_form() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 
     #[test]
     fn reply_holds_flags_a_bare_hex_echo_loudly() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 
     #[test]
     fn reply_holds_compares_like_for_like_on_canonical_forms() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
-    }
-
-    fn config_for_tests() -> Config {
-        Config {
-            lock_id: 14531090,
-            client_id: 800002,
-            lease_ms: 500,
-            renew_fraction: 0.5,
-            probe_floor_ms: 1000,
-        }
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 }

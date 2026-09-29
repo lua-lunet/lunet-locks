@@ -62,16 +62,15 @@ pub fn gossip_datagram(era: u32, view: u32) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use vrr::wire::Unpack;
-
     /// The datagram this host sends IS the frame the core's own `pack`
     /// emits and its own `unpack` reads back: the join ticket is derived
     /// from the wire, not hand-copied bytes. A body-layout change
     /// upstream fails here before it can silently disarm the rejoin.
     #[test]
     fn gossip_datagram_round_trips_through_the_cores_own_codec() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 
     /// The frame is exact-length (W3): nothing the core would reject as
@@ -79,6 +78,8 @@ mod tests {
     /// the packed length the core itself computes.
     #[test]
     fn gossip_datagram_length_is_the_cores_packed_length() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 }

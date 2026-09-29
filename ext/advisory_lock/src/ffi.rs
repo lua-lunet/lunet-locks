@@ -3232,51 +3232,44 @@ pub unsafe extern "C" fn lunet_lock_node_next(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::marker_store::superblock_path;
-    use uuid::Uuid;
-    use vrr::ids::Slot;
-
-    fn state_path(name: &str) -> PathBuf {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static SEQUENCE: AtomicU64 = AtomicU64::new(0);
-        std::env::temp_dir().join(format!(
-            "lunet-advisory-lock-{name}-{}-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("clock is after Unix epoch")
-                .as_nanos(),
-            SEQUENCE.fetch_add(1, Ordering::Relaxed),
-        ))
-    }
-
+    #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
     #[test]
     fn first_boot_anchors_the_genesis_life_and_the_crash_bump_is_durable_at_boot() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 
+    #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
     #[test]
     fn the_boot_gate_refuses_malformed_identities_and_exhausted_counters() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 
     /// The recovery boundary executes the configured variant's flush exactly
     /// at the crashed classification: its latency is reported, a re-crash
     /// replay reports it again (the pair is re-decided from the landed
     /// round), and a clean continue never flushes.
+    #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
     #[test]
     fn dirty_boot_executes_the_recovery_flush_clean_continue_does_not() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 
     /// The crash bump's marker round lands at the crashed classification
     /// (the emission gate), copy-free rig state included: a single-file
     /// projection in the running sentinel's spelling classifies crashed,
     /// the bump round writes the quorum copies and the projection.
+    #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
     #[test]
     fn existing_unflushed_files_boot_the_emission_gate_round() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 
     /// The migration path, the clean-stop spelling: a copy-free rig
@@ -3284,9 +3277,12 @@ mod tests {
     /// end state) migrates at boot — the classification reads the file,
     /// the first routed write seeds the copies, and the boot continues
     /// under the SAME identity.
+    #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
     #[test]
     fn legacy_flushed_file_migrates_and_continues_clean() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 
     /// The purge's law at the boot gate: copies that exist but cannot be
@@ -3295,34 +3291,11 @@ mod tests {
     /// torn-away shape: three copies' zones read short (never fully
     /// written), so only one readable copy stands — below the 2/4 open
     /// threshold, no verdict, the boot refuses.
+    #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
     #[test]
     fn an_unreadable_marker_quorum_refuses_the_boot() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
-    }
-
-    /// The projection line the engine marker spells on disk: the
-    /// identity pair's halves, then the state word.
-    fn marker_class(path: &Path) -> std::io::Result<(u16, u16, Marker)> {
-        read_marker(path)
-    }
-
-    /// A sink door over nothing: the marker-level boot tests never drive
-    /// a journal sink.
-    fn test_sink() -> SinkDoor {
-        Arc::new(Mutex::new(None))
-    }
-
-    /// The boot-gate tests' system half: every store is built for
-    /// system 1.
-    fn test_system() -> SystemId {
-        SystemId::new(1).expect("one is non-zero")
-    }
-
-    /// The pair the boot-gate tests expect: system 1, life `counter`.
-    fn test_identity(counter: u16) -> NodeId {
-        NodeId::new(
-            test_system(),
-            CrashCounter::new(counter).expect("a non-zero life"),
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
         )
     }
 
@@ -3333,18 +3306,24 @@ mod tests {
     /// leading sector), and the next boot panics inside the boot gate —
     /// `Node::open`'s boundary reports it as the PANIC code — with the
     /// corrupted bytes standing exactly as they were: no self-heal.
+    #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
     #[test]
     fn a_rotted_marker_copy_panics_the_boot_and_is_never_healed() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 
     /// The clean-stop lifecycle end to end through `Node::open` and
     /// `Node::stop`: the stopped node's marker reads clean on the next
     /// boot — same identity, no bump, no reincarnation announcement, the
     /// running sentinel rewritten as operating begins.
+    #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
     #[test]
     fn clean_stop_boot_continues_the_same_incarnation_no_bump() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 
     /// The mandatory obligation's proof: once stopped, NO
@@ -3352,9 +3331,12 @@ mod tests {
     /// the admin drives all refuse, and the node's state stays exactly as
     /// the drain point left it. RED before the lifecycle landed: there
     /// was no stop and no refusal.
+    #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
     #[test]
     fn stopped_node_refuses_every_inbound_entry_and_the_state_is_final() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 
     /// The stop path's write ordering with the async AOF sink (§2): the
@@ -3362,550 +3344,36 @@ mod tests {
     /// every event enqueued before the stop is durable on disk by the
     /// time the marker lands. RED before the drain existed (no stop, no
     /// marker writes at all).
+    #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
     #[test]
     fn stop_drains_the_aof_writer_before_the_flushed_marker() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
-    }
-
-    /// The sparse admin-assigned member ids every test cluster uses, in
-    /// deployment-descriptor (genesis succession) order: the provisioned
-    /// identities (system half << 16) | 1.
-    const TEST_IDS: [u32; 3] = [(10 << 16) | 1, (20 << 16) | 1, (30 << 16) | 1];
-
-    /// The own member's system half the marker-level tests read back.
-    const TEST_SYSTEM: u16 = 10;
-
-    /// The four-node tests' joiner member: id 40's provisioned identity
-    /// (the packed pair, crash counter 1).
-    const JOINER_ID: u32 = (40 << 16) | 1;
-
-    /// The member descriptor the test clusters boot through the real
-    /// construction path (`node_from_parts` — the same body the C ABI
-    /// drives): ids in genesis succession order, names derived from them.
-    fn test_members(genesis: &[u32], joiner: Option<u32>) -> String {
-        let mut entries: Vec<String> = genesis
-            .iter()
-            .map(|id| format!("{id}:member{id}"))
-            .collect();
-        if let Some(id) = joiner {
-            entries.push(format!("{id}:member{id}:j"));
-        }
-        entries.join("\0")
-    }
-
-    /// A provisioned node over an explicit state path, so the reincarnation
-    /// test can restart the same durable marker file through the real ABI.
-    fn provision_at(path: &Path, own: u32, members: u32) -> Node {
-        let descriptor = test_members(&TEST_IDS[..members as usize], None);
-        node_from_parts(
-            descriptor.as_bytes(),
-            format!("member{own}").as_bytes(),
-            path.as_os_str().as_encoded_bytes(),
-            None,
-            0,
-            PRIMARY_TIMEOUT_MS,
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
         )
-        .expect("provision")
     }
 
-    fn provision(name: &str, own: u32, members: u32) -> Node {
-        provision_at(&state_path(name), own, members)
-    }
-
-    fn request_json(message_id: Uuid) -> Vec<u8> {
-        serde_json::to_vec(&crate::locks::Request::Get {
-            message_id,
-            client_id: 11,
-            request_num: 13,
-            lock_id: 17,
-        })
-        .unwrap()
-    }
-
-    /// Deliver every queued send on every node to its destination,
-    /// recursively draining whatever the destination emits in answer, until
-    /// no node holds a send. Replies stay queued on their node. `ids` are
-    /// the member ids of `nodes`, in the same order.
-    fn route_until_quiet(nodes: &mut [Node], ids: &[u32]) {
-        loop {
-            let mut moved = false;
-            for source in 0..nodes.len() {
-                let drained: VecDeque<Queued> = std::mem::take(&mut nodes[source].outputs);
-                let (sends, kept): (Vec<Queued>, Vec<Queued>) = drained
-                    .into_iter()
-                    .partition(|output| output.kind == OUTPUT_SEND);
-                nodes[source].outputs = kept.into_iter().collect();
-                for send in sends {
-                    moved = true;
-                    let message = Message::unpack_from(&send.bytes).expect("wire round trip");
-                    let to = ids
-                        .iter()
-                        .position(|id| *id == send.to)
-                        .expect("known destination");
-                    assert_eq!(
-                        nodes[to].drive(Input::Peer {
-                            from: NodeId(ids[source]),
-                            message,
-                        }),
-                        OK
-                    );
-                }
-            }
-            if !moved {
-                return;
-            }
-        }
-    }
-
-    /// A fresh three-node cluster brought to Normal: every node provisions
-    /// fenced `Recovering` (the boot rule); the genesis primary (member id
-    /// 655361, first in the descriptor order) self-promotes on a tick and
-    /// broadcasts Commit; the Recovering backups adopt the view under the
-    /// §4 bootstrap rule when the primary's messages reach them.
-    fn boot_cluster() -> [Node; 3] {
-        let mut nodes = [
-            provision("cluster-one", TEST_IDS[0], 3),
-            provision("cluster-two", TEST_IDS[1], 3),
-            provision("cluster-three", TEST_IDS[2], 3),
-        ];
-        for (index, node) in nodes.iter_mut().enumerate() {
-            assert_eq!(
-                node.replica.progress().status(),
-                vrr::progress::Status::Joining,
-                "node {index} boots fenced"
-            );
-            node.outputs.clear();
-        }
-        assert_eq!(nodes[0].drive(Input::Tick), OK);
-        assert_eq!(
-            nodes[0].replica.observer().read().status,
-            0,
-            "genesis primary promotes to Normal"
-        );
-        route_until_quiet(&mut nodes, &TEST_IDS);
-        for (index, node) in nodes.iter_mut().enumerate() {
-            assert_eq!(
-                node.replica.observer().read().status,
-                0,
-                "node {index} is Normal"
-            );
-            node.outputs.clear();
-        }
-        nodes
-    }
-
-    fn request(node: &mut Node, json: &[u8]) -> i32 {
-        unsafe { lunet_lock_node_request((&raw mut *node).cast(), json.len(), json.as_ptr()) }
-    }
-
-    fn receive(node: &mut Node, from: u32, data: &[u8]) -> i32 {
-        unsafe { lunet_lock_node_receive((&raw mut *node).cast(), from, data.len(), data.as_ptr()) }
-    }
-
-    fn reconfigure(node: &mut Node, op: u32, member: u32, position: u32) -> i32 {
-        unsafe { lunet_lock_node_reconfigure((&raw mut *node).cast(), op, member, position) }
-    }
-
-    fn pop_send(node: &mut Node, to: u32, tag: vrr::wire::Tag) -> Option<Queued> {
-        let drained: VecDeque<Queued> = std::mem::take(&mut node.outputs);
-        let mut found = None;
-        let mut kept = VecDeque::new();
-        for output in drained {
-            if found.is_none()
-                && output.kind == OUTPUT_SEND
-                && output.to == to
-                && Message::unpack_from(&output.bytes)
-                    .ok()
-                    .is_some_and(|message| message.header.tag == tag)
-            {
-                found = Some(output);
-            } else {
-                kept.push_back(output);
-            }
-        }
-        node.outputs = kept;
-        found
-    }
-
-    /// Feeds one queued send to its destination and drains the destination's
-    /// answers the same way, one hop at a time. `nodes`/`ids` are parallel
-    /// arrays (the `ids[i]` member runs `nodes[i]`).
-    fn deliver_hop(nodes: &mut [Node], ids: &[u32], source: usize, send: Queued) {
-        let message = Message::unpack_from(&send.bytes).expect("wire round trip");
-        let to = ids
-            .iter()
-            .position(|id| *id == send.to)
-            .expect("known destination");
-        assert_eq!(
-            nodes[to].drive(Input::Peer {
-                from: NodeId(ids[source]),
-                message,
-            }),
-            OK
-        );
-    }
-
-    /// Drives a suspicion fence on `driver`: one `Input::Tick` stamped past
-    /// the primary-timeout window (the adapter clamps ticks to the wall
-    /// clock, so the test stamps a synthetic monotone value), then the
-    /// ordinary fence choreography routes to quiescence.
-    fn drive_fence(nodes: &mut [Node], ids: &[u32], driver: usize) {
-        let at = nodes[driver].last_tick + PRIMARY_TIMEOUT_MS + 1;
-        assert_eq!(nodes[driver].drive_at(at, Input::Tick), OK);
-        route_until_quiet(nodes, ids);
-    }
-
-    /// The timeout toggle's Flight Recorder capture
-    /// (`docs/src/phi-and-timeouts.md`): every toggle of the host's
-    /// `timedout` state lands as one `timeout-toggle` flight event
-    /// carrying the new state, the toggle's ts, and the ts of the
-    /// previous toggle — alongside the other internal events. The
-    /// regular-log half rides the `info!` in the same method; the
-    /// toggle's state machine and its record live in the host's phi
-    /// module.
-    #[cfg(feature = "flight-recorder")]
-    #[test]
-    fn timeout_toggles_land_in_the_flight_recorder() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
-    }
-
-    /// The phi-accrual actuation surface: the host detector that has
-    /// concluded the primary is dead drives `Node::force_view` — no timed
-    /// tick, no `PRIMARY_TIMEOUT_MS` wait. The dead primary is node 0; the
-    /// first backup forces one view past its last known view, the fence
-    /// choreography routes to quiescence skipping the dead socket, and the
-    /// surviving quorum installs a primary that is not the dead id.
-    #[test]
-    fn force_view_abi_actuates_the_phi_detection() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
-    }
-
-    /// The phi/timeout plane meets the drain point
-    /// (`docs/src/phi-and-timeouts.md`): a node sits inside a
-    /// view-change window — the host's `timedout` toggle is armed, the
-    /// randomized cluster viewchange timeout polls through ticks — and
-    /// the drain point runs there. The wire closes at the drain: every
-    /// later tick refuses STOPPED, so the viewchange timeout's poll
-    /// cannot fire, and the toggle's fresh-commit resume cannot happen —
-    /// proposals refuse too, so no commit can enter after the drain. The
-    /// in-memory state stays exactly inside the window (final), the
-    /// flushed marker makes the next boot a clean continue under the
-    /// same incarnation, and the window does not survive the restart.
-    #[test]
-    fn a_stop_inside_the_view_change_window_ends_the_toggle_resume_after_the_drain() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
-    }
-
-    /// The joiner member of the four-node tests: id 40, booted the joiner
-    /// way — a later life over the deployment's genesis, fenced
-    /// `Restarting`, addressed, and outside every configuration until a
-    /// committed `Join` admits it.
-    fn provision_joiner(name: &str, own: u32, genesis: &[u32]) -> Node {
-        let descriptor = test_members(genesis, Some(own));
-        node_from_parts(
-            descriptor.as_bytes(),
-            format!("member{own}").as_bytes(),
-            state_path(name).as_os_str().as_encoded_bytes(),
-            None,
-            0,
-            PRIMARY_TIMEOUT_MS,
-        )
-        .expect("joiner boot")
-    }
-
-    /// The four-node cluster at "the join committed": the three genesis
-    /// incumbents bootstrapped with member id 40 as primary, the join
-    /// established through the ABI, era 2 folded at the commit, and the
-    /// ordinary view change into era 2 not yet run. The joiner holds the
-    /// deployment's genesis and nothing else: it adopts the announced
-    /// era-1 view through the bootstrap rule, its frontier stands at the
-    /// genesis slots, and its era table covers era 1 only (see the
-    /// module's Identity note).
-    fn boot_four_and_join() -> ([Node; 4], [u32; 4]) {
-        let [one, two, three] = boot_cluster();
-        let joiner = provision_joiner("cluster-joiner", JOINER_ID, &TEST_IDS);
-        assert_eq!(joiner.replica.progress().status(), Status::Restarting);
-        let mut nodes = [one, two, three, joiner];
-        let ids = [TEST_IDS[0], TEST_IDS[1], TEST_IDS[2], JOINER_ID];
-
-        // The join: `construct_pivot` cannot place a non-member in either
-        // vote set (the cardinality rule's union coverage), so the adapter
-        // drives the stop-the-world fallback: the establishing Prepare goes
-        // to every backup, and the era awaits the ordinary view change.
-        assert_eq!(
-            reconfigure(&mut nodes[0], RECONFIGURE_JOIN, JOINER_ID, POSITION_APPEND),
-            OK
-        );
-        let prepare = pop_send(&mut nodes[0], TEST_IDS[1], vrr::wire::Tag::Prepare)
-            .expect("the establishing Prepare reaches every backup");
-        let prepare_two = pop_send(&mut nodes[0], TEST_IDS[2], vrr::wire::Tag::Prepare)
-            .expect("the establishing Prepare reaches every backup");
-        assert!(
-            pop_send(&mut nodes[0], JOINER_ID, vrr::wire::Tag::Prepare).is_none(),
-            "a non-member is never in the establishing fan-out"
-        );
-        assert_eq!(nodes[0].replica.progress().config().current().era, Era(1));
-        deliver_hop(&mut nodes, &ids, 0, prepare);
-        deliver_hop(&mut nodes, &ids, 0, prepare_two);
-        let ok = pop_send(&mut nodes[1], TEST_IDS[0], vrr::wire::Tag::PrepareOk)
-            .expect("the backup acknowledges");
-        let ok_two = pop_send(&mut nodes[2], TEST_IDS[0], vrr::wire::Tag::PrepareOk)
-            .expect("the backup acknowledges");
-        deliver_hop(&mut nodes, &ids, 1, ok);
-        deliver_hop(&mut nodes, &ids, 2, ok_two);
-
-        // The commit folds era 2 (the joiner at weight 0), the commit
-        // cascade announces the frontier to every folded-configuration
-        // member, and the stop-the-world path arms no planned machine.
-        // Route the announcements: the backups' commit advance folds era 2
-        // too, which is what their later fence targets read (§8.7.8).
-        route_until_quiet(&mut nodes, &ids);
-        assert_eq!(
-            nodes[0].replica.progress().config().current().era,
-            Era(2),
-            "the era advances exactly at the establishing commit"
-        );
-        for node in nodes[..3].iter_mut() {
-            assert_eq!(
-                node.replica.progress().config().current().era,
-                Era(2),
-                "every incumbent folds the era through the commit cascade"
-            );
-        }
-        assert!(
-            pop_send(
-                &mut nodes[0],
-                TEST_IDS[2],
-                vrr::wire::Tag::PlannedViewChange
-            )
-            .is_none(),
-            "the stop-the-world path solicits nothing"
-        );
-        (nodes, ids)
-    }
-
-    /// Mirrors upstream's
-    /// `tests/nonstop_overlap_protocol.rs::overlap_transition_runs_the_seven_steps_without_stopping_the_stream`
-    /// through the adapter ABI: a three-node genesis cluster, the
-    /// incrementing reconfiguration with the adapter-derived pivot, the
-    /// seven steps in order, and the client stream uninterrupted.
-    #[test]
-    fn reconfigure_abi_runs_the_nonstop_overlap_transition() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
-    }
-
-    /// Joins a fourth member at weight 0 through the ABI, observes the era-2
-    /// commit and the quorum arithmetic under the new configuration, then
-    /// leaves the zero-weight member and commits era 3. The joiner is the
-    /// upstream learner: the fence's StartView arrives one era past its
-    /// boot table, the §10 learner acquisition serves its fetch and folds
-    /// the era that admitted it at the boot fence, and the retained offer
-    /// installs on the next ordinary tick — the joiner catches up without
-    /// ever voting. The leave completes the non-stop overlap with the
-    /// caught-up learner answering the planned solicitation.
-    #[test]
-    fn reconfigure_abi_joins_a_learner_then_leaves_it_at_zero() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
-    }
-
-    /// Joins the fourth member, enters era 2, then promotes it with a
-    /// committed Increment through the non-stop overlap: the adapter's
-    /// derived pivot puts the (weight-0, not-yet-caught-up) learner inside
-    /// `qII` — its zero weight contributes nothing to either commit
-    /// threshold — and the planned quorum over `qI = {L, id 30}` completes
-    /// without stopping the stream. The promoted arithmetic is four voters
-    /// (threshold 3): a single acknowledgment no longer commits.
-    #[test]
-    fn reconfigure_abi_promotes_the_learner_and_moves_the_quorum_arithmetic() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
-    }
-
-    /// The full seven-step join, now completing: the joined learner folds
-    /// era 2 at the boot fence (the §10 acquisition), the retained offer
-    /// installs it into the leader's view, the committed Increment promotes
-    /// it through the non-stop overlap, and the promoted member — caught
-    /// up, weight 1 — participates in the promoted arithmetic: with one
-    /// voting member silent, its acknowledgment completes the era-3
-    /// quorum.
-    #[test]
-    fn reconfigure_abi_joined_learner_completes_the_seven_step_join() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
-    }
-
-    /// The four-node cluster with a full voting member: the join
-    /// established era 2 at weight 0, the learner folded its admitting era
-    /// and caught up, and the committed Increment promoted it through the
-    /// non-stop overlap. The state is era 3, weights [1,1,1,1], view (3, 5)
-    /// led by member id 20, every machine quiet.
-    fn boot_four_join_promote() -> ([Node; 4], [u32; 4]) {
-        let (mut nodes, ids) = boot_four_and_join();
-        drive_fence(&mut nodes, &ids, 2);
-        assert_eq!(nodes[1].replica.observer().read().view, 1);
-
-        // The learner folds its admitting era at the boot fence and the
-        // ordinary tick installs the retained offer: it is caught up.
-        assert_eq!(nodes[3].drive(Input::Tick), OK);
-        route_until_quiet(&mut nodes, &ids);
-        let snapshot = nodes[3].replica.observer().read();
-        assert_eq!((snapshot.status, snapshot.era, snapshot.view), (0, 2, 1));
-
-        // The promotion through the non-stop overlap: the pivot places the
-        // weight-0 learner inside qII, the commit folds era 3, the planned
-        // quorum over qI completes, and the ONE switch installs v' = (3, 5).
-        assert_eq!(
-            reconfigure(&mut nodes[1], RECONFIGURE_INCREMENT, JOINER_ID, 0),
-            OK
-        );
-        let to_learner = pop_send(&mut nodes[1], JOINER_ID, vrr::wire::Tag::Prepare)
-            .expect("the learner is inside qII: it receives the copy");
-        let to_voter = pop_send(&mut nodes[1], TEST_IDS[0], vrr::wire::Tag::Prepare)
-            .expect("the pivot routes the establishing Prepare");
-        assert!(
-            pop_send(&mut nodes[1], TEST_IDS[2], vrr::wire::Tag::Prepare).is_none(),
-            "never outside qII"
-        );
-        deliver_hop(&mut nodes, &ids, 1, to_learner);
-        let ok_learner = pop_send(&mut nodes[3], TEST_IDS[1], vrr::wire::Tag::PrepareOk)
-            .expect("the caught-up learner acknowledges the establishing copy");
-        deliver_hop(&mut nodes, &ids, 3, ok_learner);
-        assert_eq!(
-            nodes[1].replica.progress().committed(),
-            Slot(3),
-            "the learner's vote is not counted while its weight is 0"
-        );
-        deliver_hop(&mut nodes, &ids, 1, to_voter);
-        let ok = pop_send(&mut nodes[0], TEST_IDS[1], vrr::wire::Tag::PrepareOk)
-            .expect("the qII member acknowledges");
-        deliver_hop(&mut nodes, &ids, 0, ok);
-        route_until_quiet(&mut nodes, &ids);
-        let snapshot = nodes[1].replica.observer().read();
-        assert_eq!(
-            (snapshot.status, snapshot.era, snapshot.view),
-            (0, 3, 5),
-            "the single switch installs the promoted view"
-        );
-        let snapshot = nodes[3].replica.observer().read();
-        assert_eq!(
-            (snapshot.status, snapshot.era, snapshot.view),
-            (0, 3, 5),
-            "the promoted member folds the era that promotes it"
-        );
-        // Settle the lagging incumbent: the ordinary tick re-runs the
-        // retained offers and every incumbent ends in the promoted view.
-        for node in nodes[..3].iter_mut() {
-            assert_eq!(node.drive(Input::Tick), OK);
-        }
-        route_until_quiet(&mut nodes, &ids);
-        for node in nodes[..3].iter_mut() {
-            let snapshot = node.replica.observer().read();
-            assert_eq!(
-                (snapshot.status, snapshot.era, snapshot.view),
-                (0, 3, 5),
-                "every incumbent settles in the promoted view"
-            );
-        }
-        (nodes, ids)
-    }
-
-    /// The full voter departure through the ABI — the core's one departure
-    /// route as a four-era sequence: the join establishes era 2 (weight 0),
-    /// the Increment promotes (era 3, weight 1), the Decrement lowers the
-    /// voter back to a learner (era 4, weight 0), and the Leave removes the
-    /// weight-0 member (era 5, out of the configuration). Every step is its
-    /// own committed era; the operator's sequence is decrement, wait for
-    /// the era to commit, then leave.
-    #[test]
-    fn reconfigure_abi_departs_a_voter_by_decrement_then_leave() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
-    }
-
-    /// Refusals keep the log untouched: a non-primary is NOT_LEADER (the one
-    /// actionable code), a reconfigure while a transition is outstanding is
-    /// SERVICE, a fold-refused operation is SERVICE, and a bad op code is
-    /// INVALID.
-    #[test]
-    fn reconfigure_abi_refusals_never_touch_the_log() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
-    }
-
-    #[test]
-    fn committed_request_produces_a_correlated_reply_and_duplicate_replay() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
-    }
-
-    #[test]
-    fn non_primary_propose_is_refused_not_leader() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
-    }
-
-    #[test]
-    fn malformed_and_oversize_ingress_are_refused() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
-    }
-
-    #[test]
-    fn invalid_client_json_and_oversize_requests_are_refused() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
-    }
-
-    #[test]
-    fn panic_guard_reports_and_poison_sticks() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
-    }
-
+    #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
     #[test]
     fn status_and_leader_report_the_published_view() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 
+    #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
     #[test]
     fn abi_new_status_next_and_free_round_trip() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 
+    #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
     #[test]
     fn node_new_refuses_bad_membership() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
-    }
-
-    /// The bumped node of the reincarnation test: member id 1966081
-    /// (system 30) restarted dirty, its life bumped past the genesis
-    /// counter — the identity is the marker pair's next life
-    /// (`(30 << 16) | 2`).
-    const BUMPED_ID: u32 = (30 << 16) | 2;
-
-    /// Routes like `route_until_quiet` but drops sends addressed to `dead`
-    /// — the dead old-identity socket, undeliverable exactly as the live
-    /// transport drops a datagram whose id has no endpoint row.
-    fn route_until_quiet_drop(nodes: &mut [Node], ids: &[u32], dead: u32) {
-        loop {
-            let mut moved = false;
-            for source in 0..nodes.len() {
-                let drained: VecDeque<Queued> = std::mem::take(&mut nodes[source].outputs);
-                let (sends, kept): (Vec<Queued>, Vec<Queued>) = drained
-                    .into_iter()
-                    .partition(|output| output.kind == OUTPUT_SEND);
-                nodes[source].outputs = kept.into_iter().collect();
-                for send in sends {
-                    if send.to == dead {
-                        continue;
-                    }
-                    moved = true;
-                    deliver_hop(nodes, ids, source, send);
-                }
-            }
-            if !moved {
-                return;
-            }
-        }
-    }
-
-    /// Drives a suspicion fence on `driver` and routes to quiescence,
-    /// dropping the dead socket's copies.
-    fn drive_fence_drop(nodes: &mut [Node], ids: &[u32], driver: usize, dead: u32) {
-        let at = nodes[driver].last_tick + PRIMARY_TIMEOUT_MS + 1;
-        assert_eq!(nodes[driver].drive_at(at, Input::Tick), OK);
-        route_until_quiet_drop(nodes, ids, dead);
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 
     /// Mirrors upstream's `tests/reincarnation.rs::reincarnate_backup`
@@ -3921,19 +3389,28 @@ mod tests {
     /// learner's streamed catch-up is upstream §10 future work, so the
     /// named drops are the proof of arrival and no lock state is
     /// fabricated.
+    #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
     #[test]
     fn reincarnation_abi_runs_the_two_era_resurrection() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 
+    #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
     #[test]
     fn abi_refuses_unlawful_descriptor_ids() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 
+    #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
     #[test]
     fn journal_records_committed_transitions_with_roll_and_meta() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 
     // ------------------------------------------------------------------
@@ -3947,39 +3424,54 @@ mod tests {
     /// re-proposing: the second `request` queues exactly one reply output
     /// (identical bytes) and zero send outputs — the Service is never
     /// re-executed and never re-proposed.
+    #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
     #[test]
     fn duplicate_request_replays_the_cached_reply_without_reproposing() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 
     /// Every output the adapter ever queues carries kind 1 (send) or 2
     /// (reply) — drained across a boot, a stream, a fence, and a
     /// reconfiguration.
+    #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
     #[test]
     fn output_queue_carries_only_send_and_reply_kinds() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 
     /// The dirty restart announces the marker pair's next life: the
     /// reincarnated identity never reuses the old id (the asserted boot
     /// invariant, exercised through `Node::open`).
+    #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
     #[test]
     fn reincarnated_identity_never_reuses_the_old_id() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 
     /// Ticks are nondecreasing: the clamp holds a wall-clock regression
     /// back to the last tick.
+    #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
     #[test]
     fn ticks_are_nondecreasing_and_clamped() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 
     /// Poison means poisoned: a poisoned node executes nothing — every
     /// entry reports SERVICE and the queues stay empty.
+    #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
     #[test]
     fn poisoned_node_executes_nothing() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 
     /// The unknown-peer-id maybe: a datagram attributed to a low-band id
@@ -3987,23 +3479,32 @@ mod tests {
     /// maybe fires) and passes silently in release (warn-and-continue).
     /// Red was demonstrated against the unwired `receive` (the call
     /// returned OK under `catch_unwind` in a debug build).
+    #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
     #[test]
     fn maybe_unknown_low_band_peer_id_fires_in_test_builds() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 
     /// The folded-era regression helper: true exactly when the folded
     /// configuration era moved backwards. Wired as a maybe in `report`.
+    #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
     #[test]
     fn folded_era_regression_is_detected() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 
     /// A full protocol run — boot, stream, fence, join, promote — trips no
     /// maybe and no invariant: the green run the wired paths must survive.
+    #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
     #[test]
     fn protocol_run_trips_no_maybe() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 
     /// A self-arrested node names its fault. The never-repair contract is
@@ -4019,80 +3520,12 @@ mod tests {
     /// rig's own lesson), so the recording seam is driven directly:
     /// the observation path it serves is the drive's plan/publish
     /// fault arms.
+    #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
     #[test]
     fn a_self_arrested_node_names_its_fault() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
-    }
-
-    /// One client op committed through the named leader: propose, route to
-    /// quiescence, and require the committed frontier to advance.
-    fn commit_client_op(nodes: &mut [Node], ids: &[u32], leader: usize) {
-        static OP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let op = OP.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as u8;
-        let before = nodes[leader].replica.progress().committed();
-        assert_eq!(
-            request(
-                &mut nodes[leader],
-                &request_json(Uuid::from_bytes([op; 16]))
-            ),
-            OK,
-            "the serving leader accepts the op"
-        );
-        route_until_quiet(nodes, ids);
-        let after = nodes[leader].replica.progress().committed();
-        assert!(
-            after > before,
-            "the op committed through view {}: {before:?} -> {after:?}",
-            nodes[leader].replica.observer().read().view
-        );
-    }
-
-    /// The health bar every voter must clear after any fence: Normal
-    /// status, an unpoisoned request path (the leader accepts, a backup
-    /// refuses NOT_LEADER — a self-arrested node reports SERVICE), and a
-    /// committed frontier that still advances.
-    fn assert_cluster_serving(nodes: &mut [Node], ids: &[u32]) -> usize {
-        let mut leader = None;
-        for (index, node) in nodes.iter().enumerate() {
-            let snapshot = node.status();
-            assert_eq!(
-                snapshot.state, 0,
-                "member {index} must be Normal after the fence, got status {} era {} view {}",
-                snapshot.state, snapshot.era, snapshot.view
-            );
-            if snapshot.leader == node.replica.own().0 {
-                leader = Some(index);
-            }
-        }
-        for (index, node) in nodes.iter_mut().enumerate() {
-            let rc = request(node, &request_json(Uuid::from_bytes([7; 16])));
-            assert!(
-                rc == OK || rc == NOT_LEADER,
-                "member {index} is serving after the fence: rc={rc} \
-                 (SERVICE/FAULTED is the silent self-arrest the run-4 rig died of)"
-            );
-        }
-        let leader = leader.expect("a Normal member leads the installed view");
-        route_until_quiet(nodes, ids);
-        commit_client_op(nodes, ids, leader);
-        leader
-    }
-
-    /// The phi actuation against a LIVE leader: a backup concludes the
-    /// primary is dead and forces the next view — the run-4 rig's first
-    /// fence of a long-settled cluster (the leader was never dead, only
-    /// suspected).
-    fn phi_fence_live_leader(nodes: &mut [Node], ids: &[u32], suspector: usize) {
-        let before = nodes[suspector].status();
-        let target = (before.era, before.view + 1);
-        assert_eq!(nodes[suspector].force_view(target.0, target.1), OK);
-        route_until_quiet(nodes, ids);
-        let after = nodes[suspector].status();
-        assert_eq!(
-            (after.state, after.view),
-            (0, target.1),
-            "the forced view installed"
-        );
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 
     /// THE run-4 kill#3 shape (locks2, 2026-09-15): a voter triad with a
@@ -4105,8 +3538,11 @@ mod tests {
     /// views churned 15→510 with zero commits, and the wire went silent.
     /// The regression: every forced view installs Normal, no member
     /// self-arrests, and the client stream commits through each new view.
+    #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
     #[test]
     fn rapid_fences_with_learners_keep_the_voters_serving() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 }

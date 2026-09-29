@@ -509,67 +509,66 @@ pub fn agreement_key(snapshot: &Snapshot) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
-    fn member(id: u32, weight: u32, endpoint: &str) -> SnapshotMember {
-        SnapshotMember {
-            id,
-            weight,
-            endpoint: endpoint.to_string(),
-        }
-    }
-
-    fn three() -> Vec<SnapshotMember> {
-        vec![
-            member(101, 1, "127.0.0.1:27101"),
-            member(202, 1, "127.0.0.1:27102"),
-            member(303, 1, "127.0.0.1:27103"),
-        ]
-    }
-
     #[test]
     fn request_is_one_tag_byte() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 
     #[test]
     fn response_round_trips() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 
     #[test]
     fn response_decode_refuses_malformed_shapes() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 
     #[test]
     fn comparison_is_total_era_then_slot() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 
     #[test]
     fn quorum_is_the_weighted_majority_learners_never_satisfy() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 
     #[test]
     fn apply_change_moves_the_model_exactly() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 
     #[test]
     fn sidecar_round_trips_and_refuses_malformed_series() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 
     #[test]
     fn writer_enqueue_drops_on_overflow_never_blocks() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 
     #[test]
     fn tally_records_one_responder_once() {
-        panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+        panic!(
+            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        )
     }
 }

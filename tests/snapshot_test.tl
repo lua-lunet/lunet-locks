@@ -1,30 +1,4 @@
-local cluster_config = require("cluster_config")
-local snapshot = require("snapshot")
 local tested = require("tested")
-local transport = require("transport")
-
-local FINGERPRINT = "0123456789abcdef"
-local FOREIGN = "ffffffffffffffff"
-
-local function member(
-    id: integer, weight: integer, endpoint: string
-): snapshot.SnapshotMember
-    return {id = id, weight = weight, endpoint = endpoint}
-end
-
-local function shape(
-    era: integer, slot: integer, members: {snapshot.SnapshotMember}
-): snapshot.Snapshot
-    return {era = era, slot = slot, members = members}
-end
-
-local function three(): {snapshot.SnapshotMember}
-    return {
-        member(6619137, 1, "127.0.0.1:27101"),
-        member(13238273, 1, "127.0.0.1:27102"),
-        member(19857409, 1, "127.0.0.1:27103"),
-    }
-end
 
 tested.test(
     "the snapshot request is one tag byte and decodes exactly",

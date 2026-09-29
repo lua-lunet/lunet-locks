@@ -40,7 +40,6 @@ local STREAM_LOCK = 9201
 local LEADER_DEADLINE_MS = 60000
 local REJOIN_DEADLINE_MS = 150000
 local STEADY_S = 180
-local DEEP_VIEW_TARGET = 120
 
 local root = ""
 local run_dir = ""
@@ -401,60 +400,6 @@ local function verify_clients_started()
     end
 end
 
-local function start_hammer()
-    local servers: {string} = {}
-    for _, name in ipairs(GENESIS) do
-        table.insert(servers, "--server")
-        table.insert(servers, "127.0.0.1:" .. by_name[name].client_port)
-    end
-    local argv: {string} = {
-        fs.join(root, "examples/lease-sequencer/target/release/lease-load"),
-    }
-    for _, a in ipairs(servers) do
-        table.insert(argv, a)
-    end
-    local flags: {string} = {
-        "--seconds",
-        "600",
-        "--clients",
-        "2",
-        "--getters",
-        "2",
-        "--model",
-        "aggressive",
-        "--lease-ms",
-        "500",
-        "--renew-fraction",
-        "0.5",
-        "--lock-id",
-        tostring(LEASE_LOCK),
-        "--id-base",
-        "840000",
-        "--window-ms",
-        "2000",
-        "--stats-out",
-        fs.join(run_dir, "stats", "hammer.jsonl"),
-    }
-    for _, f in ipairs(flags) do
-        table.insert(argv, f)
-    end
-    local p = proc.spawn(
-        argv,
-        "hammer",
-        {
-            out_path = fs.join(run_dir, "logs", "hammer.out"),
-            err_path = fs.join(run_dir, "logs", "hammer.out"),
-            combine = true,
-        }
-    )
-    hammer_procs[#hammer_procs + 1] = p
-    fs.append_all(fs.join(run_dir, "pids"), tostring(p.pid) .. "\n")
-    -- The hammer boots silent: the start signal must land after the
-    -- client's SIGUSR2 handler is installed (the abort-3 finding).
-    clock.sleep(1)
-    shell.status("kill -USR2 " .. p.pid .. " 2>/dev/null")
-end
-
 local function signal_procs(list: {proc.Process}, signal_name: string)
     for _, p in ipairs(list) do
         if proc.alive(p) then
@@ -651,61 +596,6 @@ local function wait_node_normal(
     )
 end
 
--- One admin verb drive at one node's client port (the rig client binary,
--- fresh message id). Returns the reply line and the drive's wall
--- duration in ms.
-local function drive_verb(
-    name: string, action: string, id: integer, extra: {string}
-): string, integer
-    local parts: {string} = {
-        fs.join(root, "examples/lease-sequencer/target/release/lease-client"),
-        "--server",
-        "127.0.0.1:" .. by_name[name].client_port,
-        "--verb",
-        action,
-    }
-    if id > 0 then
-        table.insert(parts, "--id")
-        table.insert(parts, tostring(id))
-    end
-    for _, a in ipairs(extra or {}) do
-        table.insert(parts, a)
-    end
-    local t0 = clock.mono_ms()
-    local reply = shell.capture(table.concat(parts, " ") .. " 2>/dev/null")
-    return reply, (clock.mono_ms() - t0)
-end
-
--- One admin verb drive with the driver's rotation: fresh message ids per
--- attempt (each lease-client invocation mints its own), every live
--- genesis voter's client port in turn, until the verb is accepted or the
--- deadline expires.
-local function drive_verb_retry(
-    action: string, id: integer, extra: {string}, deadline_ms: integer
-): string, integer
-    local t_deadline = clock.now_ms() + deadline_ms
-    local last_reply, last_ms = "", 0
-    while clock.now_ms() < t_deadline do
-        local candidates: {string} = {}
-        for _, name in ipairs(GENESIS) do
-            local p = procs[name]
-            if p ~= nil and proc.alive(p) then
-                candidates[#candidates + 1] = name
-            end
-        end
-        for _, name in ipairs(candidates) do
-            local reply, ms = drive_verb(name, action, id, extra)
-            last_reply, last_ms = reply, ms
-            if reply:find('"accepted":true', 1, true) ~= nil then
-                return reply, ms
-            end
-            clock.sleep(1)
-        end
-        clock.sleep(1)
-    end
-    return last_reply, last_ms
-end
-
 -- The lease-load cumulative error count of one client's stats file (the
 -- window summaries always report errors: 0; the cumulative line is the
 -- truth).
@@ -745,10 +635,6 @@ local function total_errors(): integer
         n = n + cumulative_errors(name)
     end
     return n
-end
-
-local function hammer_errors(): integer
-    return cumulative_errors_file(fs.join(run_dir, "stats", "hammer.jsonl"))
 end
 
 -- A log-count delta helper: the count of `pattern` matches in the
@@ -820,7 +706,6 @@ end
 -- evidence: every client's stats file exists with its cumulative
 -- counter climbing — a missing file is a failed gate, never a vacuous
 -- zero.
-local steady_err_begin = 0
 
 local function scenario_steady()
     phase("steady serving " .. STEADY_S .. " s")
@@ -858,7 +743,6 @@ local function scenario_steady()
                 .. "phase window; the calm profile demands zero"
         )
     end
-    steady_err_begin = begin_err
     measure(
         "scenario=S0 steady_s=" .. STEADY_S .. " client_errors=0 view_depth="
             .. view_depth()

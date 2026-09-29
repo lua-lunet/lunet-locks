@@ -6,29 +6,37 @@
 //! firing the same downstream actuation the experimental build's phi
 //! crossing drives.
 
-use lease_sequencer::phi::{self, SloppyLeader};
-
 #[test]
 fn the_deadline_lands_within_the_min_max_window() {
-    panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+    panic!(
+        "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+    )
 }
 
 #[test]
 fn due_fires_only_after_the_deadline() {
-    panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+    panic!(
+        "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+    )
 }
 
 #[test]
 fn a_leader_change_re_arms_the_deadline() {
-    panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+    panic!(
+        "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+    )
 }
 
 #[test]
 fn an_era_change_re_keys_the_watch() {
-    panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+    panic!(
+        "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+    )
 }
 
 #[test]
 fn the_random_wait_spans_the_whole_window() {
-    panic!("EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration")
+    panic!(
+        "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+    )
 }
