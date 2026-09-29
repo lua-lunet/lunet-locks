@@ -630,28 +630,217 @@ fn pump(rx: Receiver<Msg>, mut core: AofCore, interval: Option<Duration>, drops:
 
 #[cfg(test)]
 mod tests {
-    #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
+    use super::*;
+    use crate::journal::{KIND_BREAK, KIND_HOLD, KIND_RELEASE, KIND_RENEW};
+    use std::io::Write as _;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// The writer's test knobs: no periodic fsync (the drain's own fsync
+    /// is the durability proof) and a queue deep enough that every
+    /// enqueue of a test lands (overflow drops would corrupt the counted
+    /// assertions).
+    fn config() -> AofConfig {
+        AofConfig {
+            flush_interval: None,
+            queue_cap: 65_536,
+            ..AofConfig::default()
+        }
+    }
+
+    fn event(kind: u8, ts: u64, lock: u64, expiry: u64) -> JournalEvent {
+        JournalEvent {
+            kind,
+            ts,
+            lock_id: lock,
+            lease_id: lock * 10,
+            holder: [kind; 16],
+            expiry,
+        }
+    }
+
+    /// The scratch tree, inside the repo (`.tmp` is scratch).
+    fn scratch(name: &str) -> PathBuf {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.tmp/aof-unit");
+        fs::create_dir_all(&root).expect("the scratch root creates");
+        let dir = root.join(format!(
+            "{name}-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::SeqCst)
+        ));
+        fs::create_dir_all(&dir).expect("the case directory creates");
+        dir
+    }
+
+    /// The one active (still-appending) file of the series.
+    fn open_file(dir: &Path) -> PathBuf {
+        let mut found = Vec::new();
+        for entry in fs::read_dir(dir).expect("the series directory reads") {
+            let path = entry.expect("the entry reads").path();
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if name.starts_with("ev-open-") {
+                found.push(path);
+            }
+        }
+        assert_eq!(found.len(), 1, "exactly one open file");
+        found.remove(0)
+    }
+
+    /// Every finalized (rolled) file of the series.
+    fn finalized_files(dir: &Path) -> Vec<PathBuf> {
+        let mut found = Vec::new();
+        for entry in fs::read_dir(dir).expect("the series directory reads") {
+            let path = entry.expect("the entry reads").path();
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if name.starts_with("ev-")
+                && !name.starts_with("ev-open-")
+                && path.extension().is_some_and(|e| e == "bin")
+            {
+                found.push(path);
+            }
+        }
+        found
+    }
+
+    /// 61-byte records do not divide the 2 MiB roll mark: the records of
+    /// one roll window stop just short of the mark and the writer's
+    /// zero pad completes it, so every finalized file is exactly one
+    /// erasure block and the record that would pass the mark starts the
+    /// fresh file.
     #[test]
     fn records_per_roll_fits_one_block() {
-        panic!(
-            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
-        )
+        let records = ROLL_BYTES / RECORD_SIZE as u64;
+        assert!(records * RECORD_SIZE as u64 <= ROLL_BYTES);
+        assert!(
+            (records + 1) * RECORD_SIZE as u64 > ROLL_BYTES,
+            "one more record would pass the mark"
+        );
+        let dir = scratch("per-roll");
+        let mut core = AofCore::open(&dir, 64 * 1024).expect("the core opens");
+        for index in 0..records {
+            core.append(&event(KIND_HOLD, 1_000 + index, 7, 5_000))
+                .expect("the record appends");
+        }
+        core.flush().expect("the buffer drains");
+        assert_eq!(
+            fs::metadata(open_file(&dir))
+                .expect("the length reads")
+                .len(),
+            records * RECORD_SIZE as u64,
+            "the window stops just short of the mark: no roll yet"
+        );
+        assert!(
+            finalized_files(&dir).is_empty(),
+            "no file finalized below the mark"
+        );
+        // The record that would pass the mark: the roll fires first.
+        let last = event(KIND_RENEW, 2_000, 8, 6_000);
+        core.append(&last).expect("the record appends");
+        core.flush().expect("the buffer drains");
+        let finalized = finalized_files(&dir);
+        assert_eq!(finalized.len(), 1, "the roll fired");
+        let finalized_bytes = fs::read(&finalized[0]).expect("the finalized file reads");
+        assert_eq!(
+            finalized_bytes.len(),
+            ROLL_BYTES as usize,
+            "the roll completes the block: exactly 2 MiB"
+        );
+        let pad = (ROLL_BYTES - records * RECORD_SIZE as u64) as usize;
+        assert!(
+            finalized_bytes[finalized_bytes.len() - pad..]
+                .iter()
+                .all(|&byte| byte == 0),
+            "the tail is the zero pad"
+        );
+        let bytes = fs::read(open_file(&dir)).expect("the open file reads");
+        assert_eq!(
+            journal::parse_file(&bytes),
+            vec![last],
+            "the record that passed the mark starts the fresh file"
+        );
     }
 
-    #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
+    /// The append path lands the record bytes byte-exact in the active
+    /// file and the rolling window tracks the events' fields directly.
     #[test]
     fn append_lands_record_bytes_and_events() {
-        panic!(
-            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
-        )
+        let dir = scratch("append");
+        let mut core = AofCore::open(&dir, 64 * 1024).expect("the core opens");
+        let events = vec![
+            event(KIND_HOLD, 1_000, 11, 5_000),
+            event(KIND_RENEW, 1_100, 11, 6_000),
+            event(KIND_RELEASE, 1_200, 11, 7_000),
+            event(KIND_HOLD, 1_300, 12, 8_000),
+            event(KIND_BREAK, 1_400, 12, 9_000),
+        ];
+        for one in &events {
+            core.append(one).expect("the record appends");
+        }
+        core.flush().expect("the buffer drains");
+        let bytes = fs::read(open_file(&dir)).expect("the open file reads");
+        assert_eq!(bytes.len(), events.len() * RECORD_SIZE);
+        assert_eq!(
+            journal::parse_file(&bytes),
+            events,
+            "the records landed byte-exact"
+        );
+        let window = core.window.as_ref().expect("the window tracks");
+        assert_eq!(window.op_min, 1_000);
+        assert_eq!(window.op_max, 1_400);
+        assert_eq!(window.expiry_min, 5_000);
+        assert_eq!(window.expiry_max, 9_000);
+        assert_eq!(window.count, 5);
     }
 
-    #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
+    /// The roll finalizes exactly one 2 MiB erasure block: the records
+    /// ride at the front, the rest of the file is the zero pad, the
+    /// metafile carries the window, and a fresh open file follows.
     #[test]
     fn roll_finalizes_exactly_two_mib_with_pad() {
-        panic!(
-            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        let dir = scratch("roll-pad");
+        let mut core = AofCore::open(&dir, 64 * 1024).expect("the core opens");
+        let events = vec![
+            event(KIND_HOLD, 1_000, 11, 5_000),
+            event(KIND_RENEW, 1_100, 11, 6_000),
+            event(KIND_RELEASE, 1_200, 11, 7_000),
+        ];
+        for one in &events {
+            core.append(one).expect("the record appends");
+        }
+        core.flush().expect("the buffer drains");
+        core.roll().expect("the roll fires");
+        let finalized = finalized_files(&dir);
+        assert_eq!(finalized.len(), 1, "one file finalized");
+        let bytes = fs::read(&finalized[0]).expect("the finalized file reads");
+        assert_eq!(
+            bytes.len(),
+            ROLL_BYTES as usize,
+            "exactly one erasure block"
+        );
+        let records_end = events.len() * RECORD_SIZE;
+        assert_eq!(
+            journal::parse_file(&bytes),
+            events,
+            "the records ride at the front"
+        );
+        assert!(
+            bytes[records_end..].iter().all(|&byte| byte == 0),
+            "the rest of the block is the zero pad"
+        );
+        let meta = journal::Meta::decode(
+            &fs::read(finalized[0].with_extension("meta")).expect("the metafile reads"),
         )
+        .expect("the metafile decodes");
+        assert_eq!(meta.count as usize, events.len());
+        assert_eq!(meta.op_min, 1_000);
+        assert_eq!(meta.op_max, 1_200);
+        assert_eq!(core.written, 0, "the window restarts");
+        assert!(core.window.is_none());
+        let bytes = fs::read(open_file(&dir)).expect("the fresh open file reads");
+        assert!(
+            journal::parse_file(&bytes).is_empty(),
+            "the fresh open file starts empty"
+        );
     }
 
     /// The stop drain's guarantee (`AofWriter::drain`): after it returns,
@@ -660,87 +849,461 @@ mod tests {
     /// write-buffer threshold, the only thing that could have landed the
     /// buffered bytes is the drain's own flush+fsync — so a full read-back
     /// here proves the drain blocked until durability.
-    #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
     #[test]
     fn drain_makes_every_queued_event_durable() {
-        panic!(
-            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
-        )
+        let dir = scratch("drain");
+        let events: Vec<_> = (0..500u64)
+            .map(|index| event(KIND_HOLD, 3_000 + index, 20 + index, 9_000))
+            .collect();
+        let writer = AofWriter::open(&dir, config()).expect("the series opens");
+        for one in &events {
+            writer.enqueue(one.clone());
+        }
+        writer.drain().expect("the drain lands every queued record");
+        assert_eq!(writer.drops(), 0, "no record drops at this depth");
+        let bytes = fs::read(open_file(&dir)).expect("the open file reads");
+        assert_eq!(
+            bytes.len(),
+            events.len() * RECORD_SIZE,
+            "the buffered bytes are on disk now, with the writer still alive"
+        );
+        assert_eq!(journal::parse_file(&bytes), events);
+        drop(writer);
     }
 
-    #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
+    /// The reader treats any prefix of the rolling series as valid:
+    /// deleting the finalized files (in whatever order the listing hands
+    /// them back, at any time) leaves the open file's records parsing and
+    /// the resume scan rebuilding over them alone.
     #[test]
     fn reader_valid_prefix_deleting_finalized_files() {
-        panic!(
-            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
-        )
+        let dir = scratch("valid-prefix");
+        let mut core = AofCore::open(&dir, 64 * 1024).expect("the core opens");
+        let windows = [
+            vec![
+                event(KIND_HOLD, 1_000, 31, 5_000),
+                event(KIND_RENEW, 1_100, 31, 6_000),
+            ],
+            vec![
+                event(KIND_HOLD, 2_000, 32, 6_000),
+                event(KIND_RELEASE, 2_100, 32, 7_000),
+            ],
+            vec![
+                event(KIND_HOLD, 3_000, 33, 7_000),
+                event(KIND_BREAK, 3_100, 33, 8_000),
+            ],
+        ];
+        for (index, window) in windows.iter().enumerate() {
+            for one in window {
+                core.append(one).expect("the record appends");
+            }
+            core.flush().expect("the buffer drains");
+            if index < windows.len() - 1 {
+                core.roll().expect("the roll fires");
+            }
+        }
+        drop(core);
+        assert_eq!(
+            finalized_files(&dir).len(),
+            2,
+            "two files finalized, one open"
+        );
+        // The finalized files delete freely.
+        for path in finalized_files(&dir) {
+            fs::remove_file(&path).expect("the finalized file deletes");
+        }
+        assert!(
+            finalized_files(&dir).is_empty(),
+            "the prefix of the series is gone"
+        );
+        // The open file's records still parse.
+        let bytes = fs::read(open_file(&dir)).expect("the open file reads");
+        assert_eq!(journal::parse_file(&bytes), windows[2]);
+        // The resume scan rebuilds over them alone.
+        let reopened = AofCore::open(&dir, 64 * 1024).expect("the series reopens");
+        assert_eq!(
+            reopened.written,
+            (windows[2].len() * RECORD_SIZE) as u64,
+            "the scan rebuilds the position over the surviving prefix"
+        );
+        let window = reopened.window.as_ref().expect("the window rebuilds");
+        assert_eq!(window.op_min, 3_000);
+        assert_eq!(window.count, 2);
     }
 
-    #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
+    /// The fsync counter moves only on the checkpoint, the roll, and the
+    /// shutdown: the open never fsyncs, the buffered-write drain never
+    /// fsyncs, and every named site adds exactly one.
     #[test]
     fn syncs_fire_only_on_checkpoint_roll_and_shutdown() {
-        panic!(
-            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
-        )
+        let dir = scratch("syncs");
+        let mut core = AofCore::open(&dir, 64 * 1024).expect("the core opens");
+        assert_eq!(core.syncs, 0, "the open never fsyncs");
+        core.append(&event(KIND_HOLD, 1_000, 11, 5_000))
+            .expect("the record appends");
+        core.flush().expect("the buffer drains");
+        assert_eq!(core.syncs, 0, "the buffered-write drain never fsyncs");
+        core.checkpoint().expect("the checkpoint succeeds");
+        assert_eq!(core.syncs, 1, "the checkpoint is one fsync");
+        core.append(&event(KIND_RENEW, 1_100, 11, 6_000))
+            .expect("the record appends");
+        core.flush().expect("the buffer drains");
+        core.roll().expect("the roll fires");
+        assert_eq!(core.syncs, 2, "the roll is one fsync");
+        core.shutdown().expect("the shutdown succeeds");
+        assert_eq!(core.syncs, 3, "the shutdown is one fsync");
     }
 
-    #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
+    /// The resume scan rebuilds the position and the metadata window over
+    /// the pre-restart records, and the next roll's metafile names the
+    /// FULL window — the rebuilt minimum included.
     #[test]
     fn resume_reopen_rebuilds_position_and_window() {
-        panic!(
-            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        let dir = scratch("resume");
+        let rebuilt = vec![
+            event(KIND_HOLD, 1_000, 31, 5_000),
+            event(KIND_RENEW, 2_000, 31, 6_000),
+        ];
+        {
+            let mut core = AofCore::open(&dir, 64 * 1024).expect("the core opens");
+            for one in &rebuilt {
+                core.append(one).expect("the record appends");
+            }
+            core.flush().expect("the buffer drains");
+            // Dropped without the shutdown: the resume scan is the only
+            // rebuild.
+        }
+        let mut core = AofCore::open(&dir, 64 * 1024).expect("the series reopens");
+        assert_eq!(
+            core.written,
+            (rebuilt.len() * RECORD_SIZE) as u64,
+            "the scan rebuilds the position"
+        );
+        let window = core.window.as_ref().expect("the scan rebuilds the window");
+        assert_eq!(window.op_min, 1_000);
+        assert_eq!(window.op_max, 2_000);
+        assert_eq!(window.expiry_min, 5_000);
+        assert_eq!(window.expiry_max, 6_000);
+        assert_eq!(window.count, 2);
+        core.append(&event(KIND_RELEASE, 3_000, 31, 7_000))
+            .expect("the record appends");
+        core.flush().expect("the buffer drains");
+        core.roll().expect("the roll fires");
+        let finalized = finalized_files(&dir);
+        assert_eq!(finalized.len(), 1);
+        let meta = journal::Meta::decode(
+            &fs::read(finalized[0].with_extension("meta")).expect("the metafile reads"),
         )
+        .expect("the metafile decodes");
+        assert_eq!(
+            meta.op_min, 1_000,
+            "the rebuilt minimum rolls with the stream"
+        );
+        assert_eq!(meta.op_max, 3_000);
+        assert_eq!(meta.count, 3);
     }
 
-    #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
+    /// The crash shapes — a whole zero-filled record-sized tail (the roll
+    /// pad's bytes) and a mid-record cut — ride past the last complete
+    /// record after a kill. Both fail record parsing, and the reopen
+    /// truncates them away; the appends continue after the truncation.
     #[test]
     fn resume_truncates_a_torn_tail() {
-        panic!(
-            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
-        )
+        let dir = scratch("torn-tail");
+        let events = vec![
+            event(KIND_HOLD, 2_000, 21, 6_000),
+            event(KIND_RENEW, 2_100, 21, 7_000),
+            event(KIND_RELEASE, 2_200, 21, 7_000),
+        ];
+        {
+            let mut core = AofCore::open(&dir, 64 * 1024).expect("the core opens");
+            for one in &events {
+                core.append(one).expect("the record appends");
+            }
+            core.flush().expect("the buffer drains");
+        }
+        let open_path = open_file(&dir);
+        {
+            let mut file = OpenOptions::new()
+                .append(true)
+                .open(&open_path)
+                .expect("the open file appends");
+            file.write_all(&[0u8; RECORD_SIZE])
+                .expect("the pad-shaped tail appends");
+            file.write_all(&[0x42u8; 20])
+                .expect("the mid-record cut appends");
+        }
+        assert_eq!(
+            fs::metadata(&open_path).expect("the length reads").len(),
+            (events.len() as u64 + 1) * RECORD_SIZE as u64 + 20,
+            "the torn tail is on disk before the reopen"
+        );
+        let mut core = AofCore::open(&dir, 64 * 1024).expect("the series reopens");
+        assert_eq!(
+            fs::metadata(&open_path).expect("the length reads").len(),
+            (events.len() * RECORD_SIZE) as u64,
+            "the torn tail truncated to the last complete record"
+        );
+        assert_eq!(
+            core.written,
+            (events.len() * RECORD_SIZE) as u64,
+            "the scan rebuilt the position at the truncation"
+        );
+        // The appends continue after the truncation.
+        let last = event(KIND_BREAK, 4_000, 33, 8_000);
+        core.append(&last).expect("the record appends");
+        core.flush().expect("the buffer drains");
+        drop(core);
+        let bytes = fs::read(&open_path).expect("the open file reads");
+        let mut expected = events;
+        expected.push(last);
+        assert_eq!(
+            journal::parse_file(&bytes),
+            expected,
+            "the appends land after the truncation"
+        );
+        assert_eq!(bytes.len(), expected.len() * RECORD_SIZE);
     }
 
-    #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
+    /// The writer thread's bounded queue drops on overflow and counts the
+    /// drops: under a burst against a one-deep queue, every enqueue
+    /// either landed (the file, in enqueue order) or dropped (the
+    /// counter) — nothing else — and the drain still answers.
     #[test]
     fn writer_thread_enqueue_lands_bytes_and_drops_on_overflow() {
-        panic!(
-            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        let dir = scratch("overflow");
+        const TOTAL: u64 = 20_000;
+        let writer = AofWriter::open(
+            &dir,
+            AofConfig {
+                flush_interval: None,
+                queue_cap: 1,
+                ..AofConfig::default()
+            },
         )
+        .expect("the series opens");
+        let events: Vec<_> = (0..TOTAL)
+            .map(|index| event(KIND_HOLD, 5_000 + index, 40 + index, 9_000))
+            .collect();
+        for one in &events {
+            writer.enqueue(one.clone());
+        }
+        writer.drain().expect("the drain lands the survivors");
+        let dropped = writer.drops();
+        assert!(dropped > 0, "a one-deep queue overflows under the burst");
+        assert!(dropped < TOTAL, "the writer kept up at least once");
+        drop(writer);
+        let bytes = fs::read(open_file(&dir)).expect("the open file reads");
+        let landed = journal::parse_file(&bytes);
+        assert!(!landed.is_empty(), "the first events landed");
+        assert_eq!(
+            landed.len() as u64 + dropped,
+            TOTAL,
+            "every enqueue either landed or dropped"
+        );
+        assert!(
+            landed.windows(2).all(|pair| pair[0].ts < pair[1].ts),
+            "the landed records ride in enqueue order"
+        );
+        assert!(
+            landed
+                .iter()
+                .all(|one| one.ts >= 5_000 && one.ts < 5_000 + TOTAL),
+            "the landed records came from the input"
+        );
     }
 
-    #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
+    /// The writer thread's checkpoint request flushes the buffer to the
+    /// file, and the last handle's drop flushes whatever remained — the
+    /// shutdown drain. Below the write-buffer threshold, with the
+    /// periodic-fsync knob OFF, the named paths are what landed the
+    /// bytes (each observed inside a bounded deadline, never an
+    /// infinite wait).
     #[test]
     fn writer_thread_checkpoint_and_shutdown_flush() {
-        panic!(
-            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        let dir = scratch("checkpoint-shutdown");
+        let writer = AofWriter::open(
+            &dir,
+            AofConfig {
+                flush_interval: None,
+                flush_bytes: 1024 * 1024,
+                ..AofConfig::default()
+            },
         )
+        .expect("the series opens");
+        let first: Vec<_> = (0..20u64)
+            .map(|index| event(KIND_HOLD, 6_000 + index, 50 + index, 9_000))
+            .collect();
+        for one in &first {
+            writer.enqueue(one.clone());
+        }
+        writer.checkpoint();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let bytes = fs::read(open_file(&dir)).expect("the open file reads");
+            if journal::parse_file(&bytes) == first {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the checkpoint flush never landed the buffer"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // The shutdown flush: twenty more events ride past the last
+        // handle's drop, and the thread's parting drain lands them.
+        let second: Vec<_> = (0..20u64)
+            .map(|index| event(KIND_RENEW, 7_000 + index, 60 + index, 9_000))
+            .collect();
+        for one in &second {
+            writer.enqueue(one.clone());
+        }
+        drop(writer);
+        let mut expected = first;
+        expected.extend(second);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let bytes = fs::read(open_file(&dir)).expect("the open file reads");
+            if journal::parse_file(&bytes) == expected {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the shutdown flush never landed the buffer"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     /// The continuous-load regression: a stream whose inter-event gaps are
     /// shorter than the pump tick must still reach the file — the buffered
     /// drain runs on its own cadence, never on recv_timeout expiry alone,
     /// and the periodic fsync fires while the stream keeps flowing.
-    #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
     #[test]
     fn writer_thread_flushes_under_continuous_load() {
-        panic!(
-            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        let dir = scratch("continuous-load");
+        let writer = AofWriter::open(
+            &dir,
+            AofConfig {
+                flush_interval: Some(Duration::from_millis(150)),
+                ..AofConfig::default()
+            },
         )
+        .expect("the series opens");
+        let events: Vec<_> = (0..40u64)
+            .map(|index| event(KIND_HOLD, 8_000 + index, 70 + index, 9_000))
+            .collect();
+        for one in &events {
+            writer.enqueue(one.clone());
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // No drain, no checkpoint: the file accumulates while the stream
+        // keeps flowing.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let bytes = fs::read(open_file(&dir)).expect("the open file reads");
+            if journal::parse_file(&bytes) == events {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the continuous stream never reached the file"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(writer.drops(), 0, "the stream fit the queue");
+        drop(writer);
     }
 
-    #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
+    /// The writer thread rolls when the block fills: the drain answers
+    /// after the roll, the finalized file is exactly one erasure block,
+    /// the metafile names the finalized window, and the rollover record
+    /// starts the fresh file.
     #[test]
     fn writer_thread_rolls_when_block_fills() {
-        panic!(
-            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
+        let dir = scratch("thread-roll");
+        const RECORDS: u64 = ROLL_BYTES / RECORD_SIZE as u64 + 1;
+        let writer = AofWriter::open(&dir, config()).expect("the series opens");
+        let events: Vec<_> = (0..RECORDS)
+            .map(|index| event(KIND_HOLD, 10_000 + index, 80 + index, 9_000))
+            .collect();
+        for one in &events {
+            writer.enqueue(one.clone());
+        }
+        writer.drain().expect("the drain lands every queued record");
+        assert_eq!(writer.drops(), 0, "no record drops at this depth");
+        drop(writer);
+        let finalized = finalized_files(&dir);
+        assert_eq!(finalized.len(), 1, "the writer rolled exactly once");
+        assert_eq!(
+            fs::metadata(&finalized[0]).expect("the length reads").len(),
+            ROLL_BYTES,
+            "the finalized file is exactly one erasure block"
+        );
+        let meta = journal::Meta::decode(
+            &fs::read(finalized[0].with_extension("meta")).expect("the metafile reads"),
         )
+        .expect("the metafile decodes");
+        assert_eq!(
+            meta.count as usize,
+            (RECORDS - 1) as usize,
+            "the roll fired at the record that would pass the mark"
+        );
+        assert_eq!(meta.op_max, 10_000 + RECORDS - 2);
+        let bytes = fs::read(open_file(&dir)).expect("the open file reads");
+        assert_eq!(
+            journal::parse_file(&bytes),
+            events[(RECORDS - 1) as usize..],
+            "the rollover record starts the fresh file"
+        );
     }
 
-    #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
+    /// The metafile written at the roll matches the window: the fixed
+    /// 40-byte file decodes to the rolled events' min/max ts and expiry
+    /// and the count, and the finalized file's own name spells the same
+    /// window.
     #[test]
     fn metafile_written_at_roll_matches_window() {
-        panic!(
-            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
-        )
+        let dir = scratch("metafile");
+        let mut core = AofCore::open(&dir, 64 * 1024).expect("the core opens");
+        let events = vec![
+            event(KIND_HOLD, 1_000, 11, 9_000),
+            event(KIND_RENEW, 2_000, 12, 5_000),
+            event(KIND_RELEASE, 3_000, 13, 7_000),
+            event(KIND_BREAK, 4_000, 14, 6_000),
+            event(KIND_HOLD, 5_000, 15, 8_000),
+        ];
+        for one in &events {
+            core.append(one).expect("the record appends");
+        }
+        core.flush().expect("the buffer drains");
+        core.roll().expect("the roll fires");
+        let finalized = finalized_files(&dir);
+        assert_eq!(finalized.len(), 1);
+        let meta_bytes = fs::read(finalized[0].with_extension("meta")).expect("the metafile reads");
+        assert_eq!(
+            meta_bytes.len(),
+            journal::META_SIZE,
+            "the fixed metafile size"
+        );
+        let meta = journal::Meta::decode(&meta_bytes).expect("the metafile decodes");
+        assert_eq!(
+            meta,
+            journal::Meta {
+                op_min: 1_000,
+                op_max: 5_000,
+                expiry_min: 5_000,
+                expiry_max: 9_000,
+                count: 5,
+            }
+        );
+        assert_eq!(
+            finalized[0]
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(""),
+            "ev-1000-5000-5000-9000.bin",
+            "the finalized file's name is the same window"
+        );
     }
 }

@@ -208,35 +208,147 @@ fn fake_block(seed: u64) -> [u8; BLOCK_BYTES] {
 
 #[cfg(test)]
 mod tests {
-    #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
+    use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// The scratch path, inside the repo (`.tmp` is scratch). The path
+    /// is only built here: `execute` creates the tree on demand, so the
+    /// diskless variant's nothing-written proof can assert the tree's
+    /// absence.
+    fn scratch(name: &str) -> PathBuf {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.tmp/recovery-flush-unit");
+        let dir = root.join(format!(
+            "{name}-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::SeqCst)
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// Every variant's command-line spelling parses to its variant, and
+    /// the label spells the same word back; an unknown spelling is no
+    /// variant.
     #[test]
     fn variant_labels_round_trip_through_parse() {
-        panic!(
-            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
-        )
+        for (text, variant) in [
+            ("diskless", RecoveryFlush::Diskless),
+            ("single", RecoveryFlush::SingleBlock),
+            ("double-ring", RecoveryFlush::DoubleRing),
+        ] {
+            assert_eq!(RecoveryFlush::parse(text), Some(variant));
+            assert_eq!(variant.label(), text, "the label spells the spelling");
+        }
+        assert_eq!(RecoveryFlush::parse(""), None);
+        assert_eq!(RecoveryFlush::parse("double"), None);
+        assert_eq!(RecoveryFlush::parse("DOUBLE-RING"), None);
     }
 
-    #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
+    /// Variant 0 is diskless: nothing is written, the reported bytes are
+    /// zero, the measured latency is zero, and the scratch tree is never
+    /// even created.
     #[test]
     fn variant_0_writes_nothing() {
-        panic!(
-            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
-        )
+        let dir = scratch("variant-0");
+        let outcome = execute(&dir, RecoveryFlush::Diskless, 7).expect("variant 0 never fails");
+        assert_eq!(outcome.variant, "diskless");
+        assert_eq!(outcome.bytes_written, 0);
+        assert_eq!(outcome.latency, Duration::ZERO);
+        assert!(
+            !dir.exists(),
+            "the diskless variant never creates the scratch tree"
+        );
     }
 
-    #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
+    /// Variant 1 writes exactly one 4 KiB block — the file's whole
+    /// length — and a second boot over the same scratch overwrites the
+    /// block in place: the baseline stays exactly one block across
+    /// boots. (The fsync itself is not observable from a test; the
+    /// geometry is what the tests verify, never a read-back path.)
     #[test]
     fn variant_1_writes_exactly_one_4k_block_and_fsyncs() {
-        panic!(
-            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
-        )
+        let dir = scratch("variant-1");
+        let outcome = execute(&dir, RecoveryFlush::SingleBlock, 9).expect("the flush executes");
+        assert_eq!(outcome.variant, "single");
+        assert_eq!(outcome.bytes_written, BLOCK_BYTES as u64);
+        let path = dir.join("recovery-flush-single.bin");
+        assert_eq!(
+            fs::metadata(&path).expect("the block file exists").len(),
+            BLOCK_BYTES as u64,
+            "exactly one 4 KiB block"
+        );
+        let bytes = fs::read(&path).expect("the block reads");
+        assert_eq!(bytes, fake_block(9), "the block is the seed's fake data");
+        // The second boot: overwrite in place, the file never grows.
+        let outcome =
+            execute(&dir, RecoveryFlush::SingleBlock, 10).expect("the second flush executes");
+        assert_eq!(outcome.bytes_written, BLOCK_BYTES as u64);
+        assert_eq!(
+            fs::metadata(&path).expect("the length reads").len(),
+            BLOCK_BYTES as u64,
+            "the baseline stays one block across boots"
+        );
+        let bytes = fs::read(&path).expect("the block reads");
+        assert_eq!(
+            bytes,
+            fake_block(10),
+            "the overwrite landed: the new seed's block"
+        );
     }
 
-    #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
+    /// Variant 2 writes both rings with the documented geometry: the
+    /// checksum header plus the 64-byte data line at the file's start,
+    /// the identical header copy with NO payload at ring two, spaced
+    /// [`RING_SPACING_BYTES`] apart — different erasure blocks for the
+    /// two checksum copies.
     #[test]
     fn variant_2_writes_both_rings_with_the_documented_geometry() {
-        panic!(
-            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
-        )
+        let dir = scratch("variant-2");
+        let outcome = execute(&dir, RecoveryFlush::DoubleRing, 11).expect("the flush executes");
+        assert_eq!(outcome.variant, "double-ring");
+        assert_eq!(outcome.bytes_written, 2 * BLOCK_BYTES as u64);
+        let path = dir.join("recovery-flush-double.bin");
+        let bytes = fs::read(&path).expect("the rings read");
+        assert_eq!(
+            bytes.len(),
+            RING_SPACING_BYTES as usize + BLOCK_BYTES,
+            "ring two sits RING_SPACING_BYTES past ring one"
+        );
+        // Ring one: magic, the FNV-1a checksum over the data line, the
+        // flush sequence, the payload length — then the 64-byte line.
+        assert_eq!(&bytes[..8], &RING_MAGIC[..], "the ring magic");
+        let line = &bytes[HEADER_BYTES..HEADER_BYTES + DATA_LINE_BYTES];
+        assert_eq!(
+            u64::from_be_bytes(bytes[8..16].try_into().expect("the checksum field")),
+            fnv1a(line),
+            "the checksum covers the data line"
+        );
+        assert_eq!(
+            u64::from_be_bytes(bytes[16..24].try_into().expect("the sequence field")),
+            11,
+            "the boot's sequence rides the header"
+        );
+        assert_eq!(
+            u64::from_be_bytes(bytes[24..32].try_into().expect("the length field")),
+            DATA_LINE_BYTES as u64,
+            "ring one carries the payload length"
+        );
+        // Ring two: the identical header copy, and the payload region
+        // absent — the rest of the block stays zero.
+        let ring_two = &bytes[RING_SPACING_BYTES as usize..];
+        assert_eq!(
+            &ring_two[..HEADER_BYTES],
+            &bytes[..HEADER_BYTES],
+            "the header copy is identical"
+        );
+        assert!(
+            ring_two[HEADER_BYTES..BLOCK_BYTES]
+                .iter()
+                .all(|&byte| byte == 0),
+            "ring two carries no payload"
+        );
     }
 }
