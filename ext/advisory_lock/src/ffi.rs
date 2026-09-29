@@ -3241,7 +3241,7 @@ mod tests {
     /// proposals round-trip the wire (the leader's phase-2 needs the
     /// follower's ack). Each member's id is its provisioned identity —
     /// its own system half, crash counter 1.
-    const MEMBERS_TWO: &str = "65537:n1\0131073:n2";
+    const MEMBERS_TWO: &str = "65537:n1\x00131073:n2";
 
     /// One full exchange: every queued send is delivered to the member
     /// whose live identity carries the addressed system half (the
@@ -3590,10 +3590,10 @@ mod tests {
         // The tear: the file is cut inside copy 1's zone (the zones are
         // the file's four uniform spans), so copy 0 is the only fully
         // readable copy — below the 2/4 open threshold.
-        let full = fs::read(&superblock_of(&state)).expect("the store reads");
+        let full = fs::read(superblock_of(&state)).expect("the store reads");
         let zone = full.len() / marker::geometry().expect("the geometry reports").copies;
         let torn = &full[..zone + zone / 2];
-        fs::write(&superblock_of(&state), torn).expect("the tear writes");
+        fs::write(superblock_of(&state), torn).expect("the tear writes");
         let projection_before = projection(&state);
         // The boot refuses: no quorum, no verdict, no identity guessed —
         // and the projection never rescues the unreadable quorum.
@@ -3603,7 +3603,7 @@ mod tests {
             "the unreadable quorum refuses the boot"
         );
         assert_eq!(
-            fs::read(&superblock_of(&state)).expect("the store reads"),
+            fs::read(superblock_of(&state)).expect("the store reads"),
             torn,
             "the refused boot rewrites nothing"
         );
@@ -3824,7 +3824,7 @@ mod tests {
         let mut durable = Vec::new();
         for entry in fs::read_dir(&aof_dir).expect("the AOF series reads") {
             let path = entry.expect("the entry reads").path();
-            if path.extension().map_or(false, |ext| ext == "bin") {
+            if path.extension().is_some_and(|ext| ext == "bin") {
                 durable.extend(journal::parse_file(
                     &fs::read(&path).expect("the file reads"),
                 ));
@@ -3886,9 +3886,9 @@ mod tests {
             ("unparseable", "65537"),
             ("empty-name", "65537:"),
             ("duplicate-id", "65537:n1\0:-"),
-            ("duplicate-ids", "65537:n1\065537:n2"),
-            ("duplicate-names", "65537:n1\065538:n1"),
-            ("own-absent", "65537:n1\065538:n2"),
+            ("duplicate-ids", "65537:n1\x0065537:n2"),
+            ("duplicate-names", "65537:n1\x0065538:n1"),
+            ("own-absent", "65537:n1\x0065538:n2"),
         ];
         for (name, members) in cases {
             assert_eq!(
@@ -3909,7 +3909,7 @@ mod tests {
         // names neither member.
         assert_eq!(
             Node::open(
-                "65537:n1\065538:n2",
+                "65537:n1\x0065538:n2",
                 "n3",
                 &state.to_string_lossy(),
                 None,
@@ -4256,29 +4256,7 @@ mod tests {
 
     /// The two-member compliance descriptor plus a joined-later entry for
     /// the reconfiguration leg.
-    const MEMBERS_THREE_J: &str = "65537:n1\0131073:n2\0196609:n3:j";
-
-    /// The two-node compliance cluster settles: both members tick under
-    /// the shared logical clock, the wire exchanges, and both report
-    /// Normal behind the primary.
-    fn settle_compliance_pair(primary: &mut Node, follower: &mut Node) {
-        let mut clock = 0u64;
-        for _ in 0..1_000 {
-            clock += 1;
-            primary.set_compliance_clock(clock);
-            follower.set_compliance_clock(clock);
-            primary.idle();
-            follower.idle();
-            let _ = exchange_all(&mut [primary, follower], 64);
-            if primary.status().state == 0
-                && follower.status().state == 0
-                && primary.status().leader == primary.own_id()
-            {
-                return;
-            }
-        }
-        panic!("the compliance pair did not settle inside the bound");
-    }
+    const MEMBERS_THREE_J: &str = "65537:n1\x00131073:n2\x00196609:n3:j";
 
     /// Every output the adapter ever queues carries kind 1 (send) or 2
     /// (reply) — drained across a boot, a stream, a fence, and a
@@ -4486,7 +4464,8 @@ mod tests {
     }
 
     /// Every output the adapter ever queues carries kind 1 (send) or 2
-
+    /// (reply) — drained across a boot, a stream, a fence, and a
+    /// reconfiguration.
     /// The unknown-peer-id maybe: a datagram attributed to a low-band id
     /// outside the descriptor address space crashes a test build (the
     /// maybe fires) and passes silently in release (warn-and-continue).
@@ -4894,7 +4873,7 @@ mod tests {
         let dir = scratch("reincarnation");
         // The triad: the corpus's shape (the forced walk's commits need
         // the surviving pair's quorum while the crashed member is dead).
-        const MEMBERS: &str = "65537:n1\0131073:n2\0196609:n3";
+        const MEMBERS: &str = "65537:n1\x00131073:n2\x00196609:n3";
         let mut primary = Node::open_compliance(
             MEMBERS,
             OWN_ONE,
@@ -5040,7 +5019,7 @@ mod tests {
     fn rapid_fences_with_learners_keep_the_voters_serving() {
         let dir = scratch("rapid-fences");
         // The voter triad plus the joined-later learner's entry.
-        const MEMBERS: &str = "65537:n1\0131073:n2\0196609:n3\0262145:n4:j";
+        const MEMBERS: &str = "65537:n1\x00131073:n2\x00196609:n3\x00262145:n4:j";
         let mut n1 = Node::open_compliance(
             MEMBERS,
             OWN_ONE,
@@ -5163,7 +5142,6 @@ mod tests {
                 "the stream proposes through view {}",
                 view + 1
             );
-            drop(leader);
             let mut committed = false;
             for _ in 0..1_000 {
                 clock += 1;
