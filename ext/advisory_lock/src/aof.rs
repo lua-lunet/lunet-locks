@@ -374,7 +374,14 @@ impl AofCore {
         self.flush_buf()?;
         self.sink.sync()?;
         self.syncs += 1;
-        debug_assert_eq!(self.sink.offset, ROLL_BYTES);
+        // The pad arithmetic above establishes the alignment: the flush
+        // lands exactly at the roll mark. A finalized file of any other
+        // size breaks the erasure-block contract silently in release, so
+        // the panic is the proof, in every build.
+        assert_eq!(
+            self.sink.offset, ROLL_BYTES,
+            "the roll finalized the erasure block"
+        );
         let final_name = format!(
             "ev-{}-{}-{}-{}.bin",
             window.op_min, window.op_max, window.expiry_min, window.expiry_max
@@ -536,9 +543,22 @@ fn pump(rx: Receiver<Msg>, mut core: AofCore, interval: Option<Duration>, drops:
                 }
             }
             Ok(Msg::Checkpoint) => {
-                if !failed && core.checkpoint().is_ok() {
-                    last_sync = Instant::now();
-                    last_flush = Instant::now();
+                if !failed {
+                    match core.checkpoint() {
+                        Ok(()) => {
+                            last_sync = Instant::now();
+                            last_flush = Instant::now();
+                        }
+                        Err(e) => {
+                            // The checkpoint request was dropped without
+                            // an answer. Survivable — telemetry carries
+                            // a documented loss window and the next
+                            // drain still reports — but never silent.
+                            crate::maybe_invariant!(
+                                "aof checkpoint request failed ({e}); the fsync was not taken"
+                            );
+                        }
+                    }
                 }
             }
             Ok(Msg::Drain(signal)) => {
@@ -581,9 +601,20 @@ fn pump(rx: Receiver<Msg>, mut core: AofCore, interval: Option<Duration>, drops:
             }
             last_flush = Instant::now();
         }
-        if interval.is_some_and(|iv| last_sync.elapsed() >= iv) && core.checkpoint().is_ok() {
-            last_sync = Instant::now();
-            last_flush = Instant::now();
+        if interval.is_some_and(|iv| last_sync.elapsed() >= iv) {
+            match core.checkpoint() {
+                Ok(()) => {
+                    last_sync = Instant::now();
+                    last_flush = Instant::now();
+                }
+                Err(e) => {
+                    // The window's fsync did not land. Survivable (the
+                    // loss window is documented), never silent.
+                    crate::maybe_invariant!(
+                        "aof periodic fsync failed ({e}); this window's fsync did not land"
+                    );
+                }
+            }
         }
     }
     if failed {
