@@ -225,7 +225,7 @@ struct Host {
     model: membership::Model,
     sidecar: membership::SidecarWriter,
     discovery: Discovery,
-    /// The phi-accrual monitor (item19): per-(era, leader, addr, monitor)
+    /// The phi-accrual monitor: per-(era, leader, addr, monitor)
     /// sketches over the leader's heartbeat Commit arrivals. Compiles
     /// only into the `experimental-phi` build; `None` when phi is
     /// disabled (`--phi-threshold 0`).
@@ -269,7 +269,7 @@ struct Host {
     /// the poll. Validated `min <= max` at parse.
     viewchange: phi::ViewChangeTimer,
     /// The sloppy leader timeout — the NORMAL build's leader-failure
-    /// detector (item25.18): a uniform random wait in
+    /// detector: a uniform random wait in
     /// `[min, max]` per watched (era, leader) key, re-armed on leader
     /// evidence, firing the §14.2 forced view when due. The
     /// `experimental-phi` build compiles it out (the detector stands in).
@@ -287,7 +287,7 @@ struct Host {
     election_wait_armed: u64,
     /// The phi-timeout clamp knobs (M3).
     timeout_knobs: telemetry::TimeoutKnobs,
-    /// The telemetry AOF (item22): the envelope record layer over the
+    /// The telemetry AOF: the envelope record layer over the
     /// vendored TigerBeetle AOF, gated by the node's voting weight —
     /// weight 0 (or the boot Recovering/Joining phase) = ON, weight > 0 =
     /// OFF. Carries the boot trace (state transitions + outbound), every
@@ -297,7 +297,7 @@ struct Host {
     /// disabled the stream for the process (telemetry contract: never
     /// poison the replication path).
     telemetry: Option<telemetry::TelemetryLog>,
-    /// The embedded lock client runner (item04): N contender loops against
+    /// The embedded lock client runner: N contender loops against
     /// this node's own service, ticked from the host loop behind the
     /// host's SIGUSR1/SIGUSR2 client gate. `None` when launched without
     /// `--embedded-client`.
@@ -475,19 +475,19 @@ struct Options {
     /// The AOF's periodic-fsync knob (ms). 0 = only at roll and shutdown.
     aof_flush_ms: u64,
     /// The vendored TigerBeetle AOF's retention threshold, in MiB of
-    /// `{epoch}.aof` series on disk (item21). Default 10.
+    /// `{epoch}.aof` series on disk. Default 10.
     aof_retention_mib: u64,
-    /// The telemetry AOF's series directory (item22). Empty = fall back to
+    /// The telemetry AOF's series directory. Empty = fall back to
     /// `aof_dir`. Every node can carry one: voting nodes log the boot
     /// trace, then the gate disarms at weight > 0; standbys stay ON.
     telemetry_aof_dir: String,
-    /// The telemetry active file's rollover threshold, in MiB (item22).
+    /// The telemetry active file's rollover threshold, in MiB.
     /// Default 4; the series keeps exactly the current file + one closed
     /// old.
     telemetry_rollover_mib: u64,
-    /// The phi-informed election-wait clamp's floor, in ms (item22 M3).
+    /// The phi-informed election-wait clamp's floor, in ms.
     phi_timeout_min_ms: u64,
-    /// The phi-informed election-wait clamp's ceiling, in ms (item22 M3).
+    /// The phi-informed election-wait clamp's ceiling, in ms.
     phi_timeout_max_ms: u64,
     /// The cluster viewchange timeout's floor
     /// (`docs/src/phi-and-timeouts.md`): while a node is timed out on
@@ -506,7 +506,7 @@ struct Options {
     election_ms: u64,
     recovery_ms: u64,
     /// The phi threshold a leader-failure sketch must cross before its
-    /// monitor acts (item19). 0 disables phi monitoring entirely.
+    /// monitor acts. 0 disables phi monitoring entirely.
     /// Compiles only into the `experimental-phi` build; the sloppy
     /// timeout needs no threshold.
     #[cfg(feature = "experimental-phi")]
@@ -515,7 +515,7 @@ struct Options {
     /// `safety * heartbeat_ms` of leader silence, whatever phi says.
     #[cfg(feature = "experimental-phi")]
     phi_safety: f64,
-    /// The embedded lock client count (item04): N contender loops run
+    /// The embedded lock client count: N contender loops run
     /// in-process against the node's own service, behind the host's
     /// SIGUSR1/SIGUSR2 client gate. 0 = none (no signal registration).
     embedded_clients: usize,
@@ -1358,7 +1358,7 @@ impl Host {
                     );
                     continue;
                 };
-                // The phi trailer (item19, `experimental-phi` only) rides
+                // The phi trailer (`experimental-phi` only) rides
                 // only the leader's Commit datagrams: the stream
                 // followers' sketches observe. The trailer lives OUTSIDE
                 // the core's message bytes — the receiving host strips it
@@ -1394,7 +1394,7 @@ impl Host {
                 let packet =
                     transport::encode_peer(transport::PEER_VRR, &self.fingerprint, &payload);
                 let _ = self.sock.send_to(&packet, addr);
-                // The outbound trace (item22): what this node decided it
+                // The outbound trace: what this node decided it
                 // was — one TelemetryOutbound record per sent datagram
                 // while the AOF gate is active.
                 self.record_outbound(&out);
@@ -1953,7 +1953,7 @@ fn serve(options: &Options, nodes: &[ClusterNode], lifecycle: &Lifecycle) -> Ser
     let fingerprint = transport::genesis_fingerprint(&genesis);
 
     let standby = !options.aof_dir.is_empty();
-    // The telemetry AOF (item22): the envelope record layer over the
+    // The telemetry AOF: the envelope record layer over the
     // vendored TigerBeetle AOF, gated by the node's voting weight. The
     // series directory is `--telemetry-aof-dir`, falling back to
     // `--aof-dir` (the standby's). EVERY node can carry one: the boot
@@ -2134,7 +2134,7 @@ fn serve(options: &Options, nodes: &[ClusterNode], lifecycle: &Lifecycle) -> Ser
         next_action_at: millis() + 300,
         pending: None,
     };
-    // The embedded lock client (item04): N contender loops against this
+    // The embedded lock client: N contender loops against this
     // node's own service. Off the bench they run behind the host's client
     // gate and the SIGUSR1/SIGUSR2 flags register only when clients run —
     // a gateless host ignores them. On the bench the SIGUSR pair carries
@@ -2245,7 +2245,7 @@ fn serve(options: &Options, nodes: &[ClusterNode], lifecycle: &Lifecycle) -> Ser
         host.model.members.len(),
         model_source
     ));
-    // The boot trace (item22): every node's startup decision —
+    // The boot trace: every node's startup decision —
     // Restarting on a dirty restart (incarnation bump), Recovering when
     // the core boots into the recovering state, Joining for a fresh
     // member already Normal — lands in its AOF with the outbound messages
@@ -2345,7 +2345,7 @@ fn serve(options: &Options, nodes: &[ClusterNode], lifecycle: &Lifecycle) -> Ser
         embedded_step(&mut host, now, &mut rng);
         host.flush_outputs(now, &mut rng);
         // The AOF lifecycle gate + the 1000 ms forced flusher + the
-        // rollover (item22 M2): the gate follows the node's voting
+        // rollover: the gate follows the node's voting
         // weight, the flusher runs only while the AOF is ON.
         if let Some(log) = host.telemetry.as_mut() {
             log.on_weight(host.node.voting_weight(), now);
@@ -2436,7 +2436,7 @@ fn timers(host: &mut Host, now: u64, rng: &mut Rng) {
         host.leader_elapsed = 0;
     } else {
         host.leader_elapsed += TICK_MS;
-        // The phi-informed election wait (item22 M3): the host tick loop
+        // The phi-informed election wait: the host tick loop
         // owns the timeout. It consults the current leader's phi sketch,
         // clamps the derived wait to [min, max] (never earlier than a
         // settled phi allows, never later than the old fixed gate), logs
@@ -2455,7 +2455,7 @@ fn timers(host: &mut Host, now: u64, rng: &mut Rng) {
             }
         }
     }
-    // The state-transition trace (item22): Recovering/Restarting/Joining
+    // The state-transition trace: Recovering/Restarting/Joining
     // decisions and the voting-weight moves land in the AOF while its
     // gate is active.
     if status.state != host.last_state {
@@ -2527,7 +2527,7 @@ fn timers(host: &mut Host, now: u64, rng: &mut Rng) {
     }
 }
 
-/// One host-loop tick of the embedded lock client runner (item04): drain
+/// One host-loop tick of the embedded lock client runner: drain
 /// the process signal flags into every embedded client's gate and step
 /// each chase — one op in flight at a time, submitted through the node's
 /// own request path.
@@ -2594,7 +2594,7 @@ fn handle_packet(
         return;
     }
     if kind == transport::PEER_VRR {
-        // Before anything else: the phi trailer (item19, `experimental-phi`
+        // Before anything else: the phi trailer (`experimental-phi`
         // only) rides at the BACK of the leader's heartbeat Commits,
         // entirely OUTSIDE the core's message bytes. Strip it here so the
         // core sees the exact-length message its W3 contract demands, and
@@ -2618,7 +2618,7 @@ fn handle_packet(
         }
         #[cfg(not(feature = "experimental-phi"))]
         host.on_leader_commit(replica, commit_datagram, now, rng);
-        // The telemetry AOF stream (item22): EVERY VRR datagram this node
+        // The telemetry AOF stream: EVERY VRR datagram this node
         // sees is one `Wire` envelope record — the datagram's VRR payload
         // byte-identical to what the network carried (the phi trailer's
         // sent_at_ms stays in the record: the export's leader-timestamp

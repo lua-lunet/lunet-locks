@@ -58,7 +58,7 @@ at 5 ms test heartbeats); a cloud deploy at the 200 ms heartbeat sets
 `--phi-timeout-min-ms 2000 --phi-timeout-max-ms 4000`. This repo's UDS
 harness pins its own knobs at 3000/5000 — its switch fabric is the test
 thread, and a scheduler stall of that thread manufactures wire silence
-(item09: a 422 ms frame gap churned the view 1→16), so its floor must
+(a 422 ms frame gap churned the view 1→16), so its floor must
 exceed the stall a loaded host produces.
 
 ## The experimental build: the phi-accrual detector

@@ -5,7 +5,7 @@
 # PARITY (identical JSON). Reference sketch: the upstream reader gist
 # (handover 337b313e, aof-reader-tool-sketch.md).
 #
-# The twins share two hard contracts (item03.5):
+# The twins share two hard contracts:
 # - --kind is repeatable AND space-joined, with UNION semantics
 #   ("--kind hb-spacing --kind aof-noise" == "--kind hb-spacing aof-noise");
 #   the special names "all" and "both" expand to their kind sets and
@@ -28,7 +28,7 @@ from pathlib import Path
 
 RECORD_MAX = (1024 * 1024) - 256
 
-# The envelope markers (item22 M1). Unknown markers are rejected, never guessed.
+# The envelope markers. Unknown markers are rejected, never guessed.
 MARKERS = {1: "Wire", 2: "TelemetryTimeoutDecision", 3: "TelemetryStateTransition",
            4: "TelemetryOutbound", 5: "TelemetryIntervalSample"}
 
@@ -201,8 +201,8 @@ def summarize_series_json(dir_path, lib=None):
 # -------------------------------------------------------------- export ----
 # The trace of what happened, as JSONL: the ts at the AOF (the standby's
 # local nanosecond clock), the ts at the leader (the phi trailer's
-# sent_at_ms, carried on every leader Commit since item22's trailer
-# retention), the command that enacted it, and the result.
+# sent_at_ms, carried on every leader Commit since the trailer's
+# retention landed), the command that enacted it, and the result.
 
 TRAILER_MAGIC = b"\xc0\x0b"
 TRAILER_BYTES = 22  # magic(2) + era(4) + leader(4) + seq(4) + sent_at_ms(8)
@@ -346,7 +346,7 @@ def lock_fields(payload: bytes):
 
 
 # ------------------------------------------------------------- anchors ----
-# item02: readable times. An anchor is a kill/silence stamp in unix ms
+# Readable times. An anchor is a kill/silence stamp in unix ms
 # (the acting host's `date +%s%3N`), DIRECTLY comparable to a same-host
 # AOF envelope ns stamp. Every exported row gains t_rel_ms (relative to
 # the latest anchor at or before the row's ts; negative before the first
@@ -399,7 +399,7 @@ def _row_ts_ms(row: dict):
 
 
 def _compensated_sum(values) -> float:
-    """The one summation algorithm both twins share (item03.5): Neumaier
+    """The one summation algorithm both twins share: Neumaier
     compensated summation over the sorted values. CPython >= 3.12's
     sum() already compensates; the explicit loop pins that behaviour
     version-independently so the LuaJIT twin has an exact recipe to

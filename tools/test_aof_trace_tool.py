@@ -244,7 +244,7 @@ def write_timeline_fixture(d):
 
 
 class AnchoredTimelineExport(unittest.TestCase):
-    # item02: --anchor, locks-timeline + takeover summaries, hb-spacing,
+    # --anchor: locks-timeline + takeover summaries, hb-spacing,
     # aof-noise. One rich fixture: lock ops on one lock (holder churn
     # 1 → 1 → break → 2 → 3), leader trailers with a sent_at_ms series,
     # marker-5 samples with dt_ms, and a ns arrival stall (9 ms gap).
@@ -447,7 +447,7 @@ class CliAnchors(unittest.TestCase):
 
 
 class KindCliContract(unittest.TestCase):
-    # item03.5: --kind is repeatable AND space-joined, union semantics,
+    # --kind is repeatable AND space-joined, union semantics,
     # ONE contract in both twins (the real-w1b dry run proved they
     # diverged: py overwrote last-wins but split joined values, tl
     # overwrote and silently exported nothing for joined values).
@@ -487,7 +487,7 @@ class KindCliContract(unittest.TestCase):
 
 
 class LargeScaleTwinParity(unittest.TestCase):
-    # item03.5 regression: the real-w1b dry run (56,385 records) drifted
+    # Regression: the real-w1b dry run (56,385 records) drifted
     # in aof-noise gaps.mean_ms at the last repr digit — the tl twin's
     # naive accumulation vs the reference's compensated summation. At
     # ≥28,000 wire records with ns stamps ~1.789e18 (> 2^53), the py and
@@ -554,7 +554,8 @@ class LargeScaleTwinParity(unittest.TestCase):
         self.assertEqual(len(tl_lines), len(py_lines))
         # The exported aof-noise mean is the compensated (Neumaier) sum
         # over the sorted gaps, and this fixture separates it from the
-        # naive accumulation the tl twin shipped before item03.5.
+        # naive accumulation the tl twin shipped before the union
+        # contract landed.
         noise = json.loads(py_lines[-1])
         self.assertEqual(noise["gaps"]["count"], 28_000)
         self.assertEqual(json.loads(py_lines[0])["count"], 28_000)

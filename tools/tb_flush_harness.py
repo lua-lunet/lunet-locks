@@ -1,4 +1,4 @@
-# The TigerBeetle-pattern flush harness (item20): the WAL double-ring
+# The TigerBeetle-pattern flush harness: the WAL double-ring
 # prepare cycle, the checkpoint with the superblock seal, and the grid
 # writes — measured with the same stats discipline fio reports
 # (nearest-rank percentiles 50/90/99/99.9/99.99, n, window).

@@ -1,6 +1,6 @@
 //! The contender decision machinery, extracted from the lease-load
 //! binary so the sequencer host can drive the identical chase machine
-//! in-process (item04): no client→cluster TCP noise, the same cadence
+//! in-process: no client→cluster TCP noise, the same cadence
 //! math, the same SIGUSR1 silence / SIGUSR2 start gate. The module is a
 //! pure object on the wall clock — every decision fn takes the
 //! caller's `now` — fed replies by whoever transported the request: the

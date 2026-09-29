@@ -173,7 +173,7 @@ that keeps the standby tracking the cluster while it applies the stream.
 
 Any node can carry a **telemetry AOF** — `--telemetry-aof-dir`, falling
 back to `--aof-dir` — a `{epoch}.aof` series written through the vendored
-TigerBeetle AOF (item21) with the typed record envelope (item22) from
+TigerBeetle AOF with the typed record envelope from
 `ext/lunet-locks-aof`: every record is `marker(1) | local-clock-ns(8) |
 payload`, and the marker names the subsystem — `Wire` (the raw uVRR wire
 message, its serialization reused as-is), `TelemetryTimeoutDecision`,

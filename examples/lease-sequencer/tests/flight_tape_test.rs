@@ -1,4 +1,4 @@
-//! The Flight Recorder's tape acceptance (item12): a recording read by
+//! The Flight Recorder's tape acceptance: a recording read by
 //! the reader path, the commit gate's refusal, the tape lines feeding the
 //! SAME playback engine the telemetry tape feeds (`scenario/mod.rs`), and
 //! the red/green story pinned.
@@ -86,7 +86,7 @@ fn the_deep_read_streams_the_full_internal_log_on_the_same_commit() {
     )
 }
 /// The `?` endpoints drop under `--from`/`--to` unless `--from-any`/
-/// `--to-any` — the telemetry tape's filter semantics (item03's shape).
+/// `--to-any` — the telemetry tape's filter semantics.
 #[test]
 fn the_question_mark_endpoints_drop_unless_any() {
     panic!(
@@ -104,7 +104,7 @@ fn the_endpoint_filter_matches_the_rendered_line() {
     )
 }
 
-/// The item18 acceptance over a REAL flight recording: the feature-ON
+/// The flight-recorder acceptance over a REAL flight recording: the feature-ON
 /// build records a live node (boot, promote, client request, emit,
 /// stop), the recording streams as the stable `from,to,jsonl` slice, the
 /// trivial shell filter's `grep "^10,11,"` matches the bin's endpoint

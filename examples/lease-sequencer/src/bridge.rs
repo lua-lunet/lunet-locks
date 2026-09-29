@@ -1,4 +1,4 @@
-//! The AOF console bridge (item23): the vanilla JS console reads the trace.
+//! The AOF console bridge: the vanilla JS console reads the trace.
 //!
 //! One binary surface, read-only on the standby's AOF series:
 //!

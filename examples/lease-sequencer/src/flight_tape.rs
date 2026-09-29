@@ -1,4 +1,4 @@
-//! The Flight Recorder's tape layer (item12): the native-Rust
+//! The Flight Recorder's tape layer: the native-Rust
 //! reader/extraction path for a node's internal trace — the
 //! skaffold-class surface ad-hoc tools and the tests use to pull the
 //! exact message/event sequence out of a flight recording and feed the
@@ -173,7 +173,7 @@ pub struct FlightTapeOptions {
     pub node: Option<u32>,
     /// Keep only lines whose derived `from` equals this. A `?` line is
     /// dropped unless `from_any` — the telemetry tape's filter
-    /// semantics (item03's shape).
+    /// semantics.
     pub from: Option<u32>,
     pub from_any: bool,
     /// Keep only lines whose derived `to` equals this. A `?` line is
@@ -360,7 +360,8 @@ pub fn stream_recording(
             .any(|kind| kind != "wire" && !WIRE_KINDS.contains(&kind.as_str()));
     if deep {
         // The deep read exposes the node's private story: readable ONLY
-        // by the code as-at the recording's commit (item12's gate).
+        // by the code as-at the recording's commit (the recorder's
+        // commit gate).
         check_commit(&header, READER_COMMIT)?;
     }
     if header.dirty {

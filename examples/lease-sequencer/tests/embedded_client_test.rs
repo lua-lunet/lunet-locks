@@ -1,4 +1,4 @@
-//! The embedded lock client (item04): the sequencer host's contender
+//! The embedded lock client: the sequencer host's contender
 //! loops driven in-process against a two-node localhost harness — the
 //! gap-test's direct-routing pump (no TCP, no sockets: node outputs are
 //! delivered to the addressed peer inside the process). The scenario is

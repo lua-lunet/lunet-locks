@@ -1,5 +1,5 @@
-//! The AOF lifecycle gate (item22 M2) and the phi-informed timeout
-//! estimator (item22 M3): red/green tests for the weight-driven gate, the
+//! The AOF lifecycle gate and the phi-informed timeout
+//! estimator: red/green tests for the weight-driven gate, the
 //! 1000 ms flusher's stop-when-off rule, the teardown record, the
 //! rollover's keep-exactly-two rule, and the phi wait derivation.
 

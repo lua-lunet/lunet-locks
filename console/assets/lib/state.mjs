@@ -5,7 +5,7 @@ import { fmtClock } from "./util.mjs";
 
 export const config = JSON.parse(document.getElementById("la-config").textContent);
 
-// Data-source switch (item23): config carries `dataSource` ("mock" | "bridge",
+// Data-source switch: config carries `dataSource` ("mock" | "bridge",
 // default mock) and `bridgeBase` (the bridge's /api/v1 URL). A query param
 // overrides both, so the same static assets serve either backend:
 //   index.html                          → mock (development default)
@@ -58,7 +58,7 @@ export const store = {
     series: null,       // {bucketMs, buckets}
     toast: "",          // transient status text
     error: "",
-    // Journal data layer (item64).
+    // Journal data layer.
     journalLocks: [],   // active-lock set [{lockId, leaseId, holder, expiry, acquiredTs, renewCount}]
     journalRates: { bucketSec: 0, buckets: [] }, // per-second rate buckets
     journalEvents: [],  // recent events (newest first)

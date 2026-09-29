@@ -158,7 +158,7 @@ local lock_ev = locks_only[1]
 check("export-clocks", lock_ev.leader_ms == 1789214915000 and lock_ev.aof_ns == 2500,
     tostring(lock_ev.leader_ms) .. "/" .. tostring(lock_ev.aof_ns))
 
--- 7. anchored timeline export (item02 item03 mirror): locks-timeline +
+-- 7. anchored timeline export: locks-timeline +
 -- takeover summaries, hb-spacing, aof-noise. One rich fixture: lock ops
 -- on ONE lock (holder churn 1 -> 1 -> break -> 2 -> 3), leader trailers
 -- with a sent_at_ms series, marker-5 samples with dt_ms, and a 9 ms ns
@@ -423,7 +423,7 @@ if not cli_ok then
     check("tl-cli-anchor-echo", false, "main errored: " .. tostring(cli_rc))
 end
 
--- 9. item03.5: --kind is repeatable AND space-joined, union semantics —
+-- 9. --kind is repeatable AND space-joined, union semantics —
 -- ONE contract in both twins (the dry run proved the divergence: py
 -- overwrote last-wins but split joined values, tl overwrote and
 -- silently exported nothing for joined values).
@@ -474,7 +474,7 @@ if not oku then
     check("kind-union-cli", false, "main errored: " .. tostring(erru))
 end
 
--- 10. item03.5 large-scale twin parity: >=28,000 wire records, ns stamps
+-- 10. large-scale twin parity: >=28,000 wire records, ns stamps
 -- ~1.789e18 (> 2^53) — the real-w1b dry run drifted in aof-noise
 -- gaps.mean_ms (the naive accumulation vs the reference's compensated
 -- sum). The tl export of hb-spacing + aof-noise must be byte-identical

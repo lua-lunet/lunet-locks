@@ -1,4 +1,4 @@
-//! The leader-failure detection surface (item19, item25.18): the
+//! The leader-failure detection surface: the
 //! trailer codec, the `timedout` toggle, the cluster viewchange timer,
 //! the sloppy leader timeout, and — behind the `experimental-phi`
 //! feature — the per-(era, leader, addr, monitor) sketches and the FFI
@@ -441,7 +441,7 @@ impl Rng {
 }
 
 /// The sloppy leader timeout — the NORMAL build's leader-failure
-/// detector (item25.18). Per watched (era, leader) key the deadline is
+/// detector. Per watched (era, leader) key the deadline is
 /// `now + uniform_random(min, max)` over the `--phi-timeout-min-ms/max`
 /// knobs, re-armed on leader evidence: the key's birth (a leader or era
 /// change), the fresh-commit resume, and each heartbeat Commit arriving

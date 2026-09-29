@@ -1,4 +1,4 @@
-//! The phi-accrual leader-failure detector (item19): red/green tests for
+//! The phi-accrual leader-failure detector: red/green tests for
 //! the trailer codec, the per-(era, leader) sketch table, the phi math
 //! wrapper, the FFI C ABI surface, and the detection decision with the
 //! 2x-interval safety floor. Runs ONLY under `experimental-phi` — the

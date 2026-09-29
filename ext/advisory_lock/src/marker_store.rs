@@ -62,7 +62,7 @@
 //! projection legacy rigs and operators read, and the boot input only
 //! while the copies predate this routing.
 //!
-//! Windows keeps the item08 single-file discipline: the vendored AOF
+//! Windows keeps the single-file discipline: the vendored AOF
 //! build is unix-only, and no Windows asset is packaged.
 use std::io;
 #[cfg(unix)]
@@ -134,7 +134,7 @@ fn zig_state(marker: Marker) -> lunet_locks_aof::marker::MarkerState {
 }
 
 /// The projection's word for an engine marker (the on-disk spelling the
-/// single file has carried since item08).
+/// single file has always carried).
 pub(crate) fn projection_word(marker: Marker) -> &'static str {
     match marker {
         Marker::Stopping => "stopped",

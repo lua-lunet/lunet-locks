@@ -1356,7 +1356,7 @@ function M.run(root_path: string, run_dir_path: string): integer
     fs.write_all(fs.join(run_dir, "progress.log"), "")
     fs.write_all(
         fs.join(run_dir, "anchors.md"),
-        "# local-harden-2026-09-19 — the hardened crash/partition run (item25.32)\n"
+        "# local-harden-2026-09-19 — the hardened crash/partition run\n"
             .. "# knobs: heartbeat 5ms, election 1000ms, recovery 1000ms, detector\n"
             .. "#   --phi-timeout-min-ms 1000 --phi-timeout-max-ms 2000 (uniform draw\n"
             .. "#   per node, re-armed on leader change / fresh-commit; the first\n"
@@ -1368,7 +1368,7 @@ function M.run(root_path: string, run_dir_path: string): integer
             .. "#   20.3 s takeover headlines were one 20 s lease-client read timeout\n"
             .. "#   on an op forwarded to a dead leader, not the detector\n"
     )
-    anchor("run-begin harden crash/partition lane (item25.32)")
+    anchor("run-begin harden crash/partition lane")
     progress("run begin: " .. states_snapshot())
 
     phase("B: boot")

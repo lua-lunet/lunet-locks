@@ -1,4 +1,4 @@
-//! The rig AOF tape (item03): the `from,to,jsonl` streaming layer that
+//! The rig AOF tape: the `from,to,jsonl` streaming layer that
 //! turns any telemetry AOF directory into a replay tape — one CSV line
 //! per record, `from,to,{json}`, in file order (epoch order = ns order).
 //!

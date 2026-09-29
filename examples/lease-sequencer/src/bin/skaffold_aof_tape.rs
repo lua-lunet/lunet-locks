@@ -1,4 +1,4 @@
-//! The AOF tape streamer (item03): one telemetry AOF directory in,
+//! The AOF tape streamer: one telemetry AOF directory in,
 //! the `from,to,{jsonl}` replay tape out — one CSV line per record, in
 //! file order (epoch order = ns order), through the vendored AOF's C
 //! ABI iterator (the same FFI the host uses; never the python tool).

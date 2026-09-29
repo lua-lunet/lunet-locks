@@ -9,7 +9,7 @@
 -- Run the parity test: LUA_PATH='./?.tl;./?.lua;<tl-path>;;' luajit -l tl \
 --   -e 'require("tl").loader(); require("tools.test_aof_trace_tool")'
 --
--- The twins share two hard contracts (item03.5):
+-- The twins share two hard contracts:
 -- - --kind is repeatable AND space-joined, with UNION semantics
 --   ("--kind hb-spacing --kind aof-noise" == "--kind hb-spacing aof-noise");
 --   the special names "all" and "both" expand to their kind sets and
@@ -36,7 +36,7 @@ int32_t lunet_aof_close(void* file);
 
 local RECORD_MAX = (1024 * 1024) - 256
 
--- The envelope markers (item22 M1). Unknown markers are rejected, never
+-- The envelope markers. Unknown markers are rejected, never
 -- guessed — the same rejection table the python twin enforces.
 local MARKER_WIRE = 1
 local MARKER_TIMEOUT = 2
@@ -700,7 +700,7 @@ local function ev_json(e: {string: any}): string
 end
 
 -- Parity with the python twin's wanted-set: "all" is the base kinds
--- only (the new kinds ride under their own names). item03.5: the kinds
+-- only (the new kinds ride under their own names). The kinds
 -- string is a whitespace-joined UNION (the CLI accumulates repeatable
 -- --kind values into it; "all"/"both" stay whole-string for the
 -- library callers).
@@ -887,7 +887,7 @@ local function export_series(dir_path: string, kinds: string, anchors: any, hb_m
     return events
 end
 
--- ------------------------------------------------- time columns (item03) ----
+-- ------------------------------------------------------- time columns ----
 -- Readable times: an anchor is a kill/silence stamp in unix ms (the
 -- acting host's date stamp), DIRECTLY comparable to a same-host AOF
 -- envelope ns stamp. Every exported row gains t_rel_ms (relative to the
@@ -950,7 +950,7 @@ end
 local STATS_ORDER: {string} = {"min_ms", "mean_ms", "p50_ms", "p95_ms",
                                "max_ms", "count"}
 
--- The one summation algorithm both twins share (item03.5): Neumaier
+-- The one summation algorithm both twins share: Neumaier
 -- compensated summation over the SORTED values — the python twin's
 -- reference behaviour (its _compensated_sum; CPython >= 3.12's sum()
 -- already compensates, the explicit loop pins it version-independently).

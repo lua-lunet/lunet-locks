@@ -53,7 +53,7 @@ fn stage4_three_clients_race_one_free_lock() {
 /// thread IS wire silence to every follower — even though every node host
 /// stayed up and every heartbeat was emitted on time. The phi detector
 /// must not read that manufactured silence as leader death: the observed
-/// red runs (item09: a 422 ms frame gap, then view churn 1→16 through the
+/// red runs (a 422 ms frame gap, then view churn 1→16 through the
 /// 3 s takeover window, the successors' ops refused not_leader mid-churn)
 /// were exactly this — a driver-side stall storming the cluster. The
 /// harness's phi timeout knobs must exceed the hiccup a loaded host

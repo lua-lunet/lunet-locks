@@ -1,4 +1,4 @@
-//! The three-AOF timeline aligner (item22 M4): reads one or more telemetry
+//! The three-AOF timeline aligner: reads one or more telemetry
 //! AOF directories through the typed envelope reader, classifies every
 //! record (Wire / TelemetryTimeoutDecision / TelemetryStateTransition /
 //! TelemetryOutbound), merges the traces by their local nanosecond clocks,

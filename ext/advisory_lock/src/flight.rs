@@ -5,7 +5,7 @@
 //! journal flushes, and which message tripped which assert / maybe /
 //! arrest as the node stops).
 //!
-//! # The two planes, named (item12)
+//! # The two planes, named
 //!
 //! - The **lock telemetry capture file** is the regular path's AOF — the
 //!   Zig TigerBeetle-format series on the non-voting telemetry nodes —

@@ -1,4 +1,4 @@
-//! The Flight Recorder's skaffold tape bin (item12, the corfu
+//! The Flight Recorder's skaffold tape bin (the corfu
 //! inverse-paste shape): a pure-Rust debugger — no Lua, no py, no
 //! network. It reads ONE node's flight recording and streams the exact
 //! message/event sequence as the `from,to,{json}` tape the scenario

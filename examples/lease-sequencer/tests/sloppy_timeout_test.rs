@@ -1,4 +1,4 @@
-//! The sloppy leader timeout (item25.18): the normal build's
+//! The sloppy leader timeout: the normal build's
 //! leader-failure detector. Per watched (era, leader) key a deadline =
 //! now + uniform_random(min, max) over the `--phi-timeout-min-ms/max`
 //! knobs, re-armed on leader evidence (leader change, the fresh-commit

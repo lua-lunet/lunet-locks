@@ -1066,7 +1066,7 @@ pub struct ClusterConfig {
     /// lower clamp. The harness's switch fabric is the test thread; a
     /// scheduler stall of that thread is wire silence to every follower
     /// while no node actually failed, so the floor must exceed the stall a
-    /// loaded host produces (item09: a 422 ms frame gap alone churned the
+    /// loaded host produces (a 422 ms frame gap alone churned the
     /// view 1→16 and starved the takeover). Defaults to 3000 ms.
     pub phi_timeout_min_ms: u64,
     pub phi_timeout_max_ms: u64,

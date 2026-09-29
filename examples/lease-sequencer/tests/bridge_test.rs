@@ -1,4 +1,4 @@
-//! The AOF console bridge (item23): red/green tests for the decode and
+//! The AOF console bridge: red/green tests for the decode and
 //! replay surface. The fixture is a real AOF series written through the
 //! vendored TigerBeetle writer (AofFile) with envelope records whose Wire
 //! payloads are packed uVRR messages carrying Service request payloads —

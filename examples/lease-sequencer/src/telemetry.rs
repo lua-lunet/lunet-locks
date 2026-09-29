@@ -1,5 +1,5 @@
-//! The AOF lifecycle gate and telemetry log (item22 M2) plus the
-//! phi-informed timeout estimator (item22 M3).
+//! The AOF lifecycle gate and telemetry log plus the
+//! phi-informed timeout estimator.
 //!
 //! # The lifecycle gate (the hard requirement)
 //!
@@ -18,7 +18,7 @@
 //! The AOF series keeps exactly the CURRENT file + ONE closed old file.
 //! When the active file's size approaches the threshold the active file is
 //! closed, a new `{epoch}.aof` opens, and the prune deletes older files
-//! oldest-first — the min-2 floor from item21's retention encodes the
+//! oldest-first — the retention policy's min-2 floor encodes the
 //! same rule; here it is enforced as keep-exactly-two.
 //!
 //! # Rotation at (re)start (the lock telemetry capture file)
