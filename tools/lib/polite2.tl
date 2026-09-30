@@ -935,7 +935,7 @@ function M.maintenance(root_path: string, run_dir_path: string): integer
     fs.write_all(
         fs.join(run_dir, "anchors.md"),
         "# local-polite2-2026-09-19 — the calm maintenance ladder\n"
-            .. "# knobs: heartbeat 5ms, election 3000ms (sloppy detector 3000-5000ms), recovery 3000ms\n"
+            .. "# knobs: heartbeat 5ms, election 3000ms (leader timeout 3000-5000ms), recovery 3000ms\n"
             .. "# binary: flight-recorder build; load: lease-load polite + stream client\n"
     )
     anchor("run-begin polite2 calm maintenance ladder")

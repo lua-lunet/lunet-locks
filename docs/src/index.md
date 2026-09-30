@@ -46,12 +46,10 @@ supplied `lunet-run` is the project-local official `v0.10.0` runtime from
   internal trace: the debug-level feature-flagged build that records
   everything the telemetry never sees, the commit gate, and the tape
   reader.
-- [Failure detection and the timeouts](phi-and-timeouts.md) states the
-  shipped leader-failure detection contract — the sloppy randomised
-  timeout the normal build runs, the phi-accrual detector behind
-  `experimental-phi` — the `timedout` toggle, the phi-sketch failover
-  protection, the cluster viewchange timeout, and the nemesis
-  interruption rules.
+- [Failure detection and the timeouts](failure-detection.md) states the
+  shipped leader-failure detection contract — the randomised leader
+  timeout, the `timedout` toggle, the failover-gap skip, the cluster
+  viewchange timeout, and the nemesis interruption rules.
 - [External client protocol](client-protocol.md) specifies GET, SET, and
   RELEASE, and the membership-administration verbs.
 - [Build and tests](build-and-tests.md) describes the pinned runtime and

@@ -4,10 +4,10 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.96" # uvrr-core 0.11.0's floor; let-chains in src/main.rs are older news
 
-# The test target: the integration tests link the pure modules (phi,
-# bridge, telemetry, embedded_client) through this thin lib facade over
-# the binary, and the lib's own unit tests (client_gate, embedded_client)
-# run under `cargo test` too.
+# The test target: the integration tests link the pure modules
+# (timeouts, bridge, telemetry, embedded_client) through this thin lib
+# facade over the binary, and the lib's own unit tests (client_gate,
+# embedded_client) run under `cargo test` too.
 [lib]
 name = "lease_sequencer"
 path = "src/lib.rs"
@@ -30,17 +30,9 @@ tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
-# The phi-accrual embed: the crate and its executor ride the
-# `experimental-phi` feature only — a normal (default) build compiles out
-# the dependency, the detector, the sketches, and the wire trailer
-# entirely; the normal path runs the sloppy leader timeout (phi.rs).
-chrono = { version = "0.4", optional = true }
-phi-accrual-detector = { version = "0.3.1", optional = true }
-tokio = { version = "1", default-features = false, features = ["rt"], optional = true }
 
 [features]
 default = []
-experimental-phi = ["dep:chrono", "dep:phi-accrual-detector", "dep:tokio"]
 # The Flight Recorder passthrough: the rig binary with the per-node
 # internal trace compiled in (the run's swap-in build —
 # `cargo build --release --features flight-recorder`). The recorded

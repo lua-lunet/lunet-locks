@@ -130,7 +130,7 @@ No instruction conflicts with Andon; if one appears to, Andon wins.
   `make check` (`ext-check`, `example-check`) with `cargo fmt --check` and
   `cargo clippy --all-targets -- -D warnings`, the example crate in both
   its feature shapes (default and the bench build's
-  `experimental-phi flight-recorder`). An `#[allow]` exists only at a
+  `flight-recorder`). An `#[allow]` exists only at a
   load-bearing site (e.g. the zero-cost tracing trick), and its comment
   above states exactly why it pays.
 

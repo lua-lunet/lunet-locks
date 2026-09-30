@@ -33,31 +33,24 @@ from/to derivation rules (the envelope carries no sender; the endpoints
 come from what each record actually carries):
 
   marker-1 wire      to = the recorder's node id;
-                     from = the Commit trailer's leader when the frame
-                     carries the 22-byte phi trailer (magic C0 0B),
-                     else '?' — the wire header (tag|era|view|slot) names
+                     from = '?' — the wire header (tag|era|view|slot) names
                      no sender.
   marker-2 decision  from = the recorder (the deciding node), to = the
                      recorder.
   marker-3 transition from = the recorder, to = the recorder.
   marker-4 outbound  from = the recorder, to = the record's target (its
                      JSON 'to' field).
-  marker-5 sample    from = the sample's node (the recording monitor's
-                     own id), to = the recorder.
 
 The jsonl payload: the full parsed record as one JSON line — ts_ms, ns,
 and for wire records tag/era/view/slot, the committed frontier when
-present, the lock fields when the payload is a lock verb, the phi fields
-when the 22-byte trailer rides the frame, and frame_hex (the raw wire
-bytes hex-encoded, trailer included — byte-exact playback needs the
-original datagram).
+present, the lock fields when the payload is a lock verb, and frame_hex
+(the raw wire bytes hex-encoded — byte-exact playback needs the original
+datagram).
 
 flags:
   --dir PATH        the telemetry AOF directory (required)
-  --recorder N      the recording node's id. Default: derived from the
-                    first marker-5 sample's 'node' field (the monitor's
-                    own id); without samples, recorder-side endpoints
-                    render as '?'.
+  --recorder N      the recording node's id. Without it, recorder-side
+                    endpoints render as '?'.
   --from N          keep only lines whose derived from == N. '?' lines
                     are dropped unless --from-any.
   --to N            keep only lines whose derived to == N. '?' lines
@@ -65,7 +58,7 @@ flags:
   --from-any        include '?'-from lines when --from is set.
   --to-any          include '?'-to lines when --to is set.
   --kinds KINDS     a comma/space-joined union of
-                    wire|decision|transition|outbound|sample|all.
+                    wire|decision|transition|outbound|all.
                     Default: all.
   --out PATH        write the tape to PATH (else stdout).
   --help            this text.

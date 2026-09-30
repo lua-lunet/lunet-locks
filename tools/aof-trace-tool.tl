@@ -11,7 +11,7 @@
 --
 -- The twins share two hard contracts:
 -- - --kind is repeatable AND space-joined, with UNION semantics
---   ("--kind hb-spacing --kind aof-noise" == "--kind hb-spacing aof-noise");
+--   ("--kind aof-noise --kind locks" == "--kind aof-noise locks");
 --   the special names "all" and "both" expand to their kind sets and
 --   union with any named kinds.
 -- - distribution means use one documented summation algorithm: Neumaier
@@ -42,7 +42,6 @@ local MARKER_WIRE = 1
 local MARKER_TIMEOUT = 2
 local MARKER_TRANSITION = 3
 local MARKER_OUTBOUND = 4
-local MARKER_INTERVAL = 5
 
 -- The uVRR wire tags (marker-1 payload header, big-endian).
 local TAG_NAMES: {number: string} = {
@@ -326,11 +325,7 @@ end
 
 -- -------------------------------------------------------------- export ----
 -- The trace of what happened, as record tables: the ts at the AOF (the
--- standby's local ns clock), the ts at the leader (the phi trailer's
--- sent_at_ms, carried on every leader Commit), the command, the result.
-
-local TRAILER_MAGIC = {0xc0, 0x0b}
-local TRAILER_BYTES = 22
+-- standby's local ns clock), the command, the result.
 
 local SYS_NAMES: {number: string} = {
     [1] = "Void", [2] = "Init", [3] = "Increment", [4] = "Decrement",
@@ -351,27 +346,6 @@ local function be_u64(buf: string, at: number): any
         v = v * 256 + b[at - 1 + i]
     end
     return v
-end
-
--- little-endian u64 from the tail (the trailer's sent_at_ms)
-local function le_u64(buf: string, at: number): any
-    local v = ffi.new("uint64_t", 0)
-    local b = ffi.cast("const uint8_t*", buf)
-    for i = 7, 0, -1 do
-        v = v * 256 + b[at - 1 + i]
-    end
-    return v
-end
-
-local function split_trailer(frame: string): (string, any)
-    if #frame >= TRAILER_BYTES then
-        local m1 = frame:byte(#frame - TRAILER_BYTES + 1)
-        local m2 = frame:byte(#frame - TRAILER_BYTES + 2)
-        if m1 == TRAILER_MAGIC[1] and m2 == TRAILER_MAGIC[2] then
-            return frame:sub(1, #frame - TRAILER_BYTES), le_u64(frame, #frame - 7)
-        end
-    end
-    return frame, nil
 end
 
 -- One SystemOperation: (command string, bytes consumed) or (nil, 0).
@@ -640,35 +614,32 @@ end
 
 -- Per-kind key order: each mirrors the python twin's dict
 -- construction order so a raw line diff is the parity check.
-local DEFAULT_ORDER: {string} = {"kind", "aof_ns", "leader_ms", "slot",
+local DEFAULT_ORDER: {string} = {"kind", "aof_ns", "slot",
                                  "result", "op", "lock_id", "message_id",
                                  "client_id", "request_num", "lease_id",
                                  "lease_holder", "expiry", "command",
-                                 "phi", "now_ms", "prev_wait_ms",
-                                 "next_wait_ms", "mean_interval_ms", "mean",
+                                 "now_ms", "prev_wait_ms",
+                                 "next_wait_ms", "mean",
                                  "min_ms", "max_ms", "node", "era", "leader",
                                  "view", "addr", "holder", "dt_ms", "ts_ms",
-                                 "sent_at_ms", "t_rel_ms", "t_fmt", "anchor",
+                                 "t_rel_ms", "t_fmt", "anchor",
                                  "last_holder", "last_slot",
                                  "last_renew_t_rel",
                                  "break_seen_t_rel", "next_acquire_t_rel",
                                  "next_slot", "next_holder", "takeover_ms",
                                  "dir", "source", "min_ms", "mean_ms",
                                  "p50_ms", "p95_ms", "max_ms", "count",
-                                 "gaps", "stalls", "samples"}
+                                 "gaps", "stalls"}
 local ROW_ORDER: {string: {string}} = {
-    ["locks"] = {"kind", "aof_ns", "leader_ms", "slot", "result", "op",
+    ["locks"] = {"kind", "aof_ns", "slot", "result", "op",
                  "lock_id", "message_id", "client_id", "request_num",
                  "lease_id", "lease_holder", "expiry", "t_rel_ms",
                  "t_fmt"},
-    ["reconfig"] = {"kind", "command", "aof_ns", "leader_ms", "slot",
+    ["reconfig"] = {"kind", "command", "aof_ns", "slot",
                     "result", "t_rel_ms", "t_fmt"},
-    ["phi"] = {"kind", "aof_ns", "phi", "now_ms", "prev_wait_ms",
-               "next_wait_ms", "leader", "era", "view", "mean",
-               "mean_interval_ms", "min_ms", "max_ms", "t_rel_ms", "t_fmt"},
-    ["phi-samples"] = {"kind", "aof_ns", "node", "era", "leader", "addr",
-                       "dt_ms", "ts_ms", "phi", "sent_at_ms",
-                       "t_rel_ms", "t_fmt"},
+    ["timeouts"] = {"kind", "aof_ns", "now_ms", "prev_wait_ms",
+                    "next_wait_ms", "leader", "era", "view", "mean",
+                    "min_ms", "max_ms", "t_rel_ms", "t_fmt"},
     ["locks-timeline"] = {"kind", "op", "holder", "lock_id", "slot",
                           "ts_ms", "aof_ns", "t_rel_ms", "t_fmt"},
     ["takeover"] = {"kind", "anchor", "last_holder", "last_slot",
@@ -676,10 +647,7 @@ local ROW_ORDER: {string: {string}} = {
                     "next_acquire_t_rel", "next_slot", "next_holder",
                     "takeover_ms"},
     ["anchor"] = {"kind", "anchor", "ts_ms", "t_rel_ms", "t_fmt"},
-    ["hb-spacing"] = {"kind", "dir", "source", "era", "leader", "min_ms",
-                      "mean_ms", "p50_ms", "p95_ms", "max_ms", "count",
-                      "t_rel_ms", "t_fmt"},
-    ["aof-noise"] = {"kind", "dir", "gaps", "stalls", "samples",
+    ["aof-noise"] = {"kind", "dir", "gaps", "stalls",
                      "t_rel_ms", "t_fmt"},
 }
 
@@ -706,8 +674,7 @@ end
 -- library callers).
 local function kind_wanted(kinds: string, kind: string): boolean
     if kinds == "all" then
-        return kind == "locks" or kind == "reconfig" or kind == "phi"
-            or kind == "phi-samples"
+        return kind == "locks" or kind == "reconfig" or kind == "timeouts"
     end
     if kinds == "both" then
         return kind == "locks" or kind == "reconfig"
@@ -720,11 +687,10 @@ local function kind_wanted(kinds: string, kind: string): boolean
     return false
 end
 
--- Forward declarations: the extras (timeline/hb-spacing/aof-noise) and
+-- Forward declarations: the extras (timeline/aof-noise) and
 -- the anchored export read export_series, but export_series appends
 -- their rows — declared here, defined below.
 local timeline_rows
-local hb_spacing_rows
 local aof_noise_rows
 local takeover_row
 local anchor_rows_and_takeovers
@@ -751,15 +717,12 @@ local function export_series(dir_path: string, kinds: string, anchors: any, hb_m
             local aof_ns = ns_of(frame)
             local marker = frame:byte(1)
             if marker == MARKER_TIMEOUT then
-                if kind_wanted(kinds, "phi") then
-                    local e: {string: any} = {kind = "phi", aof_ns = aof_ns}
+                if kind_wanted(kinds, "timeouts") then
+                    local e: {string: any} = {kind = "timeouts", aof_ns = aof_ns}
                     local j = json_payload(frame)
-                    -- the detector saturates: bare `inf` (not JSON) → null
-                    e.phi = json_num(j, "phi")
                     e.now_ms = json_num(j, "now_ms")
                     e.prev_wait_ms = json_num(j, "prev_wait_ms")
                     e.next_wait_ms = json_num(j, "next_wait_ms")
-                    e.mean_interval_ms = json_num(j, "mean_interval_ms")
                     e.min_ms = json_num(j, "min_ms")
                     e.max_ms = json_num(j, "max_ms")
                     -- the reference dumps the whole payload: the
@@ -770,22 +733,8 @@ local function export_series(dir_path: string, kinds: string, anchors: any, hb_m
                     e.view = json_num(j, "view")
                     events[#events + 1] = e
                 end
-            elseif marker == MARKER_INTERVAL then
-                if kind_wanted(kinds, "phi-samples") then
-                    local e: {string: any} = {kind = "phi-samples", aof_ns = aof_ns}
-                    local j = json_payload(frame)
-                    e.node = json_num(j, "node")
-                    e.era = json_num(j, "era")
-                    e.leader = json_num(j, "leader")
-                    e.addr = json_str(j, "addr")
-                    e.dt_ms = json_num(j, "dt_ms")
-                    e.ts_ms = json_num(j, "ts_ms")
-                    e.phi = json_num(j, "phi")
-                    e.sent_at_ms = json_num(j, "sent_at_ms")
-                    events[#events + 1] = e
-                end
             elseif marker == MARKER_WIRE then
-                local wire_frame, leader_ms = split_trailer(json_payload(frame))
+                local wire_frame = json_payload(frame)
                 local kind, _tag, _era, _view, slot, entry, committed = parse_wire(wire_frame)
                 if kind == "prepare" and entry ~= nil then
                     if entry[1] == "operation" then
@@ -807,7 +756,6 @@ local function export_series(dir_path: string, kinds: string, anchors: any, hb_m
                                 if kind_wanted(kinds, "locks") then
                                     local e: {string: any} = {
                                         kind = "locks", aof_ns = aof_ns,
-                                        leader_ms = leader_ms,
                                         slot = require_ffi_u64(tostring(s)), result = "committed",
                                     }
                                     for k, v in pairs(fields) do
@@ -818,7 +766,6 @@ local function export_series(dir_path: string, kinds: string, anchors: any, hb_m
                             elseif kind_wanted(kinds, "reconfig") then
                                 local e: {string: any} = {
                                     aof_ns = aof_ns,
-                                    leader_ms = leader_ms,
                                     slot = require_ffi_u64(tostring(s)), result = "committed",
                                 }
                                 for k, v in pairs(fields) do
@@ -837,7 +784,6 @@ local function export_series(dir_path: string, kinds: string, anchors: any, hb_m
                                 if kind_wanted(kinds, "locks") then
                                     local e: {string: any} = {
                                         kind = "locks", aof_ns = aof_ns,
-                                        leader_ms = leader_ms,
                                         slot = require_ffi_u64(tostring(s)), result = "committed",
                                     }
                                     for k, v in pairs(fields) do
@@ -848,7 +794,6 @@ local function export_series(dir_path: string, kinds: string, anchors: any, hb_m
                             elseif kind_wanted(kinds, "reconfig") then
                                 local e: {string: any} = {
                                     aof_ns = aof_ns,
-                                    leader_ms = leader_ms,
                                     slot = require_ffi_u64(tostring(s)), result = "committed",
                                 }
                                 for k, v in pairs(fields) do
@@ -864,11 +809,6 @@ local function export_series(dir_path: string, kinds: string, anchors: any, hb_m
     end
     if kind_wanted(kinds, "locks-timeline") then
         for _, r in ipairs(timeline_rows(dir_path) as {{string: any}}) do
-            events[#events + 1] = r
-        end
-    end
-    if kind_wanted(kinds, "hb-spacing") then
-        for _, r in ipairs(hb_spacing_rows(dir_path) as {{string: any}}) do
             events[#events + 1] = r
         end
     end
@@ -996,10 +936,7 @@ local function row_ts_ms(row: {string: any}): any
     local k = row.kind
     if k == "locks" or k == "locks-timeline" or k == "reconfig" then
         return ns_to_ms(row.aof_ns)
-    elseif k == "phi" or k == "phi-samples" then
-        if row.ts_ms ~= nil then
-            return tonumber(row.ts_ms)
-        end
+    elseif k == "timeouts" then
         if row.now_ms ~= nil then
             return tonumber(row.now_ms)
         end
@@ -1163,12 +1100,6 @@ anchor_rows_and_takeovers = function(events: {{string: any}}, anchors_in: {numbe
     return out
 end
 
--- little-endian u32 inside a record (the trailer's era/leader fields)
-local function le_u32(buf: string, at: number): number
-    local b = ffi.cast("const uint8_t*", buf)
-    return b[at - 1] + b[at] * 256 + b[at + 1] * 65536 + b[at + 2] * 16777216
-end
-
 -- The dir's AOF series, sorted (file order = ns order contract).
 local function aof_names(dir_path: string): {string}
     local names: {string} = {}
@@ -1181,118 +1112,12 @@ local function aof_names(dir_path: string): {string}
     return names
 end
 
--- per (era, leader) heartbeat-spacing stats: the leader's own send
--- gaps (wire trailer sent_at_ms), arrived-gap dt_ms from marker-5.
-hb_spacing_rows = function(dir_path: string): {{string: any}}
-    local sent_by: {string: {number}} = {}
-    local dt_by: {string: {number}} = {}
-    for _, path in ipairs(aof_names(dir_path)) do
-        local it = iter_open(path)
-        while true do
-            local rc = native.lunet_aof_iter_next(it, buffer, RECORD_MAX, len_out, op_out)
-            if rc <= 0 then
-                native.lunet_aof_iter_close(it)
-                break
-            end
-            local frame = ffi.string(buffer, len_out[0])
-            local marker = frame:byte(1)
-            if marker == MARKER_WIRE and #frame >= TRAILER_BYTES + 9 then
-                local _wf, sent = split_trailer(frame:sub(10))
-                if sent ~= nil then
-                    -- era then leader: the trailer's first 8 bytes
-                    local era = le_u32(frame, #frame - 19)
-                    local leader = le_u32(frame, #frame - 15)
-                    local key = tostring(era) .. ":" .. tostring(leader)
-                    local list = sent_by[key]
-                    if list == nil then
-                        list = {}
-                        sent_by[key] = list
-                    end
-                    list[#list + 1] = tonumber(sent)
-                end
-            elseif marker == MARKER_INTERVAL then
-                local j = json_payload(frame)
-                local era = json_num(j, "era")
-                local leader = json_num(j, "leader")
-                local dt = json_num(j, "dt_ms")
-                if dt ~= nil and dt ~= JSON_NULL then
-                    -- u64 cdata tostrings as "33ULL": canonicalise the
-                    -- key back to the plain integer text
-                    local key = tostring(tonumber(era)) .. ":"
-                        .. tostring(tonumber(leader))
-                    local list = dt_by[key]
-                    if list == nil then
-                        list = {}
-                        dt_by[key] = list
-                    end
-                    list[#list + 1] = tonumber(dt)
-                end
-            end
-        end
-    end
-    local rows: {{string: any}} = {}
-    local function emit(source: string, by: {string: {number}}, min_count: number, gapmode: boolean)
-        local keys: {string} = {}
-        for k, _ in pairs(by) do
-            keys[#keys + 1] = k
-        end
-        table.sort(keys, function(x: string, y: string)
-            local xe, xl = x:match("(%S+):(%S+)")
-            local ye, yl = y:match("(%S+):(%S+)")
-            local xe_n = tonumber(xe)
-            local ye_n = tonumber(ye)
-            if xe_n ~= nil and ye_n ~= nil and xe_n ~= ye_n then
-                return xe_n < ye_n
-            end
-            local xl_n = tonumber(xl)
-            local yl_n = tonumber(yl)
-            if xl_n ~= nil and yl_n ~= nil then
-                return xl_n < yl_n
-            end
-            return x < y
-        end)
-        for _, k in ipairs(keys) do
-            local values = by[k]
-            local stats_values = values
-            if gapmode then
-                -- wire: the gap series of consecutive sent_at_ms (only
-                -- forward gaps count, exactly like the python twin)
-                local gaps: {number} = {}
-                for i = 2, #values do
-                    local d = values[i] - values[i - 1]
-                    if d > 0 then
-                        gaps[#gaps + 1] = d + 0.0
-                    end
-                end
-                stats_values = gaps
-            end
-            if #stats_values >= min_count then
-                local era, leader = k:match("(%S+):(%S+)")
-                local row: {string: any} = {kind = "hb-spacing", dir = dir_path,
-                                            source = source,
-                                            era = require_ffi_u64(era),
-                                            leader = require_ffi_u64(leader)}
-                local st = stats(stats_values)
-                for _, key in ipairs(STATS_ORDER) do
-                    row[key] = st[key]
-                end
-                rows[#rows + 1] = row
-            end
-        end
-    end
-    -- wire: skip a pair whose sent_at gap series is empty
-    emit("wire", sent_by, 1, true)
-    emit("sample", dt_by, 2, false)
-    return rows
-end
-
 -- The AOF noise picture: the arrival-gap series between consecutive
 -- marker-1 records (the envelope ns is stamped pre-queue, so
--- write-behind shows up here, not as latency), the marker-5 arrival
--- dt stats, and the ns-gap stalls over the floor min(hb_ms, 5p50).
+-- write-behind shows up here, not as latency), and the ns-gap stalls
+-- over the floor min(hb_ms, 5p50).
 aof_noise_rows = function(dir_path: string, hb_ms: number): {{string: any}}
     local ns_list: {any} = {}
-    local dts: {number} = {}
     for _, path in ipairs(aof_names(dir_path)) do
         local it = iter_open(path)
         while true do
@@ -1305,12 +1130,6 @@ aof_noise_rows = function(dir_path: string, hb_ms: number): {{string: any}}
             local marker = frame:byte(1)
             if marker == MARKER_WIRE then
                 ns_list[#ns_list + 1] = ns_of(frame)
-            elseif marker == MARKER_INTERVAL then
-                local j = json_payload(frame)
-                local dt = json_num(j, "dt_ms")
-                if dt ~= nil and dt ~= JSON_NULL then
-                    dts[#dts + 1] = tonumber(dt)
-                end
             end
         end
     end
@@ -1343,9 +1162,6 @@ aof_noise_rows = function(dir_path: string, hb_ms: number): {{string: any}}
             end
         end
         row.stalls = stalls
-    end
-    if #dts > 0 then
-        row.samples = stats(dts)
     end
     return {row}
 end
@@ -1388,8 +1204,7 @@ local function main(argv: {string}): number
                 if token == "all" then
                     kind_parts[#kind_parts + 1] = "locks"
                     kind_parts[#kind_parts + 1] = "reconfig"
-                    kind_parts[#kind_parts + 1] = "phi"
-                    kind_parts[#kind_parts + 1] = "phi-samples"
+                    kind_parts[#kind_parts + 1] = "timeouts"
                 elseif token == "both" then
                     kind_parts[#kind_parts + 1] = "locks"
                     kind_parts[#kind_parts + 1] = "reconfig"
@@ -1456,7 +1271,6 @@ return {
     iterate = nil,
     ns_of = ns_of,
     parse_wire = parse_wire,
-    split_trailer = split_trailer,
     lock_fields = lock_fields,
     summarize = summarize_one,
     summarize_series = summarize_series,

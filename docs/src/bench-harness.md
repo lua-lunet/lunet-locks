@@ -1,13 +1,13 @@
 # The bench harness
 
 The bench harness is the fast local integration rig: three forked node
-processes on real UDP, driven hard, with no sloppy timeouts and no real
+processes on real UDP, driven hard, with no loose timeouts and no real
 disk in the lock protocol's durable path. It exists to answer one
 question at machine pace: with no network RTT and no fsync latency, does
 the protocol hold — and how fast is it?
 
 ```console
-make bench          # build the phi + flight-recorder rig and run the bench
+make bench          # build the flight-recorder rig and run the bench
 ```
 
 A run spawns three `lease-sequencer` node processes from a generated
@@ -15,9 +15,8 @@ three-line descriptor, loads the cluster with embedded CAS clients on
 50 ms leases, walks the lifecycle scenario ladder, and ends with the
 oracle verdict. Run state lives under `.tmp/bench-*`; every spawned
 process is reaped on every exit path. The build is the
-`experimental-phi` + `flight-recorder` shape: the sloppy randomised
-timeout is not compiled in — detection is the phi-accrual monitor — and
-each node records its flight tape under its run directory.
+`flight-recorder` shape, and each node records its flight tape under its
+run directory.
 
 ## The force-fed store
 
@@ -73,7 +72,7 @@ plus the existing TCP admin verbs:
 - **SIGKILL — the crash.** No stop path; the driver spawns the
   replacement, which reincarnates off the sentinel.
 
-Leader death is driven as an unannounced kill (phi-detector-driven
+Leader death is driven as an unannounced kill (leader-timeout-driven
 takeover — the baseline).
 
 Partition injection is not in this harness: the loopback cluster's
@@ -116,7 +115,7 @@ A bench run is a fixed ladder with the client load always on:
    under the same identity.
 3. **Crash swap** — a non-leader is SIGKILLed and respawned; it
    reincarnates bumped.
-4. **Leader crash** — the leader is SIGKILLed; the phi detector drives
+4. **Leader crash** — the leader is SIGKILLed; the leader timeout drives
    the takeover; the replacement reincarnates.
 5. **Dirty cycle** — a node takes a SIGUSR2 cycle mid-load.
 

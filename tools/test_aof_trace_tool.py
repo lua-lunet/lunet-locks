@@ -53,10 +53,10 @@ class FixtureRoundTrip(unittest.TestCase):
         with tool.FixtureDir() as d:
             path = d / "fixture.aof"
             f = tool.open_writer(path, LIB)
-            tool.append(f, envelope(2, 1_000, b'{"phi":1.5}'))
+            tool.append(f, envelope(2, 1_000, b'{"now_ms":1000,"prev_wait_ms":900,"next_wait_ms":1000}'))
             tool.append(f, envelope(1, 2_000, wire(4, 1, 0, 5)))
             tool.append(f, envelope(3, 3_000, b'{"event":"teardown"}'))
-            tool.append(f, envelope(2, 4_000, b'{"phi":2.5}'))
+            tool.append(f, envelope(2, 4_000, b'{"now_ms":4000,"prev_wait_ms":1000,"next_wait_ms":1500}'))
             tool.append(f, envelope(1, 5_000, wire(2, 1, 0, 6)))
             tool.close_writer(f)
             s = tool.summarize(path, LIB)
@@ -114,8 +114,7 @@ class ExportMode(unittest.TestCase):
         self.addCleanup(d.cleanup)
         path = d / "fixture.aof"
         f = tool.open_writer(path, LIB)
-        # A Set at slot 5, then a Commit closing it, trailer attached
-        # (the leader's send clock rides every leader Commit).
+        # A Set at slot 5, then a Commit closing it.
         set_op = ('{"op":"set","message_id":"11111111-2222-3333-4444-555555555555",'
                   '"client_id":1,"request_num":1,"lock_id":7}')
         prepare = (struct.pack(">IIIQ", 2, 4, 1, 5)  # Prepare, era 4, view 1, slot 5
@@ -129,11 +128,9 @@ class ExportMode(unittest.TestCase):
         commit = (struct.pack(">IIIQ", 4, 4, 1, 5)
                   + bytes([4])
                   + struct.pack(">Q", 5))
-        trailer = b"\xc0\x0b" + struct.pack("<IIIQ", 4, 33, 9, 1789214915000)
         tool.append(f, envelope(1, 2000, prepare))
-        tool.append(f, envelope(1, 2500, commit + trailer))
-        tool.append(f, envelope(2, 3000, b'{"phi":1.7,"now_ms":100,"prev_wait_ms":900,"next_wait_ms":1000,"leader":33,"era":4,"view":1,"mean":22.0}'))
-        tool.append(f, envelope(5, 4000, b'{"node":88,"era":4,"leader":33,"addr":"127.0.0.1:1","dt_ms":22,"ts_ms":1789214915000,"phi":0.123,"sent_at_ms":1789214915000}'))
+        tool.append(f, envelope(1, 2500, commit))
+        tool.append(f, envelope(2, 3000, b'{"now_ms":100,"prev_wait_ms":900,"next_wait_ms":1000,"leader":33,"era":4,"view":1,"mean":22.0}'))
         # a Join reconfig: System payload disc 2, op disc 7, node 77, pos 255
         join = (struct.pack(">IIIQ", 2, 4, 1, 6)
                 + bytes([2])
@@ -144,42 +141,31 @@ class ExportMode(unittest.TestCase):
                 + struct.pack(">I", 255)
                 + struct.pack(">Q", 0))
         tool.append(f, envelope(1, 5000, join))
-        # the Join commits: a Commit covering slot 6 with its own trailer
+        # the Join commits: a Commit covering slot 6
         commit6 = (struct.pack(">IIIQ", 4, 4, 1, 6) + bytes([4])
                    + struct.pack(">Q", 6))
-        tool.append(f, envelope(1, 5500, commit6 + trailer))
+        tool.append(f, envelope(1, 5500, commit6))
         tool.close(f)
 
     def test_export_all_kinds(self):
         out = tool.export_series(self.dir, LIB, kinds="all")
         kinds = [line["kind"] for line in out]
-        self.assertEqual(kinds, ["locks", "phi", "phi-samples", "reconfig"])
+        self.assertEqual(kinds, ["locks", "timeouts", "reconfig"])
         locks = [l for l in out if l["kind"] == "locks"][0]
         self.assertEqual(locks["op"], "set")
         self.assertEqual(locks["lock_id"], 7)
         self.assertEqual(locks["result"], "committed")
-        self.assertEqual(locks["leader_ms"], 1789214915000)
         self.assertEqual(locks["aof_ns"], 2500, "the commit observation ns")
         reconf = [l for l in out if l["kind"] == "reconfig"][0]
         self.assertEqual(reconf["command"], "Join node=77 position=255")
-        self.assertEqual(reconf["leader_ms"], 1789214915000)
-
-    def test_marker5_sent_at_ms_round_trips_into_the_export(self):
-        out = tool.export_series(self.dir, LIB, kinds="phi-samples")
-        self.assertEqual(len(out), 1)
-        sample = out[0]
-        self.assertEqual(sample["node"], 88)
-        self.assertEqual(sample["dt_ms"], 22)
-        self.assertEqual(sample["phi"], 0.123)
-        self.assertEqual(sample["sent_at_ms"], 1789214915000)
+        timeouts = [l for l in out if l["kind"] == "timeouts"][0]
+        self.assertEqual(timeouts["next_wait_ms"], 1000)
 
     def test_export_filters_one_kind(self):
         out = tool.export_series(self.dir, LIB, kinds="locks")
         self.assertEqual([l["kind"] for l in out], ["locks"])
-        out = tool.export_series(self.dir, LIB, kinds="phi")
-        self.assertEqual([l["kind"] for l in out], ["phi"])
-        out = tool.export_series(self.dir, LIB, kinds="phi-samples")
-        self.assertEqual([l["kind"] for l in out], ["phi-samples"])
+        out = tool.export_series(self.dir, LIB, kinds="timeouts")
+        self.assertEqual([l["kind"] for l in out], ["timeouts"])
 
     def test_both_means_reconfig_and_locks(self):
         out = tool.export_series(self.dir, LIB, kinds="both")
@@ -188,8 +174,7 @@ class ExportMode(unittest.TestCase):
 
 def write_timeline_fixture(d):
     """The rich anchored-timeline fixture: lock ops on one lock (holder
-    churn 1 → 1 → break → 2 → 3), leader trailers with a sent_at_ms
-    series, marker-5 samples with dt_ms, and a 9 ms ns arrival stall."""
+    churn 1 → 1 → break → 2 → 3) and a 9 ms ns arrival stall."""
     B = AnchoredTimelineExport.BASE_NS
 
     def lock_json(op, holder):
@@ -206,20 +191,15 @@ def write_timeline_fixture(d):
     # The wire trace, in ns order. The 4th delta is 9 ms: the stall.
     writes = [
         (B + 0, lambda: AnchoredTimelineExport.operation_prepare(5, 4, 1, lock_json("set", 1))),
-        (B + 1_000_000, lambda: (AnchoredTimelineExport.commit_frame(5, 4, 1, 5)
-                                 + AnchoredTimelineExport.trailer(4, 33, 1, AnchoredTimelineExport.BASE_MS))),
+        (B + 1_000_000, lambda: AnchoredTimelineExport.commit_frame(5, 4, 1, 5)),
         (B + 2_000_000, lambda: AnchoredTimelineExport.operation_prepare(6, 4, 1, lock_json("set", 1))),
-        (B + 3_000_000, lambda: (AnchoredTimelineExport.commit_frame(6, 4, 1, 6)
-                                 + AnchoredTimelineExport.trailer(4, 33, 2, AnchoredTimelineExport.BASE_MS + 20))),
+        (B + 3_000_000, lambda: AnchoredTimelineExport.commit_frame(6, 4, 1, 6)),
         (B + 12_000_000, lambda: AnchoredTimelineExport.operation_prepare(7, 4, 1, lock_json("break", 99))),
-        (B + 13_000_000, lambda: (AnchoredTimelineExport.commit_frame(7, 4, 1, 7)
-                                  + AnchoredTimelineExport.trailer(4, 33, 3, AnchoredTimelineExport.BASE_MS + 45))),
+        (B + 13_000_000, lambda: AnchoredTimelineExport.commit_frame(7, 4, 1, 7)),
         (B + 14_000_000, lambda: AnchoredTimelineExport.operation_prepare(8, 4, 1, lock_json("set", 2))),
-        (B + 15_000_000, lambda: (AnchoredTimelineExport.commit_frame(8, 4, 1, 8)
-                                  + AnchoredTimelineExport.trailer(4, 33, 4, AnchoredTimelineExport.BASE_MS + 65))),
+        (B + 15_000_000, lambda: AnchoredTimelineExport.commit_frame(8, 4, 1, 8)),
         (B + 16_000_000, lambda: AnchoredTimelineExport.operation_prepare(9, 4, 1, lock_json("set", 3))),
-        (B + 17_000_000, lambda: (AnchoredTimelineExport.commit_frame(9, 4, 1, 9)
-                                  + AnchoredTimelineExport.trailer(4, 33, 5, AnchoredTimelineExport.BASE_MS + 80)))]
+        (B + 17_000_000, lambda: AnchoredTimelineExport.commit_frame(9, 4, 1, 9))]
 
     for ns, build in writes:
         tool.append(f, envelope(1, ns, build()))
@@ -227,27 +207,16 @@ def write_timeline_fixture(d):
     # Telemetry in a later-sorted file keeps file order = ns order
     # across the dir (the export's ordering contract).
     f2 = tool.open_writer(d / "g.aof", LIB)
-    tool.append(f2, envelope(2, B + 18_000_000, b'{"phi":1.7,"now_ms":100,'
+    tool.append(f2, envelope(2, B + 18_000_000, b'{"now_ms":100,'
                              b'"prev_wait_ms":900,"next_wait_ms":1000,'
                              b'"leader":33,"era":4,"view":1,"mean":22.0}'))
-    tool.append(f2, envelope(5, B + 19_000_000,
-                             b'{"node":88,"era":4,"leader":33,'
-                             b'"addr":"127.0.0.1:1","dt_ms":21,"ts_ms":'
-                             + str(AnchoredTimelineExport.BASE_MS).encode() + b',"phi":0.123,'
-                             b'"sent_at_ms":' + str(AnchoredTimelineExport.BASE_MS).encode() + b"}"))
-    tool.append(f2, envelope(5, B + 20_000_000,
-                             b'{"node":88,"era":4,"leader":33,'
-                             b'"addr":"127.0.0.1:1","dt_ms":23,"ts_ms":'
-                             + str(AnchoredTimelineExport.BASE_MS + 20_000).encode() + b',"phi":0.223,'
-                             b'"sent_at_ms":' + str(AnchoredTimelineExport.BASE_MS).encode() + b"}"))
     tool.close(f2)
 
 
 class AnchoredTimelineExport(unittest.TestCase):
-    # --anchor: locks-timeline + takeover summaries, hb-spacing,
-    # aof-noise. One rich fixture: lock ops on one lock (holder churn
-    # 1 → 1 → break → 2 → 3), leader trailers with a sent_at_ms series,
-    # marker-5 samples with dt_ms, and a ns arrival stall (9 ms gap).
+    # --anchor: locks-timeline + takeover summaries and aof-noise. One
+    # rich fixture: lock ops on one lock (holder churn
+    # 1 → 1 → break → 2 → 3) and a ns arrival stall (9 ms gap).
     BASE_MS = 1789214915000
     BASE_NS = BASE_MS * 1_000_000
 
@@ -268,10 +237,6 @@ class AnchoredTimelineExport(unittest.TestCase):
                 + bytes([4])
                 + struct.pack(">Q", committed))
 
-    @staticmethod
-    def trailer(era, leader, seq, sent_at):
-        return b"\xc0\x0b" + struct.pack("<IIIQ", era, leader, seq, sent_at)
-
     def setUp(self):
         d = tool.FixtureDir()
         self.dir, self.addCleanup = d, d.cleanup
@@ -287,17 +252,11 @@ class AnchoredTimelineExport(unittest.TestCase):
         # No anchor is <= ts(first); the first anchor is authoritative.
         self.assertEqual(first["t_rel_ms"], -2.0)
         self.assertEqual(first["t_fmt"], hhmmss(self.BASE_MS + 1))
-        tl = tool.export_series(self.dir, LIB, kinds="phi-samples",
-                                anchors=[self.A1])
-        sample = [l for l in tl if l["kind"] == "phi-samples"][0]
-        self.assertEqual(sample["t_rel_ms"], -3.0,
-                         "sample ts_ms rides its payload, not aof ns")
-        self.assertEqual(sample["t_fmt"], hhmmss(self.BASE_MS))
-        ph = tool.export_series(self.dir, LIB, kinds="phi", anchors=[self.A1])
-        phi = [l for l in ph if l["kind"] == "phi"][0]
-        self.assertEqual(phi["t_rel_ms"], 100.0 - self.A1,
+        ph = tool.export_series(self.dir, LIB, kinds="timeouts", anchors=[self.A1])
+        timeouts = [l for l in ph if l["kind"] == "timeouts"][0]
+        self.assertEqual(timeouts["t_rel_ms"], 100.0 - self.A1,
                          "marker-2 ts falls back to its payload now_ms")
-        self.assertEqual(phi["t_fmt"], hhmmss(100))
+        self.assertEqual(timeouts["t_fmt"], hhmmss(100))
 
     def test_timeline_rows_ops_holders_and_ts(self):
         out = tool.export_series(self.dir, LIB, kinds="locks-timeline")
@@ -375,30 +334,11 @@ class AnchoredTimelineExport(unittest.TestCase):
                                   "next_holder": "absent",
                                   "takeover_ms": "absent"})
 
-    def test_hb_spacing_stats_per_era_leader(self):
-        out = tool.export_series(self.dir, LIB, kinds="hb-spacing")
-        wire = [l for l in out if l["source"] == "wire"]
-        sample = [l for l in out if l["source"] == "sample"]
-        self.assertEqual(len(wire), 1)
-        self.assertEqual(len(sample), 1)
-        w = wire[0]
-        self.assertEqual(w["kind"], "hb-spacing")
-        self.assertEqual(w["era"], 4)
-        self.assertEqual(w["leader"], 33)
-        # sent_at gaps 20, 25, 20, 15 ms in trace order
-        self.assertEqual(w["min_ms"], 15.0)
-        self.assertEqual(w["mean_ms"], 20.0)
-        self.assertEqual(w["p50_ms"], 20.0)
-        self.assertEqual(w["p95_ms"], 25.0)
-        self.assertEqual(w["max_ms"], 25.0)
-        self.assertEqual(w["count"], 4)
-        s = sample[0]
-        self.assertEqual(s["era"], 4)
-        self.assertEqual(s["leader"], 33)
-        self.assertEqual(s["count"], 2)
-        self.assertEqual(s["min_ms"], 21.0)
-        self.assertEqual(s["mean_ms"], 22.0)
-        self.assertEqual(s["max_ms"], 23.0)
+    def test_aof_noise_reports_no_interval_samples(self):
+        out = tool.export_series(self.dir, LIB, kinds="aof-noise")
+        self.assertEqual(len(out), 1)
+        self.assertNotIn("samples", out[0],
+                         "the interval-sample record has no producer")
 
     def test_aof_noise_stats_and_stalls(self):
         out = tool.export_series(self.dir, LIB, kinds="aof-noise")
@@ -411,8 +351,6 @@ class AnchoredTimelineExport(unittest.TestCase):
         self.assertEqual(row["gaps"]["p50_ms"], 1.0)
         self.assertEqual(row["gaps"]["p95_ms"], 9.0)
         self.assertEqual(row["gaps"]["mean_ms"], 17.0 / 9.0)
-        self.assertEqual(row["samples"]["count"], 2)
-        self.assertEqual(row["samples"]["mean_ms"], 22.0)
         # threshold min(hb_ms=5, 5 * median 1 ms) = 5 ms; only the 9 ms gap stalls
         self.assertEqual(row["stalls"],
                          [{"a_ns": self.BASE_NS + 3_000_000,
@@ -433,8 +371,7 @@ class CliAnchors(unittest.TestCase):
             path = d / "fixture.aof"
             f = tool.open_writer(path, LIB)
             tool.append(f, envelope(1, base_ms * 1_000_000 + 5_000_000,
-                                    (AnchoredTimelineExport.commit_frame(5, 4, 1, 5)
-                                     + AnchoredTimelineExport.trailer(4, 33, 1, base_ms))))
+                                    AnchoredTimelineExport.commit_frame(5, 4, 1, 5)))
             tool.close(f)
             out_path = d / "out.jsonl"
             rc = tool.main(["prog", "--lib", str(LIB), "--anchor", str(base_ms + 1),
@@ -465,24 +402,23 @@ class KindCliContract(unittest.TestCase):
         return out.read_text().splitlines()
 
     def test_kind_repeatable_unions(self):
-        lines = self._export("a.jsonl", ["--kind", "hb-spacing", "--kind", "aof-noise"])
+        lines = self._export("a.jsonl", ["--kind", "timeouts", "--kind", "aof-noise"])
         self.assertEqual([json.loads(line)["kind"] for line in lines],
-                         ["hb-spacing", "hb-spacing", "aof-noise"])
+                         ["timeouts", "aof-noise"])
 
     def test_kind_space_joined_is_the_same_contract(self):
-        repeat = self._export("b.jsonl", ["--kind", "hb-spacing", "--kind", "aof-noise"])
-        joined = self._export("c.jsonl", ["--kind", "hb-spacing aof-noise"])
+        repeat = self._export("b.jsonl", ["--kind", "timeouts", "--kind", "aof-noise"])
+        joined = self._export("c.jsonl", ["--kind", "timeouts aof-noise"])
         self.assertEqual(joined, repeat, "joined and repeatable are one contract")
 
     def test_kind_all_unions_with_named_kinds(self):
-        repeat = self._export("d.jsonl", ["--kind", "all", "--kind", "hb-spacing",
+        repeat = self._export("d.jsonl", ["--kind", "all", "--kind", "timeouts",
                                           "--kind", "aof-noise"])
-        joined = self._export("e.jsonl", ["--kind", "all hb-spacing aof-noise"])
+        joined = self._export("e.jsonl", ["--kind", "all timeouts aof-noise"])
         self.assertEqual(joined, repeat, "all unions with the named kinds")
         kinds = [json.loads(line)["kind"] for line in repeat]
         self.assertEqual(kinds.count("locks"), 5)
-        self.assertEqual(kinds.count("phi"), 1)
-        self.assertEqual(kinds.count("phi-samples"), 2)
+        self.assertEqual(kinds.count("timeouts"), 1)
         self.assertEqual(kinds[-1], "aof-noise")
 
 
@@ -491,10 +427,9 @@ class LargeScaleTwinParity(unittest.TestCase):
     # in aof-noise gaps.mean_ms at the last repr digit — the tl twin's
     # naive accumulation vs the reference's compensated summation. At
     # ≥28,000 wire records with ns stamps ~1.789e18 (> 2^53), the py and
-    # tl exports of hb-spacing + aof-noise must be byte-identical.
+    # tl exports of aof-noise must be byte-identical.
     N_WIRE = 28_001
     BASE_NS = 1_789_248_826_514_115_648  # ~1.789e18, 256-aligned (double-exact)
-    BASE_MS = 1_789_248_826_514
 
     @classmethod
     def _gaps_ns(cls):
@@ -513,30 +448,19 @@ class LargeScaleTwinParity(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.dir, True)
         gaps = list(self._gaps_ns())
         f = tool.open_writer(self.dir / "w.aof", LIB)
-        ns, sent = self.BASE_NS, self.BASE_MS
+        ns = self.BASE_NS
         for k in range(self.N_WIRE):
             if k:
                 ns += gaps[k - 1]
-                sent += 5 + (k * 97) % 17
-            trailer = b"\xc0\x0b" + struct.pack("<IIIQ", 4, 44, k, sent)
-            tool.append(f, envelope(1, ns, wire(4, 4, 1, 5) + trailer))
+            tool.append(f, envelope(1, ns, wire(4, 4, 1, 5)))
         tool.close(f)
-        f2 = tool.open_writer(self.dir / "g.aof", LIB)
-        for i in range(512):
-            dt = 20 + (i * 13 % 7) / 3
-            payload = ('{"node":88,"era":4,"leader":44,"addr":"127.0.0.1:1",'
-                       '"dt_ms":%r,"ts_ms":%d,"phi":0.123,"sent_at_ms":%d}'
-                       % (dt, self.BASE_MS + i * 7, self.BASE_MS + i * 7)).encode()
-            tool.append(f2, envelope(5, self.BASE_NS + 1_000_000_000 + i * 1_000_000,
-                                     payload))
-        tool.close(f2)
 
-    def test_hb_spacing_and_aof_noise_exports_are_byte_identical(self):
+    def test_aof_noise_exports_are_byte_identical(self):
         if LUAJIT is None or not TL_DRIVER.exists():
             self.skipTest("luajit + tools/tl-driver.lua required for the twin parity run")
         out_py = self.dir / "py.jsonl"
         out_tl = self.dir / "tl.jsonl"
-        kinds = ["--kind", "hb-spacing", "--kind", "aof-noise", "--hb-ms", "6000"]
+        kinds = ["--kind", "aof-noise", "--hb-ms", "6000"]
         rc = tool.main(["prog", "--lib", str(LIB)] + kinds
                        + [str(self.dir), str(out_py)])
         self.assertEqual(rc, 0)
@@ -547,7 +471,7 @@ class LargeScaleTwinParity(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         py_lines = out_py.read_text().splitlines()
         tl_lines = out_tl.read_text().splitlines()
-        self.assertEqual(len(py_lines), 3, "2 hb-spacing rows + 1 aof-noise row")
+        self.assertEqual(len(py_lines), 1, "1 aof-noise row")
         for i, (a, b) in enumerate(zip(py_lines, tl_lines)):
             self.assertEqual(a, b, "py/tl diverge at export line %d:\npy: %s\ntl: %s"
                              % (i, a[:200], b[:200]))
@@ -556,9 +480,8 @@ class LargeScaleTwinParity(unittest.TestCase):
         # over the sorted gaps, and this fixture separates it from the
         # naive accumulation the tl twin shipped before the union
         # contract landed.
-        noise = json.loads(py_lines[-1])
+        noise = json.loads(py_lines[0])
         self.assertEqual(noise["gaps"]["count"], 28_000)
-        self.assertEqual(json.loads(py_lines[0])["count"], 28_000)
         gaps = sorted(g / 1e6 for g in self._gaps_ns())
         naive = 0.0
         total = corr = 0.0

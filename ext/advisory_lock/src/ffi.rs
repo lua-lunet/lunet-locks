@@ -1445,7 +1445,7 @@ impl Node {
         self.drive(Input::Tick)
     }
 
-    /// Host-forced view change (§14.2): the phi-accrual detector's
+    /// Host-forced view change (§14.2): the leader timeout's
     /// conclusion that the primary is dead. `era` must be the node's
     /// current era and `view` must strictly advance the view number — the
     /// core refuses anything sideways or backwards.
@@ -1463,8 +1463,8 @@ impl Node {
         })
     }
 
-    /// One timeout toggle's event capture (`docs/src/phi-and-timeouts.md`):
-    /// the host's phi/timeout plane records EVERY toggle of its
+    /// One timeout toggle's event capture (`docs/src/failure-detection.md`):
+    /// the host's timeout plane records EVERY toggle of its
     /// `timedout` state — the new state, the toggle's local-clock ts, and
     /// the ts of the LAST toggle (kept in memory in the host's toggle) —
     /// in BOTH the regular log (the `info!` here) AND the Flight Recorder
@@ -3077,7 +3077,7 @@ pub unsafe extern "C" fn lunet_lock_node_leader_timeout(node: *mut c_void) -> i3
     })
 }
 
-/// §14.2 host-forced view change: the phi-accrual detector's conclusion
+/// §14.2 host-forced view change: the leader timeout's conclusion
 /// that the primary is dead (`era` the node's current era, `view` strictly
 /// ahead). Returns [`OK`], [`SERVICE`] (poisoned), or [`CONFIG`]-class
 /// refusals for a target that does not advance.
@@ -5180,7 +5180,7 @@ mod tests {
     /// THE run-4 kill#3 shape (locks2, 2026-09-15): a voter triad with a
     /// weight-0 learner joined, long settled in its final era and serving
     /// a client stream, meets its FIRST post-join view change — and then
-    /// the ping-pong the phi warm-up produces: a second forced view
+    /// the ping-pong the first view-change warm-up produces: a second forced view
     /// within moments of the new view's install, then a third. On the rig
     /// the voters then self-arrested one by one (the silent
     /// FAULTED→SERVICE poison): the commit stream died mid-second, the
@@ -5265,7 +5265,7 @@ mod tests {
             }
         }
         assert!(joined, "the learner's join establishes");
-        // The FIRST post-join view change, then the phi warm-up's
+        // The FIRST post-join view change, then the warm-up's
         // ping-pong: three rapid forced views, a client operation through
         // each, one committed per view. The (era, view) balloted target is
         // the leader's own published view, one view ahead.

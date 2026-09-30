@@ -60,10 +60,10 @@ still-establishing era is refused — the transition has not committed,
 so the cluster's voting count is not the one the operation was
 authorised against.
 
-## The phi monitor is removed after v0.11.0
+## Failure detection is the flavoured-timeout model alone
 
 Failure detection in this service is the flavoured-timeout model, and
-the model is complete without the phi monitor.
+the model is complete without a second estimator.
 
 The flavoured-timeout model supplies failure detection itself: each
 node watches a leader over a randomised timeout and, on the deadline,
@@ -71,22 +71,21 @@ acts — a host-forced view change, the `suspect` toggle, the flush. A
 node that observes a real failure is therefore guaranteed to act on
 its own schedule, with no further mechanism required to notice.
 
-The phi monitor computes a phi value over the heartbeat history and
-crossings are what trigger the same actuation. It is the same
-actuation, driven by a second and more elaborate estimator of the same
-fact: the silence the sloppy timeout already measures. Where the two
-disagree, the phi monitor's extra state is a second thing that can be
-wrong about liveness, and liveness reasoning is exactly where a second
-opinion is a liability rather than a redundancy — a crossed phi
-threshold on a healthy but quiet cluster manufactures an unnecessary
-view change, and an uncrossed one withholds a necessary one.
+A second estimator of the same fact is a liveness liability, not a
+redundancy. It is the same actuation, driven by a more elaborate
+measurement of the silence the leader timeout already measures. Where
+the two disagree, the extra state is a second thing that can be wrong
+about liveness, and liveness reasoning is exactly where a second
+opinion is a liability — an estimator that crosses on a healthy but
+quiet cluster manufactures an unnecessary view change, and one that
+does not cross withholds a necessary one.
 
-**The ruling: the phi monitor is removed after v0.11.0.** The
-flavoured-timeout model is the sole failure-detection mechanism. The
-detection contract the monitor served is already held by the randomised
-leader timeout, and every timeout-related rule in the service is
-expressed against that model. The timeout naming law is unchanged by
-this: timeout unqualified remains short for leader timeout.
+**The ruling: the randomised leader timeout is the sole
+failure-detection mechanism.** The detection contract a second
+estimator served is already held by the leader timeout, and every
+timeout-related rule in the service is expressed against that model.
+The timeout naming law is unchanged by this: timeout unqualified
+remains short for leader timeout.
 
-See [Failure detection and the timeouts](phi-and-timeouts.md) for the
+See [Failure detection and the timeouts](failure-detection.md) for the
 mechanisms this ruling governs.

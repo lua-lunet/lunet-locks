@@ -21,10 +21,10 @@
 //! # The timeout-toggle event kind
 //!
 //! The `timeout-toggle` kind records every toggle of the host's
-//! `timedout` state (`docs/src/phi-and-timeouts.md`): the new state,
+//! `timedout` state (`docs/src/failure-detection.md`): the new state,
 //! the toggle's ts, and the ts of the LAST toggle. The host drives it
 //! through `Node::note_timeout_toggle` on every state change, so the
-//! phi/timeout story — detection standing down at the view change,
+//! timeout story — detection standing down at the view change,
 //! resuming at the fresh commit — is on the same tape as the drives and
 //! messages it explains.
 //!

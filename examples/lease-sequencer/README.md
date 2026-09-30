@@ -186,7 +186,7 @@ yet known — keeps the AOF ON; weight > 0 turns it OFF; 1→0 re-arms it (a
 trace gap since the disarm is expected). While ON, the node writes its
 boot trace (the Recovering/Restarting/Joining decision and every outbound
 message), every VRR datagram it receives as a Wire record, and the
-phi-informed timeout decisions; the same weight sequence on a voting node
+timeout decisions; the same weight sequence on a voting node
 leaves just the boot trace. A background flush fsyncs every
 `--aof-flush-ms` (default 1000) and earlier whenever the vendored
 entry-window cap fills — and it STOPS when the gate disarms. A clean stop
@@ -204,29 +204,23 @@ reincarnates (identity bump, the `(old, new)` announcement) — the
 run-sheets' node kills use `kill -9` wherever crash semantics
 are being exercised.
 
-The leader timeout: the host tick loop runs the **sloppy timeout** — a
-uniform random wait in `--phi-timeout-min-ms` / `--phi-timeout-max-ms`
-(defaults 500 / 1000) per watched (config era, leader) key, re-armed on
+The leader timeout: the host tick loop runs a uniform random wait in
+`--leader-timeout-min-ms` / `--leader-timeout-max-ms` (defaults
+500 / 1000) per watched (config era, leader) key, re-armed on
 leader change, on the fresh-commit resume, and on each heartbeat Commit
 arriving from the current leader. When the deadline passes the host
-drives the §14.2 forced view: the `phi-detect` note (silence and armed
-deadline), `force_view(era, view + 1)`, the `timedout` toggle, and the
-output flush. The timing law is Raft's (Ongaro 2014): broadcastTime ≪
-electionTimeout ≪ MTBF with the wait randomised in a generous interval —
-a cloud deploy at the 200 ms heartbeat sets 2000–4000 ms; the local rig
-at 5 ms heartbeats runs the 500/1000 defaults. One
-`TelemetryTimeoutDecision` record (previous wait, next wait; the phi
-column is 0 — the sloppy timeout computes no phi) plus the tracing line
-per changed armed wait.
+drives the §14.2 forced view: the `leader-timeout-detect` note (silence
+and armed deadline), `force_view(era, view + 1)`, the `timedout` toggle,
+and the output flush. The timing law is Raft's (Ongaro 2014):
+broadcastTime ≪ electionTimeout ≪ MTBF with the wait randomised in a
+generous interval — a cloud deploy at the 200 ms heartbeat sets
+2000–4000 ms; the local rig at 5 ms heartbeats runs the 500/1000
+defaults. One `TelemetryTimeoutDecision` record (previous wait, next
+wait) plus the tracing line per changed armed wait.
 
-The phi-accrual detector — the wire trailer, the sketches, the
-learned-mean election wait, and the embedded crate — compiles only
-behind `experimental-phi`
-(`cargo build --features experimental-phi`); normal builds carry none
-of it and send bare core datagrams. The boot line and the boot trace
-name the compiled-in detector: `detector=sloppy-timeout` (normal) or
-`detector=experimental-phi`. See
-[phi and the timeouts](../../docs/src/phi-and-timeouts.md).
+The boot line and the boot trace name the compiled-in detector:
+`detector=sloppy-timeout`. See
+[failure detection and the timeouts](../../docs/src/failure-detection.md).
 
 The script also starts `lock-feed` against the standby's AOF directory and
 the console stack (static SPA + nginx edge with `/feed/` mapped to the

@@ -96,13 +96,3 @@ fn wire_alphabet_is_total() {
         "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
     )
 }
-
-/// The bulk telemetry endpoint: the phi samples (marker 5) and the timeout
-/// decisions (marker 2) as arrays, plus the span — the ECharts tab's data
-/// source.
-#[test]
-fn telemetry_phi_endpoint_serves_samples_and_decisions() {
-    panic!(
-        "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
-    )
-}

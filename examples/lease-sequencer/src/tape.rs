@@ -17,22 +17,17 @@
 //! derives the endpoint labels from what each record actually carries:
 //!
 //! - marker-1 `Wire` (a raw uVRR datagram the recorder RECEIVED):
-//!   `to` = the recorder's node id; `from` = the phi trailer's `leader`
-//!   when the frame carries the 22-byte trailer (magic `C0 0B`, little-
-//!   endian fields) — the leader's Commit stream, else `?` (a Prepare,
-//!   NewState, or any untrailed datagram names no sender on the wire).
+//!   `to` = the recorder's node id; `from` = `?` — no datagram names a
+//!   sender on the wire (a Prepare, a NewState, and a Commit alike).
 //! - marker-2 `TelemetryTimeoutDecision`: `from` = the recorder (the
 //!   deciding node), `to` = the recorder.
 //! - marker-3 `TelemetryStateTransition`: `from` = the recorder, `to` =
 //!   the recorder.
 //! - marker-4 `TelemetryOutbound`: `from` = the recorder, `to` = the
 //!   record's target (its JSON `to` field).
-//! - marker-5 `TelemetryIntervalSample`: `from` = the sample's `node`
-//!   field (the recording monitor's own id), `to` = the recorder.
 //!
-//! The recorder's node id is `--recorder N` on the bin, or derived from
-//! the first marker-5 sample's `node` field when the flag is omitted
-//! (the sample's `node` IS the recording node's own id).
+//! The recorder's node id is `--recorder N` on the bin; with the flag
+//! omitted, recorder-side endpoints render as `?`.
 //!
 //! # The jsonl payload
 //!
@@ -40,11 +35,9 @@
 //! `ts_ms` (the envelope's ns clock truncated to ms), `ns`, and for wire
 //! records `tag`/`era`/`view`/`slot`, the committed frontier when the
 //! frame carries one, the lock fields when the payload is a committed
-//! lock verb, the phi fields when a trailer rides the frame, and
-//! `frame_hex` — the raw wire bytes hex-encoded, trailer included:
+//! lock verb, and `frame_hex` — the raw wire bytes hex-encoded:
 //! byte-exact playback needs the original datagram.
 
-use crate::phi::Trailer;
 use lunet_locks_aof::envelope::{Marker, Record};
 use lunet_locks_aof::retention;
 use serde_json::{Map, Value};
@@ -88,9 +81,8 @@ impl TapeLine {
 /// The streaming options (the bin's flags).
 #[derive(Debug, Clone, Default)]
 pub struct TapeOptions {
-    /// The recorder's node id. `None` derives it from the first
-    /// marker-5 sample's `node` field; with neither, recorder-side
-    /// endpoints render as `?`.
+    /// The recorder's node id. `None` leaves recorder-side endpoints
+    /// rendered as `?`.
     pub recorder: Option<u32>,
     /// Keep only lines whose derived `from` equals this. `?` lines are
     /// dropped unless `from_any`.
@@ -111,7 +103,6 @@ pub enum Kind {
     Decision,
     Transition,
     Outbound,
-    Sample,
 }
 
 impl Kind {
@@ -121,20 +112,13 @@ impl Kind {
             "decision" => Some(Kind::Decision),
             "transition" => Some(Kind::Transition),
             "outbound" => Some(Kind::Outbound),
-            "sample" => Some(Kind::Sample),
             "all" => None, // callers expand; parsed per-token via all()
             _ => None,
         }
     }
 
     pub fn all() -> Vec<Kind> {
-        vec![
-            Kind::Wire,
-            Kind::Decision,
-            Kind::Transition,
-            Kind::Outbound,
-            Kind::Sample,
-        ]
+        vec![Kind::Wire, Kind::Decision, Kind::Transition, Kind::Outbound]
     }
 }
 
@@ -228,33 +212,6 @@ fn lock_fields(json: &[u8]) -> Option<Map<String, Value>> {
     Some(fields)
 }
 
-/// The recorder's node id, derived from the series' first marker-5
-/// sample's `node` field (the recording monitor's own id) when the flag
-/// did not name it.
-fn derive_recorder(dir: &Path) -> Option<u32> {
-    for (path, _, _) in series(dir) {
-        let mut iter = match retention_iter(&path) {
-            Ok(iter) => iter,
-            Err(_) => continue,
-        };
-        while let Ok(Some(entry)) = iter.next_entry() {
-            let Some(record) = Record::decode(&entry.bytes) else {
-                continue;
-            };
-            if record.marker != Marker::TelemetryIntervalSample {
-                continue;
-            }
-            let value: Value = serde_json::from_slice(&record.payload).ok()?;
-            // Borrow ends before the iterator's drop: build the id now.
-            let node = value.get("node").and_then(|v| v.as_u64());
-            if let Some(node) = node {
-                return Some(node as u32);
-            }
-        }
-    }
-    None
-}
-
 /// The safe iterator wrapper over one AOF file (the same FFI the host
 /// uses — never a shell-out to the python tool).
 fn retention_iter(path: &Path) -> Result<lunet_locks_aof::ffi::RawIter, i32> {
@@ -273,10 +230,7 @@ pub fn stream_dir(
     options: &TapeOptions,
     out: &mut dyn Write,
 ) -> std::io::Result<TapeCounts> {
-    let recorder = match options.recorder {
-        Some(id) => Some(id),
-        None => derive_recorder(dir),
-    };
+    let recorder = options.recorder;
     let wanted: Option<Vec<Kind>> = if options.kinds.is_empty() {
         None
     } else {
@@ -305,7 +259,13 @@ pub fn stream_dir(
                 Marker::TelemetryTimeoutDecision => Kind::Decision,
                 Marker::TelemetryStateTransition => Kind::Transition,
                 Marker::TelemetryOutbound => Kind::Outbound,
-                Marker::TelemetryIntervalSample => Kind::Sample,
+                // The interval-sample marker has no producer in the host:
+                // the recorder derives nothing from arrivals, so the kind
+                // carries no tape line.
+                Marker::TelemetryIntervalSample => {
+                    counts.unnamed += 1;
+                    continue;
+                }
             };
             if let Some(wanted) = &wanted
                 && !wanted.contains(&kind)
@@ -372,11 +332,7 @@ pub fn tape_line(kind: Kind, ns: u64, payload: &[u8], recorder: Option<u32>) -> 
     json.insert("ns".into(), Value::from(ns));
     match kind {
         Kind::Wire => {
-            let (front, trailer) = match Trailer::strip_from(payload) {
-                Some((front, trailer)) => (front, Some(trailer)),
-                None => (payload, None),
-            };
-            let body = wire_body(front)?;
+            let body = wire_body(payload)?;
             json.insert("tag".into(), Value::from(body.tag));
             json.insert("tag_name".into(), Value::from(tag_name(body.tag)));
             json.insert("era".into(), Value::from(body.era));
@@ -388,23 +344,10 @@ pub fn tape_line(kind: Kind, ns: u64, payload: &[u8], recorder: Option<u32>) -> 
             if let Some(lock) = body.lock {
                 json.insert("lock".into(), Value::Object(lock));
             }
-            if let Some(trailer) = &trailer {
-                let phi = serde_json::json!({
-                    "era": trailer.era,
-                    "leader": trailer.leader,
-                    "seq": trailer.seq,
-                    "sent_at_ms": trailer.sent_at_ms,
-                });
-                json.insert("phi".into(), phi);
-            }
             json.insert("frame_hex".into(), Value::from(hex(payload)));
-            let from = trailer
-                .as_ref()
-                .map(|t| t.leader.to_string())
-                .unwrap_or_else(|| "?".to_string());
             let to = recorder_text.clone()?;
             Some(TapeLine {
-                from,
+                from: "?".to_string(),
                 to,
                 json: Value::Object(json),
             })
@@ -433,20 +376,6 @@ pub fn tape_line(kind: Kind, ns: u64, payload: &[u8], recorder: Option<u32>) -> 
                 json: Value::Object(json),
             })
         }
-        Kind::Sample => {
-            insert_parsed(&mut json, payload);
-            let from = json
-                .get("node")
-                .and_then(|v| v.as_u64())
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "?".to_string());
-            let to = recorder_text?;
-            Some(TapeLine {
-                from,
-                to,
-                json: Value::Object(json),
-            })
-        }
     }
 }
 
@@ -456,7 +385,6 @@ fn kind_name(kind: Kind) -> &'static str {
         Kind::Decision => "decision",
         Kind::Transition => "transition",
         Kind::Outbound => "outbound",
-        Kind::Sample => "sample",
     }
 }
 

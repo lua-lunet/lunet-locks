@@ -200,12 +200,7 @@ def summarize_series_json(dir_path, lib=None):
 
 # -------------------------------------------------------------- export ----
 # The trace of what happened, as JSONL: the ts at the AOF (the standby's
-# local nanosecond clock), the ts at the leader (the phi trailer's
-# sent_at_ms, carried on every leader Commit since the trailer's
-# retention landed), the command that enacted it, and the result.
-
-TRAILER_MAGIC = b"\xc0\x0b"
-TRAILER_BYTES = 22  # magic(2) + era(4) + leader(4) + seq(4) + sent_at_ms(8)
+# local nanosecond clock), the command that enacted it, and the result.
 
 # The SystemOperation wire discriminants (configuration.rs, all BE fields).
 SYS_VOID, SYS_INIT, SYS_INCREMENT, SYS_DECREMENT = 1, 2, 3, 4
@@ -214,17 +209,8 @@ SYS_DOUBLE, SYS_HALVE, SYS_JOIN, SYS_LEAVE, SYS_BATCH = 5, 6, 7, 8, 9
 # The lock-op JSON kinds that count as committed lock work.
 LOCK_OPS = {"get", "set", "release", "break"}
 
-# Bare infinity in a telemetry JSON (the detector's saturation) is not
-# JSON; decode it as null.
+# Bare infinity in a telemetry JSON is not JSON; decode it as null.
 _INF_RE = __import__("re").compile(r"(:\s*)([-+]?inf\b|NaN)")
-
-
-def split_trailer(frame: bytes):
-    """(frame_without_trailer, leader_ms or None)."""
-    if len(frame) >= TRAILER_BYTES and frame[-TRAILER_BYTES:-TRAILER_BYTES + 2] == TRAILER_MAGIC:
-        sent_at = struct.unpack("<Q", frame[-8:])[0]
-        return frame[:-TRAILER_BYTES], sent_at
-    return frame, None
 
 
 def parse_wire(frame: bytes):
@@ -389,9 +375,7 @@ def _row_ts_ms(row: dict):
     kind = row.get("kind")
     if kind in ("locks", "locks-timeline", "reconfig"):
         return ns_to_ms(row["aof_ns"])
-    if kind in ("phi", "phi-samples"):
-        if "ts_ms" in row:
-            return float(row["ts_ms"])
+    if kind == "timeouts":
         if "now_ms" in row:
             return float(row["now_ms"])
         return ns_to_ms(row["aof_ns"])
@@ -489,60 +473,13 @@ def _takeover_row(window_rows, anchor) -> dict:
             "takeover_ms": exactly(nxt["ts_ms"] - anchor) if nxt else ABSENT}
 
 
-def _hb_spacing_rows(dir_path, lib=None) -> list:
-    dir_path = Path(str(getattr(dir_path, "path", dir_path)))
-    sent_by: dict = {}
-    dt_by: dict = {}
-    for path in sorted(dir_path.glob("*.aof")):
-        for _op, rec in iterate(path, lib):
-            if rec[0] == 1 and len(rec) >= TRAILER_BYTES + 9:
-                frame, sent = split_trailer(rec[9:])
-                if sent is None:
-                    continue
-                era, leader = struct.unpack("<II", rec[-20:-12])
-                sent_by.setdefault((era, leader), []).append(float(sent))
-            elif rec[0] == 5:
-                try:
-                    value = json.loads(_INF_RE.sub(r"\1null",
-                                                   rec[9:].decode("utf-8", "replace")))
-                except (ValueError, UnicodeDecodeError):
-                    continue
-                key = (value.get("era"), value.get("leader"))
-                if value.get("dt_ms") is not None:
-                    dt_by.setdefault(key, []).append(float(value["dt_ms"]))
-    rows = []
-    for (era, leader) in sorted(sent_by):
-        sents = sent_by[(era, leader)]
-        gaps = [b - a for a, b in zip(sents, sents[1:]) if b > a]
-        if not gaps:
-            continue
-        rows.append({"kind": "hb-spacing", "dir": str(dir_path), "source": "wire",
-                     "era": era, "leader": leader, **_stats(gaps)})
-    for (era, leader) in sorted(dt_by):
-        dts = dt_by[(era, leader)]
-        if len(dts) < 2:
-            continue
-        rows.append({"kind": "hb-spacing", "dir": str(dir_path), "source": "sample",
-                     "era": era, "leader": leader, **_stats(dts)})
-    return rows
-
-
 def _aof_noise_rows(dir_path, lib=None, hb_ms=5.0) -> list:
     dir_path = Path(str(getattr(dir_path, "path", dir_path)))
     ns_list: list = []
-    dts: list = []
     for path in sorted(dir_path.glob("*.aof")):
         for _op, rec in iterate(path, lib):
             if rec[0] == 1:
                 ns_list.append(ns_of(rec))
-            elif rec[0] == 5:
-                try:
-                    value = json.loads(_INF_RE.sub(r"\1null",
-                                                   rec[9:].decode("utf-8", "replace")))
-                except (ValueError, UnicodeDecodeError):
-                    continue
-                if value.get("dt_ms") is not None:
-                    dts.append(float(value["dt_ms"]))
     rows = []
     row = {"kind": "aof-noise", "dir": str(dir_path)}
     gaps_ms = [(b - a) / 1e6 for a, b in zip(ns_list, ns_list[1:])]
@@ -552,8 +489,6 @@ def _aof_noise_rows(dir_path, lib=None, hb_ms=5.0) -> list:
         row["stalls"] = [{"a_ns": a, "b_ns": b, "gap_ms": g}
                          for g, a, b in zip(gaps_ms, ns_list, ns_list[1:])
                          if g > thr]
-    if dts:
-        row["samples"] = _stats(dts)
     rows.append(row)
     return rows
 
@@ -586,15 +521,15 @@ def _anchor_rows_and_takeovers(events, anchors):
 def export_series(dir_path, lib=None, kinds="all", anchors=None, hb_ms=5.0):
     """The trace of what happened: one JSON dict per line-worthy event,
     ordered as the trace recorded them (file order = epoch order = ns
-    order). Kinds: all | both (reconfig+locks) | phi | phi-samples |
-    reconfig | locks | locks-timeline | hb-spacing | aof-noise; the
+    order). Kinds: all | both (reconfig+locks) | timeouts |
+    reconfig | locks | locks-timeline | aof-noise; the
     kinds string is a whitespace-joined UNION (the repeatable --kind
     CLI flag accumulates into it, one contract with the LuaJIT twin).
     With anchors (unix ms, repeatable), every exported row gains
     t_rel_ms / t_fmt and the locks-timeline export gains per-anchor
     takeover summary lines."""
     dir_path = Path(str(getattr(dir_path, "path", dir_path)))
-    wanted = set(kinds.split()) if kinds != "all" else {"locks", "reconfig", "phi", "phi-samples"}
+    wanted = set(kinds.split()) if kinds != "all" else {"locks", "reconfig", "timeouts"}
     if kinds == "both":
         wanted = {"locks", "reconfig"}
     events = []
@@ -604,24 +539,17 @@ def export_series(dir_path, lib=None, kinds="all", anchors=None, hb_ms=5.0):
             marker = record[0]
             aof_ns = ns_of(record)
             if marker == 2:
-                if "phi" in wanted:
-                    line = {"kind": "phi", "aof_ns": aof_ns}
-                    # The detector saturates: some emitters write bare `inf`
-                    # (not JSON). Decode tolerantly, never guessing fields.
+                if "timeouts" in wanted:
+                    line = {"kind": "timeouts", "aof_ns": aof_ns}
+                    # Some emitters write bare `inf` (not JSON). Decode
+                    # tolerantly, never guessing fields.
                     text = record[9:].decode("utf-8", "replace")
                     line.update(json.loads(_INF_RE.sub(r"\1null", text)))
                     events.append(line)
                 continue
-            if marker == 5:
-                if "phi-samples" in wanted:
-                    line = {"kind": "phi-samples", "aof_ns": aof_ns}
-                    line.update(json.loads(_INF_RE.sub(r"\1null", record[9:].decode("utf-8", "replace"))))
-                    events.append(line)
-                continue
             if marker != 1:
                 continue
-            wire_frame, leader_ms = split_trailer(record[9:])
-            parsed = parse_wire(wire_frame)
+            parsed = parse_wire(record[9:])
             if parsed is None:
                 continue
             kind = parsed[0]
@@ -642,11 +570,11 @@ def export_series(dir_path, lib=None, kinds="all", anchors=None, hb_ms=5.0):
                     if "op" in fields:
                         if "locks" in wanted:
                             events.append({"kind": "locks", "aof_ns": aof_ns,
-                                           "leader_ms": leader_ms, "slot": s,
+                                           "slot": s,
                                            "result": "committed", **fields})
                     elif "reconfig" in wanted:
                         events.append({**fields, "aof_ns": aof_ns,
-                                       "leader_ms": leader_ms, "slot": s,
+                                       "slot": s,
                                        "result": "committed"})
             elif kind == "commit":
                 committed = parsed[5]
@@ -655,16 +583,14 @@ def export_series(dir_path, lib=None, kinds="all", anchors=None, hb_ms=5.0):
                     if "op" in fields:
                         if "locks" in wanted:
                             events.append({"kind": "locks", "aof_ns": aof_ns,
-                                           "leader_ms": leader_ms, "slot": s,
+                                           "slot": s,
                                            "result": "committed", **fields})
                     elif "reconfig" in wanted:
                         events.append({**fields, "aof_ns": aof_ns,
-                                       "leader_ms": leader_ms, "slot": s,
+                                       "slot": s,
                                        "result": "committed"})
     if "locks-timeline" in wanted:
         events += _timeline_rows(dir_path, lib)
-    if "hb-spacing" in wanted:
-        events += _hb_spacing_rows(dir_path, lib)
     if "aof-noise" in wanted:
         events += _aof_noise_rows(dir_path, lib, hb_ms)
     if anchors:
@@ -672,8 +598,8 @@ def export_series(dir_path, lib=None, kinds="all", anchors=None, hb_ms=5.0):
     return events
 
 
-KINDS = ("all", "both", "phi", "phi-samples", "reconfig", "locks",
-         "locks-timeline", "hb-spacing", "aof-noise")
+KINDS = ("all", "both", "timeouts", "reconfig", "locks",
+         "locks-timeline", "aof-noise")
 
 
 def export_to(path_out: str, series_dir, lib=None, kinds="all",
@@ -706,7 +632,7 @@ def main(argv):
         elif args[i] == "--kind":
             for token in args[i + 1].split():
                 if token == "all":
-                    kind_parts.extend(("locks", "reconfig", "phi", "phi-samples"))
+                    kind_parts.extend(("locks", "reconfig", "timeouts"))
                 elif token == "both":
                     kind_parts.extend(("locks", "reconfig"))
                 else:

@@ -10,7 +10,7 @@
 -- the same anchors file. Cluster: three genesis voters on loopback.
 -- Knobs: the hardened profile (heartbeat 5 ms, election 1000 ms,
 -- recovery 1000 ms — the randomized leader timeout 1000–2000 ms via
--- --phi-timeout-min/max-ms) on the flight-recorder build. Every rejoin
+-- --leader-timeout-min/max-ms) on the flight-recorder build. Every rejoin
 -- is bounded by its own gate deadline (150 s); a bounded-out rejoin is
 -- recorded as BLOCKED with its evidence and the node is parked — the
 -- run continues on the serving remainder.
@@ -204,9 +204,9 @@ local function start_node(name: string): integer
         "1000",
         "--recovery-ms",
         "1000",
-        "--phi-timeout-min-ms",
+        "--leader-timeout-min-ms",
         "1000",
-        "--phi-timeout-max-ms",
+        "--leader-timeout-max-ms",
         "2000",
     }
     local p = proc.spawn(
@@ -1358,15 +1358,15 @@ function M.run(root_path: string, run_dir_path: string): integer
         fs.join(run_dir, "anchors.md"),
         "# local-harden-2026-09-19 — the hardened crash/partition run\n"
             .. "# knobs: heartbeat 5ms, election 1000ms, recovery 1000ms, detector\n"
-            .. "#   --phi-timeout-min-ms 1000 --phi-timeout-max-ms 2000 (uniform draw\n"
-            .. "#   per node, re-armed on leader change / fresh-commit; the first\n"
-            .. "#   armed wait is the fixed --election-ms)\n"
+            .. "#   --leader-timeout-min-ms 1000 --leader-timeout-max-ms 2000 (uniform\n"
+            .. "#   draw per node, re-armed on leader change / fresh-commit; the\n"
+            .. "#   first armed wait is the fixed --election-ms)\n"
             .. "# binary: flight-recorder build; load: lease-load polite x3 + aggressive hammer windows\n"
             .. "# partition injection: SIGSTOP/SIGCONT process suspension (loopback; heal = backlog burst)\n"
             .. "# probe discipline: every serving probe is gtimeout-bounded at 2 s and\n"
             .. "#   every attempt (ok or not) is logged to probes.log — the calm runs'\n"
             .. "#   20.3 s takeover headlines were one 20 s lease-client read timeout\n"
-            .. "#   on an op forwarded to a dead leader, not the detector\n"
+            .. "#   on an op forwarded to a dead leader, not the leader timeout\n"
     )
     anchor("run-begin harden crash/partition lane")
     progress("run begin: " .. states_snapshot())

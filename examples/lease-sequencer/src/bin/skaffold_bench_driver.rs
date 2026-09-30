@@ -450,22 +450,14 @@ impl Driver {
             .arg("500")
             .arg("--recovery-ms")
             .arg("500")
-            .arg("--phi-timeout-min-ms")
+            .arg("--leader-timeout-min-ms")
             .arg("100")
-            .arg("--phi-timeout-max-ms")
+            .arg("--leader-timeout-max-ms")
             .arg("500")
             .arg("--viewchange-timeout-min-ms")
             .arg("200")
             .arg("--viewchange-timeout-max-ms")
             .arg("400")
-            // The detection knobs: aggressive but sane — phi 8 is the
-            // standard accrual threshold; a twitchier detector churns
-            // views faster than the rejoin walk completes (the wedge
-            // class), which is a bench-config artifact, not evidence.
-            .arg("--phi-threshold")
-            .arg("8.0")
-            .arg("--phi-safety")
-            .arg("2.0")
             .env("LUNET_FLIGHT_RECORDER_DIR", &node.flight)
             // The rolling log's env filter (the runners' discipline):
             // the operator's RUST_LOG wins, else info.
@@ -563,7 +555,7 @@ impl Driver {
             self.nodes[index].name
         );
 
-        // 4. Leader crash: the phi detector drives the takeover.
+        // 4. Leader crash: the leader timeout drives the takeover.
         let leader = self
             .wait_for(
                 "a leader before the leader crash",

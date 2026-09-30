@@ -3,4 +3,4 @@ dofile((arg[0]:match("^(.*)/[^/]*$") or ".") .. "/../../tools/bootstrap.lua")
 
 local rig = require("tools.lib.rig")
 
-os.exit(rig.phi((arg[0]:match("^(.*)/[^/]*$") or ".") .. "/../.."))
+os.exit(rig.takeover((arg[0]:match("^(.*)/[^/]*$") or ".") .. "/../.."))

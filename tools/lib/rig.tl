@@ -1,5 +1,6 @@
 -- The lease-sequencer rig: the typed runner library behind the example
--- entries (run.lua, run-phi.lua, run-acceptance.lua, check-standby.lua).
+-- entries (run.lua, run-takeover.lua, run-acceptance.lua,
+-- check-standby.lua).
 -- Six storage nodes, two per three datacenters, each a release rig
 -- binary binding a UDP peer port and a TCP client NDJSON port. The
 -- gates read the logs DIRECTORY and match node-name prefixes — no
@@ -23,14 +24,12 @@ local record NodeSpec
     client_port: integer
 end
 
--- The per-run node knobs: cadences, phi thresholds, the standby's AOF
--- feed, and the descriptor the node boots.
+-- The per-run node knobs: cadences, the standby's AOF feed, and the
+-- descriptor the node boots.
 local record NodeOpts
     heartbeat_ms: integer
     election_ms: integer
     recovery_ms: integer
-    phi_threshold: string
-    phi_safety: string
     aof_dir: string
     aof_flush_ms: integer
     descriptor: string
@@ -46,8 +45,6 @@ local function opts(
         heartbeat_ms = heartbeat_ms,
         election_ms = election_ms,
         recovery_ms = recovery_ms,
-        phi_threshold = "",
-        phi_safety = "",
         aof_dir = "",
         aof_flush_ms = 0,
         descriptor = descriptor,
@@ -69,7 +66,7 @@ end
 
 local record M
     stability: function(string): integer
-    phi: function(string): integer
+    takeover: function(string): integer
     acceptance: function(string): integer
     standby: function(string): integer
     Rig: Rig
@@ -169,14 +166,6 @@ local function start_node(rig: Rig, spec: NodeSpec, node_opts: NodeOpts): proc.P
     if node_opts.recovery_ms > 0 then
         argv[#argv + 1] = "--recovery-ms"
         argv[#argv + 1] = tostring(node_opts.recovery_ms)
-    end
-    if node_opts.phi_threshold ~= "" then
-        argv[#argv + 1] = "--phi-threshold"
-        argv[#argv + 1] = node_opts.phi_threshold
-    end
-    if node_opts.phi_safety ~= "" then
-        argv[#argv + 1] = "--phi-safety"
-        argv[#argv + 1] = node_opts.phi_safety
     end
     if node_opts.aof_dir ~= "" then
         argv[#argv + 1] = "--aof-dir"
@@ -761,19 +750,19 @@ function M.stability(root: string): integer
     return guarded(function(): integer stability_body(root); return 0 end)
 end
 
--- ------------------------------------------------- phi kill-leader run --
+-- -------------------------------------------- leader-timeout takeover --
 
--- The phi-accrual kill-leader measurement: a 3-node genesis cluster on
--- 127.0.0.1 with 10 ms heartbeats; the leader is SIGKILLed and the run
--- measures the phi detection latency, the actual new-leader (view
--- change) latency, and the lease reacquire latency. The report lands
--- in .tmp/phi-run/. Observational: the only hard gate is convergence.
-function M.phi(root: string): integer
+-- The leader-timeout kill-leader measurement: a 3-node genesis cluster
+-- on 127.0.0.1 with 10 ms heartbeats; the leader is SIGKILLed and the run
+-- measures the detection latency, the actual new-leader (view change)
+-- latency, and the lease reacquire latency. The report lands in
+-- .tmp/takeover-run/. Observational: the only hard gate is convergence.
+function M.takeover(root: string): integer
     return guarded(
         function(): integer
             clear_stale()
-            local report_dir = fs.join(root, ".tmp/phi-run")
-            local config_path = fs.join(report_dir, "phi-cluster.jsonl")
+            local report_dir = fs.join(root, ".tmp/takeover-run")
+            local config_path = fs.join(report_dir, "takeover-cluster.jsonl")
             if not fs.exists(config_path) then
                 fs.mkdir_p(report_dir)
                 -- The descriptor this run drives: three genesis nodes, client
@@ -796,12 +785,9 @@ function M.phi(root: string): integer
                 gate.fail("build")
             end
 
-            local rig = new_rig(root, report_dir .. "/phi-run", config_path)
+            local rig = new_rig(root, report_dir .. "/takeover-run", config_path)
             prepare_run(rig, false)
-            local phi_opts = opts(10, 0, 0, config_path)
-            phi_opts.phi_threshold = "1.0"
-            phi_opts.phi_safety = "2.0"
-            start_all(rig, phi_opts)
+            start_all(rig, opts(10, 0, 0, config_path))
 
             wait_gate(
                 clock.now_ms() + 30000,
@@ -845,52 +831,9 @@ function M.phi(root: string): integer
                     .. ")"
             )
 
-            -- Steady state: the heartbeat interval distribution.
-            local steady_t0 = clock.now_ms()
+            -- Settle before the kill so the measurement reads a steady
+            -- cluster, not the tail of the initial election.
             clock.sleep(4)
-            local steady_t1 = clock.now_ms()
-            local steady: {string} = {}
-            local steady_n: {string: integer} = {}
-            local steady_s: {string: integer} = {}
-            local steady_mn: {string: integer} = {}
-            local steady_mx: {string: integer} = {}
-            for _, line in ipairs(logs.grep(all_logs(rig), "phi%-interval ")) do
-                local kv = logs.kv(line)
-                local ts = (tonumber(kv.ts) or 0) as integer
-                local dt = (tonumber(kv.dt) or 0) as integer
-                local node = kv.node or ""
-                if ts >= steady_t0 and ts <= steady_t1 and dt > 0 and dt <= 200 then
-                    steady_n[node] = (steady_n[node] or 0) + 1
-                    steady_s[node] = (steady_s[node] or 0) + dt
-                    local mn = steady_mn[node] or dt
-                    if dt < mn then
-                        mn = dt
-                    end
-                    steady_mn[node] = mn
-                    local mx = steady_mx[node] or dt
-                    if dt > mx then
-                        mx = dt
-                    end
-                    steady_mx[node] = mx
-                end
-            end
-            for node, n in pairs(steady_n) do
-                steady[#steady + 1] = string.format(
-                    "STEADY node=%s samples=%d min=%d mean=%.1f max=%d",
-                    node,
-                    n,
-                    steady_mn[node] or 0,
-                    (steady_s[node] or 0) / n,
-                    steady_mx[node] or 0
-                )
-            end
-            table.sort(steady)
-            fs.write_all(
-                fs.join(rig.run_dir, "steady.txt"), table.concat(steady, "\n") .. "\n"
-            )
-            for _, line in ipairs(steady) do
-                print(line)
-            end
 
             -- Kill the leader.
             local kill_ts = clock.now_ms()
@@ -907,14 +850,14 @@ function M.phi(root: string): integer
                     .. kill_ts
             )
 
-            -- The phi detector fires in milliseconds; the core's own
+            -- The leader timeout fires in milliseconds; the core's own
             -- view-change gate (primary_timeout, 5000 ms) decides when the
             -- fence actually runs. Let the aftermath settle before parsing.
             clock.sleep(8)
 
-            -- phi detection: the FIRST phi-detect line after the kill.
+            -- Detection: the FIRST leader-timeout-detect line after the kill.
             local detect_ts = 0
-            for _, line in ipairs(logs.grep(all_logs(rig), "phi%-detect ")) do
+            for _, line in ipairs(logs.grep(all_logs(rig), "leader%-timeout%-detect ")) do
                 local ts = (tonumber(logs.kv(line).ts) or 0) as integer
                 if ts >= kill_ts and (detect_ts == 0 or ts < detect_ts) then
                     detect_ts = ts
@@ -971,12 +914,12 @@ function M.phi(root: string): integer
             end
 
             print("")
-            print("=== phi kill-leader measurement ===")
+            print("=== leader-timeout kill-leader measurement ===")
             print("kill ts:                    " .. kill_ts)
             if detect_ts > 0 then
-                print("phi detection latency:      " .. (detect_ts - kill_ts) .. " ms")
+                print("detection latency:          " .. (detect_ts - kill_ts) .. " ms")
             else
-                print("phi detection latency:      NOT DETECTED (phi monitoring inert)")
+                print("detection latency:          NOT DETECTED (the leader timeout stayed down)")
             end
             if new_leader_ts > 0 then
                 print(

@@ -1,5 +1,5 @@
-//! The AOF lifecycle gate and telemetry log plus the
-//! phi-informed timeout estimator.
+//! The AOF lifecycle gate, the telemetry log, and the timeout-decision
+//! record.
 //!
 //! # The lifecycle gate (the hard requirement)
 //!
@@ -383,53 +383,16 @@ pub fn prune_plan(files: &[(String, (u64, u64))], active: &str) -> Vec<String> {
         .collect()
 }
 
-// --------------------------------------------------- phi timeout (M3) ------
-
-/// The phi-timeout knobs (the host's clamp bounds).
-#[derive(Clone, Copy, Debug)]
-pub struct TimeoutKnobs {
-    /// The wait never derives below this (`--phi-timeout-min-ms`).
-    pub min_ms: u64,
-    /// The wait never derives above this (`--phi-timeout-max-ms`).
-    pub max_ms: u64,
-    /// The old fixed gate (`--election-ms`) the estimator falls back to
-    /// when the sketch is untrustworthy.
-    pub fixed_ms: u64,
-}
-
-/// The phi-informed wait estimate (M3): `safety * max(heartbeat, learned
-/// mean)` from the leader's sketch, clamped to `[min, max]`. An unsettled
-/// sketch (`mean_interval_ms = None`: fewer than two intervals learned)
-/// falls back to the old fixed gate, itself clamped — the estimate is
-/// never earlier than a settled phi allows and never later than the old
-/// fixed gate.
-pub fn phi_wait_ms(
-    mean_interval_ms: Option<f64>,
-    heartbeat_ms: u64,
-    safety_multiple: f64,
-    knobs: &TimeoutKnobs,
-) -> Option<u64> {
-    let raw = match mean_interval_ms {
-        Some(mean) => safety_multiple * (heartbeat_ms as f64).max(mean),
-        None => knobs.fixed_ms as f64,
-    };
-    if !raw.is_finite() || raw <= 0.0 {
-        return Some(knobs.max_ms);
-    }
-    Some((raw as u64).clamp(knobs.min_ms, knobs.max_ms))
-}
-
-/// The `TelemetryTimeoutDecision` record: the phi estimate, now, the wait
-/// the loop had set before this tick, the wait it will set next.
+/// The `TelemetryTimeoutDecision` record: the local clock, the wait
+/// the loop had set before this re-arm, and the wait it will set next.
 pub fn timeout_decision_record(
     ns: u64,
-    phi: f64,
     now_ms: u64,
     prev_wait_ms: u64,
     next_wait_ms: u64,
 ) -> Record {
     let json = format!(
-        "{{\"phi\":{phi:.3},\"now_ms\":{now_ms},\"prev_wait_ms\":{prev_wait_ms},\
+        "{{\"now_ms\":{now_ms},\"prev_wait_ms\":{prev_wait_ms},\
          \"next_wait_ms\":{next_wait_ms}}}"
     );
     Record::telemetry(Marker::TelemetryTimeoutDecision, ns, json.as_bytes())

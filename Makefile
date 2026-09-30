@@ -38,10 +38,10 @@ TOOL_SOURCES = $(wildcard tools/lib/*.tl)
 # POSIX bin helpers carry no logic and still get the discipline: shellcheck
 # plus the client-signal behavioural smoke.
 SIGNAL_BIN := examples/lease-sequencer/bin
-# The example crate's bench feature shape (the phi + flight-recorder rig
+# The example crate's bench feature shape (the flight-recorder rig
 # lane). The lint gate runs the example crate in BOTH shapes.
 BENCH_DIR := examples/lease-sequencer
-BENCH_FEATURES := experimental-phi flight-recorder
+BENCH_FEATURES := flight-recorder
 
 .PHONY: init deps build check test smoke simulation simulation-test lunet-runtime docs clean ext ext-check ext-test example-check fmt lint hooks sh-check sh-smoke docker-build docker-simulation sanity release-images build-proof package package-verify bench
 
@@ -125,7 +125,7 @@ simulation-test: tools/lease_failover_sim.rs
 simulation: lunet-runtime build $(SIM_BIN)
 	SIM_ROOT=$(CURDIR) LUNET_RUN=$(abspath $(LUNET_RUN)) $(SIM_BIN) --duration $(SIM_DURATION)
 
-# The on-the-bench harness (docs/src/bench-harness.md): the phi +
+# The on-the-bench harness (docs/src/bench-harness.md): the
 # flight-recorder rig, three forked nodes on real UDP, the force-fed
 # store, and the CAS-chain oracle. The flight build wants a clean tree;
 # the bench's tapes are development artefacts, not release evidence, so
@@ -232,10 +232,10 @@ ext-check:
 	cargo clippy --manifest-path ext/paxe-core/Cargo.toml --all-targets -- -D warnings
 
 # The example crate is gated like the ext crates, in BOTH its feature
-# shapes: the default build and the bench build. The bench shape's
-# flight-recorder feature trips the AOF crate's clean-commit guard on a
-# development tree, so the line carries the bench target's override (a
-# clean CI checkout never trips the guard).
+# shapes: the default build and the flight-recorder bench build. The
+# bench shape's flight-recorder feature trips the AOF crate's clean-commit
+# guard on a development tree, so the line carries the bench target's
+# override (a clean CI checkout never trips the guard).
 example-check:
 	cargo fmt --manifest-path $(BENCH_DIR)/Cargo.toml -- --check
 	cargo clippy --manifest-path $(BENCH_DIR)/Cargo.toml --all-targets -- -D warnings

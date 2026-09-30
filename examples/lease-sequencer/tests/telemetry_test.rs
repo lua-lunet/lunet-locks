@@ -1,7 +1,7 @@
-//! The AOF lifecycle gate and the phi-informed timeout
-//! estimator: red/green tests for the weight-driven gate, the
-//! 1000 ms flusher's stop-when-off rule, the teardown record, the
-//! rollover's keep-exactly-two rule, and the phi wait derivation.
+//! The AOF lifecycle gate and the timeout-decision record: red/green
+//! tests for the weight-driven gate, the 1000 ms flusher's
+//! stop-when-off rule, the teardown record, and the rollover's
+//! keep-exactly-two rule.
 
 /// The gate starts ON (the boot Recovering/Joining phase always logs) and
 /// follows the node's voting weight: weight 0 or not-yet-a-member (None)
@@ -94,41 +94,8 @@ fn marker_bytes_table() {
         "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
     )
 }
-/// The sampled heartbeat arrival + learned interval lands as an
-/// IntervalSample record through the gated log (the exported phi-sample
-/// kind's evidence).
-#[test]
-fn interval_sample_record_passes_the_gate() {
-    panic!(
-        "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
-    )
-}
-/// The phi-informed wait: `safety * max(heartbeat, learned mean)`, clamped
-/// to the [min, max] knobs. A settled but fast sketch clamps UP to min.
-#[test]
-fn phi_wait_derivation_clamps_to_min() {
-    panic!(
-        "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
-    )
-}
-/// A slow learned interval above the max knob clamps DOWN to max.
-#[test]
-fn phi_wait_derivation_clamps_to_max() {
-    panic!(
-        "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
-    )
-}
-/// An unsettled sketch (<2 intervals: the caller passes None) falls back
-/// to the old fixed gate, clamped into [min, max] — never earlier than a
-/// settled phi allows, never later than the old fixed gate.
-#[test]
-fn phi_wait_unsettled_sketch_uses_the_clamped_fixed_gate() {
-    panic!(
-        "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
-    )
-}
 /// The decision record carries everything the failure-detection story
-/// needs: phi estimate, now, the previous wait, the next wait.
+/// needs: the local clock, the previous wait, the next wait.
 #[test]
 fn timeout_decision_record_fields() {
     panic!(

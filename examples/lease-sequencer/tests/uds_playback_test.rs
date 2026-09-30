@@ -38,15 +38,6 @@ fn given_the_recorded_heartbeat_get_reply_shape() {
         "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
     )
 }
-/// GIVEN a recorded Commit datagram with its phi trailer, EXPECT the
-/// trailer to decode with the era-4 leader-66 facts and a send clock at
-/// or before the receiving node's record clock.
-#[test]
-fn given_the_recorded_trailed_commit_the_phi_trailer_decodes() {
-    panic!(
-        "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
-    )
-}
 /// GIVEN a recorded SET re-delivered through the harness cluster (the
 /// same core, the UDS transport), EXPECT the fresh identity to be
 /// granted on the live node, and the re-delivery of the SAME op
