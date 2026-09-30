@@ -284,4 +284,67 @@ tested.test(
     end
 )
 
+tested.test(
+    "the voting floor refuses a descriptor that would run with fewer than three voting members",
+    function()
+        -- A descriptor id is the provisioned identity (system half << 16) | 1:
+        -- a non-zero system half, genesis life 1. Distinct system halves,
+        -- never recycled.
+        local function descriptor(genesis_rows: integer, learner_rows: integer): string
+            local lines: {string} = {}
+            for index = 1, genesis_rows + learner_rows do
+                local genesis = index <= genesis_rows
+                table.insert(
+                    lines,
+                    '{"id":'
+                        .. tostring(65536 * index + 1)
+                        .. ',"name":"n'
+                        .. tostring(index)
+                        .. '","host":"127.0.0.1","port":'
+                        .. tostring(7000 + index)
+                        .. ',"genesis":'
+                        .. tostring(genesis)
+                        .. "}"
+                )
+            end
+            return table.concat(lines, "\n")
+        end
+        -- `accepts` is the floor holding; its negation is the refusal.
+        local function accepts(genesis_rows: integer, learner_rows: integer): boolean
+            return not fails(
+                function(): boolean
+                    cluster_config.genesis_members(
+                        cluster_config.parse_jsonl(
+                            descriptor(genesis_rows, learner_rows)
+                        )
+                    )
+                    return true
+                end
+            )
+        end
+        tested.assert(
+            {
+                given = "descriptors of three, two, one and zero genesis rows, the last padded with a learner",
+                should = "accept three voting members and refuse every configuration that would run with fewer",
+                expected = "true:false:false:false",
+                actual = tostring(accepts(3, 0))
+                    .. ":"
+                    .. tostring(accepts(2, 0))
+                    .. ":"
+                    .. tostring(accepts(1, 0))
+                    .. ":"
+                    .. tostring(accepts(0, 1)),
+            }
+        )
+        tested.assert(
+            {
+                given = "a descriptor of two genesis rows padded out with weight-0 learners",
+                should = "count learners for nothing: two voters plus learners is still two voters",
+                expected = "false",
+                actual = tostring(accepts(2, 2)),
+            }
+        )
+    end
+)
+
 return tested

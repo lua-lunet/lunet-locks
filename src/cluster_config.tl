@@ -173,6 +173,18 @@ end
 -- The genesis succession: the descriptor's genesis lines, in line order.
 -- This is the founding membership every replica must carry identically and
 -- the order the core folds as the genesis configuration.
+--
+-- The ruling (docs/src/decisions.md): a cluster never runs with fewer than
+-- three VOTING members. In a descriptor the genesis flag IS the voting
+-- weight -- genesis lines fold at weight 1 and a post-genesis line is an
+-- addressing row at weight 0, contributing nothing to a quorum -- so the
+-- genesis count and the voting count are the same count here, and this one
+-- assert is the boot-time floor. A descriptor cannot express a demoted
+-- member, so the running floor is enforced where weights do exist: on the
+-- committed reconfiguration (the adapter's reconfigure guard) and in the
+-- membership model that records it (snapshot.tl's apply_change).
+local VOTING_MINIMUM: integer = 3
+
 local function genesis_members(nodes: {ClusterNode}): {ClusterNode}
     local genesis: {ClusterNode} = {}
     for _, node in ipairs(nodes) do
@@ -180,7 +192,12 @@ local function genesis_members(nodes: {ClusterNode}): {ClusterNode}
             table.insert(genesis, node)
         end
     end
-    assert(#genesis >= 3, "cluster_config: at least three genesis members are required")
+    assert(
+        #genesis >= VOTING_MINIMUM,
+        "cluster_config: at least "
+            .. tostring(VOTING_MINIMUM)
+            .. " genesis (voting) members are required; a cluster with fewer cannot commit a quorum"
+    )
     return genesis
 end
 

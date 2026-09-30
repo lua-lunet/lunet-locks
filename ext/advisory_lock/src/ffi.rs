@@ -1557,6 +1557,21 @@ impl Node {
             RECONFIGURE_LEAVE => SystemOperation::Leave(NodeId(member)),
             _ => return INVALID,
         };
+        // The deployment ruling (docs/src/decisions.md): a cluster never
+        // drops below three VOTING members. A departure (Leave) or a
+        // demotion (Decrement) that would is refused before it drives.
+        if matches!(op, RECONFIGURE_DECREMENT | RECONFIGURE_LEAVE) {
+            if let Some((ids, weights)) = self.membership() {
+                let voting = weights.iter().filter(|weight| **weight > 0).count();
+                let member_voting = ids
+                    .iter()
+                    .zip(&weights)
+                    .any(|(id, weight)| id.0 == member && *weight > 0);
+                if member_voting && voting <= 3 {
+                    return CONFIG;
+                }
+            }
+        }
         // The host's pivot policy (W5 is sizing; this is its transition
         // sibling): the non-stop overlap path is probed only for the
         // weight-moves it has been proven through. A membership change
@@ -3297,6 +3312,50 @@ mod tests {
         panic!("the two-node cluster did not settle inside the bound");
     }
 
+    /// Drive a system operation on whichever member currently leads, then
+    /// drive the cluster until every member's SERVING era has caught its
+    /// CONFIGURATION era. Returns the leader's return code; a refused
+    /// operation never drives and so never waits.
+    ///
+    /// The wait is the whole contract of a reconfiguration: a transition
+    /// is complete only once the view has entered the folded era, and an
+    /// operation driven inside a still-establishing era refuses with
+    /// `SERVICE` (`reconfigure`'s `POSITION_APPEND` fold at ffi.rs:1545
+    /// is the same shape of refusal). Waiting on the configuration era
+    /// alone is waiting on nothing — it advances the moment the
+    /// transition is proposed, not the moment it commits.
+    fn drive_on_leader(
+        nodes: &mut [&mut Node],
+        clock: &mut u64,
+        op: u32,
+        member: u32,
+        position: u32,
+    ) -> i32 {
+        let lead = nodes
+            .iter()
+            .position(|node| node.status().leader == node.own_id())
+            .expect("a member leads the settled cluster");
+        let code = nodes[lead].reconfigure(op, member, position);
+        if code != OK {
+            return code;
+        }
+        for _ in 0..1_000 {
+            *clock += 1;
+            for node in nodes.iter_mut() {
+                node.set_compliance_clock(*clock);
+                node.idle();
+            }
+            let _ = exchange_all(nodes, 64);
+            if nodes.iter().all(|node| {
+                let status = node.status();
+                status.state == 0 && status.era == status.config_era
+            }) {
+                break;
+            }
+        }
+        code
+    }
+
     /// The single-member descriptor: a one-node cluster elects its own
     /// leader, so every lifecycle shape is drivable alone.
     const MEMBERS_ONE: &str = "65537:n1";
@@ -4403,6 +4462,119 @@ mod tests {
                 .iter()
                 .all(|kind| *kind == OUTPUT_SEND || *kind == OUTPUT_REPLY),
             "every queued output carries kind 1 or 2"
+        );
+    }
+
+    /// The deployment ruling (docs/src/decisions.md): a cluster never
+    /// drops below three VOTING members. At three, a demotion and a
+    /// departure both refuse before they drive. The floor is a floor and
+    /// not a ceiling: a fourth member joins at weight zero, is promoted to
+    /// a fourth voter, and its demotion contracts the cluster back to
+    /// three — which drives, folds, and leaves the floor standing.
+    #[test]
+    fn reconfiguration_never_drops_below_three_voters() {
+        let dir = scratch("three-voter-floor");
+        const MEMBERS: &str = "65537:n1\x00131073:n2\x00196609:n3";
+        const JOINED: u32 = 262_145;
+        let mut n1 =
+            Node::open_compliance(MEMBERS, "n1", &dir.join("n1.state").to_string_lossy(), 50)
+                .expect("n1 boots");
+        let mut n2 =
+            Node::open_compliance(MEMBERS, "n2", &dir.join("n2.state").to_string_lossy(), 50)
+                .expect("n2 boots");
+        let mut n3 =
+            Node::open_compliance(MEMBERS, "n3", &dir.join("n3.state").to_string_lossy(), 50)
+                .expect("n3 boots");
+        let mut clock = 0u64;
+        let mut settled = false;
+        for _ in 0..1_000 {
+            clock += 1;
+            for node in [&mut n1, &mut n2, &mut n3] {
+                node.set_compliance_clock(clock);
+                node.idle();
+            }
+            let _ = exchange_all(&mut [&mut n1, &mut n2, &mut n3], 64);
+            if [&n1, &n2, &n3].iter().all(|node| {
+                let status = node.status();
+                status.state == 0 && status.era == status.config_era
+            }) {
+                settled = true;
+                break;
+            }
+        }
+        assert!(settled, "the three-member cluster settles");
+        // The floor. Both departure routes refuse before they drive, so
+        // the cluster stays at three voting members.
+        assert_eq!(
+            drive_on_leader(
+                &mut [&mut n1, &mut n2, &mut n3],
+                &mut clock,
+                RECONFIGURE_DECREMENT,
+                131_073,
+                0,
+            ),
+            CONFIG,
+            "the demotion of a voter at three is refused"
+        );
+        assert_eq!(
+            drive_on_leader(
+                &mut [&mut n1, &mut n2, &mut n3],
+                &mut clock,
+                RECONFIGURE_LEAVE,
+                131_073,
+                0,
+            ),
+            CONFIG,
+            "the departure of a voter at three is refused"
+        );
+        // The contraction. The join folds the fourth row at weight zero;
+        // the promotion makes it a fourth voter; the demotion takes the
+        // cluster back to three. Each transition waits for its era on all
+        // three live members before the next operation drives.
+        assert_eq!(
+            drive_on_leader(
+                &mut [&mut n1, &mut n2, &mut n3],
+                &mut clock,
+                RECONFIGURE_JOIN,
+                JOINED,
+                POSITION_APPEND,
+            ),
+            OK,
+            "the join of a fourth member drives"
+        );
+        assert_eq!(
+            drive_on_leader(
+                &mut [&mut n1, &mut n2, &mut n3],
+                &mut clock,
+                RECONFIGURE_INCREMENT,
+                JOINED,
+                0,
+            ),
+            OK,
+            "the promotion to a fourth voter drives"
+        );
+        assert_eq!(
+            drive_on_leader(
+                &mut [&mut n1, &mut n2, &mut n3],
+                &mut clock,
+                RECONFIGURE_DECREMENT,
+                JOINED,
+                0,
+            ),
+            OK,
+            "the contraction from four voters back to three drives"
+        );
+        // And the floor stands again on the contracted cluster.
+        assert_eq!(
+            drive_on_leader(
+                &mut [&mut n1, &mut n2, &mut n3],
+                &mut clock,
+                RECONFIGURE_DECREMENT,
+                131_073,
+                0,
+            ),
+            CONFIG,
+            "the floor holds after the contraction"
         );
     }
 

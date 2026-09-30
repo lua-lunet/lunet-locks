@@ -415,6 +415,25 @@ fn parse_config(path: &str) -> Vec<ClusterNode> {
     nodes
 }
 
+/// The deployment ruling (docs/src/decisions.md): a cluster never runs
+/// with fewer than three VOTING members. A genesis row is a voting
+/// member; a non-genesis hint row is a weight-0 learner and contributes
+/// nothing to a quorum, so it does not count toward the three.
+const VOTING_MINIMUM: usize = 3;
+
+/// The pure half of the boot refusal, unit-testable without a descriptor
+/// on disk: count the voting members and name the minimum when there are
+/// too few.
+fn check_voting_minimum(nodes: &[ClusterNode]) -> Result<(), String> {
+    let voting = nodes.iter().filter(|node| node.genesis).count();
+    if voting < VOTING_MINIMUM {
+        return Err(format!(
+            "lease-sequencer: the descriptor names {voting} voting members; the minimum is {VOTING_MINIMUM} (a cluster with fewer cannot commit a quorum)"
+        ));
+    }
+    Ok(())
+}
+
 /// The descriptor is a hint list of where the cluster is, not membership
 /// law. A name the descriptor carries boots exactly as before; a name it
 /// omits boots anyway as a weight-0 joining member whose identity comes
@@ -430,6 +449,7 @@ fn boot_nodes(nodes: Vec<ClusterNode>, options: &Options) -> Result<Vec<ClusterN
                 options.name
             ));
         }
+        check_voting_minimum(&nodes)?;
         return Ok(nodes);
     }
     if options.join_id == 0 || options.join_endpoint.is_empty() {
@@ -3150,6 +3170,72 @@ mod boot_hint_tests {
         panic!(
             "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
         )
+    }
+}
+
+#[cfg(test)]
+mod voting_minimum_tests {
+    //! The deployment ruling (docs/src/decisions.md): a descriptor naming
+    //! fewer than three VOTING members is refused at boot. The count is
+    //! over genesis rows only — a non-genesis hint row is a weight-0
+    //! learner and contributes nothing to a quorum, so a descriptor
+    //! padding its voting rows out with learners is still refused.
+
+    use super::{ClusterNode, check_voting_minimum};
+
+    fn row(id: u32, name: &str, genesis: bool) -> ClusterNode {
+        let port = u16::try_from(7000 + id).expect("the test port fits u16");
+        ClusterNode {
+            id,
+            endpoint: format!("127.0.0.1:{port}"),
+            genesis,
+            host: "127.0.0.1".to_string(),
+            name: name.to_string(),
+            port,
+        }
+    }
+
+    #[test]
+    fn two_voting_rows_are_refused_with_the_named_minimum() {
+        let nodes = vec![row(1, "n1", true), row(2, "n2", true)];
+        let error = check_voting_minimum(&nodes).expect_err("two voters cannot commit");
+        assert!(
+            error.contains("2 voting members") && error.contains("minimum is 3"),
+            "the error names the count and the minimum: {error}"
+        );
+    }
+
+    #[test]
+    fn a_single_voting_row_is_refused() {
+        let nodes = vec![row(1, "n1", true)];
+        assert!(check_voting_minimum(&nodes).is_err());
+    }
+
+    #[test]
+    fn three_voting_rows_are_accepted() {
+        let nodes = vec![row(1, "n1", true), row(2, "n2", true), row(3, "n3", true)];
+        assert_eq!(check_voting_minimum(&nodes), Ok(()));
+    }
+
+    #[test]
+    fn learners_do_not_count_toward_the_minimum() {
+        let nodes = vec![
+            row(1, "n1", true),
+            row(2, "n2", true),
+            row(3, "n3", false),
+            row(4, "n4", false),
+        ];
+        let error =
+            check_voting_minimum(&nodes).expect_err("two voters plus learners is two voters");
+        assert!(
+            error.contains("2 voting members"),
+            "the count excludes the weight-0 learners: {error}"
+        );
+    }
+
+    #[test]
+    fn a_singleton_descriptor_is_refused() {
+        assert!(check_voting_minimum(&[]).is_err());
     }
 }
 

@@ -88,6 +88,18 @@ consumption story.
 
 ## The ordering core
 
+A cluster runs at least three voting members. A singleton has no quorum to
+draw from and a two-node cluster's quorum is both of its members, so
+neither can survive the loss of a node and neither can serve a committed
+operation; three is the smallest configuration whose majority outlives any
+single member. Singleton and two-node descriptors are refused at boot, and
+a `decrement` or `leave` that would leave fewer than three voting members is
+refused when it is driven. The enforcement is best-effort and is checked at
+those two points — at boot on the descriptor, and at execution on the
+reconfiguration — so a configuration assembled by some other route is not
+re-derived against the floor. See
+[`docs/src/decisions.md`](docs/src/decisions.md).
+
 The core is vendored as the `ext/uvrr-core` git submodule, checked out on
 upstream main at tag `v0.7.4` (commit `e5b0a79`, released 2026-09-19): the
 lifecycle boot gate, the learner acquisition that lets a weight-0 member

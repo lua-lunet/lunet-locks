@@ -305,9 +305,47 @@ end
 -- idempotent), an increment promotes it to a voter, a decrement returns
 -- it to weight 0, and a leave removes it. Refused changes report false
 -- and touch nothing.
+--
+-- The ruling (docs/src/decisions.md): a cluster never runs with fewer than
+-- three VOTING members. A decrement of a voter and a leave of a voter are
+-- refused when they would leave fewer than three at positive weight. A
+-- member already at weight 0 is not a voter and its departure moves the
+-- count not at all, so it proceeds. This mirrors the adapter's reconfigure
+-- guard; the membership model records the floor for every path that
+-- reconfigures through the model.
+local VOTING_MINIMUM: integer = 3
+
+local function voting_members(members: {SnapshotMember}): integer
+    local voting = 0
+    for _, member in ipairs(members) do
+        if member.weight > 0 then
+            voting = voting + 1
+        end
+    end
+    return voting
+end
+
+local function crosses_the_floor(
+    members: {SnapshotMember}, action: string, id: integer
+): boolean
+    if action ~= "decrement" and action ~= "leave" then
+        return false
+    end
+    local is_voter = false
+    for _, member in ipairs(members) do
+        if member.id == id then
+            is_voter = member.weight > 0
+        end
+    end
+    return is_voter and voting_members(members) <= VOTING_MINIMUM
+end
+
 local function apply_change(
     members: {SnapshotMember}, action: string, id: integer, endpoint: string
 ): (boolean, {SnapshotMember})
+    if crosses_the_floor(members, action, id) then
+        return false, members
+    end
     local updated: {SnapshotMember} = {}
     local exists = false
     for _, member in ipairs(members) do
@@ -451,6 +489,8 @@ return {
     agreeing = agreeing,
     member_weight = member_weight,
     quorum_reached = quorum_reached,
+    voting_members = voting_members,
+    VOTING_MINIMUM = VOTING_MINIMUM,
     descriptor_model = descriptor_model,
     apply_change = apply_change,
     encode_sidecar = encode_sidecar,
