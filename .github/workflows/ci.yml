@@ -85,11 +85,10 @@ jobs:
       - uses: jdx/mise-action@v2
       # rustfmt + clippy are required by make ext-check and make
       # example-check (cargo fmt --check, cargo clippy); the default
-      # rust-toolchain profile omits them. The pin is the example crate's
-      # floor (its manifest's rust-version: let-chains in src/main.rs);
-      # the shipped crates keep their own lower floors in their
-      # manifests.
-      - uses: dtolnay/rust-toolchain@1.88
+      # rust-toolchain profile omits them. The pin is uvrr-core's floor
+      # (its manifest's rust-version = 1.96); the shipped crates keep
+      # their own lower floors in their manifests.
+      - uses: dtolnay/rust-toolchain@1.96
         with:
           components: rustfmt, clippy
       - name: Install project Lua tools
@@ -177,8 +176,8 @@ jobs:
       - uses: jdx/mise-action@v2
       # rustfmt + clippy are required by make ext-check (cargo fmt --check,
       # cargo clippy); the default rust-toolchain profile omits them. The
-      # pin matches the test job (the example crate's floor).
-      - uses: dtolnay/rust-toolchain@1.88
+      # pin matches the test job (uvrr-core's floor).
+      - uses: dtolnay/rust-toolchain@1.96
         with:
           components: rustfmt, clippy
       - name: Install project Lua tools
