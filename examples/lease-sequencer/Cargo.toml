@@ -2,7 +2,7 @@
 name = "lease-sequencer"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.88" # let-chains in src/main.rs; the shipped adapter crate stays at its 1.85 floor
+rust-version = "1.96" # uvrr-core 0.11.0's floor; let-chains in src/main.rs are older news
 
 # The test target: the integration tests link the pure modules (phi,
 # bridge, telemetry, embedded_client) through this thin lib facade over
