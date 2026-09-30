@@ -211,6 +211,8 @@ use crate::aof::{AofConfig, AofWriter};
 use crate::journal::{self, Journal as LockJournal, JournalEvent};
 use crate::locks::{Service, Transition};
 use crate::recovery_flush::{self, FlushOutcome, RecoveryFlush};
+#[cfg(any(test, debug_assertions))]
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{OsString, c_void};
 use std::fs::{self, File, OpenOptions};
@@ -282,6 +284,68 @@ macro_rules! maybe_invariant {
             ::tracing::warn!($($arg)*);
         }
     };
+}
+
+/// One lifecycle path line: the named census entry that a boot or stop path
+/// emits as it takes it. The observability contract's third clause — "the
+/// zero-cost `maybe!`/trace discipline logs every path the node takes
+/// through boot, drain, flush, and stop — a path that cannot show itself in
+/// the trace is a defect" — is carried here, alongside the
+/// [`maybe_invariant!`](crate::maybe_invariant) discipline it extends.
+///
+/// The convention, stated once and applied everywhere:
+///
+/// - A path's name is its stable identity: `<subject>.<verb>[.<qualifier>]`,
+///   lowercase, hyphenated. `boot.crashed`, `marker.read.corrupt`,
+///   `stop.drain-window.open`. The name never changes shape when the code
+///   around it moves, because the proving test asserts on it.
+/// - EVERY path through boot and through stop names itself, refusals
+///   included, with its own line. A refusal that shares another refusal's
+///   line is a path that cannot show itself.
+/// - The line costs nothing when the tape is not wanted. The expansion is a
+///   `#[cfg]`-gated call on a `&'static str`: a release build carries no
+///   tape, no push, and no formatting — the call site compiles to nothing
+///   rather than formatting and discarding.
+/// - The census tape is THREAD-LOCAL, not per node: a boot that REFUSES
+///   hands back no [`Node`], so a node-scoped tape could not carry the
+///   refusal paths at all. Thread-local is the granularity that works for
+///   both the node-bearing and the node-refusing paths, and it keeps
+///   concurrent callers' lines apart. [`crate::census_paths`] is the reader
+///   that drains it.
+///
+/// Unlike [`maybe_invariant!`] this is not a convention for downstream
+/// hosts: it names this adapter's own boot and stop paths.
+#[macro_export]
+macro_rules! trace_line {
+    ($path:expr) => {{
+        #[cfg(any(test, debug_assertions))]
+        $crate::census_push($path);
+    }};
+}
+
+// The lifecycle census tape: every named path line the calling thread
+// took, in order. Present in the test and dev profiles (the builds that
+// run the proving test and the cloud rigs); absent from a release build,
+// where `trace_line!` expands to nothing.
+#[cfg(any(test, debug_assertions))]
+std::thread_local! {
+    static LIFECYCLE_CENSUS: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Records one path line on the calling thread's census tape
+/// ([`trace_line!`]).
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+pub fn census_push(path: &'static str) {
+    LIFECYCLE_CENSUS.with_borrow_mut(|tape| tape.push(path));
+}
+
+/// The calling thread's census tape, drained: the lines it emitted since
+/// the last read, in emission order.
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+pub fn census_paths() -> Vec<&'static str> {
+    LIFECYCLE_CENSUS.with_borrow_mut(std::mem::take)
 }
 
 pub const OK: i32 = 0;
@@ -551,6 +615,7 @@ impl Node {
         };
         match crashed.latch(witness) {
             Ok(running) => {
+                trace_line!("boot.deferred-latch");
                 info!(
                     node = self.replica.own().0,
                     identity = running.identity().0,
@@ -559,6 +624,7 @@ impl Node {
                 self.session = Some(running);
             }
             Err((crashed, error)) => {
+                trace_line!("boot.deferred-latch-refused");
                 eprintln!(
                     "lunet-advisory-lock: the deferred latch write failed ({error:?}); \
                      the marker stays at the crashed identity and the latch retries"
@@ -1632,12 +1698,27 @@ impl Node {
     /// crashed — the purge's law: nothing vouches before the drain).
     /// SIGKILL takes none of this path: the running sentinel stays
     /// behind and the next boot classifies crashed.
+    ///
+    /// Every path below names itself on the lifecycle census tape
+    /// ([`trace_line!`]): the idempotent re-entry, the drain point, both
+    /// marker rounds, the drain window opening and closing, the unseated
+    /// window's drain, and every refusal arm.
     pub fn stop(&mut self) -> i32 {
         if self.stopped {
+            trace_line!("stop.idempotent");
             return OK;
         }
         // The drain point: the wire closes BEFORE any marker write.
         self.stopped = true;
+        trace_line!("stop.wire-closed");
+        #[cfg(feature = "flight-recorder")]
+        self.flight_log(
+            "stop",
+            serde_json::json!({
+                "path": "stop.wire-closed",
+                "node": self.replica.own().0,
+            }),
+        );
         info!(
             node = self.replica.own().0,
             "stop: the wire is closed, the in-memory state is final"
@@ -1645,8 +1726,18 @@ impl Node {
         let Some(session) = self.session.take() else {
             // The deferred window: no latched identity, no marker round.
             // The host still owes the durable sink drain.
+            trace_line!("stop.unseated");
+            #[cfg(feature = "flight-recorder")]
+            self.flight_log(
+                "stop",
+                serde_json::json!({
+                    "path": "stop.unseated",
+                    "node": self.replica.own().0,
+                }),
+            );
             let drained = drain_sink(&mut sink_guard(&self.sink));
             if let Err(error) = drained {
+                trace_line!("stop.refuse.unseated-drain");
                 eprintln!(
                     "lunet-advisory-lock: the stop drain failed ({error}); \
                            the markers hold the crash's evidence"
@@ -1664,6 +1755,7 @@ impl Node {
             );
             return OK;
         };
+        trace_line!("stop.round.begin");
         #[cfg(feature = "flight-recorder")]
         self.flight_log(
             "marker",
@@ -1678,6 +1770,7 @@ impl Node {
         let halting = match session.begin_stop() {
             Ok(halting) => halting,
             Err((_, error)) => {
+                trace_line!("stop.refuse.first-round");
                 eprintln!("lunet-advisory-lock: the stop's first marker round failed ({error:?})");
                 return SERVICE;
             }
@@ -1694,15 +1787,18 @@ impl Node {
             view: snapshot.view,
         };
         if let Err(error) = write_view_record(&self.state_path, &record) {
+            trace_line!("stop.refuse.drain-window");
             eprintln!(
                 "lunet-advisory-lock: the stop's view-record write failed ({error}); \
                         the markers hold the halt's first round"
             );
             return SERVICE;
         }
+        trace_line!("stop.drain-window.open");
         let draining = match halting.drain() {
             Ok(draining) => draining,
             Err((_, error)) => {
+                trace_line!("stop.refuse.drain");
                 eprintln!(
                     "lunet-advisory-lock: the stop drain failed ({error}); \
                            the marker stays at the first round"
@@ -1715,6 +1811,8 @@ impl Node {
                 return SERVICE;
             }
         };
+        trace_line!("stop.drain-window.close");
+        trace_line!("stop.round.finish");
         #[cfg(feature = "flight-recorder")]
         self.flight_log(
             "marker",
@@ -1725,9 +1823,11 @@ impl Node {
             }),
         );
         if let Err((_, error)) = draining.finish_stop() {
+            trace_line!("stop.refuse.second-round");
             eprintln!("lunet-advisory-lock: the stop's second marker round failed ({error:?})");
             return SERVICE;
         }
+        trace_line!("stop.complete");
         info!(
             node = self.replica.own().0,
             state = %self.state_path.display(),
@@ -2354,6 +2454,10 @@ struct BootDecision {
 /// next life must stay spellable through the packing's sixteen-bit
 /// counter half, so the boot refuses there exactly as the engine's
 /// checked bump refuses at exhaustion.
+///
+/// Every path below names itself on the lifecycle census tape
+/// ([`trace_line!`]), classification and refusal alike, and the proving
+/// test asserts each name against a fixture that reaches it.
 fn boot_gate(
     store: GateStore,
     system: SystemId,
@@ -2367,16 +2471,26 @@ fn boot_gate(
         CONFIG
     };
     match lifecycle::boot(store) {
-        Err((_, BootError::QuorumLost)) => Err(refuse(
-            "the marker set is torn beyond the quorum read".to_string(),
-        )),
-        Err((_, BootError::Exhausted(identity))) => Err(refuse(format!(
-            "the identity {identity:?} cannot be bumped"
-        ))),
-        Err((_, BootError::Store(error))) => Err(refuse(format!(
-            "the marker store refused the boot read: {error}"
-        ))),
+        Err((_, BootError::QuorumLost)) => {
+            trace_line!("boot.refuse.quorum-lost");
+            Err(refuse(
+                "the marker set is torn beyond the quorum read".to_string(),
+            ))
+        }
+        Err((_, BootError::Exhausted(identity))) => {
+            trace_line!("boot.refuse.exhausted");
+            Err(refuse(format!(
+                "the identity {identity:?} cannot be bumped"
+            )))
+        }
+        Err((_, BootError::Store(error))) => {
+            trace_line!("boot.refuse.store");
+            Err(refuse(format!(
+                "the marker store refused the boot read: {error}"
+            )))
+        }
         Ok(BootOutcome::First(first)) => {
+            trace_line!("boot.first");
             // The genesis pair: the descriptor's system half, the first
             // life's counter.
             let genesis = NodeId::new(
@@ -2386,9 +2500,11 @@ fn boot_gate(
             let session = match first.latch(genesis) {
                 Ok(session) => session,
                 Err((_, error)) => {
+                    trace_line!("boot.refuse.first-latch");
                     return Err(refuse(format!("the first latch write failed: {error}")));
                 }
             };
+            trace_line!("boot.first-latch");
             Ok(BootDecision {
                 session: Some(session),
                 deferred: None,
@@ -2400,16 +2516,23 @@ fn boot_gate(
             })
         }
         Ok(BootOutcome::Clean(clean)) => {
+            trace_line!("boot.clean");
             let identity = clean.identity();
             let restored = clean.store().view_record().map_err(|error| {
+                trace_line!("boot.refuse.view-record");
                 refuse(format!("the clean start's view record refused: {error}"))
             })?;
+            if restored.is_some() {
+                trace_line!("boot.restored-view");
+            }
             let (session, vouched) = match clean.latch() {
                 Ok(latched) => latched,
                 Err((_, error)) => {
+                    trace_line!("boot.refuse.clean-latch");
                     return Err(refuse(format!("the clean latch write failed: {error}")));
                 }
             };
+            trace_line!("boot.clean-latch");
             Ok(BootDecision {
                 session: Some(session),
                 deferred: None,
@@ -2421,9 +2544,11 @@ fn boot_gate(
             })
         }
         Ok(BootOutcome::Crashed(crashed)) => {
+            trace_line!("boot.crashed");
             let pair = match crashed.pair() {
                 Ok(pair) => pair,
                 Err(refusal) => {
+                    trace_line!("boot.refuse.pair");
                     return Err(refuse(format!("the replacement pair refused: {refusal:?}")));
                 }
             };
@@ -2434,15 +2559,24 @@ fn boot_gate(
             // bumped pair itself. A failed round refuses the boot: the
             // node is never half-announced.
             crashed.store().emission_gate(pair.new).map_err(|error| {
+                trace_line!("boot.refuse.emission-gate");
                 refuse(format!("the crash bump's marker write failed: {error}"))
             })?;
+            trace_line!("boot.emission-gate");
             let flush = match recovery {
                 None | Some((RecoveryFlush::Diskless, _)) => None,
                 Some((variant, scratch)) => Some(
-                    recovery_flush::execute(scratch, *variant, u64::from(pair.new.0))
-                        .map_err(|_| CONFIG)?,
+                    recovery_flush::execute(scratch, *variant, u64::from(pair.new.0)).map_err(
+                        |error| {
+                            trace_line!("boot.refuse.recovery-flush");
+                            refuse(format!("the recovery-boundary flush failed: {error}"))
+                        },
+                    )?,
                 ),
             };
+            if flush.is_some() {
+                trace_line!("boot.recovery-flush");
+            }
             Ok(BootDecision {
                 session: None,
                 deferred: Some(crashed),
@@ -2583,6 +2717,13 @@ fn node_from_sink(
     store_ctl: Option<&str>,
     construction: Construction,
 ) -> Result<Node, i32> {
+    // The descriptor's grammar refusals: one named path, every branch of
+    // it — the grammar is a single shape, so a violation is a single
+    // observation on the census tape.
+    let refused_descriptor = || {
+        trace_line!("boot.refuse.descriptor");
+        CONFIG
+    };
     // Member entries are "<u32-id>:<name>"; a post-genesis (joined)
     // entry is "<u32-id>:<name>:j". The plain-entry order is the
     // descriptor's genesis succession sequence and each id is the
@@ -2592,13 +2733,13 @@ fn node_from_sink(
         .map(parse_member_entry)
         .collect::<Option<Vec<_>>>()
     else {
-        return Err(CONFIG);
+        return Err(refused_descriptor());
     };
     let Ok(own) = std::str::from_utf8(own_data) else {
-        return Err(CONFIG);
+        return Err(refused_descriptor());
     };
     let Ok(state) = std::str::from_utf8(state_data) else {
-        return Err(CONFIG);
+        return Err(refused_descriptor());
     };
     if state.is_empty()
         || members.is_empty()
@@ -2607,7 +2748,7 @@ fn node_from_sink(
             .iter()
             .any(|member| member.name.is_empty() || !provisioned_identity(member.id))
     {
-        return Err(CONFIG);
+        return Err(refused_descriptor());
     }
     let mut unique_ids = members.iter().map(|member| member.id).collect::<Vec<_>>();
     unique_ids.sort_unstable();
@@ -2619,7 +2760,7 @@ fn node_from_sink(
     unique_names.sort();
     unique_names.dedup();
     if unique_ids.len() != members.len() || unique_names.len() != members.len() {
-        return Err(CONFIG);
+        return Err(refused_descriptor());
     }
     // The admin-assigned identity law: the descriptor's genesis (plain)
     // ids in buffer order are both the live NodeIds of the founding
@@ -2633,11 +2774,11 @@ fn node_from_sink(
         .map(|member| NodeId(member.id))
         .collect();
     let Some(own_member) = members.iter().find(|member| member.name == own) else {
-        return Err(CONFIG);
+        return Err(refused_descriptor());
     };
     let system = match SystemId::new((own_member.id >> SYSTEM_HALF_SHIFT) as u16) {
         Some(system) => system,
-        None => return Err(CONFIG),
+        None => return Err(refused_descriptor()),
     };
     let knobs = ViewChangeKnobs {
         primary_timeout: construction.primary_timeout,
@@ -2672,6 +2813,7 @@ fn node_from_sink(
             match GateStore::mem(Path::new(ctl), Arc::clone(&sink), Arc::clone(&marker_log)) {
                 Ok(store) => store,
                 Err(error) => {
+                    trace_line!("boot.refuse.store-control");
                     eprintln!(
                         "lunet-advisory-lock: the bench store control socket is not \
                      reachable ({error}); the boot refuses"
@@ -2776,12 +2918,21 @@ fn node_from_sink(
     // is no durable journal to carry forward) — fenced until the stream
     // proves currency; only the FIRST life of a founding member
     // provisions the genesis itself.
+    // Every later life reopens over the deployment's genesis; the era
+    // table that genesis folds cannot be built for a descriptor the
+    // grammar already accepted.
+    let refused_genesis = || {
+        trace_line!("boot.refuse.genesis");
+        CONFIG
+    };
     let replica = if let Some(pair) = decision.pair {
         // The crashed classification: `Replica::reincarnate` behind the
         // engine's `Bumped` pair. The durable bump defers — the marker
         // machine latches the new identity only once the engine's seated
         // observation mints the witness.
-        let (journal, persisted, config) = joiner_parts(genesis_order)?;
+        let (journal, persisted, config) =
+            joiner_parts(genesis_order).map_err(|_| refused_genesis())?;
+        trace_line!("boot.reincarnate");
         Replica::reincarnate(
             pair,
             own_id,
@@ -2803,9 +2954,11 @@ fn node_from_sink(
         // post-reconfiguration era is not reconstructible and the boot
         // refuses rather than resuming over a table that cannot name
         // the view.
-        let (journal, mut persisted, config) = joiner_parts(genesis_order)?;
+        let (journal, mut persisted, config) =
+            joiner_parts(genesis_order).map_err(|_| refused_genesis())?;
         if let Some(record) = decision.restored {
             if record.era != config.current().era.0 {
+                trace_line!("boot.refuse.view-era");
                 eprintln!(
                     "lunet-advisory-lock: the boot gate refuses to start \
                      (the clean start's view record names era {}, which the \
@@ -2822,6 +2975,7 @@ fn node_from_sink(
             persisted.current = ballot;
             persisted.retained = ballot;
         }
+        trace_line!("boot.resume");
         Replica::resume(
             vouched,
             own_id,
@@ -2835,7 +2989,9 @@ fn node_from_sink(
     } else if own_member.joined {
         // A post-genesis member's first life: `Replica::join` over the
         // deployment's genesis, fenced until the stream proves currency.
-        let (journal, persisted, config) = joiner_parts(genesis_order)?;
+        let (journal, persisted, config) =
+            joiner_parts(genesis_order).map_err(|_| refused_genesis())?;
+        trace_line!("boot.join");
         Replica::join(
             own_id,
             WeightedMajority,
@@ -2847,6 +3003,7 @@ fn node_from_sink(
         )
     } else {
         // The first life of a founding member: the genesis provision.
+        trace_line!("boot.provision");
         Replica::provision(
             own_id,
             genesis_order,
@@ -2856,7 +3013,10 @@ fn node_from_sink(
             knobs,
         )
     }
-    .map_err(|_| CONFIG)?;
+    .map_err(|_| {
+        trace_line!("boot.refuse.constructor");
+        CONFIG
+    })?;
     let node = Node {
         replica,
         outputs: VecDeque::new(),
@@ -3434,6 +3594,233 @@ mod tests {
             .clone()
     }
 
+    // --------------------------------------------------------------
+    // The lifecycle path census.
+    //
+    // `CENSUS` is the declared list of every path through boot and
+    // through stop. Two laws hold it honest, and both are asserted:
+    //
+    // - `every_declared_census_path_is_named_by_the_code` scans the
+    //   adapter's own sources for every `trace_line!` emission and
+    //   demands the scanned set and the declared set be EQUAL. A new
+    //   path that forgets to declare itself fails; a declared path that
+    //   no code emits fails.
+    // - `every_boot_path_shows_itself` and `every_stop_path_shows_itself`
+    //   drive a fixture per reachable path and assert the line came off
+    //   the tape, then demand that their slice of the census was fully
+    //   covered. A declared path no fixture reaches is a FAILING
+    //   assertion, never a skipped one — the paths that no fixture in
+    //   this tree can reach are listed by name in
+    //   `CENSUS_UNREACHABLE`, which the same coverage assertion names in
+    //   its failure message so a newly-unreachable path is impossible to
+    //   miss.
+    // --------------------------------------------------------------
+
+    /// Every lifecycle path name the adapter declares it takes.
+    const CENSUS: &[&str] = &[
+        // The store's read verdicts.
+        "marker.read.absent",
+        "marker.read.projection",
+        "marker.read.quorum",
+        "marker.read.cross-system",
+        "marker.read.projection-refused",
+        "marker.read.corrupt",
+        "marker.read.incompatible",
+        "marker.read.torn",
+        "marker.write.corrupt",
+        // The boot gate's classifications and latch rounds.
+        "boot.first",
+        "boot.first-latch",
+        "boot.clean",
+        "boot.clean-latch",
+        "boot.restored-view",
+        "boot.crashed",
+        "boot.emission-gate",
+        "boot.deferred-latch",
+        "boot.deferred-latch-refused",
+        // The recovery boundary's flush.
+        "boot.recovery-flush",
+        // The constructor the classification chose.
+        "boot.provision",
+        "boot.join",
+        "boot.resume",
+        "boot.reincarnate",
+        // The boot gate's refusals.
+        "boot.refuse.quorum-lost",
+        "boot.refuse.exhausted",
+        "boot.refuse.store",
+        "boot.refuse.pair",
+        "boot.refuse.first-latch",
+        "boot.refuse.clean-latch",
+        "boot.refuse.view-record",
+        "boot.refuse.view-era",
+        "boot.refuse.emission-gate",
+        "boot.refuse.recovery-flush",
+        "boot.refuse.genesis",
+        "boot.refuse.constructor",
+        "boot.refuse.descriptor",
+        "boot.refuse.store-control",
+        // The stop schedule.
+        "stop.idempotent",
+        "stop.wire-closed",
+        "stop.round.begin",
+        "stop.drain-window.open",
+        "stop.drain-window.close",
+        "stop.round.finish",
+        "stop.complete",
+        "stop.unseated",
+        "stop.refuse.first-round",
+        "stop.refuse.drain-window",
+        "stop.refuse.drain",
+        "stop.refuse.second-round",
+        "stop.refuse.unseated-drain",
+    ];
+
+    /// The census paths whose lines exist and are emitted, but which NO
+    /// fixture in this tree can reach — each one an arm the shape of the
+    /// store or the pinned core makes unreachable, named here so the
+    /// coverage assertion below can say so rather than counting them as
+    /// covered. An entry moves out of this list the day a fixture reaches
+    /// its path.
+    const CENSUS_UNREACHABLE: &[&str] = &[
+        // The Zig store refuses INCOMPATIBLE only on a checksum-valid
+        // copy carrying a foreign format version; `marker::write` stamps
+        // the current version, so no fixture can produce one.
+        "marker.read.incompatible",
+        // The write path's CORRUPT is a foreign system half on the
+        // write's read-back: the state file's system cannot change
+        // between the boot read and the write in one thread.
+        "marker.write.corrupt",
+        // `GateStore::read_copies` hands the engine a UNIFORM 4x
+        // `SuperblockCopies` or refuses outright, so the engine's
+        // `QuorumLost` verdict never arises on this store.
+        "boot.refuse.quorum-lost",
+        // `vrr::lifecycle::boot` (uvrr-core bef2d42) returns only
+        // `QuorumLost` or `Store`; `BootError::Exhausted` is produced
+        // only by the deferred latch, which `settle_deferred_latch`
+        // handles.
+        "boot.refuse.exhausted",
+        // The deployment's genesis era table cannot fail to build for a
+        // descriptor the grammar already accepted (distinct ids, at most
+        // MAX_MEMBERS).
+        "boot.refuse.genesis",
+        // The four core constructors accept the genesis the adapter
+        // builds.
+        "boot.refuse.constructor",
+        // The deferred latch's refusal needs an exhausted crash counter
+        // AND a seated witness on the same boot; the counter refuses
+        // earlier, at `crashed.pair()`.
+        "boot.deferred-latch-refused",
+        // The two halt rounds are the same write, so no fixture makes the
+        // second fail and not the first.
+        "stop.refuse.second-round",
+        // A sink-drain failure needs a fault-injection seam the host
+        // does not carry: the AOF writer drains through an already-open
+        // handle and the blocking journal's flush is an `fsync` on one.
+        "stop.refuse.drain",
+        "stop.refuse.unseated-drain",
+    ];
+
+    /// The census tape as this fixture sees it: every line the thread
+    /// emitted since the fixture's last read, accumulated (the reader
+    /// drains, so each drain is folded in here before the next assertion).
+    #[derive(Default)]
+    struct Tape(Vec<&'static str>);
+
+    impl Tape {
+        /// Drains the thread's census tape into this fixture's view.
+        fn take(&mut self) {
+            self.0.extend(crate::census_paths());
+        }
+
+        /// Asserts `path` was taken, and records it as covered.
+        fn assert_path(&mut self, covered: &mut Vec<&'static str>, path: &'static str) {
+            self.take();
+            assert!(
+                self.0.contains(&path),
+                "the census tape carries no `{path}` line; this fixture saw {:?}",
+                self.0
+            );
+            covered.push(path);
+        }
+    }
+
+    /// Demands every declared path in `declared` either was asserted by a
+    /// fixture or is named in `CENSUS_UNREACHABLE` — a path that is
+    /// neither is a census entry nobody proved and nobody explained.
+    fn assert_census_covered(declared: &[&'static str], covered: &[&'static str]) {
+        let missing: Vec<&str> = declared
+            .iter()
+            .copied()
+            .filter(|path| !covered.contains(path) && !CENSUS_UNREACHABLE.contains(path))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "every declared path needs a fixture that reaches it or an entry in the \\
+             unreachable list; these have neither: {missing:?}"
+        );
+        for path in covered {
+            assert!(
+                declared.contains(path),
+                "the fixture asserted `{path}`, which the census does not declare"
+            );
+            assert!(
+                !CENSUS_UNREACHABLE.contains(path),
+                "the fixture reached `{path}`, which the unreachable list claims no fixture \\
+                 can reach — delete it from that list"
+            );
+        }
+    }
+
+    /// The adapter's own sources are the census's ground truth: every
+    /// `trace_line!` emission, named. Scanned at compile time from the
+    /// two files that carry the boot and stop paths.
+    #[test]
+    fn every_declared_census_path_is_named_by_the_code() {
+        // The needle is assembled at run time so this scanner's own source
+        // does not contain a literal emission.
+        let needle = ["trace_line", "!(", "\""].concat();
+        let sources = [include_str!("ffi.rs"), include_str!("marker_store.rs")];
+        let mut emitted: Vec<&str> = Vec::new();
+        for source in sources {
+            let mut cursor = 0;
+            while let Some(found) = source[cursor..].find(&needle) {
+                let begin = cursor + found + needle.len();
+                let end = begin
+                    + source[begin..]
+                        .find('"')
+                        .expect("every emission's name is closed");
+                emitted.push(&source[begin..end]);
+                cursor = end + 1;
+            }
+        }
+        emitted.sort_unstable();
+        emitted.dedup();
+        let mut declared = CENSUS.to_vec();
+        declared.sort_unstable();
+        let undeclared: Vec<&str> = emitted
+            .iter()
+            .copied()
+            .filter(|path| !declared.contains(path))
+            .collect();
+        let unemitted: Vec<&str> = declared
+            .iter()
+            .copied()
+            .filter(|path| !emitted.contains(path))
+            .collect();
+        assert!(
+            undeclared.is_empty() && unemitted.is_empty(),
+            "the census and the code must be the same set; the code names but the census \
+             does not declare {undeclared:?}, the census declares but no code emits \
+             {unemitted:?}"
+        );
+        let unreachable: Vec<&str> = CENSUS_UNREACHABLE.to_vec();
+        assert!(
+            unreachable.iter().all(|path| declared.contains(path)),
+            "the unreachable list names a path the census does not declare"
+        );
+    }
+
     /// The first life anchors the genesis pair (the descriptor's system
     /// half, crash counter 1) and the boot itself emits nothing; after a
     /// crash (the drop without the stop contract) the NEXT boot's decided
@@ -3547,6 +3934,610 @@ mod tests {
             65_539,
             "the next boot derives the next life"
         );
+    }
+
+    /// Makes the scratch directory read-only, so the store's create-shaped
+    /// writes (the projection's temp+rename, the superblock's first write)
+    /// fail while its reads still succeed. The obstruction that reaches the
+    /// latch, emission-gate, and halt-round refusal arms.
+    #[cfg(unix)]
+    fn seal(dir: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o500)).expect("the directory seals");
+    }
+
+    /// Every boot path shows itself: one fixture per reachable path in the
+    /// census, each asserted against the tape the path wrote. Refusals are
+    /// first-class — a refused boot hands back no node, which is exactly
+    /// why the census tape is thread-local rather than node-scoped.
+    #[test]
+    fn every_boot_path_shows_itself() {
+        let mut covered: Vec<&'static str> = Vec::new();
+        let mut tape = Tape::default();
+
+        // --- the first life: nothing durable anywhere ------------------
+        tape.take();
+        {
+            let dir = scratch("census-first");
+            let state = dir.join("node.state");
+            let node = one_node_compliance(&state);
+            assert_eq!(node.own_id(), GENESIS_ID);
+            for path in [
+                "marker.read.absent",
+                "boot.first",
+                "boot.first-latch",
+                "boot.provision",
+            ] {
+                tape.assert_path(&mut covered, path);
+            }
+        }
+
+        // --- the clean continue: a stopped quorum, view record restored -
+        tape.take();
+        {
+            let dir = scratch("census-clean");
+            let state = dir.join("node.state");
+            let mut node = one_node_compliance(&state);
+            settle(&mut node);
+            assert_eq!(node.stop(), OK);
+            tape.take();
+            let resumed = one_node_compliance(&state);
+            assert_eq!(resumed.own_id(), GENESIS_ID);
+            for path in [
+                "marker.read.quorum",
+                "boot.clean",
+                "boot.clean-latch",
+                "boot.restored-view",
+                "boot.resume",
+            ] {
+                tape.assert_path(&mut covered, path);
+            }
+        }
+
+        // --- the crashed boot: the emission gate, then the latch -------
+        tape.take();
+        {
+            let dir = scratch("census-crashed");
+            let state = dir.join("node.state");
+            let mut life_one = one_node_compliance(&state);
+            settle(&mut life_one);
+            drop(life_one); // the crash: the running sentinel stands
+            tape.take();
+            let life_two = one_node_compliance(&state);
+            assert_eq!(life_two.own_id(), 65_538);
+            for path in [
+                "marker.read.quorum",
+                "boot.crashed",
+                "boot.emission-gate",
+                "boot.reincarnate",
+            ] {
+                tape.assert_path(&mut covered, path);
+            }
+        }
+
+        // --- the unseated window closes when the engine seats: the
+        // deferred latch lands the emission gate's round again ----------
+        tape.take();
+        {
+            let dir = scratch("census-deferred-latch");
+            const TRIAD: &str = "65537:n1\x00131073:n2\x00196609:n3";
+            const RISEN: u32 = 196_610;
+            let mut leader =
+                Node::open_compliance(TRIAD, OWN_ONE, &dir.join("n1.state").to_string_lossy(), 50)
+                    .expect("the leader boots");
+            let mut second =
+                Node::open_compliance(TRIAD, "n2", &dir.join("n2.state").to_string_lossy(), 50)
+                    .expect("the second boots");
+            let mut third =
+                Node::open_compliance(TRIAD, "n3", &dir.join("n3.state").to_string_lossy(), 50)
+                    .expect("the third boots");
+            let mut clock = 0u64;
+            let mut served = false;
+            for _ in 0..1_000 {
+                clock += 1;
+                for node in [&mut leader, &mut second, &mut third] {
+                    node.set_compliance_clock(clock);
+                    node.idle();
+                }
+                let _ = exchange_all(&mut [&mut leader, &mut second, &mut third], 64);
+                if [&leader, &second, &third]
+                    .iter()
+                    .all(|node| node.status().state == 0)
+                {
+                    served = true;
+                    break;
+                }
+            }
+            assert!(served, "the triad serves");
+            drop(third); // the crash: the running sentinel is the evidence
+            tape.take();
+            let mut risen =
+                Node::open_compliance(TRIAD, "n3", &dir.join("n3.state").to_string_lossy(), 50)
+                    .expect("the crashed member reopens");
+            assert_eq!(risen.own_id(), RISEN, "the strict next life of system 3");
+            // The leader takes the entry ticket, then drives the forced
+            // walk until the new life sits at weight 1 — the seat is what
+            // mints the witness the deferred latch needs.
+            clock += 1;
+            risen.set_compliance_clock(clock);
+            assert_eq!(risen.recover(), OK, "the announcement drives");
+            let mut leader_copy = None;
+            while let Some(output) = risen.next_output() {
+                if output.to == 65_537 {
+                    leader_copy = Some(output.bytes);
+                }
+            }
+            assert!(
+                leader_copy.is_some(),
+                "the (old, new) pair is announced to the leader"
+            );
+            assert_eq!(
+                leader.receive(RISEN, &leader_copy.expect("the leader's copy")),
+                OK,
+                "the leader takes the ticket"
+            );
+            let mut seated = false;
+            for _ in 0..4_000 {
+                clock += 1;
+                for node in [&mut leader, &mut second, &mut risen] {
+                    node.set_compliance_clock(clock);
+                    node.idle();
+                }
+                let _ = exchange_all(&mut [&mut leader, &mut second, &mut risen], 64);
+                if risen.voting_weight() != Some(1) {
+                    risen.set_compliance_clock(clock);
+                    risen.recover();
+                }
+                if risen.voting_weight() == Some(1) && risen.status().state == 0 {
+                    seated = true;
+                    break;
+                }
+            }
+            assert!(seated, "the forced walk seats the new life");
+            tape.assert_path(&mut covered, "boot.deferred-latch");
+        }
+
+        // --- the copy-free projection: clean and crashed spellings -----
+        for (name, line, expected) in [
+            ("projection-clean", "1 1 flushed\n", GENESIS_ID),
+            ("projection-crashed", "1 1 unflushed\n", 65_538),
+        ] {
+            tape.take();
+            let dir = scratch(name);
+            let state = dir.join("node.state");
+            fs::write(&state, line).expect("the projection writes");
+            let node = Node::open_compliance(MEMBERS_ONE, OWN_ONE, &state.to_string_lossy(), 50)
+                .expect("the migrating boot");
+            assert_eq!(node.own_id(), expected);
+            tape.assert_path(&mut covered, "marker.read.projection");
+            if expected == GENESIS_ID {
+                tape.assert_path(&mut covered, "boot.clean");
+                tape.assert_path(&mut covered, "boot.resume");
+            } else {
+                tape.assert_path(&mut covered, "boot.crashed");
+                tape.assert_path(&mut covered, "boot.emission-gate");
+                tape.assert_path(&mut covered, "boot.reincarnate");
+            }
+        }
+
+        // --- the joiner: a post-genesis member's first life ------------
+        tape.take();
+        {
+            let dir = scratch("census-joiner");
+            Node::open_compliance(
+                MEMBERS_THREE_J,
+                "n3",
+                &dir.join("n3.state").to_string_lossy(),
+                50,
+            )
+            .expect("the joiner boots");
+            tape.assert_path(&mut covered, "boot.join");
+        }
+
+        // --- the descriptor's grammar ---------------------------------
+        tape.take();
+        {
+            let dir = scratch("census-descriptor");
+            let state = dir.join("node.state");
+            assert_eq!(
+                Node::open_compliance("65537", OWN_ONE, &state.to_string_lossy(), 50).err(),
+                Some(CONFIG)
+            );
+            tape.assert_path(&mut covered, "boot.refuse.descriptor");
+        }
+
+        // --- the bench store's control socket is unreachable ----------
+        tape.take();
+        #[cfg(unix)]
+        {
+            let dir = scratch("census-store-control");
+            assert_eq!(
+                Node::open_bench(
+                    MEMBERS_ONE,
+                    OWN_ONE,
+                    None,
+                    0,
+                    &dir.join("absent.sock").to_string_lossy(),
+                )
+                .err(),
+                Some(CONFIG),
+                "an unreachable control socket refuses the boot"
+            );
+            tape.assert_path(&mut covered, "boot.refuse.store-control");
+        }
+
+        // --- the store's read verdicts, one fixture each --------------
+        let store_cases: &[(&str, &str, &str)] = &[
+            (
+                "projection-refused",
+                "not a marker line\n",
+                "marker.read.projection-refused",
+            ),
+            (
+                "cross-system",
+                "2 1 unflushed\n",
+                "marker.read.cross-system",
+            ),
+        ];
+        for (name, line, verdict) in store_cases {
+            tape.take();
+            let dir = scratch(&format!("census-{name}"));
+            let state = dir.join("node.state");
+            fs::write(&state, *line).expect("the projection writes");
+            assert_eq!(
+                Node::open_compliance(MEMBERS_ONE, OWN_ONE, &state.to_string_lossy(), 50).err(),
+                Some(CONFIG),
+                "the {name} projection refuses the boot"
+            );
+            tape.assert_path(&mut covered, verdict);
+            tape.assert_path(&mut covered, "boot.refuse.store");
+        }
+
+        // --- the torn quorum: below the read threshold ----------------
+        tape.take();
+        {
+            let dir = scratch("census-torn");
+            let state = dir.join("node.state");
+            let mut node = one_node_compliance(&state);
+            settle(&mut node);
+            assert_eq!(node.stop(), OK);
+            let record = superblock_of(&state);
+            let full = fs::read(&record).expect("the store reads");
+            let zone = full.len() / marker::geometry().expect("the geometry reports").copies;
+            fs::write(&record, &full[..zone + zone / 2]).expect("the tear writes");
+            tape.take();
+            assert_eq!(
+                Node::open_compliance(MEMBERS_ONE, OWN_ONE, &state.to_string_lossy(), 50).err(),
+                Some(CONFIG),
+                "a torn quorum refuses the boot"
+            );
+            tape.assert_path(&mut covered, "marker.read.torn");
+            tape.assert_path(&mut covered, "boot.refuse.store");
+        }
+
+        // --- the rotted copy: the boot-read safety law's PANIC --------
+        tape.take();
+        {
+            let dir = scratch("census-corrupt");
+            let state = dir.join("node.state");
+            let mut node = one_node_compliance(&state);
+            settle(&mut node);
+            assert_eq!(node.stop(), OK);
+            let record = superblock_of(&state);
+            let before = fs::read(&record).expect("the store reads");
+            let zone = before.len() / marker::geometry().expect("the geometry reports").copies;
+            let mut rotted = before.clone();
+            for byte in &mut rotted[2 * zone..3 * zone] {
+                *byte = 0xA5;
+            }
+            fs::write(&record, &rotted).expect("the rot writes");
+            tape.take();
+            assert_eq!(
+                Node::open_compliance(MEMBERS_ONE, OWN_ONE, &state.to_string_lossy(), 50).err(),
+                Some(PANIC),
+                "a rotted copy panics the boot"
+            );
+            tape.assert_path(&mut covered, "marker.read.corrupt");
+        }
+
+        // --- the exhausted crash counter: the replacement pair ---------
+        tape.take();
+        {
+            let dir = scratch("census-exhausted");
+            let state = dir.join("node.state");
+            marker::write(
+                &superblock_of(&state),
+                marker::NodeIdentity::new(1, u16::MAX).expect("the ceiling pair spells"),
+                marker::MarkerState::Unflushed,
+            )
+            .expect("the ceiling round writes");
+            assert_eq!(
+                Node::open_compliance(MEMBERS_ONE, OWN_ONE, &state.to_string_lossy(), 50).err(),
+                Some(CONFIG),
+                "the ceiling identity refuses the boot"
+            );
+            tape.assert_path(&mut covered, "boot.refuse.pair");
+        }
+
+        // --- the clean start's view record is unreadable --------------
+        tape.take();
+        {
+            let dir = scratch("census-view-record");
+            let state = dir.join("node.state");
+            let mut node = one_node_compliance(&state);
+            settle(&mut node);
+            assert_eq!(node.stop(), OK);
+            fs::write(view_record_path(&state), "not a record\n").expect("the view record rots");
+            tape.take();
+            assert_eq!(
+                Node::open_compliance(MEMBERS_ONE, OWN_ONE, &state.to_string_lossy(), 50).err(),
+                Some(CONFIG),
+                "an unreadable view record refuses the boot"
+            );
+            tape.assert_path(&mut covered, "boot.refuse.view-record");
+        }
+
+        // --- the recovery boundary's flush, run and refused -----------
+        tape.take();
+        {
+            let dir = scratch("census-flush");
+            let state = dir.join("node.state");
+            let mut life_one = one_node_compliance(&state);
+            settle(&mut life_one);
+            drop(life_one);
+            tape.take();
+            let node = Node::open_with_recovery_flush(
+                MEMBERS_ONE,
+                OWN_ONE,
+                &state.to_string_lossy(),
+                None,
+                0,
+                RecoveryFlush::SingleBlock,
+                &dir.join("scratch").to_string_lossy(),
+            )
+            .expect("the flushed recovery boundary boots");
+            tape.assert_path(&mut covered, "boot.recovery-flush");
+            drop(node);
+        }
+        tape.take();
+        {
+            let dir = scratch("census-flush-refused");
+            let state = dir.join("node.state");
+            let mut life_one = one_node_compliance(&state);
+            settle(&mut life_one);
+            drop(life_one);
+            let blocked = dir.join("not-a-directory");
+            fs::write(&blocked, "the scratch path is a file\n").expect("the obstruction writes");
+            tape.take();
+            assert_eq!(
+                Node::open_with_recovery_flush(
+                    MEMBERS_ONE,
+                    OWN_ONE,
+                    &state.to_string_lossy(),
+                    None,
+                    0,
+                    RecoveryFlush::SingleBlock,
+                    &blocked.to_string_lossy(),
+                )
+                .err(),
+                Some(CONFIG),
+                "a failed recovery-boundary flush refuses the boot"
+            );
+            tape.assert_path(&mut covered, "boot.refuse.recovery-flush");
+        }
+
+        // --- the view record names an era the genesis table cannot ----
+        tape.take();
+        {
+            let dir = scratch("census-view-era");
+            const TRIAD: &str = "65537:n1\x00131073:n2\x00196609:n3";
+            const JOINED: u32 = 262_145;
+            let mut n1 =
+                Node::open_compliance(TRIAD, "n1", &dir.join("n1.state").to_string_lossy(), 50)
+                    .expect("n1 boots");
+            let mut n2 =
+                Node::open_compliance(TRIAD, "n2", &dir.join("n2.state").to_string_lossy(), 50)
+                    .expect("n2 boots");
+            let mut n3 =
+                Node::open_compliance(TRIAD, "n3", &dir.join("n3.state").to_string_lossy(), 50)
+                    .expect("n3 boots");
+            let mut clock = 0u64;
+            let mut settled = false;
+            for _ in 0..1_000 {
+                clock += 1;
+                for node in [&mut n1, &mut n2, &mut n3] {
+                    node.set_compliance_clock(clock);
+                    node.idle();
+                }
+                let _ = exchange_all(&mut [&mut n1, &mut n2, &mut n3], 64);
+                if [&n1, &n2, &n3].iter().all(|node| {
+                    let status = node.status();
+                    status.state == 0 && status.era == status.config_era
+                }) {
+                    settled = true;
+                    break;
+                }
+            }
+            assert!(settled, "the triad settles");
+            assert_eq!(
+                drive_on_leader(
+                    &mut [&mut n1, &mut n2, &mut n3],
+                    &mut clock,
+                    RECONFIGURE_JOIN,
+                    JOINED,
+                    POSITION_APPEND,
+                ),
+                OK,
+                "the join folds a fourth row and the era advances"
+            );
+            assert_eq!(n1.status().era, 2, "the fold established era 2");
+            assert_eq!(n1.stop(), OK, "the drain window writes the era-2 ballot");
+            let state = dir.join("n1.state");
+            assert_eq!(
+                fs::read_to_string(view_record_path(&state)).expect("the view record reads"),
+                "2 1\n"
+            );
+            tape.take();
+            assert_eq!(
+                Node::open_compliance(TRIAD, "n1", &state.to_string_lossy(), 50).err(),
+                Some(CONFIG),
+                "a view record naming an era the genesis table cannot is refused"
+            );
+            tape.assert_path(&mut covered, "boot.refuse.view-era");
+        }
+
+        // --- the store's write refusals, three arms --------------------
+        #[cfg(unix)]
+        {
+            // The first latch: the read found nothing, the write cannot
+            // create.
+            tape.take();
+            let dir = scratch("census-first-latch");
+            let state = dir.join("node.state");
+            seal(&dir);
+            let refused =
+                Node::open_compliance(MEMBERS_ONE, OWN_ONE, &state.to_string_lossy(), 50).err();
+            assert_eq!(refused, Some(CONFIG), "the first latch write is refused");
+            tape.assert_path(&mut covered, "boot.refuse.first-latch");
+        }
+        #[cfg(unix)]
+        {
+            // The clean latch: the projection read, the routed write
+            // cannot create the copies.
+            tape.take();
+            let dir = scratch("census-clean-latch");
+            let state = dir.join("node.state");
+            fs::write(&state, "1 1 flushed\n").expect("the projection writes");
+            seal(&dir);
+            assert_eq!(
+                Node::open_compliance(MEMBERS_ONE, OWN_ONE, &state.to_string_lossy(), 50).err(),
+                Some(CONFIG),
+                "the clean latch write is refused"
+            );
+            tape.assert_path(&mut covered, "boot.refuse.clean-latch");
+        }
+        #[cfg(unix)]
+        {
+            // The emission gate: the crash classified, its round cannot
+            // be written.
+            tape.take();
+            let dir = scratch("census-emission-gate");
+            let state = dir.join("node.state");
+            let mut life_one = one_node_compliance(&state);
+            settle(&mut life_one);
+            drop(life_one);
+            seal(&dir);
+            assert_eq!(
+                Node::open_compliance(MEMBERS_ONE, OWN_ONE, &state.to_string_lossy(), 50).err(),
+                Some(CONFIG),
+                "the emission gate's round is refused"
+            );
+            tape.assert_path(&mut covered, "boot.refuse.emission-gate");
+        }
+
+        let boot_paths: Vec<&'static str> = CENSUS
+            .iter()
+            .copied()
+            .filter(|path| !path.starts_with("stop."))
+            .collect();
+        assert_census_covered(&boot_paths, &covered);
+    }
+
+    /// Every stop path shows itself: the idempotent re-entry, the drain
+    /// point, both marker rounds with the drain window opening and closing
+    /// between them, the unseated window, and the two reachable refusal
+    /// arms.
+    #[test]
+    fn every_stop_path_shows_itself() {
+        let mut covered: Vec<&'static str> = Vec::new();
+        let mut tape = Tape::default();
+
+        // --- the graceful stop and its idempotent re-entry -------------
+        {
+            let dir = scratch("census-stop");
+            let state = dir.join("node.state");
+            let mut node = one_node_compliance(&state);
+            settle(&mut node);
+            tape.take();
+            assert_eq!(node.stop(), OK);
+            for path in [
+                "stop.wire-closed",
+                "stop.round.begin",
+                "stop.drain-window.open",
+                "stop.drain-window.close",
+                "stop.round.finish",
+                "stop.complete",
+            ] {
+                tape.assert_path(&mut covered, path);
+            }
+            // The halt's two rounds with the drain strictly between them:
+            // the schedule the store records is the census's witness that
+            // the window really closed between them.
+            let schedule = marker_schedule(&node);
+            let tail = &schedule[schedule.len() - 3..];
+            assert!(
+                tail[0].starts_with("commit:Stopping@")
+                    && tail[1] == "drain"
+                    && tail[2].starts_with("commit:Stopped@"),
+                "the halt schedule is first round, drain, second round; got {tail:?}"
+            );
+            assert_eq!(node.stop(), OK, "the stop is idempotent");
+            tape.assert_path(&mut covered, "stop.idempotent");
+        }
+
+        // --- the unseated window: the wire closes, no round is lawful --
+        {
+            let dir = scratch("census-unseated");
+            let state = dir.join("node.state");
+            let mut life_one = one_node_compliance(&state);
+            settle(&mut life_one);
+            drop(life_one);
+            let mut life_two = one_node_compliance(&state);
+            tape.take();
+            assert_eq!(life_two.stop(), OK, "the unseated stop drains and exits");
+            tape.assert_path(&mut covered, "stop.wire-closed");
+            tape.assert_path(&mut covered, "stop.unseated");
+        }
+
+        // --- the drain window's own write is refused -------------------
+        {
+            let dir = scratch("census-drain-window");
+            let state = dir.join("node.state");
+            let mut node = one_node_compliance(&state);
+            settle(&mut node);
+            fs::create_dir(view_record_path(&state)).expect("the obstruction places");
+            tape.take();
+            assert_eq!(
+                node.stop(),
+                SERVICE,
+                "the failed window write reports SERVICE"
+            );
+            tape.assert_path(&mut covered, "stop.wire-closed");
+            tape.assert_path(&mut covered, "stop.round.begin");
+            tape.assert_path(&mut covered, "stop.refuse.drain-window");
+        }
+
+        // --- the halt's first round is refused -------------------------
+        #[cfg(unix)]
+        {
+            let dir = scratch("census-first-round");
+            let state = dir.join("node.state");
+            let mut node = one_node_compliance(&state);
+            settle(&mut node);
+            seal(&dir);
+            tape.take();
+            assert_eq!(node.stop(), SERVICE, "the first round's write is refused");
+            tape.assert_path(&mut covered, "stop.wire-closed");
+            tape.assert_path(&mut covered, "stop.round.begin");
+            tape.assert_path(&mut covered, "stop.refuse.first-round");
+        }
+
+        let stop_paths: Vec<&'static str> = CENSUS
+            .iter()
+            .copied()
+            .filter(|path| path.starts_with("stop."))
+            .collect();
+        assert_census_covered(&stop_paths, &covered);
     }
 
     /// The migration path, the clean-stop spelling: a copy-free rig state

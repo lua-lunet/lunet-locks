@@ -287,8 +287,11 @@ fn machine_word(marker: Marker) -> &'static str {
 /// checked against it. The `ops` log records every marker round the
 /// boot-gate machine wrote (`commit:<Marker>@<packed identity>`) and the
 /// drain the halt schedule forces between its rounds (`drain`), in write
-/// order — the schedule the compliance corpus asserts; the reads are the
-/// host's own business and are not listed.
+/// order — the schedule the compliance corpus asserts. The boot's
+/// classification branches and the store's read verdicts are NOT on this
+/// tape: they name themselves on the lifecycle census tape instead
+/// (`crate::trace_line!`), which is where a REFUSED boot can be seen at
+/// all — a refusal hands back no node, so it has no per-node tape.
 pub(crate) struct GateStore {
     backend: Backend,
     sink: SinkDoor,
@@ -338,7 +341,10 @@ impl GateStore {
     /// before the driver releases the first announcement. Unconditional:
     /// the round lands seated or not. The argument is the bumped pair
     /// itself; an identity with a zero half is no identity and refuses
-    /// here.
+    /// here. The round is the adapter's own write, not the engine's, so
+    /// it stays off the marker-round schedule the compliance corpus
+    /// pins; the `boot.emission-gate` census line is where it shows
+    /// itself.
     pub(crate) fn emission_gate(&self, identity: NodeId) -> io::Result<()> {
         match &self.backend {
             Backend::Disk { state } => {
@@ -411,10 +417,18 @@ fn read_copies_disk(state: &Path, system: u16) -> io::Result<Option<SuperblockCo
         // copies from the file's own state). Neither storage present
         // is the first life, which has no durable identity yet.
         if !state.exists() {
+            crate::trace_line!("marker.read.absent");
             return Ok(None);
         }
-        let (file_system, crash, marker) = read_marker(state)?;
+        let (file_system, crash, marker) = match read_marker(state) {
+            Ok(pair) => pair,
+            Err(error) => {
+                crate::trace_line!("marker.read.projection-refused");
+                return Err(error);
+            }
+        };
         if file_system != system {
+            crate::trace_line!("marker.read.cross-system");
             return Err(io::Error::other(format!(
                 "the projection names system {file_system} but the descriptor names system {system}"
             )));
@@ -425,6 +439,7 @@ fn read_copies_disk(state: &Path, system: u16) -> io::Result<Option<SuperblockCo
             SystemId::new(file_system).expect("the projection refuses a zero half"),
             CrashCounter::new(crash).expect("the projection refuses a zero half"),
         );
+        crate::trace_line!("marker.read.projection");
         return Ok(Some(uniform(identity, marker)));
     }
     // The copies exist: they are the authoritative read. THE
@@ -437,15 +452,19 @@ fn read_copies_disk(state: &Path, system: u16) -> io::Result<Option<SuperblockCo
     // guessing an identity or falling back to the projection.
     let classified = marker::classify(&superblock).map_err(|code| {
         if code == marker::CORRUPT {
+            crate::trace_line!("marker.read.corrupt");
             boot_read_checksum_panic(&superblock, "the quorum read");
         }
         if code == marker::INCOMPATIBLE {
+            crate::trace_line!("marker.read.incompatible");
             return io::Error::other(format!(
                 "the marker is an old-format file (FFI code {code}): invalid, never converted"
             ));
         }
+        crate::trace_line!("marker.read.torn");
         io::Error::other(format!("the marker quorum read failed (FFI code {code})"))
     })?;
+    crate::trace_line!("marker.read.quorum");
     Ok(Some(uniform(
         NodeId(classified.identity.packed()),
         engine_marker(classified.state),
@@ -456,10 +475,18 @@ fn read_copies_disk(state: &Path, system: u16) -> io::Result<Option<SuperblockCo
 #[cfg(target_os = "windows")]
 fn read_copies_disk(state: &Path, system: u16) -> io::Result<Option<SuperblockCopies>> {
     if !state.exists() {
+        crate::trace_line!("marker.read.absent");
         return Ok(None);
     }
-    let (file_system, crash, marker) = read_marker(state)?;
+    let (file_system, crash, marker) = match read_marker(state) {
+        Ok(pair) => pair,
+        Err(error) => {
+            crate::trace_line!("marker.read.projection-refused");
+            return Err(error);
+        }
+    };
     if file_system != system {
+        crate::trace_line!("marker.read.cross-system");
         return Err(io::Error::other(format!(
             "the projection names system {file_system} but the descriptor names system {system}"
         )));
@@ -468,6 +495,7 @@ fn read_copies_disk(state: &Path, system: u16) -> io::Result<Option<SuperblockCo
         SystemId::new(file_system).expect("the projection refuses a zero half"),
         CrashCounter::new(crash).expect("the projection refuses a zero half"),
     );
+    crate::trace_line!("marker.read.projection");
     Ok(Some(uniform(identity, marker)))
 }
 
@@ -484,6 +512,7 @@ fn commit_disk(state: &Path, copy: CopyState) -> io::Result<()> {
     })?;
     marker::write(&superblock_path(state), identity, zig_state(copy.marker)).map_err(|code| {
         if code == marker::CORRUPT {
+            crate::trace_line!("marker.write.corrupt");
             boot_read_checksum_panic(&superblock_path(state), "the write's read");
         }
         io::Error::other(format!("the marker quorum write failed (FFI code {code})"))
@@ -526,6 +555,7 @@ fn write_round(
 ) -> io::Result<()> {
     marker::write(&superblock_path(state), identity, round).map_err(|code| {
         if code == marker::CORRUPT {
+            crate::trace_line!("marker.write.corrupt");
             boot_read_checksum_panic(&superblock_path(state), "the write's read");
         }
         io::Error::other(format!("the marker quorum write failed (FFI code {code})"))

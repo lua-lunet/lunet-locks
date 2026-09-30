@@ -17,6 +17,10 @@ pub use ffi::{
 
 pub use recovery_flush::{FlushOutcome, RecoveryFlush};
 
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+pub use ffi::{census_paths, census_push};
+
 pub use ffi::{
     CLIENT_JSON, CONFIG, FAULTED, INVALID, NOT_LEADER, OK, PANIC, SERVICE, TOO_LARGE, VRR_MESSAGE,
 };
