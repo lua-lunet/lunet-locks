@@ -9,8 +9,8 @@
 //! the sentinel lock (SET, 500 ms lease), renew it 250 ms before the
 //! deadline, and — while another node holds it — poll it as a GET and
 //! schedule the next poll at the reported expiry plus `rand()*100 ms`.
-//! Every attempt is logged as
-//! `lease-attempt ts=<ms> node=<id> op=set|renew|get|steal expiry=<ms>`.
+//! Every attempt is logged as one JSON line:
+//! `{"event":"lease-attempt","ts":<ms>,"node":<id>,"op":"set|renew|get|steal","expiry":<ms>,"era":<era>,"view":<view>,…}`.
 //!
 //! The embedded lock client: launched with `--embedded-client N`, the
 //! host runs N contender loops against its own `Node` in-process (the
@@ -89,17 +89,10 @@ const STATE_RECOVERING: u32 = 2;
 /// its own tick emits nothing — the rejoin gossip is the host's drive.
 const STATE_JOINING: u32 = 4;
 
-const VRR_COMMIT_TAG: u32 = 4;
-
 /// The compiled-in leader-failure detector, named on the boot line and
 /// in the boot trace: the randomised leader timeout, the service's only
 /// failure-detection mechanism.
 const DETECTOR: &str = "sloppy-timeout";
-
-fn is_commit(payload: &[u8]) -> bool {
-    payload.len() >= 21
-        && u32::from_be_bytes(payload[0..4].try_into().expect("4 bytes")) == VRR_COMMIT_TAG
-}
 
 #[derive(Clone, Debug)]
 struct ClusterNode {
@@ -220,6 +213,11 @@ struct Host {
     /// The last Commit-send time this leader produced — "when otherwise
     /// idle" is measured against it.
     last_leader_commit_ms: u64,
+    /// The slot frontier: the highest slot this node has put on the wire
+    /// (`flush_outputs`' established frontier, never lower). It rides
+    /// the periodic frontier line and the telemetry tape; no protocol
+    /// decision reads it.
+    frontier_slot: u64,
     /// The keepalive proposer's own client identity and request counter.
     heartbeat_client_id: u64,
     heartbeat_request_num: u64,
@@ -294,6 +292,12 @@ fn millis() -> u64 {
 /// The tracing subscriber stack. `--log` names the per-node file; its stem
 /// becomes the daily-rolling file prefix under the same directory. The
 /// returned `WorkerGuard` must live for the process lifetime.
+///
+/// The observability contract's line shape: ONE JSON object per line, the
+/// event's own fields flattened into the root object beside `level`. The
+/// formatter's own clock is off (`without_time`): every line's `ts` is the
+/// host's [`millis`], a field the emitting site carries, so the log and the
+/// protocol agree on one clock.
 fn init_tracing(log_path: &str) -> WorkerGuard {
     let path = std::path::Path::new(log_path);
     let dir = path
@@ -315,6 +319,10 @@ fn init_tracing(log_path: &str) -> WorkerGuard {
         });
     let (writer, guard) = tracing_appender::non_blocking(appender);
     tracing_subscriber::fmt()
+        .json()
+        .flatten_event(true)
+        .with_current_span(false)
+        .with_span_list(false)
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_ansi(false)
         .with_target(false)
@@ -655,8 +663,12 @@ fn parse_options() -> Options {
 }
 
 impl Host {
+    /// The free-text channel: a line that carries no protocol
+    /// observable of its own — a signal, a no-op, a foreign datagram
+    /// dropped. The body rides the `text` field; it never escapes the
+    /// object, and no reader parses `key=value` tokens out of it.
     fn note(&self, body: &str) {
-        info!("{} ts={}", body, millis());
+        info!(ts = millis(), event = "note", text = body);
     }
 
     /// The node timed out on its leader (`docs/src/failure-detection.md`):
@@ -673,19 +685,26 @@ impl Host {
         }
     }
 
-    /// One toggle record's logging: the new state, the current ts, and
-    /// the ts of the LAST toggle — in the regular log AND the Flight
-    /// Recorder (`docs/src/failure-detection.md`).
+    /// One toggle record's logging: the new state, the toggle's own
+    /// clock, the clock of the LAST toggle, and the caller's reason — in
+    /// the regular log AND the Flight Recorder
+    /// (`docs/src/failure-detection.md`).
     fn log_timeout_toggle(&mut self, record: &timeouts::ToggleRecord, why: &str) {
-        self.note(&format!(
-            "timedout={} ts={} last_toggle={} why={why}",
-            record.timedout,
-            record.at_ms,
-            record
-                .previous_ms
-                .map(|ts| ts.to_string())
-                .unwrap_or_else(|| "none".into())
-        ));
+        let status = self.node.status();
+        info!(
+            ts = millis(),
+            event = "timeout-toggle",
+            node = self.own_id,
+            era = status.era,
+            view = status.view,
+            leader = status.leader,
+            state = status.state_name(),
+            timedout = record.timedout,
+            toggle_ts = record.at_ms,
+            last_toggle = record.previous_ms,
+            why,
+            "timeout toggle"
+        );
         self.node
             .note_timeout_toggle(record.timedout, record.at_ms, record.previous_ms);
     }
@@ -750,10 +769,19 @@ impl Host {
             let previous = self.election_wait_armed;
             self.election_wait_armed = wait;
             let status = self.node.status();
-            self.note(&format!(
-                "timeout-wait leader={} prev_wait={previous} next_wait={wait}",
-                status.leader
-            ));
+            info!(
+                ts = millis(),
+                event = "timeout-wait",
+                node = self.own_id,
+                era = status.era,
+                view = status.view,
+                leader = status.leader,
+                prev_wait_ms = previous,
+                next_wait_ms = wait,
+                min_ms = min_ms,
+                max_ms = max_ms,
+                "timeout-wait"
+            );
             let json = format!(
                 "{{\"leader\":{},\"era\":{},\"view\":{},\
                  \"prev_wait_ms\":{previous},\"next_wait_ms\":{wait},\
@@ -822,15 +850,20 @@ impl Host {
         }
         self.detected_key = Some(watched);
         let silence = now.saturating_sub(self.leader_timeout.last_evidence_ms());
-        self.note(&format!(
-            "leader-timeout-detect node={} era={} leader={} silence={} deadline={} addr={}",
-            self.own_id,
-            status.config_era,
-            status.leader,
-            silence,
-            self.leader_timeout.deadline_ms(),
-            timeouts::addr_text(addr)
-        ));
+        info!(
+            ts = millis(),
+            event = "leader-timeout-detect",
+            node = self.own_id,
+            era = status.era,
+            view = status.view,
+            config_era = status.config_era,
+            leader = status.leader,
+            state = status.state_name(),
+            silence_ms = silence,
+            deadline_ms = self.leader_timeout.deadline_ms(),
+            addr = timeouts::addr_text(addr),
+            "leader-timeout-detect"
+        );
         // The actuation: the §14.2 host-forced view change — the
         // timeout's verdict drives it directly, falling back to the
         // ordinary suspicion tick on refusal. A node below voting weight
@@ -859,11 +892,35 @@ impl Host {
     /// Re-arms the leader deadline; while the node is timed out the
     /// arrival IS the fresh-commit resume: the toggle flips false, the
     /// detection latch clears, and both waits re-arm.
-    fn on_leader_commit(&mut self, replica: u32, is_commit: bool, now: u64, rng: &mut Rng) {
+    fn on_leader_commit(
+        &mut self,
+        replica: u32,
+        header: Option<transport::VrrHeader>,
+        now: u64,
+        rng: &mut Rng,
+    ) {
         let status = self.node.status();
-        if !is_commit || status.leader != replica {
+        let Some(header) = header.filter(|h| h.tag == transport::COMMIT_TAG) else {
+            return;
+        };
+        if status.leader != replica {
             return;
         }
+        // The heartbeat's own line: every Commit this node's leader
+        // sends is one line, naming the ballot it was authorised at and
+        // the frontier slot it advances.
+        info!(
+            ts = millis(),
+            event = "commit-in",
+            node = self.own_id,
+            from = replica,
+            era = header.era,
+            view = header.view,
+            slot = header.slot,
+            leader = status.leader,
+            state = status.state_name(),
+            "commit-in"
+        );
         if self.timedout.timed_out() {
             if let Some(record) = self.timedout.on_commit(now) {
                 self.log_timeout_toggle(&record, "fresh-commit");
@@ -898,13 +955,66 @@ impl Host {
         );
         let _ = self.node.request(json.as_bytes());
         self.flush_outputs(now, rng);
+        // The heartbeat's own line, and the periodic frontier record: the
+        // slot this node has put on the wire, the ballot that authorised
+        // it, and the leader that drove it. The drive is unchanged — this
+        // is visibility of the drive, not a change to it.
+        let status = self.node.status();
+        info!(
+            ts = millis(),
+            event = "heartbeat-commit",
+            node = self.own_id,
+            era = status.era,
+            view = status.view,
+            leader = status.leader,
+            state = status.state_name(),
+            slot = self.frontier_slot,
+            request_num = self.heartbeat_request_num,
+            "heartbeat-commit"
+        );
         let _ = rng;
     }
 
+    /// The slot frontier onto the telemetry tape: one periodic record
+    /// carrying the frontier this node reached and the ballot that
+    /// authorised it. The frontier is not gate-silenced — a voting node's
+    /// lifecycle gate is disarmed, and that is exactly the node an
+    /// operator asks the tape about. Telemetry stays downstream of the
+    /// recorder: a failed append disables the stream and no protocol
+    /// decision reads this record.
+    fn record_frontier(&mut self, status: &lunet_advisory_lock::NodeStatus) {
+        let json = format!(
+            "{{\"event\":\"slot-frontier\",\"era\":{},\"view\":{},\"leader\":{},\
+             \"state\":\"{}\",\"slot\":{}}}",
+            status.era,
+            status.view,
+            status.leader,
+            status.state_name(),
+            self.frontier_slot,
+        );
+        let ns = local_ns();
+        if let Some(log) = self.telemetry.as_mut() {
+            log.record_frontier(Record::telemetry(
+                Marker::TelemetryStateTransition,
+                ns,
+                json.as_bytes(),
+            ));
+        }
+    }
+
     fn lease_attempt(&self, node_id: u32, op: &str, expiry: u64) {
+        let status = self.node.status();
         info!(
-            "lease-attempt ts={} node={node_id} op={op} expiry={expiry}",
-            millis()
+            ts = millis(),
+            event = "lease-attempt",
+            node = node_id,
+            era = status.era,
+            view = status.view,
+            leader = status.leader,
+            state = status.state_name(),
+            op,
+            expiry,
+            "lease-attempt"
         );
     }
 
@@ -914,11 +1024,29 @@ impl Host {
         let _ = self.sock.send_to(&packet, addr);
     }
 
+    /// The forwarding channel's three sends, each one line: a verb this
+    /// node handed to the leader, the leader's committed reply, and the
+    /// refusal that tells a non-leader's client to re-route. The message
+    /// id is the correlation the whole stream is read by.
     fn send_forward_request(&mut self, addr: SocketAddr, message_id: &[u8; 16], json: &str) {
         let mut payload = Vec::with_capacity(1 + 16 + json.len());
         payload.push(transport::FORWARD_REQUEST);
         payload.extend_from_slice(message_id);
         payload.extend_from_slice(json.as_bytes());
+        let status = self.node.status();
+        info!(
+            ts = millis(),
+            event = "forward-request",
+            node = self.own_id,
+            era = status.era,
+            view = status.view,
+            leader = status.leader,
+            state = status.state_name(),
+            peer = %addr,
+            message_id = %uuid::Uuid::from_bytes(*message_id),
+            bytes = json.len(),
+            "forward-request"
+        );
         self.send_application(addr, &payload);
     }
 
@@ -928,6 +1056,19 @@ impl Host {
         payload.extend_from_slice(message_id);
         payload.extend_from_slice(&era.to_be_bytes());
         payload.extend_from_slice(&view.to_be_bytes());
+        let status = self.node.status();
+        info!(
+            ts = millis(),
+            event = "forward-not-leader",
+            node = self.own_id,
+            era = status.era,
+            view = status.view,
+            leader = status.leader,
+            state = status.state_name(),
+            peer = %addr,
+            message_id = %uuid::Uuid::from_bytes(*message_id),
+            "forward-not-leader"
+        );
         self.send_application(addr, &payload);
     }
 
@@ -936,6 +1077,20 @@ impl Host {
         payload.push(transport::FORWARD_RESPONSE);
         payload.extend_from_slice(message_id);
         payload.extend_from_slice(bytes);
+        let status = self.node.status();
+        info!(
+            ts = millis(),
+            event = "forward-response",
+            node = self.own_id,
+            era = status.era,
+            view = status.view,
+            leader = status.leader,
+            state = status.state_name(),
+            peer = %addr,
+            message_id = %uuid::Uuid::from_bytes(*message_id),
+            bytes = bytes.len(),
+            "forward-response"
+        );
         self.send_application(addr, &payload);
     }
 
@@ -957,10 +1112,16 @@ impl Host {
             let _ = self.sock.send_to(&packet, *addr);
             sent += 1;
         }
-        self.note(&format!(
-            "join-gossip era={} view={} peers={sent}",
-            status.era, status.view
-        ));
+        info!(
+            ts = millis(),
+            event = "join-gossip",
+            node = self.own_id,
+            era = status.era,
+            view = status.view,
+            state = status.state_name(),
+            peers = sent,
+            "join-gossip"
+        );
     }
 
     fn flush_outputs(&mut self, now: u64, rng: &mut Rng) -> u64 {
@@ -969,6 +1130,9 @@ impl Host {
             if out.kind == OUTPUT_SEND {
                 if out.slot > established_slot {
                     established_slot = out.slot;
+                }
+                if out.slot > self.frontier_slot {
+                    self.frontier_slot = out.slot;
                 }
                 let Some(&addr) = self.peers.get(&out.to) else {
                     maybe_invariant!(
@@ -990,7 +1154,8 @@ impl Host {
                 let status = self.node.status();
                 let payload = if status.state == STATE_NORMAL
                     && status.leader == self.own_id
-                    && is_commit(&out.bytes)
+                    && transport::vrr_header(&out.bytes)
+                        .is_some_and(|h| h.tag == transport::COMMIT_TAG)
                 {
                     self.last_leader_commit_ms = now;
                     out.bytes.clone()
@@ -1021,23 +1186,22 @@ impl Host {
                 } else if self.embedded_reply(now, rng, &out.message_id, &out.bytes) {
                     // An embedded contender's op completed in-process.
                 } else {
-                    let mut matched = false;
-                    for conn in &mut self.conns {
+                    let mut claimant = None;
+                    for (index, conn) in self.conns.iter_mut().enumerate() {
                         let matches = matches!(
                             conn.pending,
                             Some(TcpPending::Lock { message_id, .. })
                                 if message_id == out.message_id
                         );
                         if matches {
-                            matched = true;
                             conn.pending = None;
-                            let _ = conn.stream.write_all(&out.bytes);
-                            let _ = conn.stream.write_all(b"\n");
-                            let _ = conn.stream.flush();
+                            claimant = Some(index);
                             break;
                         }
                     }
-                    if !matched {
+                    if let Some(index) = claimant {
+                        client_reply(self, index, "lock", &out.bytes);
+                    } else {
                         // The maybe: an operation's committed reply reached
                         // the drain with no live claimant (the conn's 30 s
                         // pending expired and its client retried with a
@@ -1045,7 +1209,16 @@ impl Host {
                         // impossible, survivable — reported with full
                         // context, never silent.
                         self.late_acks += 1;
+                        let status = self.node.status();
                         tracing::warn!(
+                            ts = millis(),
+                            event = "late-ack",
+                            node = self.own_id,
+                            era = status.era,
+                            view = status.view,
+                            leader = status.leader,
+                            state = status.state_name(),
+                            late_acks = self.late_acks,
                             message_id = %uuid::Uuid::from_bytes(out.message_id),
                             bytes = out.bytes.len(),
                             "committed reply drained with no live conn claimant"
@@ -1071,10 +1244,17 @@ impl Host {
             {
                 self.peers.insert(member.id, addr);
                 self.addr_to_id.insert(addr, member.id);
-                self.note(&format!(
-                    "member row learned id={} endpoint={}",
-                    member.id, member.endpoint
-                ));
+                let status = self.node.status();
+                info!(
+                    ts = millis(),
+                    event = "membership-row-learned",
+                    node = self.own_id,
+                    era = status.era,
+                    view = status.view,
+                    id = member.id,
+                    endpoint = %member.endpoint,
+                    "membership-row-learned"
+                );
                 return true;
             }
         }
@@ -1107,12 +1287,21 @@ impl Host {
         }
         self.add_member_rows(&snapshot.members);
         self.sidecar.enqueue(&snapshot);
-        self.note(&format!(
-            "membership snapshot adopted era={} slot={} members={} source={source}",
-            snapshot.era,
-            snapshot.slot,
-            snapshot.members.len()
-        ));
+        let status = self.node.status();
+        info!(
+            ts = millis(),
+            event = "membership-snapshot-adopted",
+            node = self.own_id,
+            era = status.era,
+            view = status.view,
+            leader = status.leader,
+            state = status.state_name(),
+            model_era = snapshot.era,
+            model_slot = snapshot.slot,
+            members = snapshot.members.len(),
+            source,
+            "membership-snapshot-adopted"
+        );
     }
 
     /// The leader's post-commit dissemination: the as-at-new-generation
@@ -1136,12 +1325,21 @@ impl Host {
             let _ = self.sock.send_to(&packet, addr);
         }
         self.sidecar.enqueue(&snapshot);
-        self.note(&format!(
-            "membership snapshot disseminated era={} slot={} members={}",
-            snapshot.era,
-            snapshot.slot,
-            snapshot.members.len()
-        ));
+        let status = self.node.status();
+        info!(
+            ts = millis(),
+            event = "membership-snapshot-disseminated",
+            node = self.own_id,
+            era = status.era,
+            view = status.view,
+            leader = status.leader,
+            state = status.state_name(),
+            model_era = snapshot.era,
+            model_slot = snapshot.slot,
+            members = snapshot.members.len(),
+            peers = self.peers.len(),
+            "membership-snapshot-disseminated"
+        );
     }
 
     /// The boot-time discovery round: one request per remembered peer, on
@@ -1152,7 +1350,17 @@ impl Host {
         }
         if now >= self.discovery.deadline_ms {
             self.discovery.active = false;
-            self.note("discovery deadline reached; the ordinary fenced boot proceeds");
+            let status = self.node.status();
+            info!(
+                ts = millis(),
+                event = "discovery-deadline",
+                node = self.own_id,
+                era = status.era,
+                view = status.view,
+                model_era = self.discovery.era,
+                model_slot = self.discovery.slot,
+                "discovery deadline reached; the ordinary fenced boot proceeds"
+            );
             return;
         }
         if now >= self.discovery.next_request_ms {
@@ -1164,11 +1372,24 @@ impl Host {
                 .map(|(_, addr)| *addr)
                 .collect();
             let payload = membership::encode_request();
-            for addr in targets {
+            for addr in &targets {
                 let packet =
                     transport::encode_peer(transport::PEER_SNAPSHOT, &self.fingerprint, &payload);
                 let _ = self.sock.send_to(&packet, addr);
             }
+            let status = self.node.status();
+            info!(
+                ts = millis(),
+                event = "discovery-request",
+                node = self.own_id,
+                era = status.era,
+                view = status.view,
+                model_era = self.discovery.era,
+                model_slot = self.discovery.slot,
+                peers = targets.len(),
+                bytes = payload.len(),
+                "discovery-request"
+            );
         }
     }
 
@@ -1293,11 +1514,19 @@ impl Host {
                 if granted {
                     let expiry = reply["lease"]["expiry"].as_u64().unwrap_or(now + LEASE_MS);
                     self.driver.held_expiry = Some(expiry);
-                    self.note(&format!(
-                        "grant node={} op={} expiry={expiry}",
-                        self.own_id,
-                        op.label()
-                    ));
+                    let status = self.node.status();
+                    info!(
+                        ts = millis(),
+                        event = "lease-grant",
+                        node = self.own_id,
+                        era = status.era,
+                        view = status.view,
+                        leader = status.leader,
+                        state = status.state_name(),
+                        op = op.label(),
+                        expiry,
+                        "lease-grant"
+                    );
                 } else {
                     self.driver.held_expiry = None;
                     if let Some(lease) = reply["lease"].as_object() {
@@ -1499,12 +1728,13 @@ fn main() {
     });
 
     // The subscriber stack (the binary owns it; the library stays
-    // subscriber-free): `RUST_LOG` env-filter, ANSI off, no line timestamp
-    // (events carry their own `ts=` fields), through `NonBlocking` over a
-    // per-node daily rolling file. The guard is held for the process
-    // lifetime and flushes on an orderly shutdown — the Exit arm drops it
-    // explicitly, because `exit()` skips the drop and would lose the
-    // stop path's final records still sitting in the writer's buffer.
+    // subscriber-free): the JSON line formatter, `RUST_LOG` env-filter,
+    // ANSI off, no formatter timestamp (every line's `ts` is the host's
+    // own `millis()`), through `NonBlocking` over a per-node daily
+    // rolling file. The guard is held for the process lifetime and
+    // flushes on an orderly shutdown — the Exit arm drops it explicitly,
+    // because `exit()` skips the drop and would lose the stop path's
+    // final records still sitting in the writer's buffer.
     let mut worker_guard = Some(init_tracing(&options.log));
     let lifecycle = Lifecycle::register(!options.bench_store.is_empty());
     // The bench cycle loop: a SIGUSR1/SIGUSR2 cycle returns from `serve`
@@ -1799,6 +2029,7 @@ fn serve(options: &Options, nodes: &[ClusterNode], lifecycle: &Lifecycle) -> Ser
             active: true,
         },
         last_leader_commit_ms: 0,
+        frontier_slot: 0,
         heartbeat_client_id: 0x0BEEF000 + own_desc_id as u64,
         heartbeat_request_num: 0,
         detected_key: None,
@@ -1818,19 +2049,45 @@ fn serve(options: &Options, nodes: &[ClusterNode], lifecycle: &Lifecycle) -> Ser
         telemetry,
         embedded,
     };
-    host.note(&format!(
-        "boot name={} descriptor-id={own_desc_id} own={own_id} incarnation={incarnation} \
-         detector={DETECTOR}",
-        options.name
-    ));
-    host.note(&format!("membership fingerprint={}", host.fingerprint));
-    host.note(&format!(
-        "membership model era={} slot={} members={} source={}",
-        host.model.era,
-        host.model.slot,
-        host.model.members.len(),
-        model_source
-    ));
+    {
+        let status = host.node.status();
+        info!(
+            ts = millis(),
+            event = "boot",
+            node = host.own_id,
+            era = status.era,
+            view = status.view,
+            leader = status.leader,
+            state = status.state_name(),
+            name = %options.name,
+            descriptor_id = own_desc_id,
+            own = own_id,
+            incarnation,
+            detector = DETECTOR,
+            "boot"
+        );
+        info!(
+            ts = millis(),
+            event = "membership-fingerprint",
+            node = host.own_id,
+            era = status.era,
+            view = status.view,
+            fingerprint = %host.fingerprint,
+            "membership-fingerprint"
+        );
+        info!(
+            ts = millis(),
+            event = "membership-model",
+            node = host.own_id,
+            era = status.era,
+            view = status.view,
+            model_era = host.model.era,
+            model_slot = host.model.slot,
+            members = host.model.members.len(),
+            source = model_source,
+            "membership-model"
+        );
+    }
     // The boot trace: every node's startup decision —
     // Restarting on a dirty restart (incarnation bump), Recovering when
     // the core boots into the recovering state, Joining for a fresh
@@ -1963,10 +2220,17 @@ fn timers(host: &mut Host, now: u64, rng: &mut Rng) {
     let status = host.node.status();
     if status.leader != host.last_seen_leader {
         host.last_seen_leader = status.leader;
-        host.note(&format!(
-            "leader leader={} era={} view={}",
-            status.leader, status.era, status.view
-        ));
+        info!(
+            ts = millis(),
+            event = "leader",
+            node = host.own_id,
+            era = status.era,
+            view = status.view,
+            leader = status.leader,
+            state = status.state_name(),
+            frontier_slot = host.frontier_slot,
+            "leader"
+        );
         // The host re-arms the election wait on a leader change (the
         // fresh-commit resume re-arms it at `on_leader_commit`).
         host.rearm_election_wait(now, rng.unit());
@@ -2001,8 +2265,10 @@ fn timers(host: &mut Host, now: u64, rng: &mut Rng) {
         if !host.viewchange.armed() {
             host.viewchange.arm(now, rng.unit());
         } else if host.viewchange.due(now) {
+            let fired_ms = host.viewchange.deadline_ms();
             host.viewchange.arm(now, rng.unit());
-            match timeouts::poll_actuation(true, status.state, true) {
+            let actuation = timeouts::poll_actuation(true, status.state, true);
+            match actuation {
                 timeouts::PollActuation::ForceView => {
                     let forced = host.node.force_view(status.era, status.view + 1);
                     if forced != 0 {
@@ -2013,6 +2279,23 @@ fn timers(host: &mut Host, now: u64, rng: &mut Rng) {
                     let _ = host.node.leader_timeout();
                 }
             }
+            info!(
+                ts = millis(),
+                event = "timeout-poll",
+                node = host.own_id,
+                era = status.era,
+                view = status.view,
+                leader = status.leader,
+                state = status.state_name(),
+                actuation = match actuation {
+                    timeouts::PollActuation::ForceView => "force-view",
+                    timeouts::PollActuation::LeaderTimeout => "leader-timeout",
+                    timeouts::PollActuation::None => "none",
+                },
+                fired_ms,
+                next_deadline_ms = host.viewchange.deadline_ms(),
+                "timeout-poll"
+            );
             host.flush_outputs(now, rng);
         }
     } else {
@@ -2032,10 +2315,24 @@ fn timers(host: &mut Host, now: u64, rng: &mut Rng) {
         if !host.timedout.timed_out() {
             let wait = host.election_wait();
             if host.leader_elapsed >= wait + host.stagger_ms {
+                let fired_ms = host.leader_elapsed;
                 host.leader_elapsed = 0;
                 let _ = host.node.leader_timeout();
                 host.flush_outputs(now, rng);
                 host.suspect(now, "election-wait");
+                info!(
+                    ts = millis(),
+                    event = "election-wait-fire",
+                    node = host.own_id,
+                    era = status.era,
+                    view = status.view,
+                    leader = status.leader,
+                    state = status.state_name(),
+                    wait_ms = wait,
+                    stagger_ms = host.stagger_ms,
+                    fired_ms,
+                    "election-wait-fire"
+                );
             }
         }
     }
@@ -2073,16 +2370,24 @@ fn timers(host: &mut Host, now: u64, rng: &mut Rng) {
         // configuration once the leader's forced reconfiguration walk
         // completes.
         let voting = u32::from(host.node.voting_weight().unwrap_or(0) > 0);
-        host.note(&format!(
-            "status state={} leader={} era={} view={} config_era={} voting={voting} \
-             sidecar_drops={}",
-            lunet_advisory_lock::replication_state_name(status.state),
-            status.leader,
-            status.era,
-            status.view,
-            status.config_era,
-            host.sidecar.drops()
-        ));
+        info!(
+            ts = millis(),
+            event = "status",
+            node = host.own_id,
+            era = status.era,
+            view = status.view,
+            leader = status.leader,
+            state = status.state_name(),
+            config_era = status.config_era,
+            frontier_slot = host.frontier_slot,
+            voting,
+            sidecar_drops = host.sidecar.drops(),
+            "status"
+        );
+        // The slot frontier onto the telemetry tape, on the same periodic
+        // cadence as the status note: every node states how far it got,
+        // not only the one that happens to lead.
+        host.record_frontier(&status);
     }
     if (status.state == STATE_RECOVERING
         || (host.reincarnated && host.node.voting_weight().is_none_or(|weight| weight == 0)))
@@ -2183,7 +2488,7 @@ fn handle_packet(
         // so the core's exact-length wire contract (W3) is untouched.
         // The Commit-from-leader arrival is the heartbeat evidence
         // `on_leader_commit` consumes.
-        host.on_leader_commit(replica, is_commit(payload), now, rng);
+        host.on_leader_commit(replica, transport::vrr_header(payload), now, rng);
         // The telemetry AOF stream: EVERY VRR datagram this node
         // sees is one `Wire` envelope record — the datagram's VRR payload
         // byte-identical to what the network carried — with the local
@@ -2213,7 +2518,19 @@ fn handle_packet(
         {
             host.peers.insert(new, addr);
             host.addr_to_id.insert(addr, new);
-            host.note(&format!("remap old={old} new={new}"));
+            let status = host.node.status();
+            info!(
+                ts = millis(),
+                event = "remap",
+                node = host.own_id,
+                era = status.era,
+                view = status.view,
+                leader = status.leader,
+                state = status.state_name(),
+                old,
+                new,
+                "remap"
+            );
             replica = new;
         }
         if host.node.status().leader == replica {
@@ -2234,6 +2551,19 @@ fn handle_packet(
                 message_id.copy_from_slice(&payload[1..17]);
                 let json = &payload[17..];
                 let status = host.node.status();
+                info!(
+                    ts = millis(),
+                    event = "forward-request-in",
+                    node = host.own_id,
+                    era = status.era,
+                    view = status.view,
+                    leader = status.leader,
+                    state = status.state_name(),
+                    peer = %addr,
+                    message_id = %uuid::Uuid::from_bytes(message_id),
+                    bytes = json.len(),
+                    "forward-request-in"
+                );
                 if status.state == STATE_NORMAL && status.leader == host.own_id {
                     let deadline = now + 30000;
                     host.forwarded_from.insert(message_id, (addr, deadline));
@@ -2268,9 +2598,23 @@ fn handle_packet(
             } else if payload.len() > 1 + 16 {
                 let mut message_id = [0u8; 16];
                 message_id.copy_from_slice(&payload[1..17]);
+                let status = host.node.status();
+                info!(
+                    ts = millis(),
+                    event = "forward-response-in",
+                    node = host.own_id,
+                    era = status.era,
+                    view = status.view,
+                    leader = status.leader,
+                    state = status.state_name(),
+                    peer = %addr,
+                    message_id = %uuid::Uuid::from_bytes(message_id),
+                    bytes = payload.len() - 17,
+                    "forward-response-in"
+                );
                 if host.embedded_reply(now, rng, &message_id, &payload[17..]) {
                     // The embedded contender's forwarded op completed.
-                } else if let Some(conn) = host.conns.iter_mut().find(|conn| {
+                } else if let Some(index) = host.conns.iter().position(|conn| {
                     matches!(
                         conn.pending,
                         Some(TcpPending::Lock { message_id: pending_id, .. })
@@ -2279,10 +2623,8 @@ fn handle_packet(
                 }) {
                     // The forwarded TCP client's op committed on the
                     // leader: one reply line, then the conn is idle.
-                    conn.pending = None;
-                    let _ = conn.stream.write_all(&payload[17..]);
-                    let _ = conn.stream.write_all(b"\n");
-                    let _ = conn.stream.flush();
+                    host.conns[index].pending = None;
+                    client_reply(host, index, "lock", &payload[17..]);
                 } else {
                     // The late ack: the verb's claim was already gone —
                     // by design on the driver's churn gate (the
@@ -2294,7 +2636,16 @@ fn handle_packet(
                     // re-acquires it, so the ack's result is dead on
                     // arrival: drained and counted, never a fault.
                     host.late_acks += 1;
+                    let status = host.node.status();
                     tracing::warn!(
+                        ts = millis(),
+                        event = "late-ack-forward",
+                        node = host.own_id,
+                        era = status.era,
+                        view = status.view,
+                        leader = status.leader,
+                        state = status.state_name(),
+                        late_acks = host.late_acks,
                         message_id = %uuid::Uuid::from_bytes(message_id),
                         len = payload.len(),
                         "late ack for an unclaimed verb drained"
@@ -2307,6 +2658,19 @@ fn handle_packet(
         0x03 if payload.len() == 1 + 16 + 8 => {
             let mut message_id = [0u8; 16];
             message_id.copy_from_slice(&payload[1..17]);
+            let status = host.node.status();
+            info!(
+                ts = millis(),
+                event = "forward-not-leader-in",
+                node = host.own_id,
+                era = status.era,
+                view = status.view,
+                leader = status.leader,
+                state = status.state_name(),
+                peer = %addr,
+                message_id = %uuid::Uuid::from_bytes(message_id),
+                "forward-not-leader-in"
+            );
             if host
                 .driver
                 .pending
@@ -2318,7 +2682,7 @@ fn handle_packet(
             } else if host.embedded_not_leader(now, &message_id) {
                 // The embedded contender's forwarded op was refused; the
                 // chase backs off and re-probes.
-            } else if let Some(conn) = host.conns.iter_mut().find(|conn| {
+            } else if let Some(index) = host.conns.iter().position(|conn| {
                 matches!(
                     conn.pending,
                     Some(TcpPending::Lock { message_id: pending_id, .. })
@@ -2328,9 +2692,8 @@ fn handle_packet(
                 // The forwarded TCP client's op was refused (the leader
                 // stood down mid-flight); the conn answers not_leader and
                 // its client retries or rotates.
-                conn.pending = None;
-                let _ = conn.stream.write_all(b"{\"error\":\"not_leader\"}\n");
-                let _ = conn.stream.flush();
+                host.conns[index].pending = None;
+                client_reply(host, index, "not_leader", b"{\"error\":\"not_leader\"}");
             }
         }
         _ => {}
@@ -2367,10 +2730,18 @@ fn handle_snapshot_packet(host: &mut Host, addr: SocketAddr, payload: &[u8]) {
             host.discovery.slot = snap.slot;
             host.discovery.tallies.clear();
             host.add_member_rows(&snap.members);
-            host.note(&format!(
-                "discovery escalate era={} slot={}; older-era responses dropped",
-                snap.era, snap.slot
-            ));
+            let status = host.node.status();
+            info!(
+                ts = millis(),
+                event = "discovery-escalate",
+                node = host.own_id,
+                era = status.era,
+                view = status.view,
+                responder,
+                model_era = snap.era,
+                model_slot = snap.slot,
+                "discovery escalate: the older-era responses dropped"
+            );
         } else if snap.era == host.discovery.era && snap.slot == host.discovery.slot {
             let key = membership::agreement_key(&snap);
             let tally = host.discovery.tallies.entry(key).or_default();
@@ -2378,13 +2749,33 @@ fn handle_snapshot_packet(host: &mut Host, addr: SocketAddr, payload: &[u8]) {
                 responder,
                 membership::member_weight(&snap.members, responder),
             );
+            let status = host.node.status();
+            info!(
+                ts = millis(),
+                event = "discovery-tally",
+                node = host.own_id,
+                era = status.era,
+                view = status.view,
+                responder,
+                weight = membership::member_weight(&snap.members, responder),
+                model_era = snap.era,
+                model_slot = snap.slot,
+                members = snap.members.len(),
+                "discovery-tally"
+            );
             if tally.agrees_with(&snap.members) {
                 host.discovery.active = false;
                 host.adopt(snap, "discovery");
-                host.note(&format!(
-                    "discovery quorum reached at era={} slot={}",
-                    host.model.era, host.model.slot
-                ));
+                info!(
+                    ts = millis(),
+                    event = "discovery-quorum",
+                    node = host.own_id,
+                    era = status.era,
+                    view = status.view,
+                    model_era = host.model.era,
+                    model_slot = host.model.slot,
+                    "discovery quorum reached"
+                );
             }
         }
     } else {
@@ -2467,6 +2858,29 @@ fn pop_line(conn: &mut Conn) -> Option<Vec<u8>> {
     Some(line)
 }
 
+/// One answer written back down a client connection: the bytes on the
+/// wire, the outcome they name, and the ballot the client is being
+/// answered under. Every reply the client stream produces goes through
+/// here, so the request/response stream is transparent in one place.
+fn client_reply(host: &mut Host, index: usize, outcome: &str, bytes: &[u8]) {
+    let status = host.node.status();
+    info!(
+        ts = millis(),
+        event = "client-reply",
+        node = host.own_id,
+        era = status.era,
+        view = status.view,
+        leader = status.leader,
+        state = status.state_name(),
+        outcome,
+        bytes = bytes.len(),
+        "client-reply"
+    );
+    let _ = host.conns[index].stream.write_all(bytes);
+    let _ = host.conns[index].stream.write_all(b"\n");
+    let _ = host.conns[index].stream.flush();
+}
+
 /// The pending verb's deadline discipline (the admin ack's era-advance wait,
 /// the lock reply's client deadline); false closes the connection.
 fn pending_deadline(host: &mut Host, index: usize, now: u64) -> bool {
@@ -2500,11 +2914,8 @@ fn pending_deadline(host: &mut Host, index: usize, now: u64) -> bool {
                     "\"action\":\"{action}\",\"id\":{id},\"accepted\":false,\"reason\":\"deadline\""
                 )
             };
-            let line = format!("{{{reply}}}\n");
-            let conn = &mut host.conns[index];
-            conn.pending = None;
-            let _ = conn.stream.write_all(line.as_bytes());
-            let _ = conn.stream.flush();
+            host.conns[index].pending = None;
+            client_reply(host, index, &action, format!("{{{reply}}}").as_bytes());
             true
         }
         TcpPending::Lock { deadline, .. } => now < deadline,
@@ -2513,26 +2924,34 @@ fn pending_deadline(host: &mut Host, index: usize, now: u64) -> bool {
 
 fn handle_client_line(host: &mut Host, index: usize, line: &str, now: u64, rng: &mut Rng) -> bool {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-        let _ = host.conns[index]
-            .stream
-            .write_all(b"{\"error\":\"bad_request\"}\n");
+        client_reply(host, index, "bad_request", b"{\"error\":\"bad_request\"}");
         return true;
     };
     let Some(action) = value["action"].as_str().map(|s| s.to_string()) else {
         // A lock verb: propose locally; a non-leader answers the error the
         // operator (or the run.sh driver) re-routes.
         let Some(message_id_hex) = value["message_id"].as_str() else {
-            let _ = host.conns[index]
-                .stream
-                .write_all(b"{\"error\":\"bad_request\"}\n");
+            client_reply(host, index, "bad_request", b"{\"error\":\"bad_request\"}");
             return true;
         };
         let Some(message_id) = transport::uuid_bytes(message_id_hex) else {
-            let _ = host.conns[index]
-                .stream
-                .write_all(b"{\"error\":\"bad_request\"}\n");
+            client_reply(host, index, "bad_request", b"{\"error\":\"bad_request\"}");
             return true;
         };
+        let status = host.node.status();
+        info!(
+            ts = millis(),
+            event = "client-request",
+            node = host.own_id,
+            era = status.era,
+            view = status.view,
+            leader = status.leader,
+            state = status.state_name(),
+            message_id = %uuid::Uuid::from_bytes(message_id),
+            bytes = line.len(),
+            verb = value["op"].as_str().unwrap_or("lock"),
+            "client-request"
+        );
         let rc = host.node.request(line.as_bytes());
         host.flush_outputs(now, rng);
         if rc == OK {
@@ -2548,28 +2967,24 @@ fn handle_client_line(host: &mut Host, index: usize, line: &str, now: u64, rng: 
         // the FORWARD_RESPONSE datagram and this conn answers once. When
         // no leader is known yet (or the forwarding route is unlearned),
         // the error reply stands so the client retries or rotates.
-        if rc == NOT_LEADER {
-            let status = host.node.status();
-            if status.leader != LEADER_UNKNOWN
-                && status.leader != host.own_id
-                && let Some(&addr) = host.peers.get(&status.leader)
-            {
-                host.send_forward_request(addr, &message_id, line);
-                host.conns[index].pending = Some(TcpPending::Lock {
-                    message_id,
-                    deadline: now + 30000,
-                });
-                return true;
-            }
+        if rc == NOT_LEADER
+            && status.leader != LEADER_UNKNOWN
+            && status.leader != host.own_id
+            && let Some(&addr) = host.peers.get(&status.leader)
+        {
+            host.send_forward_request(addr, &message_id, line);
+            host.conns[index].pending = Some(TcpPending::Lock {
+                message_id,
+                deadline: now + 30000,
+            });
+            return true;
         }
         let reply = if rc == NOT_LEADER {
             "{\"error\":\"not_leader\"}".to_string()
         } else {
             format!("{{\"error\":\"rejected\",\"code\":{rc}}}")
         };
-        let _ = host.conns[index].stream.write_all(reply.as_bytes());
-        let _ = host.conns[index].stream.write_all(b"\n");
-        let _ = host.conns[index].stream.flush();
+        client_reply(host, index, "rejected", reply.as_bytes());
         return true;
     };
     // An admin verb: leader-only in this host; the run.sh driver retries the
@@ -2580,24 +2995,31 @@ fn handle_client_line(host: &mut Host, index: usize, line: &str, now: u64, rng: 
         "leave" => RECONFIGURE_LEAVE,
         "decrement" => RECONFIGURE_DECREMENT,
         _ => {
-            let _ = host.conns[index]
-                .stream
-                .write_all(b"{\"error\":\"bad_request\"}\n");
+            client_reply(host, index, "bad_request", b"{\"error\":\"bad_request\"}");
             return true;
         }
     };
     let Some(id) = value["id"].as_u64() else {
-        let _ = host.conns[index]
-            .stream
-            .write_all(b"{\"error\":\"bad_request\"}\n");
+        client_reply(host, index, "bad_request", b"{\"error\":\"bad_request\"}");
         return true;
     };
     let id = id as u32;
     let status = host.node.status();
+    info!(
+        ts = millis(),
+        event = "client-request",
+        node = host.own_id,
+        era = status.era,
+        view = status.view,
+        leader = status.leader,
+        state = status.state_name(),
+        action = %action,
+        id,
+        bytes = line.len(),
+        "client-request"
+    );
     if status.state != STATE_NORMAL || status.leader != host.own_id {
-        let _ = host.conns[index]
-            .stream
-            .write_all(b"{\"error\":\"not_leader\"}\n");
+        client_reply(host, index, "not_leader", b"{\"error\":\"not_leader\"}");
         return true;
     }
     let rc = host.node.reconfigure(op, id, POSITION_APPEND);
@@ -2607,9 +3029,8 @@ fn handle_client_line(host: &mut Host, index: usize, line: &str, now: u64, rng: 
     // the drain run in the same loop slice, so the capture races nothing.
     let establishing_slot = host.flush_outputs(now, rng);
     if rc != OK {
-        let reply = format!("{{\"action\":\"{action}\",\"id\":{id},\"accepted\":false}}\n");
-        let _ = host.conns[index].stream.write_all(reply.as_bytes());
-        let _ = host.conns[index].stream.flush();
+        let reply = format!("{{\"action\":\"{action}\",\"id\":{id},\"accepted\":false}}");
+        client_reply(host, index, "rejected", reply.as_bytes());
         return true;
     }
     let endpoint = value["endpoint"].as_str().unwrap_or_default().to_string();

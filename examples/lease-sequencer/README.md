@@ -34,10 +34,10 @@ Every node runs the same driver:
   the leader-echoed remaining time plus `rand()*100 ms` (thinned by the
   polite probe floor under `--model polite`).
 
-Every attempt is logged at `info` as
+Every attempt is logged at `info` as one JSON line:
 
 ```
-lease-attempt ts=<ms> node=<id> op=set|renew|get|steal expiry=<ms>
+{"ts":<ms>,"level":"INFO","event":"lease-attempt","node":<id>,"op":"set|renew|get|steal","expiry":<ms>,"era":<era>,"view":<view>,"leader":<id>,"state":<name>}
 ```
 
 ## Tracing
@@ -45,13 +45,25 @@ lease-attempt ts=<ms> node=<id> op=set|renew|get|steal expiry=<ms>
 The node logs through `tracing`; the library (`lunet_advisory_lock`)
 emits events and the binary owns the subscriber stack, exactly the
 tokio-rs guidance: a downstream embedder chooses its own subscriber.
-This binary installs `tracing_subscriber::fmt` with
+This binary installs `tracing_subscriber::fmt` with the **JSON**
+formatter (the event's own fields flattened into the root object),
 `EnvFilter::from_default_env()` (the `RUST_LOG` variable), ANSI off, no
-line timestamp (events carry their own `ts=` fields), writing through
-`tracing_appender`'s `NonBlocking` writer to a per-node **daily rolling**
-file (the `--log` path's stem becomes the file prefix under the same
-directory). The `WorkerGuard` is held for the process lifetime and
-flushes on an orderly shutdown.
+line timestamp (each line's `ts` is the host's own `millis()`), writing
+through `tracing_appender`'s `NonBlocking` writer to a per-node **daily
+rolling** file (the `--log` path's stem becomes the file prefix under
+the same directory). The `WorkerGuard` is held for the process lifetime
+and flushes on an orderly shutdown.
+
+**The line shape.** One JSON object per line, `ts` and `event` on every
+line, `era` and `view` on every line that concerns the protocol, and the
+line's own fields beside them. A free-text body rides `text` (the
+`note(body)` channel) or `message` (a line's own sentence) and never
+escapes the object. The observability contract
+(`docs/src/test-scaffold.md`) names the contents: the NOMINATE
+computation's traffic, the cluster gossip, the timeouts and the
+request/response streams are all transparent, every heartbeat commit is
+a line carrying its slot, view and era, and the slot frontier rides the
+telemetry tape as well as the log.
 
 **Loss window.** `NonBlocking` is drop-on-overflow: when a node writes
 faster than the worker drains, events are dropped, never backpressured

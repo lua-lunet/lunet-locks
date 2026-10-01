@@ -220,6 +220,29 @@ impl TelemetryLog {
         }
     }
 
+    /// One record the lifecycle gate does NOT silence: the periodic slot
+    /// frontier. The gate disarms on a voting node — exactly the node an
+    /// operator asks the tape about — so the frontier rides the gate-free
+    /// append path alongside the boot and teardown records. A failed
+    /// append still only disables the stream: the frontier is telemetry
+    /// and never load-bearing.
+    pub fn record_frontier(&mut self, record: Record) {
+        if self.file.is_none() {
+            return;
+        }
+        self.append(record);
+        if self.rollover_due()
+            && let Err(error) = self.rollover()
+        {
+            eprintln!(
+                "lease-sequencer: telemetry aof rollover failed ({error}); \
+                 the telemetry stream is disabled for this process"
+            );
+            self.file = None;
+            self.closed = true;
+        }
+    }
+
     /// The active file's path (for operators: which file is being
     /// appended to).
     pub fn active_path(&self) -> &Path {

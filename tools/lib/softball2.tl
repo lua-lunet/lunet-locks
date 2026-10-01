@@ -104,7 +104,7 @@ end
 -- is a 2 s cadence; every note carries ts=<epoch ms>).
 local function status_at(name: string, since_ms: integer): {string: string}
     local latest: {string: string} = {}
-    for _, line in ipairs(logs.grep(node_log_files(name), "status state=")) do
+    for _, line in ipairs(logs.event_lines(node_log_files(name), "status")) do
         local kv = logs.kv(line)
         local ts = tonumber(kv.ts) or 0
         if ts >= since_ms then
@@ -637,33 +637,22 @@ local function total_errors(): integer
     return n
 end
 
--- A log-count delta helper: the count of `pattern` matches in the
--- node's logs captured before and after a window; the difference is the
--- window's count (no ts on every line, so the line totals bracket it).
-local function line_count(name: string, pattern: string): integer
-    return logs.count(node_log_files(name), pattern)
+-- A log-count delta helper: the count of `event` lines in the node's
+-- logs captured before and after a window; the difference is the
+-- window's count.
+local function line_count(name: string, event: string): integer
+    return #logs.event_lines(node_log_files(name), event)
 end
 
 -- The named-diagnostic drop counter: per-reason counts over a node's
 -- whole log surface (windowed deltas are taken by the caller at two
--- points in time).
+-- points in time). Every named drop is one `peer-input-dropped` line
+-- carrying the core's `diagnostic`.
 local function drop_reasons(name: string): {string: integer}
-    local reasons: {string} = {
-        "ViewMismatch",
-        "GapDetected",
-        "SlotNotOutstanding",
-        "StaleEvidence",
-        "StaleTransfer",
-        "StaleViewChange",
-        "StartViewFromStaleView",
-        "StatusGate",
-        "PrepareOkNotPrimary",
-        "ReincarnationRefused",
-        "TransferNotServed",
-    }
     local counts: {string: integer} = {}
-    for _, reason in ipairs(reasons) do
-        counts[reason] = line_count(name, "diagnostic=" .. reason)
+    for _, line in ipairs(logs.event_lines(node_log_files(name), "peer-input-dropped")) do
+        local reason = logs.kv(line).diagnostic or "unnamed"
+        counts[reason] = (counts[reason] or 0) + 1
     end
     return counts
 end
@@ -672,7 +661,7 @@ end
 -- fields, or "" when no bumped boot note exists.
 local function bumped_boot(name: string, since_ms: integer): string
     local found = ""
-    for _, line in ipairs(logs.grep(node_log_files(name), "boot name=")) do
+    for _, line in ipairs(logs.event_lines(node_log_files(name), "boot")) do
         local kv = logs.kv(line)
         if
             (tonumber(kv.ts) or 0) >= since_ms
@@ -690,12 +679,12 @@ end
 -- The newest named diagnostic in one node's logs (the fenced node's
 -- newest complaint).
 local function newest_diagnostic(name: string): string
-    local lines = logs.grep(node_log_files(name), "diagnostic=")
+    local lines = logs.event_lines(node_log_files(name), "peer-input-dropped")
     local n = #lines
     if n == 0 then
         return ""
     end
-    return lines[n]:match("diagnostic=([A-Za-z]+)") or ""
+    return logs.kv(lines[n]).diagnostic or ""
 end
 
 -- ------------------------------------------------------ the scenarios --
@@ -850,8 +839,8 @@ local function scenario_partitions()
     local p1_heal = anchor("P1-CONT " .. follower)
     proc.resume(procs[follower] as proc.Process)
     local f_drops_before = drop_reasons(follower)
-    local p1_lc_before = line_count(leader, "leader change")
-    local p1_lf_before = line_count(follower, "leader change")
+    local p1_lc_before = line_count(leader, "leader-change")
+    local p1_lf_before = line_count(follower, "leader-change")
     local ok_rejoin, rejoin_report = wait_node_normal(
         follower, p1_heal, REJOIN_DEADLINE_MS
     )
@@ -875,9 +864,9 @@ local function scenario_partitions()
             .. " client_errors_in_window=" .. (t_err - t0_err)
             .. " heal_rejoin_ms=" .. (t_rejoined - p1_heal)
             .. " leader_changes_in_window="
-            .. (line_count(leader, "leader change") - p1_lc_before)
+            .. (line_count(leader, "leader-change") - p1_lc_before)
             .. " follower_changes_in_window="
-            .. (line_count(follower, "leader change") - p1_lf_before)
+            .. (line_count(follower, "leader-change") - p1_lf_before)
             .. " healed_drops " .. table.concat(f_storm, " ")
             .. " states=" .. states_snapshot()
     )
@@ -914,7 +903,7 @@ local function scenario_partitions()
             end
         end
     end
-    local lc_before = line_count(new_leader ~= "" and new_leader or survivor, "leader change")
+    local lc_before = line_count(new_leader ~= "" and new_leader or survivor, "leader-change")
     anchor(
         "P2-takeover new_leader=" .. new_leader .. " states=" .. states_snapshot()
     )
@@ -942,7 +931,7 @@ local function scenario_partitions()
             .. " client_errors_in_window=" .. (t_err2 - t0_err2)
             .. " heal_rejoin_ms=" .. (t_rejoined2 - p2_heal)
             .. " leader_changes_on_new_leader_in_window="
-            .. (line_count(new_leader ~= "" and new_leader or survivor, "leader change") - lc_before)
+            .. (line_count(new_leader ~= "" and new_leader or survivor, "leader-change") - lc_before)
             .. " healed_drops " .. table.concat(storm_parts, " ")
             .. " states=" .. states_snapshot()
     )
@@ -989,7 +978,7 @@ local function scenario_crashes(tag: string)
         local remaps_before = 0
         for _, other in ipairs(GENESIS) do
             if other ~= name then
-                remaps_before = remaps_before + line_count(other, "remap ")
+                remaps_before = remaps_before + line_count(other, "remap")
             end
         end
         local t_boot = anchor("C-restart " .. name)
@@ -999,7 +988,7 @@ local function scenario_crashes(tag: string)
         local remaps = 0
         for _, other in ipairs(GENESIS) do
             if other ~= name then
-                remaps = remaps + line_count(other, "remap ")
+                remaps = remaps + line_count(other, "remap")
             end
         end
         remaps = remaps - remaps_before
@@ -1088,7 +1077,7 @@ local function scenario_compound()
     )
     local x_heal = anchor("X-CONT " .. partitioned)
     proc.resume(pp)
-    local lc_before = line_count(partitioned, "leader change")
+    local lc_before = line_count(partitioned, "leader-change")
     local healed_drops_before = drop_reasons(partitioned)
     local ok_elect, elect_report = wait_quorum(2, LEADER_DEADLINE_MS)
     if not ok_elect then
@@ -1110,7 +1099,7 @@ local function scenario_compound()
             .. " first_serve_ms=" .. (probe_landed - x_heal)
             .. " client_errors_in_heal_window=" .. (t_err2 - t_err)
             .. " leader_changes_on_healed_in_window="
-            .. (line_count(partitioned, "leader change") - lc_before)
+            .. (line_count(partitioned, "leader-change") - lc_before)
             .. " states=" .. states_snapshot()
     )
     local function storm_line(k: string, before: integer, after: integer): string
@@ -1128,14 +1117,14 @@ local function scenario_compound()
     clock.sleep(5)
     local lateacks_before = 0
     for _, name in ipairs(GENESIS) do
-        lateacks_before = lateacks_before + line_count(name, "late ack")
+        lateacks_before = lateacks_before + line_count(name, "late-ack")
     end
     local t_boot = anchor("X-restart " .. leader)
     start_node(leader)
     local ok_rejoin, rejoin_report = wait_node_normal(leader, t_boot, REJOIN_DEADLINE_MS)
     local lateacks = 0
     for _, name in ipairs(GENESIS) do
-        lateacks = lateacks + line_count(name, "late ack")
+        lateacks = lateacks + line_count(name, "late-ack")
     end
     lateacks = lateacks - lateacks_before
     local leader_drops_before = drop_reasons(leader)

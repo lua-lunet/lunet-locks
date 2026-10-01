@@ -20,17 +20,58 @@ const REPLACEMENT_DELAY: Duration = Duration::from_millis(1_100);
 const KILL_EVERY: Duration = Duration::from_secs(3);
 const TAKEOVER_DEADLINE: Duration = Duration::from_secs(5);
 
+/// One JSON line on the simulator's own log: the observability
+/// contract's shape, `ts` (the wall clock), `event` (the line's stable
+/// name) and the line's own fields. Echoed to stdout in the same shape,
+/// so a lane that tees the stream captures JSON lines too.
 struct Logger {
     file: File,
 }
 
 impl Logger {
-    fn line(&mut self, message: impl AsRef<str>) {
-        let line = message.as_ref();
+    fn event(&mut self, event: &str, fields: &[(&str, String)]) {
+        let mut line = format!(
+            "{{\"ts\":{},\"level\":\"INFO\",\"event\":{}{}",
+            now_ms(),
+            json_string(event),
+            fields
+                .iter()
+                .map(|(key, value)| format!(",{}:{value}", json_string(key)))
+                .collect::<String>()
+        );
+        line.push('}');
         println!("{line}");
         let _ = writeln!(self.file, "{line}");
         let _ = self.file.flush();
     }
+
+    fn detail(&mut self, event: &str, detail: &str) {
+        self.event(event, &[("detail", json_string(detail))]);
+    }
+}
+
+/// One string as a JSON literal, quotes and control characters escaped.
+fn json_string(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('"');
+    for c in text.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// One number as a JSON literal.
+fn json_number(value: u64) -> String {
+    value.to_string()
 }
 
 struct Cluster {
@@ -313,10 +354,13 @@ fn main() -> io::Result<()> {
     let mut log = Logger {
         file: File::create(work.join("simulation.log"))?,
     };
-    log.line(format!(
-        "simulation start duration={duration}s work={}",
-        work.display()
-    ));
+    log.event(
+        "simulation-start",
+        &[
+            ("duration_s", json_number(duration)),
+            ("work", json_string(&work.display().to_string())),
+        ],
+    );
     let mut cluster = if let Some(runtime) = &runtime {
         Some(start_cluster(&root, runtime, &work)?)
     } else {
@@ -324,13 +368,28 @@ fn main() -> io::Result<()> {
     };
     let ports = external_ports.unwrap_or([29_101, 29_102, 29_103]);
     if cluster.is_some() {
-        log.line("cluster start n1,n2,n3; client endpoints 29101,29102,29103");
+        log.event(
+            "cluster-start",
+            &[
+                ("cluster", json_string("n1,n2,n3")),
+                (
+                    "client_endpoints",
+                    json_string("29101,29102,29103"),
+                ),
+            ],
+        );
         thread::sleep(Duration::from_millis(2_600));
     } else {
-        log.line(format!(
-            "external stable cluster; client endpoints {},{},{}",
-            ports[0], ports[1], ports[2]
-        ));
+        log.event(
+            "cluster-start",
+            &[
+                ("cluster", json_string("external-stable")),
+                (
+                    "client_endpoints",
+                    json_string(&format!("{},{},{}", ports[0], ports[1], ports[2])),
+                ),
+            ],
+        );
     }
 
     let mut workers = vec![
@@ -339,11 +398,13 @@ fn main() -> io::Result<()> {
         Worker::new(3, 1, ports[2]),
     ];
     for worker in &workers {
-        log.line(format!(
-            "client start {} logical_id={}",
-            worker.name(),
-            worker.client_id
-        ));
+        log.event(
+            "client-start",
+            &[
+                ("node", json_string(&worker.name())),
+                ("logical_id", json_number(worker.client_id)),
+            ],
+        );
     }
     let started = Instant::now();
     let end = started + Duration::from_secs(duration);
@@ -388,32 +449,26 @@ fn main() -> io::Result<()> {
                                 workers[index].last_renewal = Instant::now();
                                 observed_holder = Some(index);
                                 observed_live_holder = true;
-                                if was_owner {
-                                    log.line(format!(
-                                        "renew {} lease_id={}",
-                                        workers[index].name(),
-                                        workers[index].lease_id
-                                    ));
-                                } else {
-                                    log.line(format!(
-                                        "acquire {} lease_id={}",
-                                        workers[index].name(),
-                                        workers[index].lease_id
-                                    ));
-                                }
+                                log.event(
+                                    if was_owner { "client-renew" } else { "client-acquire" },
+                                    &[
+                                        ("node", json_string(&workers[index].name())),
+                                        ("lease_id", json_number(workers[index].lease_id)),
+                                    ],
+                                );
                             }
                             Ok(_) => workers[index].owns = false,
-                            Err(error) => log.line(format!(
-                                "no-leader/unavailable {}: {error}",
-                                workers[index].name()
-                            )),
+                            Err(error) => log.detail(
+                                "client-unavailable",
+                                &format!("{}: {error}", workers[index].name()),
+                            ),
                         }
                     }
                 }
-                Err(error) => log.line(format!(
-                    "no-leader/unavailable {}: {error}",
-                    workers[index].name()
-                )),
+                Err(error) => log.detail(
+                    "client-unavailable",
+                    &format!("{}: {error}", workers[index].name()),
+                ),
             }
         }
 
@@ -425,11 +480,13 @@ fn main() -> io::Result<()> {
             let killed_client_id = pending.killed_client_id;
             if Instant::now() >= due {
                 let worker = Worker::new(dc, serial, ports[(dc - 1) as usize]);
-                log.line(format!(
-                    "client start {} logical_id={} after lease expiry",
-                    worker.name(),
-                    worker.client_id
-                ));
+                log.event(
+                    "client-restart",
+                    &[
+                        ("node", json_string(&worker.name())),
+                        ("logical_id", json_number(worker.client_id)),
+                    ],
+                );
                 workers.push(worker);
                 replacement.as_mut().unwrap().due = end + Duration::from_secs(1);
             }
@@ -441,7 +498,10 @@ fn main() -> io::Result<()> {
             }
             if let Some(holder) = observed_holder {
                 if workers[holder].client_id != killed_client_id && workers[holder].active {
-                    log.line(format!("lease expiry/takeover {}", workers[holder].name()));
+                    log.event(
+                        "lease-takeover",
+                        &[("node", json_string(&workers[holder].name()))],
+                    );
                     replacement = None;
                 }
             }
@@ -452,11 +512,13 @@ fn main() -> io::Result<()> {
                 if workers[holder].active {
                     let killed = &mut workers[holder];
                     killed.stop();
-                    log.line(format!(
-                        "client kill {} logical_id={}",
-                        killed.name(),
-                        killed.client_id
-                    ));
+                    log.event(
+                        "client-kill",
+                        &[
+                            ("node", json_string(&killed.name())),
+                            ("logical_id", json_number(killed.client_id)),
+                        ],
+                    );
                     replacement = Some(PendingReplacement {
                         dc: killed.dc,
                         serial: killed.serial + 1,
@@ -478,10 +540,13 @@ fn main() -> io::Result<()> {
         cluster.stop();
     }
     if let Some(message) = failure {
-        log.line(format!("simulation FAILED: {message}"));
+        log.detail("simulation-failed", &message);
         return Err(io::Error::other(message));
     }
-    log.line("simulation passed: no conflicting live holder observed; nodes cleaned up");
+    log.detail(
+        "simulation-passed",
+        "no conflicting live holder observed; nodes cleaned up",
+    );
     Ok(())
 }
 

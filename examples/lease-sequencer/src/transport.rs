@@ -50,6 +50,35 @@ pub fn reincarnation_pair(payload: &[u8]) -> Option<(u32, u32)> {
     Some((old, new))
 }
 
+/// The core's 20-byte big-endian VRR header: `(tag, era, view, slot)` —
+/// the same four words `reincarnation_pair` reads, stated once. `None`
+/// when the payload is too short to carry a header; the reader never
+/// guesses past what the bytes carry.
+pub fn vrr_header(payload: &[u8]) -> Option<VrrHeader> {
+    if payload.len() < 20 {
+        return None;
+    }
+    Some(VrrHeader {
+        tag: u32::from_be_bytes(payload[0..4].try_into().ok()?),
+        era: u32::from_be_bytes(payload[4..8].try_into().ok()?),
+        view: u32::from_be_bytes(payload[8..12].try_into().ok()?),
+        slot: u64::from_be_bytes(payload[12..20].try_into().ok()?),
+    })
+}
+
+/// One decoded VRR header.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VrrHeader {
+    pub tag: u32,
+    pub era: u32,
+    pub view: u32,
+    pub slot: u64,
+}
+
+/// The core's Commit tag (`vrr::wire::Tag::Commit`): a commit-frontier
+/// advance carrying no new operation — the heartbeat's own datagram.
+pub const COMMIT_TAG: u32 = 4;
+
 pub fn encode_peer(kind: u8, fingerprint: &str, payload: &[u8]) -> Vec<u8> {
     let mut packet = Vec::with_capacity(PEER_HEADER_BYTES + payload.len());
     packet.extend_from_slice(PEER_MAGIC);

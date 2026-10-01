@@ -21,6 +21,12 @@ pub use recovery_flush::{FlushOutcome, RecoveryFlush};
 #[doc(hidden)]
 pub use ffi::{census_paths, census_push};
 
+/// The wall-clock millisecond every log line carries. `#[doc(hidden)]`
+/// because no embedder calls it: `maybe_invariant!` reaches it through
+/// `$crate`, and the crate's own sites call it directly.
+#[doc(hidden)]
+pub use ffi::log_millis;
+
 pub use ffi::{
     CLIENT_JSON, CONFIG, FAULTED, INVALID, NOT_LEADER, OK, PANIC, SERVICE, TOO_LARGE, VRR_MESSAGE,
 };

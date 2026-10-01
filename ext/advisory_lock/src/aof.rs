@@ -169,7 +169,11 @@ impl FileSink {
         let ring = match io_uring::IoUring::new(64) {
             Ok(ring) => Some(ring),
             Err(e) => {
-                warn!("aof: io_uring unavailable ({e}); falling back to buffered write_all");
+                warn!(
+                    ts = crate::log_millis(),
+                    event = "aof-io-uring-unavailable",
+                    "aof: io_uring unavailable ({e}); falling back to buffered write_all"
+                );
                 None
             }
         };

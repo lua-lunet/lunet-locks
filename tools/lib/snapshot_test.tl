@@ -95,7 +95,9 @@ function M.main(argv_root: string, argv: {string}): integer
     fs.write_all(fs.join(run_dir, "aof/dc1/1789725519.meta"), "meta\n")
     fs.write_all(
         fs.join(run_dir, "n1.2026-09-18.log"),
-        " INFO stop: drained and flushed; the next boot continues under the same identity node=1\n"
+        '{"ts":1789725518000,"level":"INFO","event":"stop-drained","node":1,"era":1,'
+            .. '"view":3,"message":"stop: drained and the drain proven; the next boot '
+            .. 'continues under the same identity"}\n'
     )
     fs.write_all(fs.join(run_dir, "n1.nohup"), "nohup\n")
     fs.write_all(

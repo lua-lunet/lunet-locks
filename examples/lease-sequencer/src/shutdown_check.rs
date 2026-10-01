@@ -1,7 +1,9 @@
 //! The shutdown-restart consistency check (the snapshot rule's
 //! verification half): the run's logs are cross-checked against the
 //! run's durable markers, from a raw run directory or a
-//! `snapshot_run.lua` archive alike.
+//! `snapshot_run.lua` archive alike. The node's own log is JSON lines,
+//! one object per line; the Lua host's stdout beside it is plain text,
+//! and both are read here.
 //!
 //! The stop path (the termination obligations' §2 write order) leaves
 //! both a log record trail and a durable marker trail, and the two must
@@ -69,7 +71,14 @@ const FLUSHED_SPELLINGS: &[&str] = &[
     "stop: drained and the drain proven",
 ];
 
-const BOOT_SPELLINGS: &[&str] = &["membership model era=", "boot name=", "node provisioned"];
+/// The records that open a new life on a node's log. The node's own log
+/// is JSON lines, so its boot records are named by their `event`; the
+/// Lua host's stdout beside it is plain text and is named by its prose.
+const BOOT_SPELLINGS: &[&str] = &[
+    "node provisioned",
+    "\"event\":\"boot\"",
+    "\"event\":\"membership-model\"",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StopKind {
@@ -146,7 +155,18 @@ fn is_boot_record(line: &str) -> bool {
     BOOT_SPELLINGS.iter().any(|needle| lower.contains(needle))
 }
 
+/// The record's own timestamp, in milliseconds. A JSON line carries it
+/// as the `ts` field — the host's own clock, the same clock the log's
+/// formatter deliberately does not stamp beside it. A plain text line
+/// (the Lua host's stdout, which the check reads beside the node's own
+/// log) carries it as a `ts=` token.
 fn explicit_ts(line: &str) -> Option<u64> {
+    if line.starts_with('{')
+        && let Some((_, rest)) = line.split_once("\"ts\":")
+    {
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        return digits.parse::<u64>().ok();
+    }
     for field in line.split_whitespace() {
         if let Some(value) = field.strip_prefix("ts=") {
             return value.parse::<u64>().ok();

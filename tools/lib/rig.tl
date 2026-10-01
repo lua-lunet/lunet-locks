@@ -218,11 +218,11 @@ local function all_logs(rig: Rig): {string}
 end
 
 local function total_renews(rig: Rig): integer
-    return logs.count(all_logs(rig), "op=renew")
+    return logs.count_where(all_logs(rig), "lease-attempt", { op = "renew" })
 end
 
 local function grant_lines(rig: Rig): {string}
-    return logs.grep(all_logs(rig), "grant node=")
+    return logs.event_lines(all_logs(rig), "lease-grant")
 end
 
 -- The node id holding the lease: the latest grant across all logs.
@@ -357,7 +357,7 @@ local function cadence_report(rig: Rig, t0: integer, t1: integer): boolean, stri
     local s_get: {string: integer} = {}
     local c_get: {string: integer} = {}
     local s_renew, n_renew = 0, 0
-    for _, line in ipairs(logs.grep(all_logs(rig), "lease%-attempt ")) do
+    for _, line in ipairs(logs.event_lines(all_logs(rig), "lease-attempt")) do
         local kv = logs.kv(line)
         local ts = (tonumber(kv.ts) or 0) as integer
         local node = kv.node or ""
@@ -652,7 +652,7 @@ local function stability_body(root: string)
                 .. hname
                 .. " did not reincarnate (no identity bump in its boot note)",
             function(): boolean, string
-                for _, line in ipairs(logs.grep(node_logs(rig, hname), "boot name=")) do
+                for _, line in ipairs(logs.event_lines(node_logs(rig, hname), "boot")) do
                     local kv = logs.kv(line)
                     local ts = (tonumber(kv.ts) or 0) as integer
                     local own = (tonumber(kv.own) or 0) as integer
@@ -680,9 +680,10 @@ local function stability_body(root: string)
                 for _, other in ipairs(rig.names) do
                     if other ~= hname then
                         if
-                            logs.count(
+                            logs.count_where(
                                 node_logs(rig, other),
-                                "remap old=" .. hid .. " new=" .. bumped
+                                "remap",
+                                { old = tostring(hid), new = bumped }
                             ) > 0
                         then
                             n = n + 1
@@ -704,7 +705,7 @@ local function stability_body(root: string)
             end
         )
         local held_again = false
-        for _, line in ipairs(logs.grep(node_logs(rig, hname), "grant node=")) do
+        for _, line in ipairs(logs.event_lines(node_logs(rig, hname), "lease-grant")) do
             if tonumber(logs.kv(line).node) == tonumber(bumped) then
                 held_again = true
             end
@@ -799,13 +800,14 @@ function M.takeover(root: string): integer
             )
             print("converged: lease granted")
 
-            -- The consensus leader: each node logs status lines naming leader=<id>.
+            -- The consensus leader: each node logs a `leader` line naming
+            -- the primary it currently sees.
             clock.sleep(2)
             local leader_id = 0
             local leader_ts = 0
-            for _, line in ipairs(logs.grep(all_logs(rig), "status state=")) do
+            for _, line in ipairs(logs.event_lines(all_logs(rig), "status")) do
                 local kv = logs.kv(line)
-                if kv.state == "0" then
+                if kv.state == "normal" then
                     local ts = (tonumber(kv.ts) or 0) as integer
                     if ts > leader_ts then
                         leader_ts = ts
@@ -857,18 +859,20 @@ function M.takeover(root: string): integer
 
             -- Detection: the FIRST leader-timeout-detect line after the kill.
             local detect_ts = 0
-            for _, line in ipairs(logs.grep(all_logs(rig), "leader%-timeout%-detect ")) do
+            for _, line in ipairs(
+                logs.event_lines(all_logs(rig), "leader-timeout-detect")
+            ) do
                 local ts = (tonumber(logs.kv(line).ts) or 0) as integer
                 if ts >= kill_ts and (detect_ts == 0 or ts < detect_ts) then
                     detect_ts = ts
                 end
             end
 
-            -- The new leader: the first post-kill leader-change status line
+            -- The new leader: the first post-kill leader line
             -- naming a different leader id.
             local new_leader_ts = 0
             local new_leader_line = ""
-            for _, line in ipairs(logs.grep(all_logs(rig), "leader leader=")) do
+            for _, line in ipairs(logs.event_lines(all_logs(rig), "leader")) do
                 local kv = logs.kv(line)
                 local ts = (tonumber(kv.ts) or 0) as integer
                 local node_id = (tonumber(kv.node) or 0) as integer
@@ -907,7 +911,7 @@ function M.takeover(root: string): integer
             print("--- last leader lines per survivor ---")
             for _, name in ipairs(rig.names) do
                 if name ~= leader_name then
-                    local lines = logs.grep(node_logs(rig, name), "leader leader=")
+                    local lines = logs.event_lines(node_logs(rig, name), "leader")
                     local last = lines[#lines] or "none"
                     print(name .. ": " .. last)
                 end
@@ -1000,7 +1004,7 @@ function M.acceptance(root: string): integer
                 clock.now_ms() + 60000,
                 "the genesis cluster did not stabilize",
                 function(): boolean, string
-                    local n = #logs.grep(all_logs(rig), "grant node=")
+                    local n = #logs.event_lines(all_logs(rig), "lease-grant")
                     return n >= 4, "grants=" .. n
                 end
             )
@@ -1048,13 +1052,27 @@ function M.acceptance(root: string): integer
             clock.sleep(1)
 
             local node_files = logs.node_files(fs.join(rig.run_dir, "logs"), joiner)
-            if logs.count(node_files, "discovery escalate era=6") == 0 then
+            if
+                logs.count_where(
+                    node_files,
+                    "discovery-escalate",
+                    { model_era = "6" }
+                ) == 0
+            then
                 gate.fail("the 7th node's discovery never escalated to the live era 6")
             end
             print("discovery: escalated to the live era 6")
             if
-                logs.count(node_files, "membership snapshot adopted era=6") == 0
-                or logs.count(node_files, "source=discovery") == 0
+                logs.count_where(
+                    node_files,
+                    "membership-snapshot-adopted",
+                    { model_era = "6" }
+                ) == 0
+                or logs.count_where(
+                    node_files,
+                    "membership-snapshot-adopted",
+                    { source = "discovery" }
+                ) == 0
             then
                 gate.fail(
                     "the 7th node never adopted a quorum of agreeing era-6 snapshots"
@@ -1107,7 +1125,13 @@ function M.acceptance(root: string): integer
             -- The discovered addressing rows let the node address the live
             -- members it did not remember: its status line shows it tracking
             -- the cluster.
-            if logs.count(node_files, "membership snapshot adopted") == 0 then
+            if
+                logs.count_where(
+                    node_files,
+                    "membership-snapshot-adopted",
+                    {}
+                ) == 0
+            then
                 gate.fail("no membership adoption evidence in the 7th node's log")
             end
 

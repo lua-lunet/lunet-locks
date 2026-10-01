@@ -1,9 +1,10 @@
 -- The polite run's per-operation stream client (typed body): one lock, a
--- cycle of acquire → 3× extend → release → get, one log line per completed
--- operation in key=value form (rel_ms, op, ok, dur_ms, detail). It is the
--- per-op latency sample source and the honest error recorder: a connect
--- refusal, a write failure, a reply deadline, or an error body is one
--- error record, never silent.
+-- cycle of acquire → 3× extend → release → get, one JSON line per
+-- completed operation (the observability contract's shape: `event`,
+-- `rel_ms`, `op`, `ok`, `dur_ms`, `detail`). It is the per-op latency
+-- sample source and the honest error recorder: a connect refusal, a
+-- write failure, a reply deadline, or an error body is one error record,
+-- never silent.
 --
 -- Connection discipline: ONE persistent connection to the leader-side
 -- server list, the server's sequential client path (one op in flight at a
@@ -86,19 +87,46 @@ function M.main(): integer
 
     local holder = new_uuid()
 
+    -- One free-text value as a JSON string: the quotes, backslashes and
+    -- control characters a node's reply detail can carry, escaped.
+    local function json_string(text: string): string
+        local escaped = text:gsub("[%c\"\\]", function(c: string): string
+            if c == '"' then
+                return '\\"'
+            elseif c == "\\" then
+                return "\\\\"
+            elseif c == "\n" then
+                return "\\n"
+            elseif c == "\r" then
+                return "\\r"
+            elseif c == "\t" then
+                return "\\t"
+            end
+            return string.format("\\u%04x", string.byte(c))
+        end)
+        return '"' .. escaped .. '"'
+    end
+
+    -- One JSON object per line, the observability contract's shape: the
+    -- client's own line identity in `event`, the node it drove against in
+    -- `node`, the op and its outcome as fields, and the client's own
+    -- relative clock in `rel_ms`. Free text rides `detail` and never
+    -- escapes the object.
     local function log_line(op: string, ok: boolean, dur_ms: integer, detail: string)
         log_file:write(
-            "rel_ms="
+            '{"level":"INFO","ts":'
+                .. clock.now_ms()
+                .. ',"event":"client-op","rel_ms":'
                 .. (clock.now_ms() - boot_ms)
-                .. " op="
+                .. ',"op":"'
                 .. op
-                .. " ok="
-                .. (ok and "1" or "0")
-                .. " dur_ms="
+                .. '","ok":'
+                .. (ok and "true" or "false")
+                .. ',"dur_ms":'
                 .. dur_ms
-                .. " detail="
-                .. detail
-                .. "\n"
+                .. ',"detail":'
+                .. json_string(detail)
+                .. "}\n"
         )
         log_file:flush()
     end

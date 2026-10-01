@@ -238,7 +238,7 @@ use vrr::replica::{
     Input, PersistedProgress, Pivot, PlanRefusal, PublishOutcome, PublishRefusal, Replica,
     TimedInput, ViewChangeKnobs,
 };
-use vrr::wire::{Pack, Unpack, UnpackError};
+use vrr::wire::{Pack, Tag, Unpack, UnpackError};
 
 use crate::marker_store::{GateStore, SinkDoor, drain_sink, sink_guard};
 
@@ -281,9 +281,43 @@ macro_rules! maybe_invariant {
         if cfg!(test) || cfg!(debug_assertions) {
             panic!("maybe-invariant violation: {}", format_args!($($arg)*));
         } else {
-            ::tracing::warn!($($arg)*);
+            ::tracing::warn!(
+                ts = $crate::log_millis(),
+                event = "maybe-invariant",
+                $($arg)*
+            );
         }
     };
+}
+
+/// The wall-clock millisecond every log line this crate emits carries:
+/// the same host clock the marker layer's `unix_millis` reads and the
+/// same one the embedding host stamps its own lines with, so the log's
+/// order is the host's order. A clock reading before the UNIX epoch
+/// carries no millisecond; the line then reads `0` and nothing else
+/// decides on it — no protocol path reads a log field.
+#[doc(hidden)]
+#[must_use]
+pub fn log_millis() -> u64 {
+    unix_millis().unwrap_or(0)
+}
+
+/// The view-change message family (`vrr::wire::Tag`): the NOMINATE
+/// computation's own traffic — the fence, the evidence, the selected
+/// history. Ordinary replication traffic stays at `trace` (it is the
+/// heartbeat's subject, and the host logs every heartbeat commit with
+/// its slot, view and era), so the whole fence is visible in the log at
+/// the default `RUST_LOG=info` without the replication flood.
+fn is_view_change_family(tag: Tag) -> bool {
+    matches!(
+        tag,
+        Tag::StartViewChange
+            | Tag::DoViewChange
+            | Tag::PlannedViewChange
+            | Tag::StartView
+            | Tag::GetState
+            | Tag::NewState
+    )
 }
 
 /// One lifecycle path line: the named census entry that a boot or stop path
@@ -616,9 +650,14 @@ impl Node {
         match crashed.latch(witness) {
             Ok(running) => {
                 trace_line!("boot.deferred-latch");
+                let snapshot = self.replica.observer().read();
                 info!(
+                    ts = log_millis(),
+                    event = "deferred-latch",
                     node = self.replica.own().0,
                     identity = running.identity().0,
+                    era = snapshot.era,
+                    view = snapshot.view,
                     "the deferred latch landed: the bumped identity is durable"
                 );
                 self.session = Some(running);
@@ -877,11 +916,22 @@ impl Node {
     fn report(&mut self) {
         let diagnostic = self.replica.observer().read_diagnostic();
         if diagnostic != Diagnostic::None {
-            warn!(?diagnostic, "peer input dropped with a named diagnostic");
+            let snapshot = self.replica.observer().read();
+            warn!(
+                ts = log_millis(),
+                event = "peer-input-dropped",
+                node = self.replica.own().0,
+                era = snapshot.era,
+                view = snapshot.view,
+                ?diagnostic,
+                "peer input dropped with a named diagnostic"
+            );
         }
         let snapshot = self.replica.observer().read();
         if self.last_view != Some((snapshot.era, snapshot.view)) {
             debug!(
+                ts = log_millis(),
+                event = "view-change",
                 node = self.replica.own().0,
                 era = snapshot.era,
                 view = snapshot.view,
@@ -892,6 +942,8 @@ impl Node {
         let leader = self.primary_index();
         if self.last_leader != Some(leader) {
             info!(
+                ts = log_millis(),
+                event = "leader-change",
                 node = self.replica.own().0,
                 era = snapshot.era,
                 view = snapshot.view,
@@ -936,6 +988,24 @@ impl Node {
                 let written = message.pack_into(&mut bytes).map_err(|_| VRR_MESSAGE)?;
                 bytes.truncate(written);
                 let header = message.header;
+                // The NOMINATE computation's outbound half: every fence,
+                // every piece of evidence and every selected history this
+                // node sends is a line, with the ballot and the slot it
+                // speaks at. Ordinary replication traffic stays at `trace`
+                // (the host logs each heartbeat commit).
+                if is_view_change_family(header.tag) {
+                    info!(
+                        ts = log_millis(),
+                        event = "nominate-out",
+                        node = self.replica.own().0,
+                        to = to.0,
+                        era = header.view.era.0,
+                        view = header.view.view.0,
+                        slot = header.slot.0,
+                        tag = header.tag.name(),
+                        bytes = size,
+                    );
+                }
                 self.outputs.push_back(Queued {
                     kind: OUTPUT_SEND,
                     to: to.0,
@@ -1452,7 +1522,13 @@ impl Node {
         let message = match Message::unpack_from(data) {
             Ok(message) => message,
             Err(UnpackError::Incomplete { .. } | UnpackError::Malformed(_)) => {
+                let snapshot = self.replica.observer().read();
                 warn!(
+                    ts = log_millis(),
+                    event = "datagram-undecodable",
+                    node = self.replica.own().0,
+                    era = snapshot.era,
+                    view = snapshot.view,
                     from,
                     len = data.len(),
                     "undecodable peer datagram discarded"
@@ -1460,6 +1536,22 @@ impl Node {
                 return VRR_MESSAGE;
             }
         };
+        // The NOMINATE computation's inbound half, with the same ballot
+        // discipline as the outbound half: a fence this node heard, the
+        // evidence it holds, the history it was handed.
+        if is_view_change_family(message.header.tag) {
+            info!(
+                ts = log_millis(),
+                event = "nominate-in",
+                node = self.replica.own().0,
+                from,
+                era = message.header.view.era.0,
+                view = message.header.view.view.0,
+                slot = message.header.slot.0,
+                tag = message.header.tag.name(),
+                len = data.len(),
+            );
+        }
         trace!(
             from,
             len = data.len(),
@@ -1476,6 +1568,9 @@ impl Node {
         // validates none of them.
         if self.compliance.is_none() && !valid_message_payloads(&message) {
             warn!(
+                ts = log_millis(),
+                event = "payload-gate-refused",
+                node = self.replica.own().0,
                 from,
                 era = message.header.view.era.0,
                 view = message.header.view.view.0,
@@ -1537,10 +1632,15 @@ impl Node {
     /// as one `timeout-toggle` event, alongside the other internal
     /// events. A no-op on the replication path: capture only.
     pub fn note_timeout_toggle(&mut self, timedout: bool, at_ms: u64, previous_ms: Option<u64>) {
+        let snapshot = self.replica.observer().read();
         info!(
+            ts = log_millis(),
+            event = "timeout-toggle",
             node = self.replica.own().0,
+            era = snapshot.era,
+            view = snapshot.view,
             timedout,
-            ts = at_ms,
+            toggle_ts = at_ms,
             last_toggle = previous_ms.unwrap_or(at_ms),
             previous_known = previous_ms.is_some(),
             "timeout toggle"
@@ -1575,6 +1675,8 @@ impl Node {
         }
         if let Some(old) = self.reincarnate_from {
             debug!(
+                ts = log_millis(),
+                event = "fenced-boot-reincarnate",
                 node = self.replica.own().0,
                 old = old.0,
                 "fenced-boot drive: re-announcing the reincarnation"
@@ -1584,7 +1686,12 @@ impl Node {
                 return result;
             }
         }
-        debug!(node = self.replica.own().0, "fenced-boot drive: tick");
+        debug!(
+            ts = log_millis(),
+            event = "fenced-boot-tick",
+            node = self.replica.own().0,
+            "fenced-boot drive: tick"
+        );
         self.drive(Input::Tick)
     }
 
@@ -1719,8 +1826,13 @@ impl Node {
                 "node": self.replica.own().0,
             }),
         );
+        let ballot = self.replica.observer().read();
         info!(
+            ts = log_millis(),
+            event = "stop-wire-closed",
             node = self.replica.own().0,
+            era = ballot.era,
+            view = ballot.view,
             "stop: the wire is closed, the in-memory state is final"
         );
         let Some(session) = self.session.take() else {
@@ -1750,7 +1862,11 @@ impl Node {
                 return SERVICE;
             }
             info!(
+                ts = log_millis(),
+                event = "stop-unseated-drain",
                 node = self.replica.own().0,
+                era = ballot.era,
+                view = ballot.view,
                 "stop: the unseated window drains and exits; the next boot derives the next life"
             );
             return OK;
@@ -1829,7 +1945,11 @@ impl Node {
         }
         trace_line!("stop.complete");
         info!(
+            ts = log_millis(),
+            event = "stop-drained",
             node = self.replica.own().0,
+            era = snapshot.era,
+            view = snapshot.view,
             state = %self.state_path.display(),
             "stop: drained and the drain proven; the next boot continues under the same identity"
         );
@@ -2854,6 +2974,8 @@ fn node_from_sink(
     let incarnation = u64::from(counter);
     if let Some(outcome) = decision.flush {
         info!(
+            ts = log_millis(),
+            event = "recovery-flush",
             variant = outcome.variant,
             bytes = outcome.bytes_written,
             latency_us = outcome.latency.as_micros() as u64,
@@ -2893,6 +3015,8 @@ fn node_from_sink(
     );
     if incarnation > 1 {
         info!(
+            ts = log_millis(),
+            event = "identity-restart",
             old = reincarnate_from.map_or(0, |old| old.0),
             new = own_id.0,
             incarnation,
@@ -2900,6 +3024,8 @@ fn node_from_sink(
         );
     }
     info!(
+        ts = log_millis(),
+        event = "node-provisioned",
         own = own_id.0,
         incarnation,
         boot = if own_member.joined {

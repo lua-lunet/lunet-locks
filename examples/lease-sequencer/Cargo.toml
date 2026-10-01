@@ -28,7 +28,9 @@ flate2 = "1"
 signal-hook = "0.3"
 tracing = "0.1"
 tracing-appender = "0.2"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# `json`: the observability contract's line shape — one JSON object per
+# line, the event's fields flattened into the root object.
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1", features = ["v4"] }
 
 [features]

@@ -97,7 +97,7 @@ end
 -- is a 2 s cadence; every note carries ts=<epoch ms>).
 local function status_at(name: string, since_ms: integer): {string: string}
     local latest: {string: string} = {}
-    for _, line in ipairs(logs.grep(node_log_files(name), "status state=")) do
+    for _, line in ipairs(logs.event_lines(node_log_files(name), "status")) do
         local kv = logs.kv(line)
         local ts = tonumber(kv.ts) or 0
         if ts >= since_ms then
@@ -622,7 +622,7 @@ local function scenario_crashes()
         -- The dirty-boot evidence: the bumped boot note and the remap
         -- notices at the peers.
         local bumped = ""
-        for _, line in ipairs(logs.grep(node_log_files(name), "boot name=")) do
+        for _, line in ipairs(logs.event_lines(node_log_files(name), "boot")) do
             local kv = logs.kv(line)
             if
                 (tonumber(kv.ts) or 0) >= t_boot
@@ -637,7 +637,7 @@ local function scenario_crashes()
         local remaps = 0
         for _, other in ipairs(GENESIS) do
             if other ~= name then
-                remaps = remaps + logs.count(node_log_files(other), "remap ")
+                remaps = remaps + #logs.event_lines(node_log_files(other), "remap")
             end
         end
         if not ok then
@@ -647,8 +647,8 @@ local function scenario_crashes()
             -- and the newest named diagnostic ARE the evidence; the node's
             -- process is stopped so the serving pair carries the ladder.
             local diagnostic_name = ""
-            for _, line in ipairs(logs.grep(node_log_files(name), "diagnostic=")) do
-                diagnostic_name = line:match("diagnostic=(%S+)") or ""
+            for _, line in ipairs(logs.event_lines(node_log_files(name), "peer-input-dropped")) do
+                diagnostic_name = (logs.kv(line).diagnostic) or ""
                 break
             end
             anchor("S4-rejoin-BLOCKED " .. name .. " states=" .. states_snapshot())
