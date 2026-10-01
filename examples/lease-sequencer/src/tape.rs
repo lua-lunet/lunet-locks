@@ -259,13 +259,6 @@ pub fn stream_dir(
                 Marker::TelemetryTimeoutDecision => Kind::Decision,
                 Marker::TelemetryStateTransition => Kind::Transition,
                 Marker::TelemetryOutbound => Kind::Outbound,
-                // The interval-sample marker has no producer in the host:
-                // the recorder derives nothing from arrivals, so the kind
-                // carries no tape line.
-                Marker::TelemetryIntervalSample => {
-                    counts.unnamed += 1;
-                    continue;
-                }
             };
             if let Some(wanted) = &wanted
                 && !wanted.contains(&kind)

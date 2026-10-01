@@ -334,12 +334,6 @@ class AnchoredTimelineExport(unittest.TestCase):
                                   "next_holder": "absent",
                                   "takeover_ms": "absent"})
 
-    def test_aof_noise_reports_no_interval_samples(self):
-        out = tool.export_series(self.dir, LIB, kinds="aof-noise")
-        self.assertEqual(len(out), 1)
-        self.assertNotIn("samples", out[0],
-                         "the interval-sample record has no producer")
-
     def test_aof_noise_stats_and_stalls(self):
         out = tool.export_series(self.dir, LIB, kinds="aof-noise")
         self.assertEqual(len(out), 1)

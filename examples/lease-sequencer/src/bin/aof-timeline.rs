@@ -35,20 +35,19 @@ fn main() {
     }
 
     let mut timeline: Vec<(String, Record)> = Vec::new();
-    let mut per_dir_stats: Vec<(String, [usize; 5])> = Vec::new();
+    let mut per_dir_stats: Vec<(String, [usize; 4])> = Vec::new();
     for dir in &dirs {
         let name = dir
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| dir.display().to_string());
-        let mut counts = [0usize; 5];
+        let mut counts = [0usize; 4];
         for record in read_series(dir) {
             match record.marker {
                 Marker::Wire => counts[0] += 1,
                 Marker::TelemetryTimeoutDecision => counts[1] += 1,
                 Marker::TelemetryStateTransition => counts[2] += 1,
                 Marker::TelemetryOutbound => counts[3] += 1,
-                Marker::TelemetryIntervalSample => counts[4] += 1,
             }
             timeline.push((name.clone(), record));
         }
@@ -72,8 +71,8 @@ fn main() {
     if stats {
         for (name, counts) in &per_dir_stats {
             println!(
-                "# {name} wire={} timeout_decisions={} transitions={} outbound={} interval_samples={}",
-                counts[0], counts[1], counts[2], counts[3], counts[4]
+                "# {name} wire={} timeout_decisions={} transitions={} outbound={}",
+                counts[0], counts[1], counts[2], counts[3]
             );
         }
     }
@@ -83,9 +82,6 @@ fn main() {
     );
     for (name, record) in excerpt {
         let payload = match record.marker {
-            Marker::TelemetryIntervalSample => {
-                String::from_utf8_lossy(&record.payload).into_owned()
-            }
             Marker::Wire => wire_summary(&record.payload),
             _ => String::from_utf8_lossy(&record.payload).into_owned(),
         };

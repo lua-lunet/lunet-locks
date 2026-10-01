@@ -133,7 +133,7 @@ same playback engine (`examples/lease-sequencer/tests/scenario/mod.rs`).
 
 | | The lock telemetry capture file | The Flight Recorder |
 | --- | --- | --- |
-| What it holds | the public, wire-visible events (wire datagrams, timeout decisions, state transitions, outbound queue, interval samples) | the node's private story: every drive outcome, fault, maybe, journal flush, and stop marker, plus the wire events byte-exact |
+| What it holds | the public, wire-visible events (wire datagrams, timeout decisions, state transitions, outbound queue) | the node's private story: every drive outcome, fault, maybe, journal flush, and stop marker, plus the wire events byte-exact |
 | Where it runs | the separate non-voting telemetry nodes, off the critical path — no performance impact on the quorum | feature-flagged build (`flight-recorder`), never a prod release |
 | Format stability | stable-ish file formats for the UI | unstable internal format; captures hidden state that never goes on the wire |
 | Reader gate | none | the deep read requires reader commit == recording commit |

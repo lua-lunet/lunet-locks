@@ -30,7 +30,7 @@ RECORD_MAX = (1024 * 1024) - 256
 
 # The envelope markers. Unknown markers are rejected, never guessed.
 MARKERS = {1: "Wire", 2: "TelemetryTimeoutDecision", 3: "TelemetryStateTransition",
-           4: "TelemetryOutbound", 5: "TelemetryIntervalSample"}
+           4: "TelemetryOutbound"}
 
 # The uVRR wire tags (marker-1 payload header, big-endian).
 TAGS = {2: "2 Prepare", 3: "3 PrepareOk", 4: "4 Commit", 5: "5 StartViewChange",
