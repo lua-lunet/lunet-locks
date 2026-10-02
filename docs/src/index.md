@@ -52,6 +52,10 @@ supplied `lunet-run` is the project-local official `v0.10.0` runtime from
   viewchange timeout, and the nemesis interruption rules.
 - [External client protocol](client-protocol.md) specifies GET, SET, and
   RELEASE, and the membership-administration verbs.
+- [The Compliance ABI and the information console](compliance-abi.md)
+  states what a production build exposes — the read-only console, and
+  nothing else — and the nine `unsafe_*` compliance exports the
+  production library does not compile at all.
 - [Build and tests](build-and-tests.md) describes the pinned runtime and
   project commands.
 - [Building and release](build-and-release.md) documents the two-build

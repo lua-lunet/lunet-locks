@@ -51,6 +51,24 @@ io-uring = ["dep:io-uring"]
 # unchanged. The ON build is a debug-level swap-in binary — never the
 # released prod shape (docs/src/flight-recorder.md).
 flight-recorder = []
+# The Compliance ABI: the nine `lunet_lock_node_unsafe_*` exports the
+# upstream compliance corpus drives (the compliance constructor, the
+# executor's logical clock, the opaque propose and reconfigure, and the
+# frontiers, journal, membership, witnesses and marker-log reads). Each
+# WRITES protocol state; they exist for the corpus and for nothing else.
+#
+# OFF (the default) compiles none of them: a production cdylib does not
+# carry the symbols at all — an absence, not a runtime refusal — and the
+# symbol-table gate (tests/abi_door_test.rs) proves it on every run. The
+# ON build is a development shape and is never booted in production: the
+# build script holds the clean-commit guard
+# (`COMPATIBILITY_SUITE_ALLOW_DIRTY=1` overrides) and every node boot
+# announces the exposure at error severity
+# (docs/src/compliance-abi.md). `vrr/serde` rides the feature: the
+# opaque reconfiguration crosses the ABI as the core's own JSON encoding
+# of `SystemOperation`, and the derives are behind that dependency
+# feature.
+compatibility_suite = ["vrr/serde"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = { version = "0.7", optional = true }

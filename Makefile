@@ -40,6 +40,11 @@ SIGNAL_BIN := examples/lease-sequencer/bin
 # lane). The lint gate runs the example crate in BOTH shapes.
 BENCH_DIR := examples/lease-sequencer
 BENCH_FEATURES := flight-recorder
+# The advisory-lock crate's Compliance ABI shape (docs/src/compliance-abi.md).
+# The lint and test gates run the crate in BOTH shapes: the default one
+# proves the nine unsafe_* exports are absent from the production build,
+# this one proves they are all there.
+COMPAT_FEATURES := compatibility_suite
 
 .PHONY: init deps build check test smoke simulation simulation-test lunet-runtime docs clean ext ext-check ext-test example-check fmt lint hooks sh-check sh-smoke docker-build docker-simulation sanity release-images build-proof package package-verify bench
 
@@ -222,6 +227,7 @@ ext: ext-test
 ext-check:
 	cargo fmt --manifest-path ext/advisory_lock/Cargo.toml -- --check
 	cargo clippy --manifest-path ext/advisory_lock/Cargo.toml --all-targets -- -D warnings
+	COMPATIBILITY_SUITE_ALLOW_DIRTY=1 cargo clippy --manifest-path ext/advisory_lock/Cargo.toml --all-targets --features "$(COMPAT_FEATURES)" -- -D warnings
 	cargo fmt --manifest-path ext/lunet-locks-aof/Cargo.toml -- --check
 	cargo clippy --manifest-path ext/lunet-locks-aof/Cargo.toml --all-targets -- -D warnings
 	mise exec -- zig fmt --check ext/lunet-locks-aof/zig/src
@@ -240,6 +246,7 @@ example-check:
 
 ext-test: ext-check
 	cargo test --manifest-path ext/advisory_lock/Cargo.toml
+	COMPATIBILITY_SUITE_ALLOW_DIRTY=1 cargo test --manifest-path ext/advisory_lock/Cargo.toml --features "$(COMPAT_FEATURES)"
 	cargo test --manifest-path ext/lunet-locks-aof/Cargo.toml
 	cd ext/lunet-locks-aof/zig && mise exec -- zig build test $(ZIG_TEST_FLAGS)
 	cargo test --manifest-path ext/paxe-core/Cargo.toml

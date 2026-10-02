@@ -33,12 +33,14 @@ ffi.cdef(
         uint8_t* message_id,
         size_t capacity, size_t* len, uint8_t* data);
     int32_t lunet_lock_node_stop(void* node);
+    int32_t lunet_lock_version_properties(uint8_t* data, size_t capacity, size_t* len);
 ]]
 )
 
 local MAX_DATAGRAM = 65507
 local MESSAGE_ID_BYTES = 16
 local NOT_LEADER = -8
+local TOO_LARGE = -6
 -- `lunet_lock_node_reconfigure` operation codes: Join at weight 0, weight
 -- Increment (learner to voter), Decrement (voter to learner), Leave (only
 -- at weight 0, per the core's rules). The position sentinel means "append
@@ -92,6 +94,7 @@ local record Native
         any
     ): number
     lunet_lock_node_stop: function(any): number
+    lunet_lock_version_properties: function(any, integer, {number}): number
 end
 
 local record DebugInfo
@@ -160,6 +163,7 @@ local record advisory_lock
     end
 
     new: function({cluster_config.ClusterNode}, string, string, string, integer): Node
+    version_properties: function(): {string: string}
 end
 
 local Node = advisory_lock.Node
@@ -476,6 +480,41 @@ function M.new(
         close = Node.close,
         stop = Node.stop,
     }
+end
+
+-- The read-only information console: this build's own identity facts as
+-- the native `version.properties` payload, parsed. The keys are `version`
+-- (the release tag naming this build, or `unknown`), `sha`, `dirty`, and
+-- `feature_shape`, all stamped at build time from git facts.
+--
+-- The native call takes NO node handle, so nothing reachable from here
+-- writes protocol state; this map is the whole of the surface a
+-- production build adds (docs/src/compliance-abi.md). The native side
+-- answers the pull-style sizing call first, so the buffer is the size
+-- the library itself reports.
+function M.version_properties(): {string: string}
+    local needed = ffi.new("size_t[1]") as {number}
+    local probe = (
+        tonumber(native.lunet_lock_version_properties(nil, 0, needed)) or -127
+    ) as integer
+    assert(
+        probe == TOO_LARGE,
+        "advisory_lock: the version properties sizing call reported " .. tostring(probe)
+    )
+    local size = needed[0] as integer
+    local data = ffi.new("uint8_t[?]", size + 1) as any
+    check(
+        (tonumber(native.lunet_lock_version_properties(data, size + 1, needed)) or -127)
+            as integer
+    )
+    local properties: {string: string} = {}
+    for line in (ffi.string(data, size) as string):gmatch("[^\n]+") do
+        local key, value = line:match("^([^=]+)=(.*)$")
+        if key ~= nil and value ~= nil then
+            properties[key] = value
+        end
+    end
+    return properties
 end
 
 -- The two FFI calls with more than eight arguments are excluded from

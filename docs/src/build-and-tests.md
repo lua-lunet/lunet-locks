@@ -62,6 +62,24 @@ cargo build --release --features flight-recorder -p lease-sequencer   # the rig 
 A node opts in per node via `LUNET_FLIGHT_RECORDER_DIR`; the reader is
 `skaffold_flight_tape`. See [the Flight Recorder](flight-recorder.md).
 
+## The Compliance ABI build
+
+The Compliance ABI — the nine `unsafe_*` exports the upstream compliance
+corpus drives — is a cargo feature, OFF by default, so the production
+library does not compile them at all. The development shape MUST come
+from a clean commit (the build fails on a dirty tree;
+`COMPATIBILITY_SUITE_ALLOW_DIRTY=1` overrides, stamping the build dirty
+and warning), and a boot of it announces the exposure at error severity.
+It is never booted in production.
+
+```console
+cargo build --release --features compatibility_suite   # the compliance cdylib shape
+```
+
+`make ext-check` and `make ext-test` run the crate in BOTH shapes, and
+the symbol-table gate reads both built libraries on every run. See [the
+Compliance ABI and the information console](compliance-abi.md).
+
 ## The build-confirmation gate
 
 `make sanity` is MANDATORY before every cloud test run. We test

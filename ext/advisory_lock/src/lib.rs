@@ -4,6 +4,7 @@ pub mod aof;
 mod ffi;
 #[cfg(feature = "flight-recorder")]
 pub mod flight;
+pub mod info;
 pub mod journal;
 pub mod locks;
 mod marker_store;

@@ -1,33 +1,46 @@
-//! The build script stamps the Flight Recorder's commit facts and holds
-//! the clean-commit guard.
+//! The build script stamps the build's identity facts and holds the two
+//! clean-commit guards.
 //!
 //! Every build carries `FLIGHT_COMMIT` (the HEAD hash) and `FLIGHT_DIRTY`
 //! so a flight recording can name the exact code state it was recorded
 //! by, and so the reader path can refuse a recording whose commit the
 //! reading code is not.
 //!
-//! The clean-commit rule is enforced ONLY where it is owed: a
-//! `flight-recorder` build (the feature flag set) MUST come from a clean
-//! commit — a dirty tree fails the build with the escape hatch
-//! `FLIGHT_RECORDER_ALLOW_DIRTY=1` (which still stamps the recording
-//! `dirty: true` so every reader annotates it loudly). An ordinary prod
-//! build (flag OFF) is never gated: dev trees stay buildable.
+//! Every build ALSO carries the read-only console's facts
+//! (`LUNET_INFO_*`): the release tag this build is, the commit, the
+//! dirty flag, and the build's feature shape. They are stamped from the
+//! same git probe, and a fact the probe cannot reach is stamped
+//! `unknown` rather than guessed (`src/info.rs`).
+//!
+//! Two features hold a clean-commit guard, each for its own reason:
+//! `flight-recorder` because a recording is readable only by the code
+//! as-at its commit, and `compatibility_suite` because a compliance
+//! verdict is evidence about a commit — a verdict produced from an
+//! uncommitted tree names no code state at all. A guard that fires is
+//! overridden by the feature's own `*_ALLOW_DIRTY=1`, which still
+//! stamps the build `dirty: true` so every reader annotates it loudly.
+//! An ordinary prod build (both features OFF) is never gated: dev trees
+//! stay buildable.
 
 use std::process::Command;
 
 fn main() {
-    let flight_feature = std::env::var("CARGO_FEATURE_FLIGHT_RECORDER")
-        .map(|value| value == "1")
-        .unwrap_or(false);
+    let flight_feature = feature_on("FLIGHT_RECORDER");
+    let suite_feature = feature_on("COMPATIBILITY_SUITE");
     let (commit, dirty) = match head_state() {
         Some((commit, dirty)) => (commit, dirty),
         None => {
-            if flight_feature {
-                panic!(
-                    "flight-recorder build refuses to proceed: the git commit hash \
-                     could not be read, so the recording could not name its code \
-                     state (a flight-recording build must come from a clean commit)"
-                );
+            for (on, feature) in [
+                (flight_feature, "flight-recorder"),
+                (suite_feature, "compatibility_suite"),
+            ] {
+                if on {
+                    panic!(
+                        "{feature} build refuses to proceed: the git commit hash \
+                         could not be read, so the build could not name its code \
+                         state (a {feature} build must come from a clean commit)"
+                    );
+                }
             }
             ("unknown".to_string(), true)
         }
@@ -35,23 +48,99 @@ fn main() {
     println!("cargo:rustc-env=FLIGHT_COMMIT={commit}");
     println!("cargo:rustc-env=FLIGHT_DIRTY={}", u8::from(dirty));
 
-    if flight_feature && dirty {
-        if std::env::var_os("FLIGHT_RECORDER_ALLOW_DIRTY").is_none() {
-            panic!(
-                "flight-recorder build refuses a dirty tree: a flight recording \
-                 is readable only by the code as-at its commit, and a dirty tree \
-                 has no such commit. Commit (or stash with a todo to restore) \
-                 first, or set FLIGHT_RECORDER_ALLOW_DIRTY=1 to override — the \
-                 recording is then stamped dirty and every reader annotates it \
-                 loudly."
-            );
+    let (version, sha) = version_facts(&commit);
+    println!("cargo:rustc-env=LUNET_INFO_VERSION={version}");
+    println!("cargo:rustc-env=LUNET_INFO_SHA={sha}");
+    println!("cargo:rustc-env=LUNET_INFO_DIRTY={dirty}");
+    println!(
+        "cargo:rustc-env=LUNET_INFO_FEATURES={}",
+        feature_shape(suite_feature, flight_feature)
+    );
+
+    guard_clean_commit(
+        "FLIGHT_RECORDER_ALLOW_DIRTY",
+        "flight-recorder",
+        flight_feature,
+        &commit,
+        dirty,
+    );
+    guard_clean_commit(
+        "COMPATIBILITY_SUITE_ALLOW_DIRTY",
+        "compatibility_suite",
+        suite_feature,
+        &commit,
+        dirty,
+    );
+}
+
+/// Whether the named cargo feature is on for this build.
+fn feature_on(name: &str) -> bool {
+    std::env::var(format!("CARGO_FEATURE_{name}"))
+        .map(|value| value == "1")
+        .unwrap_or(false)
+}
+
+/// The build's feature shape: `production`, then `+<feature>` for each
+/// development feature it carries.
+fn feature_shape(suite: bool, flight: bool) -> String {
+    let mut shape = String::from("production");
+    for (on, name) in [(suite, "compatibility_suite"), (flight, "flight-recorder")] {
+        if on {
+            shape.push('+');
+            shape.push_str(name);
         }
-        println!(
-            "cargo:warning=flight-recorder build is from a DIRTY tree ({commit}); \
-             the recording carries dirty=true and reads only through the \
-             override-annotated path"
+    }
+    shape
+}
+
+/// The release tag this build IS, and the short commit. A build whose
+/// HEAD is not exactly at a tag carries no version: the nearest tag is
+/// not this build, and reporting it would be a lie the `/info` console
+/// could not defend. With no git facts at all (the Docker context, a
+/// tarball) both are `unknown`.
+fn version_facts(commit: &str) -> (String, String) {
+    if commit == "unknown" {
+        return (String::from("unknown"), String::from("unknown"));
+    }
+    let sha: String = commit.chars().take(12).collect();
+    match git(&["describe", "--tags", "--exact-match"]) {
+        Some(tag) if !tag.is_empty() => (tag, sha),
+        _ => (String::from("unknown"), sha),
+    }
+}
+
+/// The clean-commit guard, one per guarded feature. Off trees are never
+/// gated.
+fn guard_clean_commit(override_var: &str, feature: &str, on: bool, commit: &str, dirty: bool) {
+    if !on || !dirty {
+        return;
+    }
+    if std::env::var_os(override_var).is_none() {
+        panic!(
+            "{feature} build refuses a dirty tree: a {feature} artefact is \
+             evidence about a commit, and a dirty tree has no such commit. \
+             Commit (or stash with a todo to restore) first, or set \
+             {override_var}=1 to override — the build is then stamped \
+             dirty and every reader annotates it loudly."
         );
     }
+    println!(
+        "cargo:warning={feature} build is from a DIRTY tree ({commit}); the \
+         build is stamped dirty and reads only through the override-annotated \
+         path"
+    );
+}
+
+/// One git query, trimmed. `None` when git is unavailable, this is not a
+/// checkout, or the query fails.
+fn git(args: &[&str]) -> Option<String> {
+    let output = Command::new("git").args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout)
+        .ok()
+        .map(|text| text.trim().to_string())
 }
 
 /// The HEAD hash and whether the working tree carries uncommitted changes.
@@ -75,16 +164,7 @@ fn head_state() -> Option<(String, bool)> {
     }) {
         return Some((commit, false));
     }
-    let commit = String::from_utf8(
-        Command::new("git")
-            .args(["rev-parse", "HEAD"])
-            .output()
-            .ok()?
-            .stdout,
-    )
-    .ok()?
-    .trim()
-    .to_string();
+    let commit = git(&["rev-parse", "HEAD"])?;
     if commit.is_empty() {
         return None;
     }

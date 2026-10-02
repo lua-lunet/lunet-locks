@@ -2837,6 +2837,14 @@ fn node_from_sink(
     store_ctl: Option<&str>,
     construction: Construction,
 ) -> Result<Node, i32> {
+    // Every construction in this shape announces that the nine
+    // `lunet_lock_node_unsafe_*` exports are present, before anything is
+    // built: a boot of a `compatibility_suite` build is a misconfiguration
+    // and must be unmissable in the log the runbook reads
+    // (docs/src/compliance-abi.md). The default shape compiles no such
+    // exports and no such line.
+    #[cfg(feature = "compatibility_suite")]
+    crate::info::announce_compatibility_exposure();
     // The descriptor's grammar refusals: one named path, every branch of
     // it — the grammar is a single shape, so a violation is a single
     // observation on the census tape.
@@ -3176,6 +3184,46 @@ fn node_from_sink(
     // already landed (the emission gate), so the drive's announcement
     // vouches for a durable identity from the first wire emission.
     Ok(node)
+}
+
+/// The read-only information console: this build's own identity facts,
+/// as the Maven `version.properties` text (the release tag naming the
+/// build or `unknown`, the commit, the dirty flag, the feature shape),
+/// NUL-terminated into `out_data` with its length (excluding the NUL)
+/// in `out_len`. The pull-style contract of `lunet_lock_node_fault`:
+/// when the text does not fit `capacity` the call reports TOO_LARGE and
+/// writes the needed size.
+///
+/// The call takes NO node handle — that is the whole of its safety
+/// argument. Nothing reachable from here reaches a [`Node`], so the
+/// console is read-only by construction: there is no path through it
+/// that writes protocol state, mutates the store, or arms the
+/// compliance rules (`src/info.rs`, docs/src/compliance-abi.md). Every
+/// value is stamped at build time, so the answer is the same on every
+/// call and on every host that loaded this cdylib.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lunet_lock_version_properties(
+    out_data: *mut u8,
+    capacity: usize,
+    out_len: *mut usize,
+) -> i32 {
+    guarded(|| {
+        if out_len.is_null() {
+            return INVALID;
+        }
+        let text = crate::info::properties();
+        unsafe { *out_len = text.len() };
+        if text.len() + 1 > capacity {
+            return TOO_LARGE;
+        }
+        if !out_data.is_null() {
+            unsafe {
+                ptr::copy_nonoverlapping(text.as_ptr(), out_data, text.len());
+                *out_data.add(text.len()) = 0;
+            }
+        }
+        OK
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -3528,6 +3576,334 @@ pub unsafe extern "C" fn lunet_lock_node_next(
         node.outputs.pop_front();
         1
     })
+}
+
+/// The Compliance ABI — the locked door.
+///
+/// Nine exports over the [`Node`] methods the upstream compliance corpus
+/// drives (`docs/uvrr-host-compliance.md`). The whole module is behind
+/// the `compatibility_suite` cargo feature, which is OFF in `default`:
+/// with the feature off these functions DO NOT COMPILE, so a production
+/// cdylib carries no such symbol at all — an absence, not a runtime
+/// refusal. `tests/abi_door_test.rs` reads the built library's symbol
+/// table and fails if any `unsafe_` symbol is present in the default
+/// build, or if these nine are absent from the feature build; that gate
+/// runs on every `make ext-test`.
+///
+/// Most of these write protocol state, directly or by arming the
+/// compliance rules; the rest read the state the corpus's expectations
+/// are written against. All of them exist for the corpus and for nothing
+/// else, and a build carrying them must never be booted in production:
+/// the build script holds the clean-commit guard and every node boot
+/// announces the exposure at error severity (`src/info.rs`).
+///
+/// The vector returns mirror the pull-style buffer contract of
+/// `lunet_lock_node_fault`: the payload is written NUL-terminated with
+/// its length (excluding the NUL) in `out_len`, and a caller whose
+/// buffer is too small gets `TOO_LARGE` and the size it needs. Nothing
+/// here allocates across the boundary.
+#[cfg(feature = "compatibility_suite")]
+mod unsafe_abi {
+    use super::*;
+    use std::sync::PoisonError;
+
+    /// Copies a NUL-terminated payload out, on the `lunet_lock_node_fault`
+    /// contract: `out_len` carries the length excluding the NUL, a
+    /// buffer that cannot hold it plus the NUL is `TOO_LARGE` with the
+    /// needed size written, and a null `out_data` is a sizing probe.
+    unsafe fn copy_out(text: &str, out_data: *mut u8, capacity: usize, out_len: *mut usize) -> i32 {
+        unsafe { *out_len = text.len() };
+        if text.len() + 1 > capacity {
+            return TOO_LARGE;
+        }
+        if !out_data.is_null() {
+            unsafe {
+                ptr::copy_nonoverlapping(text.as_ptr(), out_data, text.len());
+                *out_data.add(text.len()) = 0;
+            }
+        }
+        OK
+    }
+
+    /// [`Node::open_compliance`] — the compliance constructor: the same
+    /// marker store and lock-event journal disabled, with the corpus's
+    /// harness rules armed. This is the ONLY entry that arms them, and
+    /// the constructor a production host never reaches
+    /// (`lunet_lock_node_new` does not arm them).
+    ///
+    /// Writes: a node, its marker store, and its incarnation markers.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn lunet_lock_node_unsafe_open_compliance(
+        members_len: usize,
+        members_data: *const u8,
+        own_len: usize,
+        own_data: *const u8,
+        state_len: usize,
+        state_data: *const u8,
+        primary_timeout: u64,
+        out: *mut *mut c_void,
+    ) -> i32 {
+        guarded(|| {
+            if out.is_null() {
+                return INVALID;
+            }
+            let Ok(members_data) = (unsafe { bytes(members_len, members_data) }) else {
+                return INVALID;
+            };
+            let Ok(own_data) = (unsafe { bytes(own_len, own_data) }) else {
+                return INVALID;
+            };
+            let Ok(state_data) = (unsafe { bytes(state_len, state_data) }) else {
+                return INVALID;
+            };
+            let (Ok(members), Ok(own), Ok(state)) = (
+                std::str::from_utf8(members_data),
+                std::str::from_utf8(own_data),
+                std::str::from_utf8(state_data),
+            ) else {
+                return INVALID;
+            };
+            match Node::open_compliance(members, own, state, primary_timeout) {
+                Ok(node) => {
+                    unsafe { *out = Box::into_raw(Box::new(node)).cast() };
+                    OK
+                }
+                Err(code) => code,
+            }
+        })
+    }
+
+    /// [`Node::set_compliance_clock`] — the executor's logical tick,
+    /// carried by every drive until the executor advances it again.
+    ///
+    /// Writes: the node's clock source, and through it every subsequent
+    /// drive's timeout arithmetic.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn lunet_lock_node_unsafe_set_compliance_clock(
+        node: *mut c_void,
+        at: u64,
+    ) -> i32 {
+        guarded(|| {
+            let Some(node) = (unsafe { node.cast::<Node>().as_mut() }) else {
+                return INVALID;
+            };
+            node.set_compliance_clock(at);
+            OK
+        })
+    }
+
+    /// [`Node::propose_opaque`] — one opaque proposal: the payload is raw
+    /// bytes the core carries opaque, and `id_msb`/`id_lsb` are the
+    /// executor's own `OperationId` (first eight bytes big-endian, last
+    /// eight big-endian — the core's wire order). Outside a compliance
+    /// node the method reports `INVALID`; the rules are the ABI's own
+    /// refusal, not this wrapper's.
+    ///
+    /// Writes: protocol state — this is a proposal into the replicated
+    /// log.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn lunet_lock_node_unsafe_propose_opaque(
+        node: *mut c_void,
+        id_msb: u64,
+        id_lsb: u64,
+        payload_len: usize,
+        payload: *const u8,
+    ) -> i32 {
+        guarded(|| {
+            let Some(node) = (unsafe { node.cast::<Node>().as_mut() }) else {
+                return INVALID;
+            };
+            let Ok(payload) = (unsafe { bytes(payload_len, payload) }) else {
+                return INVALID;
+            };
+            node.propose_opaque(
+                OperationId {
+                    msb: id_msb,
+                    lsb: id_lsb,
+                },
+                payload,
+            )
+        })
+    }
+
+    /// [`Node::reconfigure_opaque`] — one typed cluster operation over
+    /// the ordinary consensus pipeline, at the reference host's pivot
+    /// policy (the stop-the-world fallback, a latency outcome). The
+    /// operation crosses as the core's own JSON encoding of
+    /// `SystemOperation` (the `vrr/serde` derives, which the feature
+    /// enables); an unparseable body is `CLIENT_JSON`.
+    ///
+    /// Writes: protocol state — this is a reconfiguration into the
+    /// replicated log, and on commit the folded configuration itself.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn lunet_lock_node_unsafe_reconfigure_opaque(
+        node: *mut c_void,
+        op_json_len: usize,
+        op_json: *const u8,
+    ) -> i32 {
+        guarded(|| {
+            let Some(node) = (unsafe { node.cast::<Node>().as_mut() }) else {
+                return INVALID;
+            };
+            let Ok(op_json) = (unsafe { bytes(op_json_len, op_json) }) else {
+                return INVALID;
+            };
+            let Ok(op) = serde_json::from_slice::<SystemOperation>(op_json) else {
+                return CLIENT_JSON;
+            };
+            node.reconfigure_opaque(op)
+        })
+    }
+
+    /// [`Node::frontiers`] — `(accepted, committed, applied)` as the
+    /// observation carries them.
+    ///
+    /// Reads: protocol state. Drives nothing.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn lunet_lock_node_unsafe_frontiers(
+        node: *mut c_void,
+        out_accepted: *mut u64,
+        out_committed: *mut u64,
+        out_applied: *mut u64,
+    ) -> i32 {
+        guarded(|| {
+            if node.is_null()
+                || out_accepted.is_null()
+                || out_committed.is_null()
+                || out_applied.is_null()
+            {
+                return INVALID;
+            }
+            let node = unsafe { &*node.cast::<Node>() };
+            let (accepted, committed, applied) = node.frontiers();
+            unsafe {
+                *out_accepted = accepted;
+                *out_committed = committed;
+                *out_applied = applied;
+            }
+            OK
+        })
+    }
+
+    /// [`Node::journal_entries`] — the whole journal, void slot through
+    /// the accepted frontier, as the core's own JSON encoding of the
+    /// entries (slot, era, payload; an operation payload is its opaque
+    /// bytes as a JSON byte array, a system payload its `SystemOperation`).
+    ///
+    /// Reads: protocol state. Drives nothing.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn lunet_lock_node_unsafe_journal_entries(
+        node: *mut c_void,
+        out_data: *mut u8,
+        capacity: usize,
+        out_len: *mut usize,
+    ) -> i32 {
+        guarded(|| {
+            if node.is_null() || out_len.is_null() {
+                return INVALID;
+            }
+            let node = unsafe { &*node.cast::<Node>() };
+            let Ok(text) = serde_json::to_string(&node.journal_entries()) else {
+                return SERVICE;
+            };
+            unsafe { copy_out(&text, out_data, capacity, out_len) }
+        })
+    }
+
+    /// [`Node::membership`] — the folded configuration's current record:
+    /// the succession order and each member's weight, in the same order,
+    /// as `out_count` `u32` ids and `u64` weights. A node holding no era
+    /// record reports zero members. A caller whose arrays cannot hold the
+    /// record gets `TOO_LARGE` and the count it needs.
+    ///
+    /// Reads: protocol state. Drives nothing.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn lunet_lock_node_unsafe_membership(
+        node: *mut c_void,
+        out_count: *mut usize,
+        out_ids: *mut u32,
+        out_weights: *mut u64,
+        capacity: usize,
+    ) -> i32 {
+        guarded(|| {
+            if node.is_null() || out_count.is_null() {
+                return INVALID;
+            }
+            let node = unsafe { &*node.cast::<Node>() };
+            let Some((order, weights)) = node.membership() else {
+                unsafe { *out_count = 0 };
+                return OK;
+            };
+            unsafe { *out_count = order.len() };
+            if order.len() > capacity || out_ids.is_null() || out_weights.is_null() {
+                return TOO_LARGE;
+            }
+            for (index, (&id, &weight)) in order.iter().zip(&weights).enumerate() {
+                unsafe {
+                    *out_ids.add(index) = id.0;
+                    *out_weights.add(index) = weight;
+                }
+            }
+            OK
+        })
+    }
+
+    /// [`Node::witnesses`] — the gossip-witness list, in list order, as
+    /// `out_count` `u32` ids. A caller's array that cannot hold the list
+    /// gets `TOO_LARGE` and the count it needs.
+    ///
+    /// Reads: protocol state. Drives nothing.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn lunet_lock_node_unsafe_witnesses(
+        node: *mut c_void,
+        out_count: *mut usize,
+        out_ids: *mut u32,
+        capacity: usize,
+    ) -> i32 {
+        guarded(|| {
+            if node.is_null() || out_count.is_null() {
+                return INVALID;
+            }
+            let node = unsafe { &*node.cast::<Node>() };
+            let witnesses = node.witnesses();
+            unsafe { *out_count = witnesses.len() };
+            if witnesses.len() > capacity || out_ids.is_null() {
+                return TOO_LARGE;
+            }
+            for (index, &id) in witnesses.iter().enumerate() {
+                unsafe { *out_ids.add(index) = id.0 };
+            }
+            OK
+        })
+    }
+
+    /// [`Node::marker_log`] — this boot's own marker-round schedule, in
+    /// write order, one raw line per record and LF-separated: every
+    /// machine commit (`commit:<Marker>@<packed identity>`) and the
+    /// halt's drain (`drain`). The lines are the store's own, so the
+    /// reader renders them; this call does not interpret them.
+    ///
+    /// Reads: the marker store's schedule. Drives nothing.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn lunet_lock_node_unsafe_marker_log(
+        node: *mut c_void,
+        out_data: *mut u8,
+        capacity: usize,
+        out_len: *mut usize,
+    ) -> i32 {
+        guarded(|| {
+            if node.is_null() || out_len.is_null() {
+                return INVALID;
+            }
+            let node = unsafe { &*node.cast::<Node>() };
+            let log = node.marker_log();
+            let text = log
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .join("\n");
+            unsafe { copy_out(&text, out_data, capacity, out_len) }
+        })
+    }
 }
 
 #[cfg(test)]
