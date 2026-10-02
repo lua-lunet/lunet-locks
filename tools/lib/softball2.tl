@@ -174,10 +174,15 @@ end
 -- run dir's markers as the nodes' live durable state, and an archival
 -- copy of an older marker inverts against the teardown stop record).
 local function snapshot_state(label: string)
-    local dst = fs.join(fs.dirname(run_dir), fs.basename(run_dir) .. "-state-snaps", label)
+    local dst = fs.join(
+        fs.dirname(run_dir), fs.basename(run_dir) .. "-state-snaps", label
+    )
     fs.mkdir_p(dst)
     shell.status(
-        "cp -p " .. shell.quote(fs.join(run_dir, "state")) .. "/* " .. shell.quote(dst)
+        "cp -p "
+            .. shell.quote(fs.join(run_dir, "state"))
+            .. "/* "
+            .. shell.quote(dst)
             .. "/ 2>/dev/null"
     )
 end
@@ -311,14 +316,23 @@ local function verify_clients_started()
             or not fs.exists(fs.join(run_dir, "stats", "load-" .. name .. ".jsonl"))
         if dead then
             progress(
-                "client " .. name .. " died at start (pid "
-                    .. (p ~= nil and tostring(p.pid) or "?") .. "); respawning"
+                "client "
+                    .. name
+                    .. " died at start (pid "
+                    .. (p ~= nil and tostring(p.pid) or "?")
+                    .. "); respawning"
             )
             local poll_dead = p ~= nil and proc.poll(p)
             if poll_dead then
                 progress(
-                    "client " .. name .. " decode: state=" .. (p.state or "?")
-                        .. " exit=" .. p.exit_code .. " signal=" .. p.signal
+                    "client "
+                        .. name
+                        .. " decode: state="
+                        .. (p.state or "?")
+                        .. " exit="
+                        .. p.exit_code
+                        .. " signal="
+                        .. p.signal
                 )
             end
             if p ~= nil then
@@ -330,7 +344,9 @@ local function verify_clients_started()
                 table.insert(servers, "127.0.0.1:" .. by_name[other].client_port)
             end
             local bases: {string: string} = {
-                n1 = "810000", n2 = "820000", n3 = "830000",
+                n1 = "810000",
+                n2 = "820000",
+                n3 = "830000",
             }
             local argv: {string} = {
                 fs.join(root, "examples/lease-sequencer/target/release/lease-load"),
@@ -478,8 +494,9 @@ local function probe_serving(
         fs.append_all(
             fs.join(run_dir, "probes.log"),
             "rel="
-                .. (clock.now_ms() - (probe_epoch > 0 and probe_epoch or clock.now_ms()))
-                .. " node="
+                .. (
+                    clock.now_ms() - (probe_epoch > 0 and probe_epoch or clock.now_ms())
+                ) .. " node="
                 .. node
                 .. " dur_ms="
                 .. dur
@@ -650,7 +667,9 @@ end
 -- carrying the core's `diagnostic`.
 local function drop_reasons(name: string): {string: integer}
     local counts: {string: integer} = {}
-    for _, line in ipairs(logs.event_lines(node_log_files(name), "peer-input-dropped")) do
+    for _, line in ipairs(
+        logs.event_lines(node_log_files(name), "peer-input-dropped")
+    ) do
         local reason = logs.kv(line).diagnostic or "unnamed"
         counts[reason] = (counts[reason] or 0) + 1
     end
@@ -664,8 +683,7 @@ local function bumped_boot(name: string, since_ms: integer): string
     for _, line in ipairs(logs.event_lines(node_log_files(name), "boot")) do
         local kv = logs.kv(line)
         if
-            (tonumber(kv.ts) or 0) >= since_ms
-            and (tonumber(kv.incarnation) or 0) >= 2
+            (tonumber(kv.ts) or 0) >= since_ms and (tonumber(kv.incarnation) or 0) >= 2
         then
             found = "incarnation="
                 .. (kv.incarnation or "?")
@@ -721,21 +739,29 @@ local function scenario_steady()
         end
         if count == 0 then
             gate.fail(
-                "steady serving: load-" .. name .. " recorded count=0 over "
-                    .. STEADY_S .. " s — the client is not chasing the lock"
+                "steady serving: load-"
+                    .. name
+                    .. " recorded count=0 over "
+                    .. STEADY_S
+                    .. " s — the client is not chasing the lock"
             )
         end
     end
     if err > 0 then
         gate.fail(
-            "steady serving recorded " .. err .. " client errors in the "
+            "steady serving recorded "
+                .. err
+                .. " client errors in the "
                 .. "phase window; the calm profile demands zero"
         )
     end
     measure(
-        "scenario=S0 steady_s=" .. STEADY_S .. " client_errors=0 view_depth="
+        "scenario=S0 steady_s="
+            .. STEADY_S
+            .. " client_errors=0 view_depth="
             .. view_depth()
-            .. " states=" .. states_snapshot()
+            .. " states="
+            .. states_snapshot()
     )
 end
 
@@ -770,16 +796,20 @@ local function scenario_leader_term()
             end
         end
     end
-    anchor(
-        "S3-takeover new_leader=" .. new_leader .. " states=" .. states_snapshot()
-    )
+    anchor("S3-takeover new_leader=" .. new_leader .. " states=" .. states_snapshot())
     measure(
-        "scenario=S3 node=" .. leader
-            .. " stop_ms=" .. (t_gone - t_term)
-            .. " takeover_ms=" .. takeover_ms
-            .. " new_leader=" .. new_leader
-            .. " client_errors_in_window=" .. (t_err - t0_err)
-            .. " states=" .. states_snapshot()
+        "scenario=S3 node="
+            .. leader
+            .. " stop_ms="
+            .. (t_gone - t_term)
+            .. " takeover_ms="
+            .. takeover_ms
+            .. " new_leader="
+            .. new_leader
+            .. " client_errors_in_window="
+            .. (t_err - t0_err)
+            .. " states="
+            .. states_snapshot()
     )
     progress("S3: takeover under the hardened detector in " .. takeover_ms .. " ms")
     clock.sleep(2)
@@ -791,8 +821,12 @@ local function scenario_leader_term()
     end
     local t_rejoined = anchor("S3-rejoined " .. leader .. " " .. report2)
     measure(
-        "scenario=S3 rejoin node=" .. leader .. " rejoin_ms=" .. (t_rejoined - t_boot)
-            .. " states=" .. states_snapshot()
+        "scenario=S3 rejoin node="
+            .. leader
+            .. " rejoin_ms="
+            .. (t_rejoined - t_boot)
+            .. " states="
+            .. states_snapshot()
     )
     clock.sleep(10)
 end
@@ -822,8 +856,12 @@ local function scenario_partitions()
 
     -- P1: cut the follower.
     anchor(
-        "P1-begin target=" .. follower .. " leader=" .. leader
-            .. " states=" .. states_snapshot()
+        "P1-begin target="
+            .. follower
+            .. " leader="
+            .. leader
+            .. " states="
+            .. states_snapshot()
     )
     local t0_err = total_errors()
     local t_cut = anchor("P1-STOP " .. follower)
@@ -832,9 +870,12 @@ local function scenario_partitions()
     local cont_ok, cont_landed = probe_serving(other, 2, 20000)
     local t_err = total_errors()
     anchor(
-        "P1-cut-window-done " .. follower
-            .. " serving_continued=" .. tostring(cont_ok)
-            .. " states=" .. states_snapshot()
+        "P1-cut-window-done "
+            .. follower
+            .. " serving_continued="
+            .. tostring(cont_ok)
+            .. " states="
+            .. states_snapshot()
     )
     local p1_heal = anchor("P1-CONT " .. follower)
     proc.resume(procs[follower] as proc.Process)
@@ -845,7 +886,9 @@ local function scenario_partitions()
         follower, p1_heal, REJOIN_DEADLINE_MS
     )
     if not ok_rejoin then
-        gate.fail("P1: " .. follower .. " did not rejoin after the heal: " .. rejoin_report)
+        gate.fail(
+            "P1: " .. follower .. " did not rejoin after the heal: " .. rejoin_report
+        )
     end
     local t_rejoined = anchor("P1-rejoined " .. follower .. " " .. rejoin_report)
     local f_drops_after = drop_reasons(follower)
@@ -857,18 +900,26 @@ local function scenario_partitions()
         end
     end
     measure(
-        "scenario=P1 node=" .. follower .. " leader=" .. leader
-            .. " serving_continued=" .. (cont_ok and "1" or "0")
+        "scenario=P1 node="
+            .. follower
+            .. " leader="
+            .. leader
+            .. " serving_continued="
+            .. (cont_ok and "1" or "0")
             .. " first_ok_gap_ms="
             .. (cont_landed >= 0 and tostring(cont_landed - t_cut) or "-1")
-            .. " client_errors_in_window=" .. (t_err - t0_err)
-            .. " heal_rejoin_ms=" .. (t_rejoined - p1_heal)
+            .. " client_errors_in_window="
+            .. (t_err - t0_err)
+            .. " heal_rejoin_ms="
+            .. (t_rejoined - p1_heal)
             .. " leader_changes_in_window="
             .. (line_count(leader, "leader-change") - p1_lc_before)
             .. " follower_changes_in_window="
             .. (line_count(follower, "leader-change") - p1_lf_before)
-            .. " healed_drops " .. table.concat(f_storm, " ")
-            .. " states=" .. states_snapshot()
+            .. " healed_drops "
+            .. table.concat(f_storm, " ")
+            .. " states="
+            .. states_snapshot()
     )
     clock.sleep(8)
 
@@ -878,17 +929,13 @@ local function scenario_partitions()
         gate.fail("P2: no leader before the leader cut")
     end
     local survivor = live_probe_target(leader)
-    anchor(
-        "P2-begin target=" .. leader .. " states=" .. states_snapshot()
-    )
+    anchor("P2-begin target=" .. leader .. " states=" .. states_snapshot())
     local t0_err2 = total_errors()
     local p2_cut = anchor("P2-STOP " .. leader)
     proc.suspend(procs[leader] as proc.Process)
     local ok_takeover, landed = probe_serving(survivor, 1, 30000)
     if not ok_takeover then
-        gate.fail(
-            "P2: no client operation served within 30 s of the leader cut"
-        )
+        gate.fail("P2: no client operation served within 30 s of the leader cut")
     end
     local takeover_ms = landed - p2_cut
     local t_err2 = total_errors()
@@ -903,10 +950,10 @@ local function scenario_partitions()
             end
         end
     end
-    local lc_before = line_count(new_leader ~= "" and new_leader or survivor, "leader-change")
-    anchor(
-        "P2-takeover new_leader=" .. new_leader .. " states=" .. states_snapshot()
+    local lc_before = line_count(
+        new_leader ~= "" and new_leader or survivor, "leader-change"
     )
+    anchor("P2-takeover new_leader=" .. new_leader .. " states=" .. states_snapshot())
     local p2_heal = anchor("P2-CONT " .. leader)
     proc.resume(procs[leader] as proc.Process)
     local old_drops_before = drop_reasons(leader)
@@ -920,20 +967,29 @@ local function scenario_partitions()
     for reason, before in pairs(old_drops_before) do
         local after = old_drops_after[reason] or 0
         if after - before > 0 then
-            storm_parts[#storm_parts + 1] = reason
-                .. "="
-                .. (after - before)
+            storm_parts[#storm_parts + 1] = reason .. "=" .. (after - before)
         end
     end
     measure(
-        "scenario=P2 node=" .. leader .. " takeover_ms=" .. takeover_ms
-            .. " new_leader=" .. new_leader
-            .. " client_errors_in_window=" .. (t_err2 - t0_err2)
-            .. " heal_rejoin_ms=" .. (t_rejoined2 - p2_heal)
+        "scenario=P2 node="
+            .. leader
+            .. " takeover_ms="
+            .. takeover_ms
+            .. " new_leader="
+            .. new_leader
+            .. " client_errors_in_window="
+            .. (t_err2 - t0_err2)
+            .. " heal_rejoin_ms="
+            .. (t_rejoined2 - p2_heal)
             .. " leader_changes_on_new_leader_in_window="
-            .. (line_count(new_leader ~= "" and new_leader or survivor, "leader-change") - lc_before)
-            .. " healed_drops " .. table.concat(storm_parts, " ")
-            .. " states=" .. states_snapshot()
+            .. (
+                line_count(
+                    new_leader ~= "" and new_leader or survivor, "leader-change"
+                ) - lc_before
+            ) .. " healed_drops "
+            .. table.concat(storm_parts, " ")
+            .. " states="
+            .. states_snapshot()
     )
     progress("P2: the partitioned leader rejoined; drop deltas recorded")
     clock.sleep(8)
@@ -962,9 +1018,14 @@ local function scenario_crashes(tag: string)
         end
         local label = tag .. "-k" .. i .. "-" .. name
         anchor(
-            "C-begin tag=" .. tag .. " target=" .. name
-                .. " view_depth=" .. view_depth()
-                .. " states=" .. states_snapshot()
+            "C-begin tag="
+                .. tag
+                .. " target="
+                .. name
+                .. " view_depth="
+                .. view_depth()
+                .. " states="
+                .. states_snapshot()
         )
         snapshot_state("pre-restart-" .. label)
         proc.kill(p as proc.Process)
@@ -999,22 +1060,38 @@ local function scenario_crashes(tag: string)
             -- ladder on.
             snapshot_state("blocked-" .. label)
             anchor(
-                "C-rejoin-BLOCKED tag=" .. tag .. " " .. name
-                    .. " states=" .. states_snapshot()
+                "C-rejoin-BLOCKED tag="
+                    .. tag
+                    .. " "
+                    .. name
+                    .. " states="
+                    .. states_snapshot()
             )
             measure(
-                "scenario=C tag=" .. tag .. " node=" .. name
+                "scenario=C tag="
+                    .. tag
+                    .. " node="
+                    .. name
                     .. " crash_restart_to_serving_ms=BLOCKED"
-                    .. " rejoin_ms=BLOCKED view_depth_at_stuck=" .. view_depth()
+                    .. " rejoin_ms=BLOCKED view_depth_at_stuck="
+                    .. view_depth()
                     .. " "
                     .. (bumped ~= "" and bumped or "no_bump_seen")
-                    .. " remap_notices=" .. remaps
-                    .. " stuck_status=" .. report
-                    .. " newest_diagnostic=" .. newest_diagnostic(name)
-                    .. " states=" .. states_snapshot()
+                    .. " remap_notices="
+                    .. remaps
+                    .. " stuck_status="
+                    .. report
+                    .. " newest_diagnostic="
+                    .. newest_diagnostic(name)
+                    .. " states="
+                    .. states_snapshot()
             )
             progress(
-                "C(" .. tag .. ") " .. name .. ": the crashed rejoin stayed "
+                "C("
+                    .. tag
+                    .. ") "
+                    .. name
+                    .. ": the crashed rejoin stayed "
                     .. "fenced (blocked, recorded, node parked)"
             )
             term_node(name, 2000)
@@ -1024,12 +1101,18 @@ local function scenario_crashes(tag: string)
             local t_serving = anchor("C-serving " .. name .. " " .. report)
             snapshot_state("post-settle-" .. label)
             measure(
-                "scenario=C tag=" .. tag .. " node=" .. name
-                    .. " crash_restart_to_serving_ms=" .. (t_serving - t_boot)
+                "scenario=C tag="
+                    .. tag
+                    .. " node="
+                    .. name
+                    .. " crash_restart_to_serving_ms="
+                    .. (t_serving - t_boot)
                     .. " "
                     .. (bumped ~= "" and bumped or "no_bump_seen")
-                    .. " remap_notices=" .. remaps
-                    .. " states=" .. states_snapshot()
+                    .. " remap_notices="
+                    .. remaps
+                    .. " states="
+                    .. states_snapshot()
             )
             clock.sleep(8)
         end
@@ -1055,9 +1138,14 @@ local function scenario_compound()
         end
     end
     anchor(
-        "X-begin leader=" .. leader .. " partitioned=" .. partitioned
-            .. " view_depth=" .. view_depth()
-            .. " states=" .. states_snapshot()
+        "X-begin leader="
+            .. leader
+            .. " partitioned="
+            .. partitioned
+            .. " view_depth="
+            .. view_depth()
+            .. " states="
+            .. states_snapshot()
     )
     local t0_err = total_errors()
     anchor("X-SIGKILL " .. leader)
@@ -1072,8 +1160,10 @@ local function scenario_compound()
     local ok_noquorum, _landed = probe_serving(partitioned, 1, 15000)
     local t_err = total_errors()
     anchor(
-        "X-no-quorum-window measured=" .. (ok_noquorum and "0" or "1")
-            .. " states=" .. states_snapshot()
+        "X-no-quorum-window measured="
+            .. (ok_noquorum and "0" or "1")
+            .. " states="
+            .. states_snapshot()
     )
     local x_heal = anchor("X-CONT " .. partitioned)
     proc.resume(pp)
@@ -1083,7 +1173,9 @@ local function scenario_compound()
     if not ok_elect then
         gate.fail("X: the healed pair did not elect: " .. elect_report)
     end
-    local t_elect = anchor("X-elected " .. elect_report .. " states=" .. states_snapshot())
+    local t_elect = anchor(
+        "X-elected " .. elect_report .. " states=" .. states_snapshot()
+    )
     local ok_probe, probe_landed = probe_serving(partitioned, 1, 30000)
     if not ok_probe then
         gate.fail("X: no client operation served after the heal")
@@ -1091,16 +1183,25 @@ local function scenario_compound()
     local t_err2 = total_errors()
     local healed_drops_after = drop_reasons(partitioned)
     measure(
-        "scenario=X leader=" .. leader .. " partitioned=" .. partitioned
+        "scenario=X leader="
+            .. leader
+            .. " partitioned="
+            .. partitioned
             .. " no_quorum_serving=0"
-            .. " no_quorum_window_ms=" .. (x_heal - t_cut)
-            .. " client_errors_in_noquorum_window=" .. (t_err - t0_err)
-            .. " elect_ms=" .. (t_elect - x_heal)
-            .. " first_serve_ms=" .. (probe_landed - x_heal)
-            .. " client_errors_in_heal_window=" .. (t_err2 - t_err)
+            .. " no_quorum_window_ms="
+            .. (x_heal - t_cut)
+            .. " client_errors_in_noquorum_window="
+            .. (t_err - t0_err)
+            .. " elect_ms="
+            .. (t_elect - x_heal)
+            .. " first_serve_ms="
+            .. (probe_landed - x_heal)
+            .. " client_errors_in_heal_window="
+            .. (t_err2 - t_err)
             .. " leader_changes_on_healed_in_window="
             .. (line_count(partitioned, "leader-change") - lc_before)
-            .. " states=" .. states_snapshot()
+            .. " states="
+            .. states_snapshot()
     )
     local function storm_line(k: string, before: integer, after: integer): string
         return k .. "=" .. (after - before)
@@ -1121,7 +1222,9 @@ local function scenario_compound()
     end
     local t_boot = anchor("X-restart " .. leader)
     start_node(leader)
-    local ok_rejoin, rejoin_report = wait_node_normal(leader, t_boot, REJOIN_DEADLINE_MS)
+    local ok_rejoin, rejoin_report = wait_node_normal(
+        leader, t_boot, REJOIN_DEADLINE_MS
+    )
     local lateacks = 0
     for _, name in ipairs(GENESIS) do
         lateacks = lateacks + line_count(name, "late-ack")
@@ -1130,16 +1233,23 @@ local function scenario_compound()
     local leader_drops_before = drop_reasons(leader)
     if not ok_rejoin then
         snapshot_state("blocked-X-" .. leader)
-        anchor(
-            "X-rejoin-BLOCKED " .. leader .. " states=" .. states_snapshot()
-        )
+        anchor("X-rejoin-BLOCKED " .. leader .. " states=" .. states_snapshot())
         measure(
-            "scenario=X node=" .. leader .. " rejoin_ms=BLOCKED"
-                .. " " .. (bumped_boot(leader, t_boot) ~= "" and bumped_boot(leader, t_boot) or "no_bump_seen")
-                .. " stuck_status=" .. rejoin_report
-                .. " newest_diagnostic=" .. newest_diagnostic(leader)
-                .. " late_ack_drains_in_window=" .. lateacks
-                .. " states=" .. states_snapshot()
+            "scenario=X node="
+                .. leader
+                .. " rejoin_ms=BLOCKED"
+                .. " "
+                .. (
+                    bumped_boot(leader, t_boot) ~= "" and bumped_boot(leader, t_boot)
+                    or "no_bump_seen"
+                ) .. " stuck_status="
+                .. rejoin_report
+                .. " newest_diagnostic="
+                .. newest_diagnostic(leader)
+                .. " late_ack_drains_in_window="
+                .. lateacks
+                .. " states="
+                .. states_snapshot()
         )
         progress("X: the crashed leader's rejoin stayed fenced (blocked, recorded)")
         term_node(leader, 2000)
@@ -1155,11 +1265,20 @@ local function scenario_compound()
             end
         end
         measure(
-            "scenario=X node=" .. leader .. " rejoin_ms=" .. (t_rejoined - t_boot)
-                .. " " .. (bumped_boot(leader, t_boot) ~= "" and bumped_boot(leader, t_boot) or "no_bump_seen")
-                .. " late_ack_drains_in_window=" .. lateacks
-                .. " rejoined_drops " .. table.concat(rejoined_storm, " ")
-                .. " states=" .. states_snapshot()
+            "scenario=X node="
+                .. leader
+                .. " rejoin_ms="
+                .. (t_rejoined - t_boot)
+                .. " "
+                .. (
+                    bumped_boot(leader, t_boot) ~= "" and bumped_boot(leader, t_boot)
+                    or "no_bump_seen"
+                ) .. " late_ack_drains_in_window="
+                .. lateacks
+                .. " rejoined_drops "
+                .. table.concat(rejoined_storm, " ")
+                .. " states="
+                .. states_snapshot()
         )
         clock.sleep(8)
     end
@@ -1193,9 +1312,7 @@ local function fresh_files_boundary(label: string)
     if not ok_conv then
         gate.fail("the fresh boot did not converge: " .. conv_report)
     end
-    anchor(
-        "FF-converged " .. conv_report .. " states=" .. states_snapshot()
-    )
+    anchor("FF-converged " .. conv_report .. " states=" .. states_snapshot())
     clock.sleep(5)
 end
 
@@ -1229,21 +1346,26 @@ local function scenario_full_cycle()
         snapshot_state("post-settle-s5-pass1")
         measure(
             "scenario=S5 pass=1"
-                .. " down_ms=" .. (t_restart - t_all_down)
-                .. " first_op_ms=" .. (first_op - t_restart)
-                .. " converge_ms=" .. (t_conv - t_restart)
-                .. " states=" .. states_snapshot()
+                .. " down_ms="
+                .. (t_restart - t_all_down)
+                .. " first_op_ms="
+                .. (first_op - t_restart)
+                .. " converge_ms="
+                .. (t_conv - t_restart)
+                .. " states="
+                .. states_snapshot()
         )
     else
         snapshot_state("blocked-s5-pass1")
-        anchor(
-            "S5-converge-BLOCKED pass=1 states=" .. states_snapshot()
-        )
+        anchor("S5-converge-BLOCKED pass=1 states=" .. states_snapshot())
         measure(
             "scenario=S5 pass=1 converge=BLOCKED"
-                .. " down_ms=" .. (t_restart - t_all_down)
-                .. " stuck_report=" .. report
-                .. " states=" .. states_snapshot()
+                .. " down_ms="
+                .. (t_restart - t_all_down)
+                .. " stuck_report="
+                .. report
+                .. " states="
+                .. states_snapshot()
         )
         progress(
             "S5 pass 1: the durable resurrection did not converge (blocked, recorded)"
@@ -1285,10 +1407,14 @@ local function scenario_full_cycle()
     snapshot_state("post-settle-s5-pass2")
     measure(
         "scenario=S5 pass=2"
-            .. " down_ms=" .. (t_restart_b - t_all_down_b)
-            .. " first_op_ms=" .. (first_op_b - t_restart_b)
-            .. " converge_ms=" .. (t_conv_b - t_restart_b)
-            .. " states=" .. states_snapshot()
+            .. " down_ms="
+            .. (t_restart_b - t_all_down_b)
+            .. " first_op_ms="
+            .. (first_op_b - t_restart_b)
+            .. " converge_ms="
+            .. (t_conv_b - t_restart_b)
+            .. " states="
+            .. states_snapshot()
     )
     clock.sleep(10)
 end

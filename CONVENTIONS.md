@@ -44,7 +44,9 @@ of thumb; one genuine linchpin parameter may be made conspicuous when consistenc
 ## Type checking is the lint
 
 The type checker is the primary static gate ([warnings](https://teal-language.org/book/latest/compiler_options.html)).
-`make check` type checks everything outside `source_dir` that `cyan build` does not reach.
+`make check` type checks every tracked `.tl` in the tree through one Cyan invocation (`TEAL_SOURCES` in the
+Makefile); `tests/fixtures` is test data whose deliberately broken fixtures are asserted by the learning
+tests, so it stays out of the gate. `make fmt`/`make lint` hold the same whole tree to the Cerulean format.
 
 Unexpected Teal facts should be captured as **learning tests**, not copied into prose. See
 [`tests/teal_learning_test.tl`](tests/teal_learning_test.tl) and its fixtures for the current

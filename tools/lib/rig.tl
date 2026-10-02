@@ -218,7 +218,7 @@ local function all_logs(rig: Rig): {string}
 end
 
 local function total_renews(rig: Rig): integer
-    return logs.count_where(all_logs(rig), "lease-attempt", { op = "renew" })
+    return logs.count_where(all_logs(rig), "lease-attempt", {op = "renew"})
 end
 
 local function grant_lines(rig: Rig): {string}
@@ -652,7 +652,9 @@ local function stability_body(root: string)
                 .. hname
                 .. " did not reincarnate (no identity bump in its boot note)",
             function(): boolean, string
-                for _, line in ipairs(logs.event_lines(node_logs(rig, hname), "boot")) do
+                for _, line in ipairs(
+                    logs.event_lines(node_logs(rig, hname), "boot")
+                ) do
                     local kv = logs.kv(line)
                     local ts = (tonumber(kv.ts) or 0) as integer
                     local own = (tonumber(kv.own) or 0) as integer
@@ -683,7 +685,7 @@ local function stability_body(root: string)
                             logs.count_where(
                                 node_logs(rig, other),
                                 "remap",
-                                { old = tostring(hid), new = bumped }
+                                {old = tostring(hid), new = bumped}
                             ) > 0
                         then
                             n = n + 1
@@ -923,7 +925,9 @@ function M.takeover(root: string): integer
             if detect_ts > 0 then
                 print("detection latency:          " .. (detect_ts - kill_ts) .. " ms")
             else
-                print("detection latency:          NOT DETECTED (the leader timeout stayed down)")
+                print(
+                    "detection latency:          NOT DETECTED (the leader timeout stayed down)"
+                )
             end
             if new_leader_ts > 0 then
                 print(
@@ -1054,9 +1058,7 @@ function M.acceptance(root: string): integer
             local node_files = logs.node_files(fs.join(rig.run_dir, "logs"), joiner)
             if
                 logs.count_where(
-                    node_files,
-                    "discovery-escalate",
-                    { model_era = "6" }
+                    node_files, "discovery-escalate", {model_era = "6"}
                 ) == 0
             then
                 gate.fail("the 7th node's discovery never escalated to the live era 6")
@@ -1064,14 +1066,9 @@ function M.acceptance(root: string): integer
             print("discovery: escalated to the live era 6")
             if
                 logs.count_where(
-                    node_files,
-                    "membership-snapshot-adopted",
-                    { model_era = "6" }
-                ) == 0
-                or logs.count_where(
-                    node_files,
-                    "membership-snapshot-adopted",
-                    { source = "discovery" }
+                    node_files, "membership-snapshot-adopted", {model_era = "6"}
+                ) == 0 or logs.count_where(
+                    node_files, "membership-snapshot-adopted", {source = "discovery"}
                 ) == 0
             then
                 gate.fail(
@@ -1119,19 +1116,15 @@ function M.acceptance(root: string): integer
             if not fs.read_all(sidecar_of(joiner)):find(
                 '"id":393217,"weight":0', 1, true
             ) then
-                gate.fail("the adopted sidecar should carry the weight-0 learner id 393217")
+                gate.fail(
+                    "the adopted sidecar should carry the weight-0 learner id 393217"
+                )
             end
 
             -- The discovered addressing rows let the node address the live
             -- members it did not remember: its status line shows it tracking
             -- the cluster.
-            if
-                logs.count_where(
-                    node_files,
-                    "membership-snapshot-adopted",
-                    {}
-                ) == 0
-            then
+            if logs.count_where(node_files, "membership-snapshot-adopted", {}) == 0 then
                 gate.fail("no membership adoption evidence in the 7th node's log")
             end
 

@@ -90,20 +90,23 @@ function M.main(): integer
     -- One free-text value as a JSON string: the quotes, backslashes and
     -- control characters a node's reply detail can carry, escaped.
     local function json_string(text: string): string
-        local escaped = text:gsub("[%c\"\\]", function(c: string): string
-            if c == '"' then
-                return '\\"'
-            elseif c == "\\" then
-                return "\\\\"
-            elseif c == "\n" then
-                return "\\n"
-            elseif c == "\r" then
-                return "\\r"
-            elseif c == "\t" then
-                return "\\t"
+        local escaped = text:gsub(
+            "[%c\"\\]",
+            function(c: string): string
+                if c == '"' then
+                    return '\\"'
+                elseif c == "\\" then
+                    return "\\\\"
+                elseif c == "\n" then
+                    return "\\n"
+                elseif c == "\r" then
+                    return "\\r"
+                elseif c == "\t" then
+                    return "\\t"
+                end
+                return string.format("\\u%04x", string.byte(c))
             end
-            return string.format("\\u%04x", string.byte(c))
-        end)
+        )
         return '"' .. escaped .. '"'
     end
 

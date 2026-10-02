@@ -483,7 +483,11 @@ function M.main(root: string, _argv: {string}): integer
         clock.sleep(2)
 
         local leave_ok = drive_admin(
-            work, 28101, "leave", '{"action":"leave","message_id":"%s","id":26476545}', "d"
+            work,
+            28101,
+            "leave",
+            '{"action":"leave","message_id":"%s","id":26476545}',
+            "d"
         )
         local _leave_ok = leave_ok
         local leave_start_raw = fs.read_all(fs.join(work, "leave.start"))

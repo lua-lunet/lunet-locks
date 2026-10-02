@@ -37,7 +37,8 @@
 --     luajit -l tl tools/tl-driver.lua [--kind KIND ...] DIR OUT.jsonl
 local ffi = require("ffi")
 
-ffi.cdef([[
+ffi.cdef(
+    [[
 int32_t lunet_aof_iter_open(const char* path, size_t path_len, void** out);
 int32_t lunet_aof_iter_next(void* it, char* out_data, size_t cap,
                             size_t* out_len, uint64_t* out_op);
@@ -45,7 +46,8 @@ void lunet_aof_iter_close(void* it);
 int32_t lunet_aof_open(const char* path, size_t path_len, uint8_t force_flush, void** out);
 int32_t lunet_aof_append(void* file, const char* data, size_t len, uint64_t* out_op);
 int32_t lunet_aof_close(void* file);
-]])
+]]
+)
 
 local RECORD_MAX = (1024 * 1024) - 256
 
@@ -73,13 +75,22 @@ local TAG_NAMES: {number: string} = {
 -- The sentinel a saturated field carries through to the JSON as null.
 local JSON_NULL = "json-null"
 
+-- Teal has no cdata type: LuaJIT cdata scalars are annotated `any` and
+-- carry runtime-neutral `as integer`/`as number` no-op casts at their
+-- arithmetic sites (tl gen compiles `as` away, so the runtime stays
+-- exact cdata arithmetic past 2^53). cdata arrays carry the element
+-- type, the same convention src/advisory_lock.tl uses.
 local record Native
-    lunet_aof_iter_open: function(cdata, number, {any}): number
-    lunet_aof_iter_next: function(any, cdata, number, {any}, {any}): number
+    lunet_aof_iter_open: function(string, number, {any}): number
+    lunet_aof_iter_next: function(any, any, number, {number}, {any}): number
     lunet_aof_iter_close: function(any)
-    lunet_aof_open: function(cdata, number, number, {any}): number
-    lunet_aof_append: function(any, cdata, number, {any}): number
-    lunet_aof_close: function(any)
+    lunet_aof_open: function(string, number, number, {any}): number
+    lunet_aof_append: function(any, string, number, {any}): number
+    lunet_aof_close: function(any): number
+end
+
+local record DebugInfo
+    source: string
 end
 
 local function default_lib(): string
@@ -87,10 +98,12 @@ local function default_lib(): string
     if env ~= nil and env ~= "" then
         return env
     end
-    local info = debug.getinfo(1, "S") as {source: string}
-    local dir = info.source:match("^@(.+)/[^/]+$") or "."
+    local dir = ((debug.getinfo(1, "S") as DebugInfo).source):match("^@(.+)/[^/]+$")
+        or "."
     local suffix = ffi.os == "OSX" and "dylib" or "so"
-    return dir .. "/../ext/lunet-locks-aof/zig/zig-out/lib/liblunet_locks_aof." .. suffix
+    return dir
+        .. "/../ext/lunet-locks-aof/zig/zig-out/lib/liblunet_locks_aof."
+        .. suffix
 end
 
 local native = ffi.load(os.getenv("AOF_LIB") or default_lib()) as Native
@@ -99,22 +112,22 @@ local native = ffi.load(os.getenv("AOF_LIB") or default_lib()) as Native
 -- materialise — a python list of 50k records costs the world; this
 -- costs one MiB, and only what the analysis needs ever survives).
 local buffer = ffi.new("char[?]", RECORD_MAX)
-local len_out = ffi.new("size_t[1]")
-local op_out = ffi.new("uint64_t[1]")
+local len_out = ffi.new("size_t[1]") as {number}
+local op_out = ffi.new("uint64_t[1]") as {any}
 
 local record Summary
-    files: number
-    records: number
-    by_marker: {string: number}
-    tags: {string: number}
+    files: integer
+    records: integer
+    by_marker: {string: integer}
+    tags: {string: integer}
     first_ns: any
     last_ns: any
     span_s: string
-    malformed: number
+    malformed: integer
 end
 
 local function iter_open(path: string): any
-    local out = ffi.new("void*[1]")
+    local out = ffi.new("void*[1]") as {any}
     local rc = native.lunet_aof_iter_open(path, #path, out)
     if rc ~= 0 then
         error("lunet_aof_iter_open rc=" .. tostring(rc))
@@ -123,22 +136,22 @@ local function iter_open(path: string): any
 end
 
 -- Big-endian ns of an envelope record: exact via cdata uint64.
-function ns_of(record: string): any
+local function ns_of(record: string): any
     local v = ffi.new("uint64_t", 0)
-    local b = ffi.cast("const uint8_t*", record)
+    local b = ffi.cast("const uint8_t*", record) as {integer}
     for i = 1, 8 do
-        v = v * 256 + b[i]
+        v = (v as integer) * 256 + b[i]
     end
     return v
 end
 
-local function bump(t: {string: number}, key: string, by: number)
+local function bump(t: {string: integer}, key: string, by: integer)
     t[key] = (t[key] or 0) + by
 end
 
 local function summarize_one(path: string): Summary
-    local by_marker: {string: number} = {}
-    local tags: {string: number} = {}
+    local by_marker: {string: integer} = {}
+    local tags: {string: integer} = {}
     local first_ns: any = nil
     local last_ns: any = nil
     local records = 0
@@ -152,20 +165,25 @@ local function summarize_one(path: string): Summary
             native.lunet_aof_iter_close(it)
             break
         end
-        local frame = ffi.string(buffer, len_out[0])
+        local frame = ffi.string(buffer, len_out[0] as integer)
         records = records + 1
         local marker = frame:byte(1)
-        if (marker ~= MARKER_WIRE and marker ~= MARKER_TIMEOUT
-            and marker ~= MARKER_TRANSITION and marker ~= MARKER_OUTBOUND)
-            or #frame < 9 then
+        if
+            (
+                marker ~= MARKER_WIRE
+                and marker ~= MARKER_TIMEOUT
+                and marker ~= MARKER_TRANSITION
+                and marker ~= MARKER_OUTBOUND
+            ) or #frame < 9
+        then
             malformed = malformed + 1
         else
             bump(by_marker, tostring(marker), 1)
             local ns = ns_of(frame)
-            if first_ns == nil or ns < first_ns then
+            if first_ns == nil or (ns as integer) < (first_ns as integer) then
                 first_ns = ns
             end
-            if last_ns == nil or ns > last_ns then
+            if last_ns == nil or (ns as integer) > (last_ns as integer) then
                 last_ns = ns
             end
             if marker == MARKER_WIRE then
@@ -173,10 +191,9 @@ local function summarize_one(path: string): Summary
                     malformed = malformed + 1
                 else
                     -- payload starts at byte 10 (1-indexed): marker(1)+ns(8)
-                    local tag = frame:byte(10) * 16777216
-                        + frame:byte(11) * 65536
-                        + frame:byte(12) * 256
-                        + frame:byte(13)
+                    local tag = frame:byte(10) * 16777216 + frame:byte(
+                        11
+                    ) * 65536 + frame:byte(12) * 256 + frame:byte(13)
                     local name = TAG_NAMES[tag]
                     if name ~= nil then
                         bump(tags, name, 1)
@@ -189,7 +206,9 @@ local function summarize_one(path: string): Summary
     end
     local span_s = "0.000000"
     if first_ns ~= nil and last_ns ~= nil then
-        span_s = string.format("%.6f", tonumber(last_ns - first_ns) / 1e9)
+        span_s = string.format(
+            "%.6f", tonumber((last_ns as integer) - (first_ns as integer)) / 1e9
+        )
     end
     return {
         files = 1,
@@ -203,7 +222,7 @@ local function summarize_one(path: string): Summary
     }
 end
 
-local function merge_key(total: {string: number}, part: {string: number}, key: string)
+local function merge_key(total: {string: integer}, part: {string: integer}, key: string)
     local v = part[key]
     if v ~= nil then
         bump(total, key, v)
@@ -240,15 +259,30 @@ local function summarize_series(dir_path: string): Summary
         for k, v in pairs(s.tags) do
             bump(total.tags, k, v)
         end
-        if s.first_ns ~= nil and (total.first_ns == nil or s.first_ns < total.first_ns) then
+        if
+            s.first_ns ~= nil
+            and (
+                total.first_ns == nil
+                or (s.first_ns as integer) < (total.first_ns as integer)
+            )
+        then
             total.first_ns = s.first_ns
         end
-        if s.last_ns ~= nil and (total.last_ns == nil or s.last_ns > total.last_ns) then
+        if
+            s.last_ns ~= nil
+            and (
+                total.last_ns == nil
+                or (s.last_ns as integer) > (total.last_ns as integer)
+            )
+        then
             total.last_ns = s.last_ns
         end
     end
     if total.first_ns ~= nil then
-        total.span_s = string.format("%.6f", tonumber(total.last_ns - total.first_ns) / 1e9)
+        total.span_s = string.format(
+            "%.6f",
+            tonumber((total.last_ns as integer) - (total.first_ns as integer)) / 1e9
+        )
     end
     return total
 end
@@ -257,10 +291,10 @@ end
 -- twin's sort_keys output). ns values are cdata uint64 → tostring keeps
 -- full precision past 2^53.
 local function json_escape(s: string): string
-    return (s:gsub('\\', '\\\\'):gsub('"', '\\"'))
+    return (s:gsub("\\", "\\\\"):gsub('"', '\\"'))
 end
 
-local function sorted_map_json(m: {string: number}): string
+local function sorted_map_json(m: {string: integer}): string
     local keys: {string} = {}
     for k, _ in pairs(m) do
         keys[#keys + 1] = k
@@ -273,29 +307,44 @@ local function sorted_map_json(m: {string: number}): string
     return "{" .. table.concat(out, ", ") .. "}"
 end
 
-function summarize_series_json(dir_path: string): string
+local function summarize_series_json(dir_path: string): string
     local total = summarize_series(dir_path)
-    return ('{"files": %d, "records": %d, "by_marker": %s, "tags": %s, '
-        .. '"first_ns": %s, "last_ns": %s, "span_s": %s, "malformed": %d}')
-        :format(total.files, total.records, sorted_map_json(total.by_marker),
-            sorted_map_json(total.tags), tostring(total.first_ns),
-            tostring(total.last_ns), total.span_s, total.malformed)
+    return (
+        '{"files": %d, "records": %d, "by_marker": %s, "tags": %s, '
+        .. '"first_ns": %s, "last_ns": %s, "span_s": %s, "malformed": %d}'
+    ):format(
+        total.files,
+        total.records,
+        sorted_map_json(total.by_marker),
+        sorted_map_json(total.tags),
+        tostring(total.first_ns),
+        tostring(total.last_ns),
+        total.span_s,
+        total.malformed
+    )
 end
 
 -- One file's summary: the same shape the python twin's summarize()
 -- produces (no "files" key).
-function summarize_one_json(path: string): string
+local function summarize_one_json(path: string): string
     local s = summarize_one(path)
-    return ('{"records": %d, "by_marker": %s, "tags": %s, '
-        .. '"first_ns": %s, "last_ns": %s, "span_s": %s, "malformed": %d}')
-        :format(s.records, sorted_map_json(s.by_marker),
-            sorted_map_json(s.tags), tostring(s.first_ns),
-            tostring(s.last_ns), s.span_s, s.malformed)
+    return (
+        '{"records": %d, "by_marker": %s, "tags": %s, '
+        .. '"first_ns": %s, "last_ns": %s, "span_s": %s, "malformed": %d}'
+    ):format(
+        s.records,
+        sorted_map_json(s.by_marker),
+        sorted_map_json(s.tags),
+        tostring(s.first_ns),
+        tostring(s.last_ns),
+        s.span_s,
+        s.malformed
+    )
 end
 
 -- The test-fixture writer surface (the same C ABI the standby uses).
-function open_writer(path: string): any
-    local out = ffi.new("void*[1]")
+local function open_writer(path: string): any
+    local out = ffi.new("void*[1]") as {any}
     local rc = native.lunet_aof_open(path, #path, 0, out)
     if rc ~= 0 then
         error("lunet_aof_open rc=" .. tostring(rc))
@@ -303,8 +352,8 @@ function open_writer(path: string): any
     return out[0]
 end
 
-function append(handle: any, data: string): number
-    local op = ffi.new("uint64_t[1]")
+local function append(handle: any, data: string): number
+    local op = ffi.new("uint64_t[1]") as {any}
     local rc = native.lunet_aof_append(handle, data, #data, op)
     if rc ~= 0 then
         error("lunet_aof_append rc=" .. tostring(rc))
@@ -312,21 +361,25 @@ function append(handle: any, data: string): number
     return tonumber(op[0])
 end
 
-function close_writer(handle: any)
+local function close_writer(handle: any)
     local rc = native.lunet_aof_close(handle)
     if rc ~= 0 then
         error("lunet_aof_close rc=" .. tostring(rc))
     end
 end
 
-function fixture_dir(): string
+local function fixture_dir(): string
     local tmpl = os.getenv("TMPDIR") or "/tmp"
-    local name = tmpl .. "/aof-trace-tool-" .. tostring(os.time()) .. "-" .. tostring(math.random(100000))
+    local name = tmpl
+        .. "/aof-trace-tool-"
+        .. tostring(os.time())
+        .. "-"
+        .. tostring(math.random(100000))
     os.execute("mkdir -p " .. name)
     return name
 end
 
-function is_dir(path: string): boolean
+local function is_dir(path: string): boolean
     local p = io.open(path .. "/.", "r")
     if p ~= nil then
         p:close()
@@ -335,34 +388,40 @@ function is_dir(path: string): boolean
     return false
 end
 
-
 -- -------------------------------------------------------------- export ----
 -- The trace of what happened, as record tables: the ts at the AOF (the
 -- standby's local ns clock), the command, the result.
 
 local SYS_NAMES: {number: string} = {
-    [1] = "Void", [2] = "Init", [3] = "Increment", [4] = "Decrement",
-    [5] = "Double", [6] = "Halve", [7] = "Join", [8] = "Leave", [9] = "Batch",
+    [1] = "Void",
+    [2] = "Init",
+    [3] = "Increment",
+    [4] = "Decrement",
+    [5] = "Double",
+    [6] = "Halve",
+    [7] = "Join",
+    [8] = "Leave",
+    [9] = "Batch",
 }
 
 -- All byte readers are 1-INDEXED like the string: the ffi cast is
 -- 0-indexed, so every lookup lands at `at - 1`.
-local function be_u32(buf: string, at: number): number
-    local b = ffi.cast("const uint8_t*", buf)
+local function be_u32(buf: string, at: integer): integer
+    local b = ffi.cast("const uint8_t*", buf) as {integer}
     return b[at - 1] * 16777216 + b[at] * 65536 + b[at + 1] * 256 + b[at + 2]
 end
 
-local function be_u64(buf: string, at: number): any
+local function be_u64(buf: string, at: integer): any
     local v = ffi.new("uint64_t", 0)
-    local b = ffi.cast("const uint8_t*", buf)
+    local b = ffi.cast("const uint8_t*", buf) as {integer}
     for i = 0, 7 do
-        v = v * 256 + b[at - 1 + i]
+        v = (v as integer) * 256 + b[at - 1 + i]
     end
     return v
 end
 
 -- One SystemOperation: (command string, bytes consumed) or (nil, 0).
-local function parse_system(buf: string): (string, number)
+local function parse_system(buf: string): (string, integer)
     if #buf == 0 then
         return nil, 0
     end
@@ -421,8 +480,12 @@ local function parse_system(buf: string): (string, number)
 end
 
 -- One uVRR wire frame: (kind, tag, era, view, slot, entry, committed)
--- where entry is ("operation", payload-json) or ("system", command).
-local function parse_wire(frame: string): (string, number, number, number, any, ({string, string} | {string, any}), any)
+-- where entry is the {discriminant, payload} string pair —
+-- {"operation", payload-json} or {"system", command} — a plain {string}
+-- array (both payloads are strings; no table union to discriminate).
+local function parse_wire(
+    frame: string
+): (string, integer, integer, integer, any, {string}, any)
     if #frame < 21 then
         return nil, nil, nil, nil, nil, nil, nil
     end
@@ -438,10 +501,8 @@ local function parse_wire(frame: string): (string, number, number, number, any, 
         if #frame < 21 + 8 + 4 + 1 then
             return nil, nil, nil, nil, nil, nil, nil
         end
-        local entry_slot = be_u64(frame, 22)
-        local entry_era = be_u32(frame, 30)
         local payload_disc = frame:byte(34)
-        local entry: {string, string}
+        local entry: {string}
         local cursor = 35
         if payload_disc == 1 then
             if #frame < cursor + 16 + 4 then
@@ -469,8 +530,6 @@ local function parse_wire(frame: string): (string, number, number, number, any, 
             return nil, nil, nil, nil, nil, nil, nil
         end
         local committed = be_u64(frame, cursor)
-        _ = entry_slot
-        _ = entry_era
         return "prepare", tag, era, view, slot, entry, committed
     elseif tag == 4 then
         if #frame < 21 + 8 - 1 then
@@ -496,10 +555,10 @@ local function require_ffi_u64(s: string): any
     end
     local v = ffi.new("uint64_t", 0)
     for i = 1, #body do
-        v = v * 10 + (body:byte(i) - 48)
+        v = (v as integer) * 10 + (body:byte(i) - 48)
     end
     if not sign then
-        v = -v
+        v = -(v as integer)
     end
     return v
 end
@@ -515,9 +574,11 @@ local function json_num(json: string, key: string): any
         return tonumber(raw)
     end
     -- the detector's bare `inf`/`nan` saturations are not JSON: null
-    if json:match('"' .. key .. '":%s*[-+]?inf') ~= nil
+    if
+        json:match('"' .. key .. '":%s*[-+]?inf') ~= nil
         or json:match('"' .. key .. '":%s*[Nn]a[Nn]') ~= nil
-        or json:match('"' .. key .. '":%s*null') ~= nil then
+        or json:match('"' .. key .. '":%s*null') ~= nil
+    then
         return JSON_NULL
     end
     return nil
@@ -528,7 +589,10 @@ local function json_str(json: string, key: string): string
 end
 
 local LOCK_OPS: {string: boolean} = {
-    ["get"] = true, ["set"] = true, ["release"] = true, ["break"] = true,
+    ["get"] = true,
+    ["set"] = true,
+    ["release"] = true,
+    ["break"] = true,
 }
 
 local function lock_fields(json: string): ({string: any} | nil)
@@ -536,7 +600,7 @@ local function lock_fields(json: string): ({string: any} | nil)
     if op == nil or LOCK_OPS[op] ~= true then
         return nil
     end
-    local fields = {
+    local fields: {string: any} = {
         op = op,
         lock_id = json_num(json, "lock_id"),
         message_id = json_str(json, "message_id"),
@@ -561,13 +625,6 @@ local function json_payload(frame: string): string
     return frame:sub(10)
 end
 
--- The JSONL line for one event: fixed key order (the parity contract).
-local function json_escape(s: string): string
-    local out = s:gsub("\\", "\\\\")
-    out = out:gsub('"', '\\"')
-    return out
-end
-
 -- Nested aggregate serialisation: _stats tables and stall entries
 -- carry their own key order in _o (the parity contract with the
 -- python twin's dict construction order).
@@ -587,22 +644,30 @@ local function float_repr(v: number): string
     return string.format("%.17g", v)
 end
 
+-- ffi.istype is a LuaJIT ffi member Teal's stdlib declaration omits:
+-- the extension record states it, cast through any (runtime-neutral).
+local record FfiExt
+    istype: function(string, any): boolean
+end
+
+local ffi_istype = (ffi as any as FfiExt).istype
+
 local function scalar_json(key: string, v: any): string
     if v == JSON_NULL then
         return ('"%s": null'):format(key)
     elseif v == true or v == false then
         return ('"%s": %s'):format(key, tostring(v))
     elseif type(v) == "string" then
-        return ('"%s": "%s"'):format(key, json_escape(v))
-    elseif ffi.istype("uint64_t", v) then
+        return ('"%s": "%s"'):format(key, json_escape(v as string))
+    elseif ffi_istype("uint64_t", v) then
         -- exact past 2^53: the cdata formats itself, no ULL suffix
-        return ('"%s": %s'):format(key, string.format("%d", v))
-    elseif ffi.istype("int64_t", v) then
+        return ('"%s": %s'):format(key, string.format("%d", v as integer))
+    elseif ffi_istype("int64_t", v) then
         -- the exact signed difference of two integral ts stamps (the
         -- python twin's int): prints as an integer, never a .0 float
-        return ('"%s": %s'):format(key, string.format("%d", v))
+        return ('"%s": %s'):format(key, string.format("%d", v as integer))
     elseif type(v) == "number" then
-        return ('"%s": %s'):format(key, float_repr(v))
+        return ('"%s": %s'):format(key, float_repr(v as number))
     else
         return ('"%s": %s'):format(key, tostring(v))
     end
@@ -612,18 +677,19 @@ local function nested_json(v: any): string
     if type(v) ~= "table" then
         return tostring(v)
     end
-    if v._o ~= nil then
+    local t = v as {string: any}
+    if t["_o"] ~= nil then
         local parts: {string} = {}
-        for _, key in ipairs(v._o as {string}) do
-            if v[key] ~= nil then
-                parts[#parts + 1] = scalar_json(key, v[key])
+        for _, key in ipairs(t["_o"] as {string}) do
+            if t[key] ~= nil then
+                parts[#parts + 1] = scalar_json(key, t[key])
             end
         end
         return "{" .. table.concat(parts, ", ") .. "}"
     end
     -- an array of nested objects (the stall list)
     local parts: {string} = {}
-    for _, e in ipairs(v) do
+    for _, e in ipairs(v as {any}) do
         parts[#parts + 1] = nested_json(e)
     end
     return "[" .. table.concat(parts, ", ") .. "]"
@@ -631,52 +697,136 @@ end
 
 -- Per-kind key order: each mirrors the python twin's dict
 -- construction order so a raw line diff is the parity check.
-local DEFAULT_ORDER: {string} = {"kind", "aof_ns", "slot",
-                                 "result", "op", "lock_id", "message_id",
-                                 "client_id", "request_num", "lease_id",
-                                 "lease_holder", "expiry", "command",
-                                 "now_ms", "prev_wait_ms",
-                                 "next_wait_ms", "mean",
-                                 "min_ms", "max_ms", "node", "era", "leader",
-                                 "view", "addr", "holder", "dt_ms", "ts_ms",
-                                 "t_rel_ms", "t_fmt", "anchor",
-                                 "last_holder", "last_slot",
-                                 "last_renew_t_rel",
-                                 "break_seen_t_rel", "next_acquire_t_rel",
-                                 "next_slot", "next_holder", "takeover_ms",
-                                 "dir", "source", "min_ms", "mean_ms",
-                                 "p50_ms", "p95_ms", "max_ms", "count",
-                                 "gaps", "stalls"}
+local DEFAULT_ORDER: {string} = {
+    "kind",
+    "aof_ns",
+    "slot",
+    "result",
+    "op",
+    "lock_id",
+    "message_id",
+    "client_id",
+    "request_num",
+    "lease_id",
+    "lease_holder",
+    "expiry",
+    "command",
+    "now_ms",
+    "prev_wait_ms",
+    "next_wait_ms",
+    "mean",
+    "min_ms",
+    "max_ms",
+    "node",
+    "era",
+    "leader",
+    "view",
+    "addr",
+    "holder",
+    "dt_ms",
+    "ts_ms",
+    "t_rel_ms",
+    "t_fmt",
+    "anchor",
+    "last_holder",
+    "last_slot",
+    "last_renew_t_rel",
+    "break_seen_t_rel",
+    "next_acquire_t_rel",
+    "next_slot",
+    "next_holder",
+    "takeover_ms",
+    "dir",
+    "source",
+    "min_ms",
+    "mean_ms",
+    "p50_ms",
+    "p95_ms",
+    "max_ms",
+    "count",
+    "gaps",
+    "stalls",
+}
 local ROW_ORDER: {string: {string}} = {
-    ["locks"] = {"kind", "aof_ns", "slot", "result", "op",
-                 "lock_id", "message_id", "client_id", "request_num",
-                 "lease_id", "lease_holder", "expiry", "t_rel_ms",
-                 "t_fmt"},
-    ["reconfig"] = {"kind", "command", "aof_ns", "slot",
-                    "result", "t_rel_ms", "t_fmt"},
-    ["timeouts"] = {"kind", "aof_ns", "now_ms", "prev_wait_ms",
-                    "next_wait_ms", "leader", "era", "view", "mean",
-                    "min_ms", "max_ms", "t_rel_ms", "t_fmt"},
-    ["locks-timeline"] = {"kind", "op", "holder", "lock_id", "slot",
-                          "ts_ms", "aof_ns", "t_rel_ms", "t_fmt"},
-    ["takeover"] = {"kind", "anchor", "last_holder", "last_slot",
-                    "last_renew_t_rel", "break_seen_t_rel",
-                    "next_acquire_t_rel", "next_slot", "next_holder",
-                    "takeover_ms"},
+    ["locks"] = {
+        "kind",
+        "aof_ns",
+        "slot",
+        "result",
+        "op",
+        "lock_id",
+        "message_id",
+        "client_id",
+        "request_num",
+        "lease_id",
+        "lease_holder",
+        "expiry",
+        "t_rel_ms",
+        "t_fmt",
+    },
+    ["reconfig"] = {
+        "kind", "command", "aof_ns", "slot", "result", "t_rel_ms", "t_fmt"
+    },
+    ["timeouts"] = {
+        "kind",
+        "aof_ns",
+        "now_ms",
+        "prev_wait_ms",
+        "next_wait_ms",
+        "leader",
+        "era",
+        "view",
+        "mean",
+        "min_ms",
+        "max_ms",
+        "t_rel_ms",
+        "t_fmt",
+    },
+    ["locks-timeline"] = {
+        "kind",
+        "op",
+        "holder",
+        "lock_id",
+        "slot",
+        "ts_ms",
+        "aof_ns",
+        "t_rel_ms",
+        "t_fmt",
+    },
+    ["takeover"] = {
+        "kind",
+        "anchor",
+        "last_holder",
+        "last_slot",
+        "last_renew_t_rel",
+        "break_seen_t_rel",
+        "next_acquire_t_rel",
+        "next_slot",
+        "next_holder",
+        "takeover_ms",
+    },
     ["anchor"] = {"kind", "anchor", "ts_ms", "t_rel_ms", "t_fmt"},
-    ["aof-noise"] = {"kind", "dir", "gaps", "stalls",
-                     "t_rel_ms", "t_fmt"},
-    ["hb-spacing"] = {"kind", "node", "event", "min_ms", "mean_ms",
-                      "p50_ms", "p95_ms", "max_ms", "count"},
-    ["log-integrity"] = {"kind", "file", "lines", "events",
-                         "parse_failures", "skipped"},
-    ["leader-lag"] = {"kind", "leader", "node", "era", "view", "slot",
-                      "leader_ms"},
+    ["aof-noise"] = {"kind", "dir", "gaps", "stalls", "t_rel_ms", "t_fmt"},
+    ["hb-spacing"] = {
+        "kind",
+        "node",
+        "event",
+        "min_ms",
+        "mean_ms",
+        "p50_ms",
+        "p95_ms",
+        "max_ms",
+        "count",
+    },
+    ["log-integrity"] = {
+        "kind", "file", "lines", "events", "parse_failures", "skipped"
+    },
+    ["leader-lag"] = {"kind", "leader", "node", "era", "view", "slot", "leader_ms"},
 }
 
 local function ev_json(e: {string: any}): string
     local parts: {string} = {}
-    local order = ROW_ORDER[e.kind] or DEFAULT_ORDER
+    local order = ROW_ORDER[e.kind as string] or DEFAULT_ORDER
     for _, key in ipairs(order) do
         local v = e[key]
         if v ~= nil then
@@ -727,8 +877,9 @@ end
 
 local STAMP_MAX = 60
 
-local function policy_skip(policy: SkipPolicy, path: string, lineno: number,
-                           line: string, why: string)
+local function policy_skip(
+    policy: SkipPolicy, path: string, lineno: number, line: string, why: string
+)
     local stamp = path .. ":" .. tostring(lineno)
     if policy._seen[stamp] then
         return
@@ -740,11 +891,9 @@ local function policy_skip(policy: SkipPolicy, path: string, lineno: number,
         text = text:sub(1, STAMP_MAX)
     end
     if policy.allow then
-        io.stderr:write(("skipped line %s (%s): %s\n")
-            :format(stamp, why, text))
+        io.stderr:write(("skipped line %s (%s): %s\n"):format(stamp, why, text))
     else
-        error(("%s: %s (offending text: %q)")
-            :format(stamp, why, text), 0)
+        error(("%s: %s (offending text: %q)"):format(stamp, why, text), 0)
     end
 end
 
@@ -752,21 +901,25 @@ end
 -- builds policy_new(true) and passes it as `ctx`.
 local STRICT = policy_new(false)
 
-
 -- Forward declarations: the extras (timeline/aof-noise/hb-spacing/
 -- leader-lag) and the anchored export read export_series, but
 -- export_series appends their rows — declared here, defined below.
-local timeline_rows
-local aof_noise_rows
-local hb_spacing_rows
-local leader_lag_rows
-local log_integrity_rows
-local takeover_row
-local anchor_rows_and_takeovers
+local timeline_rows: function(string): {{string: any}}
+local aof_noise_rows: function(string, number): {{string: any}}
+local hb_spacing_rows: function({string}, SkipPolicy): {{string: any}}
+local leader_lag_rows: function({string}, SkipPolicy): {{string: any}}
+local log_integrity_rows: function({string}, SkipPolicy): {{string: any}}
+local takeover_row: function({{string: any}}, number, string): {string: any}
+local anchor_rows_and_takeovers: function({{string: any}}, {number}): {{string: any}}
 
-local function export_series(dir_path: string, kinds: string, anchors: any,
-                             hb_ms: any, logs: any,
-                             policy: SkipPolicy): {{string: any}}
+local function export_series(
+    dir_path: string,
+    kinds: string,
+    anchors: any,
+    hb_ms: any,
+    logs: any,
+    policy: SkipPolicy
+): {{string: any}}
     policy = policy or STRICT
     local wanted_names: {string} = {}
     local p = io.popen("ls -1 " .. dir_path .. "/*.aof 2>/dev/null")
@@ -780,12 +933,14 @@ local function export_series(dir_path: string, kinds: string, anchors: any,
     for _, path in ipairs(wanted_names) do
         local it = iter_open(path)
         while true do
-            local rc = native.lunet_aof_iter_next(it, buffer, RECORD_MAX, len_out, op_out)
+            local rc = native.lunet_aof_iter_next(
+                it, buffer, RECORD_MAX, len_out, op_out
+            )
             if rc <= 0 then
                 native.lunet_aof_iter_close(it)
                 break
             end
-            local frame = ffi.string(buffer, len_out[0])
+            local frame = ffi.string(buffer, len_out[0] as integer)
             local aof_ns = ns_of(frame)
             local marker = frame:byte(1)
             if marker == MARKER_TIMEOUT then
@@ -807,7 +962,9 @@ local function export_series(dir_path: string, kinds: string, anchors: any,
                 end
             elseif marker == MARKER_WIRE then
                 local wire_frame = json_payload(frame)
-                local kind, _tag, _era, _view, slot, entry, committed = parse_wire(wire_frame)
+                local kind, _tag, _era, _view, slot, entry, committed = parse_wire(
+                    wire_frame
+                )
                 if kind == "prepare" and entry ~= nil then
                     if entry[1] == "operation" then
                         local fields = lock_fields(entry[2])
@@ -827,8 +984,10 @@ local function export_series(dir_path: string, kinds: string, anchors: any,
                             if fields.op ~= nil then
                                 if kind_wanted(kinds, "locks") then
                                     local e: {string: any} = {
-                                        kind = "locks", aof_ns = aof_ns,
-                                        slot = require_ffi_u64(tostring(s)), result = "committed",
+                                        kind = "locks",
+                                        aof_ns = aof_ns,
+                                        slot = require_ffi_u64(tostring(s)),
+                                        result = "committed",
                                     }
                                     for k, v in pairs(fields) do
                                         e[k] = v
@@ -838,7 +997,8 @@ local function export_series(dir_path: string, kinds: string, anchors: any,
                             elseif kind_wanted(kinds, "reconfig") then
                                 local e: {string: any} = {
                                     aof_ns = aof_ns,
-                                    slot = require_ffi_u64(tostring(s)), result = "committed",
+                                    slot = require_ffi_u64(tostring(s)),
+                                    result = "committed",
                                 }
                                 for k, v in pairs(fields) do
                                     e[k] = v
@@ -855,8 +1015,10 @@ local function export_series(dir_path: string, kinds: string, anchors: any,
                             if fields.op ~= nil then
                                 if kind_wanted(kinds, "locks") then
                                     local e: {string: any} = {
-                                        kind = "locks", aof_ns = aof_ns,
-                                        slot = require_ffi_u64(tostring(s)), result = "committed",
+                                        kind = "locks",
+                                        aof_ns = aof_ns,
+                                        slot = require_ffi_u64(tostring(s)),
+                                        result = "committed",
                                     }
                                     for k, v in pairs(fields) do
                                         e[k] = v
@@ -866,7 +1028,8 @@ local function export_series(dir_path: string, kinds: string, anchors: any,
                             elseif kind_wanted(kinds, "reconfig") then
                                 local e: {string: any} = {
                                     aof_ns = aof_ns,
-                                    slot = require_ffi_u64(tostring(s)), result = "committed",
+                                    slot = require_ffi_u64(tostring(s)),
+                                    result = "committed",
                                 }
                                 for k, v in pairs(fields) do
                                     e[k] = v
@@ -880,7 +1043,7 @@ local function export_series(dir_path: string, kinds: string, anchors: any,
         end
     end
     if kind_wanted(kinds, "locks-timeline") then
-        for _, r in ipairs(timeline_rows(dir_path) as {{string: any}}) do
+        for _, r in ipairs(timeline_rows(dir_path)) do
             events[#events + 1] = r
         end
     end
@@ -889,27 +1052,30 @@ local function export_series(dir_path: string, kinds: string, anchors: any,
         if floor == nil then
             floor = 5.0
         end
-        for _, r in ipairs(aof_noise_rows(dir_path, floor) as {{string: any}}) do
+        for _, r in ipairs(aof_noise_rows(dir_path, floor as number)) do
             events[#events + 1] = r
         end
     end
     if type(logs) == "table" and kind_wanted(kinds, "hb-spacing") then
-        for _, r in ipairs(hb_spacing_rows(logs as {string}, policy) as {{string: any}}) do
+        for _, r in ipairs(hb_spacing_rows(logs as {string}, policy)) do
             events[#events + 1] = r
         end
     end
     if type(logs) == "table" and kind_wanted(kinds, "leader-lag") then
-        for _, r in ipairs(leader_lag_rows(logs as {string}, policy) as {{string: any}}) do
+        for _, r in ipairs(leader_lag_rows(logs as {string}, policy)) do
             events[#events + 1] = r
         end
     end
     if type(logs) == "table" and kind_wanted(kinds, "log-integrity") then
-        for _, r in ipairs(log_integrity_rows(logs as {string}, policy) as {{string: any}}) do
+        for _, r in ipairs(log_integrity_rows(logs as {string}, policy)) do
             events[#events + 1] = r
         end
     end
-    if anchors ~= nil and type(anchors) == "table" and #anchors > 0 then
-        events = anchor_rows_and_takeovers(events, anchors as {number})
+    if anchors ~= nil and type(anchors) == "table" then
+        local anchor_list = anchors as {number}
+        if #anchor_list > 0 then
+            events = anchor_rows_and_takeovers(events, anchor_list)
+        end
     end
     return events
 end
@@ -927,9 +1093,9 @@ local ABSENT = "absent"
 -- sub-ms remainder rides in as its own fraction. All arithmetic on the
 -- cdata uint64 stays exact (u64 div/mod); only the final conversion is
 -- a double.
-ns_to_ms = function(ns: any): number
-    local rem = tonumber(ns % 1000000)
-    local whole = tonumber((ns - ns % 1000000) / 1000000)
+local function ns_to_ms(ns: any): number
+    local rem = tonumber((ns as integer) % 1000000)
+    local whole = tonumber((ns as integer) - (ns as integer) % 1000000) / 1000000
     return whole + rem / 1e6
 end
 
@@ -945,8 +1111,13 @@ local function fmt_ts_ms(ts_ms: any): string
     local mi = math.floor(m)
     local frac = mi % 1000
     local tod = math.floor(mi / 1000)
-    return string.format("%02d:%02d:%02d.%03d",
-        math.floor(tod / 3600) % 24, math.floor(tod / 60) % 60, tod % 60, frac)
+    return string.format(
+        "%02d:%02d:%02d.%03d",
+        math.floor(tod / 3600) % 24,
+        math.floor(tod / 60) % 60,
+        tod % 60,
+        frac
+    )
 end
 
 -- The latest anchor at or before the ts; the first anchor before any ts
@@ -974,8 +1145,9 @@ end
 -- The distribution record: min/mean/p50/p95/max + count, nearest-rank
 -- percentile over the sorted values (table.sort's contract is enough —
 -- the sort is stable for the statistics read).
-local STATS_ORDER: {string} = {"min_ms", "mean_ms", "p50_ms", "p95_ms",
-                               "max_ms", "count"}
+local STATS_ORDER: {string} = {
+    "min_ms", "mean_ms", "p50_ms", "p95_ms", "max_ms", "count"
+}
 
 -- The one summation algorithm both twins share: Neumaier
 -- compensated summation over the SORTED values — the python twin's
@@ -1007,14 +1179,25 @@ local function stats(values: {number}): {string: any}
     table.sort(s)
     local n = #s
     if n == 0 then
-        return {min_ms = ABSENT, mean_ms = ABSENT, p50_ms = ABSENT,
-                p95_ms = ABSENT, max_ms = ABSENT, count = ffi.new("uint64_t", 0),
-                _o = STATS_ORDER}
+        return {
+            min_ms = ABSENT,
+            mean_ms = ABSENT,
+            p50_ms = ABSENT,
+            p95_ms = ABSENT,
+            max_ms = ABSENT,
+            count = ffi.new("uint64_t", 0),
+            _o = STATS_ORDER,
+        }
     end
-    return {min_ms = s[1], mean_ms = compensated_sum(s) / n,
-            p50_ms = s[math.ceil(0.5 * n)],
-            p95_ms = s[math.ceil(0.95 * n)],
-            max_ms = s[n], count = ffi.new("uint64_t", n), _o = STATS_ORDER}
+    return {
+        min_ms = s[1],
+        mean_ms = compensated_sum(s) / n,
+        p50_ms = s[math.ceil(0.5 * n)],
+        p95_ms = s[math.ceil(0.95 * n)],
+        max_ms = s[n],
+        count = ffi.new("uint64_t", n),
+        _o = STATS_ORDER,
+    }
 end
 
 -- The row's best ts in unix ms, or nil when the row is an aggregate
@@ -1056,10 +1239,15 @@ timeline_rows = function(dir_path: string): {{string: any}}
         else
             op = "get"
         end
-        rows[#rows + 1] = {kind = "locks-timeline", op = op, holder = holder,
-                           lock_id = r.lock_id, slot = r.slot,
-                           ts_ms = ns_to_ms(r.aof_ns),
-                           aof_ns = r.aof_ns}
+        rows[#rows + 1] = {
+            kind = "locks-timeline",
+            op = op,
+            holder = holder,
+            lock_id = r.lock_id,
+            slot = r.slot,
+            ts_ms = ns_to_ms(r.aof_ns),
+            aof_ns = r.aof_ns,
+        }
     end
     return rows
 end
@@ -1067,14 +1255,15 @@ end
 -- The per-anchor takeover summary: the last sign of the outgoing
 -- holder, the server break if seen, and the next holder's acquire.
 -- Any fact not in this anchor's window states "absent" (never guessed).
-takeover_row = function(window_rows: {{string: any}}, anchor: number,
-                        anchor_text: string): {string: any}
+takeover_row = function(
+    window_rows: {{string: any}}, anchor: number, anchor_text: string
+): {string: any}
     local anchor_out = require_ffi_u64(anchor_text)
     local function exactly(v: any): any
         if v == nil then
             return ABSENT
         end
-        return round3(v)
+        return round3(v as number)
     end
     local heres: {{string: any}} = {}
     local brk: {{string: any}} = nil
@@ -1093,12 +1282,12 @@ takeover_row = function(window_rows: {{string: any}}, anchor: number,
         -- the last holder fact BEFORE the break, then the first
         -- acquire AFTER it
         for _, r in ipairs(heres) do
-            if r.ts_ms < b.ts_ms + 0.0 then
+            if (r.ts_ms as number) < (b.ts_ms as number) + 0.0 then
                 last = r
             end
         end
         for _, r in ipairs(heres) do
-            if r.op == "acquire" and r.ts_ms > b.ts_ms then
+            if r.op == "acquire" and (r.ts_ms as number) > (b.ts_ms as number) then
                 if nxt == nil then
                     nxt = r
                 end
@@ -1118,20 +1307,29 @@ takeover_row = function(window_rows: {{string: any}}, anchor: number,
             last = heres[#heres]
         end
     end
-    return {kind = "takeover", anchor = anchor_out,
-            last_holder = (last ~= nil) and last.holder or ABSENT,
-            last_slot = (last ~= nil) and last.slot or ABSENT,
-            last_renew_t_rel = (last ~= nil) and exactly(last.ts_ms - anchor) or ABSENT,
-            break_seen_t_rel = (#brk > 0) and exactly(brk[1].ts_ms - anchor) or ABSENT,
-            next_acquire_t_rel = (nxt ~= nil) and exactly(nxt.ts_ms - anchor) or ABSENT,
-            next_slot = (nxt ~= nil) and nxt.slot or ABSENT,
-            next_holder = (nxt ~= nil) and nxt.holder or ABSENT,
-            takeover_ms = (nxt ~= nil) and exactly(nxt.ts_ms - anchor) or ABSENT}
+    return {
+        kind = "takeover",
+        anchor = anchor_out,
+        last_holder = (last ~= nil) and last.holder or ABSENT,
+        last_slot = (last ~= nil) and last.slot or ABSENT,
+        last_renew_t_rel = (last ~= nil) and exactly((last.ts_ms as number) - anchor)
+            or ABSENT,
+        break_seen_t_rel = (#brk > 0) and exactly((brk[1].ts_ms as number) - anchor)
+            or ABSENT,
+        next_acquire_t_rel = (nxt ~= nil) and exactly((nxt.ts_ms as number) - anchor)
+            or ABSENT,
+        next_slot = (nxt ~= nil) and nxt.slot or ABSENT,
+        next_holder = (nxt ~= nil) and nxt.holder or ABSENT,
+        takeover_ms = (nxt ~= nil) and exactly((nxt.ts_ms as number) - anchor)
+            or ABSENT,
+    }
 end
 
 -- The anchored export: time columns on every row, anchor echoes first,
 -- then takeover summary lines when the locks-timeline ran.
-anchor_rows_and_takeovers = function(events: {{string: any}}, anchors_in: {number}): {{string: any}}
+anchor_rows_and_takeovers = function(
+    events: {{string: any}}, anchors_in: {number}
+): {{string: any}}
     local anchors: {number} = {}
     for _, a in ipairs(anchors_in) do
         anchors[#anchors + 1] = a
@@ -1144,7 +1342,7 @@ anchor_rows_and_takeovers = function(events: {{string: any}}, anchors_in: {numbe
             row.t_rel_ms = ABSENT
             row.t_fmt = ABSENT
         else
-            row.t_rel_ms = round3(ts - anchor_of(ts, anchors))
+            row.t_rel_ms = round3((ts as number) - anchor_of(ts as number, anchors))
             row.t_fmt = fmt_ts_ms(ts)
         end
         timed[#timed + 1] = row
@@ -1153,9 +1351,13 @@ anchor_rows_and_takeovers = function(events: {{string: any}}, anchors_in: {numbe
     for _, a in ipairs(anchors) do
         -- the anchor echoes as the int the reference keeps; the float
         -- rides on for the window arithmetic
-        out[#out + 1] = {kind = "anchor", anchor = require_ffi_u64(tostring(a)),
-                         ts_ms = a + 0.0,
-                         t_rel_ms = 0.0, t_fmt = fmt_ts_ms(a)}
+        out[#out + 1] = {
+            kind = "anchor",
+            anchor = require_ffi_u64(tostring(a)),
+            ts_ms = a + 0.0,
+            t_rel_ms = 0.0,
+            t_fmt = fmt_ts_ms(a),
+        }
     end
     for _, row in ipairs(timed) do
         out[#out + 1] = row
@@ -1177,7 +1379,9 @@ anchor_rows_and_takeovers = function(events: {{string: any}}, anchors_in: {numbe
             local hi = anchors[i + 1]
             local window: {{string: any}} = {}
             for _, r in ipairs(tl) do
-                if r.ts_ms >= a and (hi == nil or r.ts_ms < hi) then
+                if
+                    (r.ts_ms as number) >= a and (hi == nil or (r.ts_ms as number) < hi)
+                then
                     window[#window + 1] = r
                 end
             end
@@ -1208,12 +1412,14 @@ aof_noise_rows = function(dir_path: string, hb_ms: number): {{string: any}}
     for _, path in ipairs(aof_names(dir_path)) do
         local it = iter_open(path)
         while true do
-            local rc = native.lunet_aof_iter_next(it, buffer, RECORD_MAX, len_out, op_out)
+            local rc = native.lunet_aof_iter_next(
+                it, buffer, RECORD_MAX, len_out, op_out
+            )
             if rc <= 0 then
                 native.lunet_aof_iter_close(it)
                 break
             end
-            local frame = ffi.string(buffer, len_out[0])
+            local frame = ffi.string(buffer, len_out[0] as integer)
             local marker = frame:byte(1)
             if marker == MARKER_WIRE then
                 ns_list[#ns_list + 1] = ns_of(frame)
@@ -1229,10 +1435,10 @@ aof_noise_rows = function(dir_path: string, hb_ms: number): {{string: any}}
         local a, b = ns_list[i - 1], ns_list[i]
         local d: any
         local sign = 1.0
-        if b >= a then
-            d = b - a
+        if (b as integer) >= (a as integer) then
+            d = (b as integer) - (a as integer)
         else
-            d = a - b
+            d = (a as integer) - (b as integer)
             sign = -1.0
         end
         gaps_ms[#gaps_ms + 1] = tonumber(d) / 1e6 * sign
@@ -1240,12 +1446,16 @@ aof_noise_rows = function(dir_path: string, hb_ms: number): {{string: any}}
     if #gaps_ms > 0 then
         local st = stats(gaps_ms)
         row.gaps = st
-        local thr = math.min(hb_ms, 5 * st.p50_ms)
+        local thr = math.min(hb_ms, 5 * (st.p50_ms as number))
         local stalls: {{string: any}} = {}
         for i, g in ipairs(gaps_ms) do
             if g > thr then
-                stalls[#stalls + 1] = {a_ns = ns_list[i], b_ns = ns_list[i + 1],
-                                       gap_ms = g, _o = {"a_ns", "b_ns", "gap_ms"}}
+                stalls[#stalls + 1] = {
+                    a_ns = ns_list[i],
+                    b_ns = ns_list[i + 1],
+                    gap_ms = g,
+                    _o = {"a_ns", "b_ns", "gap_ms"},
+                }
             end
         end
         row.stalls = stalls
@@ -1332,11 +1542,9 @@ local function log_all_lines(paths: {string}, policy: SkipPolicy): {LogLine}
             for line in data:gmatch("(.-)\n") do
                 lineno = lineno + 1
                 if log_is_object(line) then
-                    out[#out + 1] = {path = path, lineno = lineno,
-                                     line = line}
+                    out[#out + 1] = {path = path, lineno = lineno, line = line}
                 else
-                    policy_skip(policy, path, lineno, line,
-                                "not one JSON object")
+                    policy_skip(policy, path, lineno, line, "not one JSON object")
                 end
             end
         end
@@ -1356,12 +1564,10 @@ local function log_num(line: string, key: string): any
     return v
 end
 
-local function require_num(l: LogLine, policy: SkipPolicy,
-                           key: string): any
+local function require_num(l: LogLine, policy: SkipPolicy, key: string): any
     local v = log_num(l.line, key)
     if v == nil then
-        policy_skip(policy, l.path, l.lineno, l.line,
-                    "missing member '" .. key .. "'")
+        policy_skip(policy, l.path, l.lineno, l.line, "missing member '" .. key .. "'")
     end
     return v
 end
@@ -1374,7 +1580,9 @@ local function ts_diff(a: any, b: any): any
     if type(a) == "number" or type(b) == "number" then
         return tonumber(a) - tonumber(b)
     end
-    return ffi.new("int64_t", tonumber(a)) - ffi.new("int64_t", tonumber(b))
+    return (ffi.new("int64_t", tonumber(a)) as integer) - (
+        ffi.new("int64_t", tonumber(b)) as integer
+    )
 end
 
 -- leader_ms: the leader's own heartbeat-commit `ts` vs the standby's
@@ -1393,18 +1601,27 @@ leader_lag_rows = function(logs: {string}, policy: SkipPolicy): {{string: any}}
             local view = require_num(l, policy, "view")
             local slot = require_num(l, policy, "slot")
             local node = require_num(l, policy, "node")
-            if ts ~= nil and era ~= nil and view ~= nil and slot ~= nil
-                and node ~= nil then
-                local key = tostring(era) .. "|" .. tostring(view)
-                    .. "|" .. tostring(slot)
+            if
+                ts ~= nil and era ~= nil and view ~= nil and slot ~= nil and node ~= nil
+            then
+                local key = tostring(era)
+                    .. "|"
+                    .. tostring(view)
+                    .. "|"
+                    .. tostring(slot)
                 if event == "heartbeat-commit" then
                     heartbeat[key] = {node, ts}
                 else
                     local from = require_num(l, policy, "from")
                     if from ~= nil then
                         arrivals[#arrivals + 1] = {
-                            leader = from, node = node, era = era,
-                            view = view, slot = slot, key = key, ts = ts,
+                            leader = from,
+                            node = node,
+                            era = era,
+                            view = view,
+                            slot = slot,
+                            key = key,
+                            ts = ts,
                         }
                     end
                 end
@@ -1416,24 +1633,41 @@ leader_lag_rows = function(logs: {string}, policy: SkipPolicy): {{string: any}}
         local sent = heartbeat[arr.key as string]
         if sent ~= nil and sent[1] == arr.leader then
             rows[#rows + 1] = {
-                kind = "leader-lag", leader = arr.leader, node = arr.node,
-                era = arr.era, view = arr.view, slot = arr.slot,
+                kind = "leader-lag",
+                leader = arr.leader,
+                node = arr.node,
+                era = arr.era,
+                view = arr.view,
+                slot = arr.slot,
                 leader_ms = ts_diff(arr.ts, sent[2]),
             }
         end
     end
-    table.sort(rows, function(x: {string: any}, y: {string: any}): boolean
-        local xa = {tonumber(x.leader), tonumber(x.node), tonumber(x.era),
-                    tonumber(x.view), tonumber(x.slot)}
-        local ya = {tonumber(y.leader), tonumber(y.node), tonumber(y.era),
-                    tonumber(y.view), tonumber(y.slot)}
-        for i = 1, 5 do
-            if xa[i] ~= ya[i] then
-                return (xa[i] as number) < (ya[i] as number)
+    table.sort(
+        rows,
+        function(x: {string: any}, y: {string: any}): boolean
+            local xa = {
+                tonumber(x.leader),
+                tonumber(x.node),
+                tonumber(x.era),
+                tonumber(x.view),
+                tonumber(x.slot),
+            }
+            local ya = {
+                tonumber(y.leader),
+                tonumber(y.node),
+                tonumber(y.era),
+                tonumber(y.view),
+                tonumber(y.slot),
+            }
+            for i = 1, 5 do
+                if xa[i] ~= ya[i] then
+                    return (xa[i] as number) < (ya[i] as number)
+                end
             end
+            return false
         end
-        return false
-    end)
+    )
     return rows
 end
 
@@ -1469,33 +1703,43 @@ hb_spacing_rows = function(logs: {string}, policy: SkipPolicy): {{string: any}}
     for k, _ in pairs(ts_by) do
         keys[#keys + 1] = k
     end
-    table.sort(keys, function(x: string, y: string): boolean
-        local xe = (x:match("^([^|]+)") as string)
-        local xn = (x:match("|(.+)$") as string)
-        local ye = (y:match("^([^|]+)") as string)
-        local yn = (y:match("|(.+)$") as string)
-        if xe ~= ye then
-            return xe < ye
+    table.sort(
+        keys,
+        function(x: string, y: string): boolean
+            local xe = (x:match("^([^|]+)") as string)
+            local xn = (x:match("|(.+)$") as string)
+            local ye = (y:match("^([^|]+)") as string)
+            local yn = (y:match("|(.+)$") as string)
+            if xe ~= ye then
+                return xe < ye
+            end
+            return tonumber(xn) < tonumber(yn)
         end
-        return tonumber(xn) < tonumber(yn)
-    end)
+    )
     local rows: {{string: any}} = {}
     for _, k in ipairs(keys) do
         local list = ts_by[k]
         if #list >= 2 then
             local meta = meta_by[k]
-            table.sort(list, function(a: any, b: any): boolean
-                return tonumber(a) < tonumber(b)
-            end)
+            table.sort(
+                list,
+                function(a: any, b: any): boolean return tonumber(a) < tonumber(b) end
+            )
             local gaps: {number} = {}
             for i = 2, #list do
                 gaps[#gaps + 1] = tonumber(list[i]) - tonumber(list[i - 1])
             end
             local st = stats(gaps)
             rows[#rows + 1] = {
-                kind = "hb-spacing", node = meta.node, event = meta.event,
-                min_ms = st.min_ms, mean_ms = st.mean_ms, p50_ms = st.p50_ms,
-                p95_ms = st.p95_ms, max_ms = st.max_ms, count = st.count,
+                kind = "hb-spacing",
+                node = meta.node,
+                event = meta.event,
+                min_ms = st.min_ms,
+                mean_ms = st.mean_ms,
+                p50_ms = st.p50_ms,
+                p95_ms = st.p95_ms,
+                max_ms = st.max_ms,
+                count = st.count,
             }
         end
     end
@@ -1517,15 +1761,23 @@ log_integrity_rows = function(logs: {string}, policy: SkipPolicy): {{string: any
     local files: {string} = log_files(logs)
     local by_file: {string: {string: any}} = {}
     for _, path in ipairs(files) do
-        local fresh: {string: any} = {lines = 0, events = {} as {string: number},
-                                      _order = {} as {string}, parse_failures = 0}
+        local fresh: {string: any} = {
+            lines = 0,
+            events = {} as {string: number},
+            _order = {} as {string},
+            parse_failures = 0,
+        }
         by_file[path] = fresh
     end
     for _, l in ipairs(log_all_lines(logs, policy)) do
         local entry = by_file[l.path]
         if entry == nil then
-            entry = {lines = 0, events = {} as {string: number},
-                     _order = {} as {string}, parse_failures = 0}
+            entry = {
+                lines = 0,
+                events = {} as {string: number},
+                _order = {} as {string},
+                parse_failures = 0,
+            }
             by_file[l.path] = entry
         end
         local lines_n = entry.lines as number
@@ -1534,7 +1786,8 @@ log_integrity_rows = function(logs: {string}, policy: SkipPolicy): {{string: any
         if event ~= nil and event ~= "" then
             local events_map = entry.events as {string: number}
             if events_map[event] == nil then
-                (entry._order as {string})[#entry._order as {string} + 1] = event
+                local order = entry._order as {string}
+                order[#order + 1] = event
             end
             events_map[event] = (events_map[event] or 0) + 1
         else
@@ -1552,14 +1805,15 @@ log_integrity_rows = function(logs: {string}, policy: SkipPolicy): {{string: any
         -- insertion order — the parity contract), the values the
         -- counts, carried in the events record itself.
         local order = entry._order as {string}
-        local events_out: any = {}
-        events_out._o = order
+        local events_out: {string: any} = {}
+        events_out["_o"] = order
         local counts = entry.events as {string: number}
         for _, k in ipairs(order) do
             events_out[k] = require_ffi_u64(tostring(counts[k]))
         end
         rows[#rows + 1] = {
-            kind = "log-integrity", file = path,
+            kind = "log-integrity",
+            file = path,
             lines = require_ffi_u64(tostring(entry.lines as number)),
             events = events_out,
             parse_failures = require_ffi_u64(tostring(entry.parse_failures as number)),
@@ -1569,11 +1823,16 @@ log_integrity_rows = function(logs: {string}, policy: SkipPolicy): {{string: any
     return rows
 end
 
-local function export_to(out_path: string, series_dir: string, kinds: string,
-                         anchors: any, hb_ms: any, logs: any,
-                         policy: SkipPolicy): number
-    local events = export_series(series_dir, kinds, anchors, hb_ms, logs,
-                                 policy)
+local function export_to(
+    out_path: string,
+    series_dir: string,
+    kinds: string,
+    anchors: any,
+    hb_ms: any,
+    logs: any,
+    policy: SkipPolicy
+): number
+    local events = export_series(series_dir, kinds, anchors, hb_ms, logs, policy)
     local handle = io.open(out_path, "w")
     if handle == nil then
         error("cannot write " .. out_path)
@@ -1594,7 +1853,6 @@ local function main(argv: {string}): number
     -- --anchor EPOCHMS, repeatable --logs PATH (the JSON log series the
     -- hb-spacing and leader-lag kinds read), --hb-ms N, FILE_OR_DIR
     -- [OUT.jsonl].
-    local follow_json = false
     local allow_skips = false
     local anchors: {number} = {}
     local logs: {string} = {}
@@ -1607,7 +1865,6 @@ local function main(argv: {string}): number
         if a == "--lib" then
             i = i + 2
         elseif a == "--json" then
-            follow_json = true
             i = i + 1
         elseif a == "--allow-skips" then
             allow_skips = true
@@ -1642,9 +1899,11 @@ local function main(argv: {string}): number
     end
     local export_kinds = #kind_parts > 0 and table.concat(kind_parts, " ") or "all"
     if #paths < 1 then
-        print("usage: aof-trace-tool.tl [--lib PATH] [--json] "
-            .. "[--allow-skips] [--kind KIND ...] [--anchor EPOCHMS ...] "
-            .. "[--logs PATH ...] [--hb-ms N] FILE_OR_DIR [OUT.jsonl]")
+        print(
+            "usage: aof-trace-tool.tl [--lib PATH] [--json] "
+                .. "[--allow-skips] [--kind KIND ...] [--anchor EPOCHMS ...] "
+                .. "[--logs PATH ...] [--hb-ms N] FILE_OR_DIR [OUT.jsonl]"
+        )
         return 2
     end
     local export_out: (string | nil) = nil
@@ -1669,17 +1928,27 @@ local function main(argv: {string}): number
             print("anchor " .. fmt_ts_ms(a))
         end
         local policy = policy_new(allow_skips)
-        local ok, n_or_err = pcall(export_to, export_out, paths[1],
-            export_kinds, #anchors > 0 and anchors or nil, hb_ms,
-            #logs > 0 and logs or nil, policy)
+        local ok, n_or_err = pcall(
+            export_to,
+            export_out,
+            paths[1],
+            export_kinds,
+            #anchors > 0 and anchors or nil,
+            hb_ms,
+            #logs > 0 and logs or nil,
+            policy
+        )
         if not ok then
             -- The strict reader's failure IS the tool's answer: the
             -- named line, on stderr, exit non-zero — never a traceback.
             io.stderr:write("aof-trace-tool: " .. tostring(n_or_err) .. "\n")
             return 1
         end
-        print(("exported %d events to %s")
-            :format(math.floor(n_or_err as number), export_out))
+        print(
+            ("exported %d events to %s"):format(
+                math.floor(n_or_err as number), export_out
+            )
+        )
         print(("skipped lines: %d"):format(math.floor(policy.count)))
         if policy.count > 0 and not allow_skips then
             return 1

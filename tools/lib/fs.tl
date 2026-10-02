@@ -53,8 +53,8 @@ else
     -- into wrong offsets and every is_dir() reads garbage — the smoke's
     -- work-dir mkdir_p fails on the arm64 runners while amd64 sails.
     if ffi.arch == "x64" then
-    ffi.cdef(
-        [[
+        ffi.cdef(
+            [[
       struct stat {
          unsigned long st_dev;
          unsigned long st_ino;
@@ -83,10 +83,10 @@ else
          char d_name[256];
       };
    ]]
-    )
+        )
     else
-    ffi.cdef(
-        [[
+        ffi.cdef(
+            [[
       struct stat {
          unsigned long st_dev;
          unsigned long st_ino;
@@ -115,7 +115,7 @@ else
          char d_name[256];
       };
    ]]
-    )
+        )
     end
 end
 

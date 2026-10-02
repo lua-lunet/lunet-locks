@@ -532,7 +532,6 @@ local function scenario_rotation()
     end
 end
 
-
 -- Scenario 3: clean TERM stop/start of the leader, the timeout-driven
 -- takeover baseline — detection + takeover under the
 -- detector, then the old leader's rejoin.
@@ -647,7 +646,9 @@ local function scenario_crashes()
             -- and the newest named diagnostic ARE the evidence; the node's
             -- process is stopped so the serving pair carries the ladder.
             local diagnostic_name = ""
-            for _, line in ipairs(logs.event_lines(node_log_files(name), "peer-input-dropped")) do
+            for _, line in ipairs(
+                logs.event_lines(node_log_files(name), "peer-input-dropped")
+            ) do
                 diagnostic_name = (logs.kv(line).diagnostic) or ""
                 break
             end

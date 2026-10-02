@@ -114,9 +114,7 @@ end
 -- The field predicate a gate states as data: the line's own name plus
 -- the exact member values it is counting.
 function M.count_where(
-    files: {string},
-    event: string,
-    members: {string: string}
+    files: {string}, event: string, members: {string: string}
 ): integer
     local n = 0
     for _, line in ipairs(M.event_lines(files, event)) do
@@ -192,11 +190,7 @@ end
 
 -- Reads the JSON object at `i` into `out`; the index just past its
 -- closing brace, or 0 when the text there is not an object.
-function scan_object(
-    line: string,
-    i: integer,
-    out: {string: string}
-): integer
+function scan_object(line: string, i: integer, out: {string: string}): integer
     i = skip_space(line, i)
     if line:sub(i, i) ~= "{" then
         return 0

@@ -18,52 +18,74 @@ end
 -- LuaJIT has no string.pack (5.1 ABI): the BE integers go out by hand.
 local function be_u32(v: number): string
     return string.char(
-        math.floor(v / 16777216) % 256,
-        math.floor(v / 65536) % 256,
-        math.floor(v / 256) % 256,
-        v % 256)
+        (math.floor(v / 16777216) % 256) as integer,
+        (math.floor(v / 65536) % 256) as integer,
+        (math.floor(v / 256) % 256) as integer,
+        (v % 256) as integer
+    )
 end
 
 local function be_u64(v: number): string
     local out: {string} = {}
     for i = 7, 0, -1 do
-        out[#out + 1] = string.char(math.floor(v / 256 ^ i) % 256)
+        out[#out + 1] = string.char((math.floor(v / 256 ^ i) % 256) as integer)
     end
     return table.concat(out)
 end
 
-local function envelope(marker: number, ns: number, payload: string): string
+local function envelope(marker: integer, ns: number, payload: string): string
     return string.char(marker) .. be_u64(ns) .. payload
 end
 
 local function wire(tag: number, era: number, view: number, slot: number): string
     -- marker-1 payload: 20 B big-endian header + body discriminant
-    return be_u32(tag) .. be_u32(era) .. be_u32(view) .. be_u64(slot)
-        .. string.char(9) .. ("\0"):rep(8)
+    return be_u32(tag)
+        .. be_u32(era)
+        .. be_u32(view)
+        .. be_u64(slot)
+        .. string.char(9)
+        .. ("\0"):rep(8)
 end
 
 -- 1. fixture round-trip: write five records through the C ABI, read back.
 local dir = tool.fixture_dir()
 local path = dir .. "/fixture.aof"
 local h = tool.open_writer(path)
-tool.append(h, envelope(2, 1000, '{"now_ms":1000,"prev_wait_ms":900,"next_wait_ms":1000}'))
+tool.append(
+    h, envelope(2, 1000, '{"now_ms":1000,"prev_wait_ms":900,"next_wait_ms":1000}')
+)
 tool.append(h, envelope(1, 2000, wire(4, 1, 0, 5)))
 tool.append(h, envelope(3, 3000, '{"event":"teardown"}'))
-tool.append(h, envelope(2, 4000, '{"now_ms":4000,"prev_wait_ms":1000,"next_wait_ms":1500}'))
+tool.append(
+    h, envelope(2, 4000, '{"now_ms":4000,"prev_wait_ms":1000,"next_wait_ms":1500}')
+)
 tool.append(h, envelope(1, 5000, wire(2, 1, 0, 6)))
 tool.close_writer(h)
 local s = tool.summarize(path)
 check("fixture-records", s.records == 5, tostring(s.records))
-check("fixture-markers", s.by_marker["1"] == 2 and s.by_marker["2"] == 2
-    and s.by_marker["3"] == 1, tostring(s.by_marker))
-check("fixture-tags", s.tags["4 Commit"] == 1 and s.tags["2 Prepare"] == 1,
-    tostring(s.tags))
-check("fixture-ns", s.first_ns == 1000 and s.last_ns == 5000,
-    tostring(s.first_ns) .. ".." .. tostring(s.last_ns))
+check(
+    "fixture-markers",
+    s.by_marker["1"] == 2 and s.by_marker["2"] == 2 and s.by_marker["3"] == 1,
+    tostring(s.by_marker)
+)
+check(
+    "fixture-tags",
+    s.tags["4 Commit"] == 1 and s.tags["2 Prepare"] == 1,
+    tostring(s.tags)
+)
+check(
+    "fixture-ns",
+    s.first_ns == 1000 and s.last_ns == 5000,
+    tostring(s.first_ns) .. ".." .. tostring(s.last_ns)
+)
 check("fixture-clean", s.malformed == 0, tostring(s.malformed))
 
 -- 2. big-endian ns header
-check("ns-big-endian", tool.ns_of(envelope(1, 0x1122334455667788, "")) == 0x1122334455667788, "ns")
+check(
+    "ns-big-endian",
+    tool.ns_of(envelope(1, 0x1122334455667788, "")) == 0x1122334455667788,
+    "ns"
+)
 
 -- 3. unknown markers rejected, never guessed
 local dir2 = tool.fixture_dir()
@@ -80,15 +102,23 @@ if ok_real then
     local sr = tool.summarize_series(real)
     check("real-records", sr.records == 49832, tostring(sr.records))
     check("real-wire", sr.by_marker["1"] == 33285, tostring(sr.by_marker))
-    local tel = (sr.by_marker["2"] or 0) + (sr.by_marker["3"] or 0) + (sr.by_marker["4"] or 0)
+    local tel = (sr.by_marker["2"] or 0) + (sr.by_marker["3"] or 0) + (
+        sr.by_marker["4"] or 0
+    )
     check("real-telemetry", tel == 16547, tostring(tel))
     check("real-clean", sr.malformed == 0, tostring(sr.malformed))
     -- 5. the parity contract: the summary must parse as JSON with the
     -- shared key set (the python twin's shape).
     local j = tool.summarize_series_json(real)
-    check("parity-keys", j:find('"records"') and j:find('"by_marker"')
-        and j:find('"first_ns"') and j:find('"last_ns"') and j:find('"span_s"'),
-        j:sub(1, 60))
+    check(
+        "parity-keys",
+        j:find('"records"')
+            and j:find('"by_marker"')
+            and j:find('"first_ns"')
+            and j:find('"last_ns"')
+            and j:find('"span_s"') ~= nil,
+        j:sub(1, 60)
+    )
 else
     print("SKIP: real rig traces not extracted (tools/../.tmp/telemetry/...)")
 end
@@ -97,55 +127,92 @@ end
 local export_dir = tool.fixture_dir()
 local hp = tool.open_writer(export_dir .. "/fixture.aof")
 local function be32(v: number): string
-    return string.char(math.floor(v / 16777216) % 256,
-        math.floor(v / 65536) % 256, math.floor(v / 256) % 256, v % 256)
+    return string.char(
+        (math.floor(v / 16777216) % 256) as integer,
+        (math.floor(v / 65536) % 256) as integer,
+        (math.floor(v / 256) % 256) as integer,
+        (v % 256) as integer
+    )
 end
 local function be64n(v: number): string
     local o: {string} = {}
     for i = 7, 0, -1 do
-        o[#o + 1] = string.char(math.floor(v / 256 ^ i) % 256)
+        o[#o + 1] = string.char((math.floor(v / 256 ^ i) % 256) as integer)
     end
     return table.concat(o)
 end
 local set_json = '{"op":"set","message_id":"11111111-2222-3333-4444-555555555555","client_id":1,"request_num":1,"lock_id":7}'
-local prepare = be32(2) .. be32(4) .. be32(1) .. be64n(5)
-    .. string.char(2) .. be64n(5) .. be32(4) .. string.char(1)
-    .. be64n(0x1111) .. be64n(0x2222) .. be32(#set_json) .. set_json
+local prepare = be32(2)
+    .. be32(4)
+    .. be32(1)
+    .. be64n(5)
+    .. string.char(2)
+    .. be64n(5)
+    .. be32(4)
+    .. string.char(1)
+    .. be64n(0x1111)
+    .. be64n(0x2222)
+    .. be32(#set_json)
+    .. set_json
     .. be64n(0)
 local commit = be32(4) .. be32(4) .. be32(1) .. be64n(5) .. string.char(4) .. be64n(5)
 tool.append(hp, envelope(1, 2000, prepare))
 tool.append(hp, envelope(1, 2500, commit))
-tool.append(hp, envelope(2, 3000, '{"now_ms":100,"prev_wait_ms":900,"next_wait_ms":1000}'))
-local join = be32(2) .. be32(4) .. be32(1) .. be64n(6)
-    .. string.char(2) .. be64n(6) .. be32(4) .. string.char(2, 7)
-    .. be32(77) .. be32(255) .. be64n(0)
+tool.append(
+    hp, envelope(2, 3000, '{"now_ms":100,"prev_wait_ms":900,"next_wait_ms":1000}')
+)
+local join = be32(2)
+    .. be32(4)
+    .. be32(1)
+    .. be64n(6)
+    .. string.char(2)
+    .. be64n(6)
+    .. be32(4)
+    .. string.char(2, 7)
+    .. be32(77)
+    .. be32(255)
+    .. be64n(0)
 local commit6 = be32(4) .. be32(4) .. be32(1) .. be64n(6) .. string.char(4) .. be64n(6)
 tool.append(hp, envelope(1, 5000, join))
 tool.append(hp, envelope(1, 5500, commit6))
 tool.close_writer(hp)
-local events = tool.export_series(export_dir, "all")
+local events = tool.export_series(export_dir, "all", nil, nil, nil, nil)
 local kinds: {string} = {}
 for _, e in ipairs(events) do
-    kinds[#kinds + 1] = e.kind
+    kinds[#kinds + 1] = e.kind as string
 end
-check("export-kinds", #kinds == 3 and kinds[1] == "locks" and kinds[2] == "timeouts"
-    and kinds[3] == "reconfig",
-    table.concat(kinds, ","))
+check(
+    "export-kinds",
+    #kinds == 3
+        and kinds[1] == "locks"
+        and kinds[2] == "timeouts"
+        and kinds[3] == "reconfig",
+    table.concat(kinds, ",")
+)
 local locks = 0
 local reconf: string = ""
 local timeouts_seen = false
 for _, e in ipairs(events) do
-    if e.kind == "locks" then locks = locks + 1 end
-    if e.kind == "reconfig" then reconf = e.command end
-    if e.kind == "timeouts" then timeouts_seen = e.next_wait_ms == 1000 end
+    if e.kind == "locks" then
+        locks = locks + 1
+    end
+    if e.kind == "reconfig" then
+        reconf = e.command as string
+    end
+    if e.kind == "timeouts" then
+        timeouts_seen = e.next_wait_ms == 1000
+    end
 end
 check("export-locks-count", locks == 1, tostring(locks))
 check("export-reconfig", reconf == "Join node=77 position=255", reconf)
 check("export-timeouts", timeouts_seen, "timeouts")
-local locks_only = tool.export_series(export_dir, "locks")
-local both_only = tool.export_series(export_dir, "both")
-check("export-filter", #locks_only == 1 and #both_only == 2,
-    tostring(#locks_only) .. "/" .. tostring(#both_only))
+local locks_only = tool.export_series(export_dir, "locks", nil, nil, nil, nil)
+local both_only = tool.export_series(export_dir, "both", nil, nil, nil, nil)
+check(
+    "export-filter",
+    #locks_only == 1 and #both_only == 2,
+    tostring(#locks_only) .. "/" .. tostring(#both_only)
+)
 -- the lock record carries the AOF clock
 local lock_ev = locks_only[1]
 check("export-clocks", lock_ev.aof_ns == 2500, tostring(lock_ev.aof_ns))
@@ -155,79 +222,95 @@ check("export-clocks", lock_ev.aof_ns == 2500, tostring(lock_ev.aof_ns))
 -- 1 -> 1 -> break -> 2 -> 3) and a 9 ms ns arrival stall. Mirrors the py
 -- AnchoredTimelineExport fixture 1:1.
 local BASE_MS = 1789214915000
-local BASE_NS = ffi.new("uint64_t", BASE_MS) * 1000000
-local A1 = BASE_MS + 3   -- the renew's commit ts: last sign of holder 1
-local A2 = BASE_MS + 15  -- next holder's acquire commit ts
+local BASE_NS = (ffi.new("uint64_t", BASE_MS) as integer) * 1000000
+local A1 = BASE_MS + 3 -- the renew's commit ts: last sign of holder 1
+local A2 = BASE_MS + 15 -- next holder's acquire commit ts
 -- u64 from a cdata byte-exact: 8 subtraction-extraction rounds keep
 -- bytes exact past 2^53 (the number path cannot).
-local u64_bytes_le_orig = function(v: any): string
-    local out: {string} = {}
-    for i = 8, 1, -1 do
-        local b = v % 256
-        out[i] = string.char(tonumber(b))
-        v = (v - b) / 256
-    end
-    return table.concat(out)
-end
 local u64_bytes_be = function(v: any): string
     local out: {string} = {}
     for i = 8, 1, -1 do
-        local b = v % 256
-        out[i] = string.char(tonumber(b))
-        v = (v - b) / 256
+        local b = (v as integer) % 256
+        out[i] = string.char(tonumber(b) as integer)
+        v = ((v as integer) - b) / 256
     end
     return table.concat(out)
 end
-local function op_lock_json(op: string, holder: number): string
+local function op_lock_json(op: string, holder: integer): string
     local mid = ("23456789-1234-5678-9123-67890123456%d"):format(holder)
     local lease = ""
     if op == "set" then
-        lease = (',"lease":{"lease_id":%d,"holder":"%032x","expiry":%d}')
-            :format(holder, holder, BASE_MS + 500)
+        lease = (',"lease":{"lease_id":%d,"holder":"%032x","expiry":%d}'):format(
+            holder, holder, (BASE_MS + 500) as integer
+        )
     end
-    return ('{"op":"%s","message_id":"%s","client_id":%d,'
-        .. '"request_num":1,"lock_id":7%s}'):format(op, mid, holder, lease)
+    return (
+        '{"op":"%s","message_id":"%s","client_id":%d,'
+        .. '"request_num":1,"lock_id":7%s}'
+    ):format(op, mid, holder, lease)
 end
-local function operation_prepare(slot: number, era: number, view: number,
-                                 lock_json: string, committed: number): string
-    return be32(2) .. be32(era) .. be32(view) .. be64n(slot)
-        .. string.char(2) .. be64n(slot) .. be32(era) .. string.char(1)
-        .. be64n(slot) .. be64n(slot) .. be32(#lock_json) .. lock_json
+local function operation_prepare(
+    slot: number, era: number, view: number, lock_json: string, committed: number
+): string
+    return be32(2)
+        .. be32(era)
+        .. be32(view)
+        .. be64n(slot)
+        .. string.char(2)
+        .. be64n(slot)
+        .. be32(era)
+        .. string.char(1)
+        .. be64n(slot)
+        .. be64n(slot)
+        .. be32(#lock_json)
+        .. lock_json
         .. be64n(committed)
 end
-local function commit_frame(slot: number, era: number, view: number,
-                            committed: number): string
-    return be32(4) .. be32(era) .. be32(view) .. be64n(slot)
-        .. string.char(4) .. be64n(committed)
+local function commit_frame(
+    slot: number, era: number, view: number, committed: number
+): string
+    return be32(4)
+        .. be32(era)
+        .. be32(view)
+        .. be64n(slot)
+        .. string.char(4)
+        .. be64n(committed)
 end
-local function envelope_u64(marker: number, ns: any, payload: string): string
+local function envelope_u64(marker: integer, ns: any, payload: string): string
     return string.char(marker) .. u64_bytes_be(ns) .. payload
 end
 local timeline_dir = tool.fixture_dir()
 local hpt = tool.open_writer(timeline_dir .. "/fixture.aof")
 -- The wire trace, in ns order. The 4th delta is 9 ms: the stall.
 local writes: {any} = {
-    {BASE_NS + 0,          operation_prepare(5, 4, 1, op_lock_json("set", 1), 0)},
-    {BASE_NS + 1e6,        commit_frame(5, 4, 1, 5)},
-    {BASE_NS + 2e6,        operation_prepare(6, 4, 1, op_lock_json("set", 1), 0)},
-    {BASE_NS + 3e6,        commit_frame(6, 4, 1, 6)},
-    {BASE_NS + 12e6,       operation_prepare(7, 4, 1, op_lock_json("break", 99), 0)},
-    {BASE_NS + 13e6,       commit_frame(7, 4, 1, 7)},
-    {BASE_NS + 14e6,       operation_prepare(8, 4, 1, op_lock_json("set", 2), 0)},
-    {BASE_NS + 15e6,       commit_frame(8, 4, 1, 8)},
-    {BASE_NS + 16e6,       operation_prepare(9, 4, 1, op_lock_json("set", 3), 0)},
-    {BASE_NS + 17e6,       commit_frame(9, 4, 1, 9)},
+    {BASE_NS + 0, operation_prepare(5, 4, 1, op_lock_json("set", 1), 0)},
+    {BASE_NS + 1e6, commit_frame(5, 4, 1, 5)},
+    {BASE_NS + 2e6, operation_prepare(6, 4, 1, op_lock_json("set", 1), 0)},
+    {BASE_NS + 3e6, commit_frame(6, 4, 1, 6)},
+    {BASE_NS + 12e6, operation_prepare(7, 4, 1, op_lock_json("break", 99), 0)},
+    {BASE_NS + 13e6, commit_frame(7, 4, 1, 7)},
+    {BASE_NS + 14e6, operation_prepare(8, 4, 1, op_lock_json("set", 2), 0)},
+    {BASE_NS + 15e6, commit_frame(8, 4, 1, 8)},
+    {BASE_NS + 16e6, operation_prepare(9, 4, 1, op_lock_json("set", 3), 0)},
+    {BASE_NS + 17e6, commit_frame(9, 4, 1, 9)},
 }
 for _, w in ipairs(writes) do
-    tool.append(hpt, envelope_u64(1, w[1], w[2]))
+    local rec = w as {any}
+    tool.append(hpt, envelope_u64(1, rec[1], rec[2] as string))
 end
 tool.close_writer(hpt)
 -- Telemetry in a later-sorted file keeps file order = ns order across
 -- the dir (the export's ordering contract).
 local h2t = tool.open_writer(timeline_dir .. "/g.aof")
-tool.append(h2t, envelope_u64(2, BASE_NS + 18e6,
-    '{"now_ms":100,"prev_wait_ms":900,"next_wait_ms":1000,'
-    .. '"leader":33,"era":4,"view":1,"mean":22.0}'))
+tool.append(
+    h2t,
+    envelope_u64(
+        2,
+        BASE_NS + 18e6,
+        '{"now_ms":100,"prev_wait_ms":900,"next_wait_ms":1000,'
+            .. '"leader":33,"era":4,"view":1,"mean":22.0}'
+    )
+)
 tool.close_writer(h2t)
 
 -- Independent reference for t_fmt: divmod over the UTC day portion.
@@ -237,102 +320,177 @@ local function hhmmss(ms: number): string
     local rem = secs % 3600
     local mm = math.floor(rem / 60)
     local ss = rem % 60
-    local frac = ms % 1000
+    local frac = (ms % 1000) as integer
     return ("%02d:%02d:%02d.%03d"):format(hh, mm, ss, frac)
 end
 
 local tlkinds: {string} = {}
-local tlout = tool.export_series(timeline_dir, "locks-timeline", {A1, A2})
+local tlout = tool.export_series(
+    timeline_dir, "locks-timeline", {A1, A2}, nil, nil, nil
+)
 for _, e in ipairs(tlout) do
-    tlkinds[#tlkinds + 1] = e.kind
+    tlkinds[#tlkinds + 1] = e.kind as string
 end
-check("tl-anchor-echoes-first", #tlkinds == 9 and tlkinds[1] == "anchor"
-    and tlkinds[2] == "anchor", table.concat(tlkinds, ","))
-check("tl-timeline-ops", #tlout >= 7 and tlout[3].op == "acquire"
-    and tlout[4].op == "renew" and tlout[5].op == "break"
-    and tlout[6].op == "acquire" and tlout[7].op == "acquire",
-    tostring(tlout[3]) .. "|" .. tostring(tlout[4]))
-check("tl-timeline-holders", #tlout >= 7 and tlout[3].holder == 1
-    and tlout[4].holder == 1 and tlout[5].holder == 99
-    and tlout[6].holder == 2 and tlout[7].holder == 3,
-    tostring(tlout[6]) .. "/" .. tostring(tlout[7]))
-check("tl-timeline-slots", #tlout >= 7 and tlout[3].slot == 5
-    and tlout[4].slot == 6 and tlout[5].slot == 7
-    and tlout[6].slot == 8 and tlout[7].slot == 9,
-    tostring(tlout[6]) .. "/" .. tostring(tlout[7]))
-local lockout = tool.export_series(timeline_dir, "locks", {})
-check("tl-timeline-lease", #lockout >= 5
-    and lockout[1].lease_holder == ("%032x"):format(1)
-    and lockout[1].lease_id == 1 and lockout[1].expiry == BASE_MS + 500
-    and lockout[1].slot == 5 and lockout[3].lease_holder == nil,
-    tostring(lockout[1]))
-check("tl-timeline-ts", #tlout >= 7 and tlout[3].ts_ms == BASE_MS + 1
-    and tlout[4].ts_ms == BASE_MS + 3 and tlout[5].ts_ms == BASE_MS + 13
-    and tlout[6].ts_ms == BASE_MS + 15 and tlout[7].ts_ms == BASE_MS + 17,
-    tostring(tlout[3] and tlout[3].ts_ms))
-check("tl-anchor-echo-fields", #tlout >= 2 and tlout[1].anchor == A1
-    and tlout[1].t_fmt == hhmmss(A1) and tlout[2].t_fmt == hhmmss(A2),
-    tostring(tlout[1]))
-local tc: {any} = {}
+check(
+    "tl-anchor-echoes-first",
+    #tlkinds == 9 and tlkinds[1] == "anchor" and tlkinds[2] == "anchor",
+    table.concat(tlkinds, ",")
+)
+check(
+    "tl-timeline-ops",
+    #tlout >= 7
+        and tlout[3].op == "acquire"
+        and tlout[4].op == "renew"
+        and tlout[5].op == "break"
+        and tlout[6].op == "acquire"
+        and tlout[7].op == "acquire",
+    tostring(tlout[3]) .. "|" .. tostring(tlout[4])
+)
+check(
+    "tl-timeline-holders",
+    #tlout >= 7
+        and tlout[3].holder == 1
+        and tlout[4].holder == 1
+        and tlout[5].holder == 99
+        and tlout[6].holder == 2
+        and tlout[7].holder == 3,
+    tostring(tlout[6]) .. "/" .. tostring(tlout[7])
+)
+check(
+    "tl-timeline-slots",
+    #tlout >= 7
+        and tlout[3].slot == 5
+        and tlout[4].slot == 6
+        and tlout[5].slot == 7
+        and tlout[6].slot == 8
+        and tlout[7].slot == 9,
+    tostring(tlout[6]) .. "/" .. tostring(tlout[7])
+)
+local lockout = tool.export_series(timeline_dir, "locks", {}, nil, nil, nil)
+check(
+    "tl-timeline-lease",
+    #lockout >= 5
+        and lockout[1].lease_holder == ("%032x"):format(1)
+        and lockout[1].lease_id == 1
+        and lockout[1].expiry == BASE_MS + 500
+        and lockout[1].slot == 5
+        and lockout[3].lease_holder == nil,
+    tostring(lockout[1])
+)
+check(
+    "tl-timeline-ts",
+    #tlout >= 7
+        and tlout[3].ts_ms == BASE_MS + 1
+        and tlout[4].ts_ms == BASE_MS + 3
+        and tlout[5].ts_ms == BASE_MS + 13
+        and tlout[6].ts_ms == BASE_MS + 15
+        and tlout[7].ts_ms == BASE_MS + 17,
+    tostring(tlout[3] and tlout[3].ts_ms)
+)
+check(
+    "tl-anchor-echo-fields",
+    #tlout >= 2
+        and tlout[1].anchor == A1
+        and tlout[1].t_fmt == hhmmss(A1)
+        and tlout[2].t_fmt == hhmmss(A2),
+    tostring(tlout[1])
+)
+local tc: {{string: any}} = {}
 for _, e in ipairs(tlout) do
     if e.kind == "takeover" then
         tc[#tc + 1] = e
     end
 end
-check("tl-takeover-anchors", #tc == 2 and tc[1].anchor == A1
-    and tc[2].anchor == A2, tostring(#tc))
-check("tl-takeover-1-py-mirror", #tc >= 2 and tc[1].last_holder == 1
-    and tc[1].last_slot == 6
-    and tc[1].last_renew_t_rel == 0.0 and tc[1].break_seen_t_rel == 10.0
-    and tc[1].next_acquire_t_rel == "absent"
-    and tc[1].next_slot == "absent"
-    and tc[1].next_holder == "absent" and tc[1].takeover_ms == "absent",
-    tostring(tc[1]))
-check("tl-takeover-2-py-mirror", #tc >= 2 and tc[2].last_holder == 2
-    and tc[2].last_renew_t_rel == 0.0
-    and tc[2].break_seen_t_rel == "absent"
-    and tc[2].next_acquire_t_rel == 2.0 and tc[2].next_holder == 3
-    and tc[2].takeover_ms == 2.0, tostring(tc[2]))
+check(
+    "tl-takeover-anchors",
+    #tc == 2 and tc[1].anchor == A1 and tc[2].anchor == A2,
+    tostring(#tc)
+)
+check(
+    "tl-takeover-1-py-mirror",
+    #tc >= 2
+        and tc[1].last_holder == 1
+        and tc[1].last_slot == 6
+        and tc[1].last_renew_t_rel == 0.0
+        and tc[1].break_seen_t_rel == 10.0
+        and tc[1].next_acquire_t_rel == "absent"
+        and tc[1].next_slot == "absent"
+        and tc[1].next_holder == "absent"
+        and tc[1].takeover_ms == "absent",
+    tostring(tc[1])
+)
+check(
+    "tl-takeover-2-py-mirror",
+    #tc >= 2
+        and tc[2].last_holder == 2
+        and tc[2].last_renew_t_rel == 0.0
+        and tc[2].break_seen_t_rel == "absent"
+        and tc[2].next_acquire_t_rel == 2.0
+        and tc[2].next_holder == 3
+        and tc[2].takeover_ms == 2.0,
+    tostring(tc[2])
+)
 
 -- plates: from the py suite — anchors map onto every extra kind's ts.
-local lk: {any} = {}
-for _, e in ipairs(tool.export_series(timeline_dir, "locks", {A2, A1}) as {{string: any}}) do
+local lk: {{string: any}} = {}
+for _, e in ipairs(
+    tool.export_series(timeline_dir, "locks", {A2, A1}, nil, nil, nil)
+) do
     if e.kind == "locks" then
         lk[#lk + 1] = e
     end
 end
 local lkfirst = lk[1]
-check("tl-anchors-add-time-columns", lkfirst ~= nil
-    and lkfirst.t_rel_ms == -2.0
-    and lkfirst.t_fmt == hhmmss(BASE_MS + 1),
-    tostring(lkfirst and lkfirst.t_rel_ms) .. "/" .. tostring(lkfirst))
-local ph: {any} = {}
-for _, e in ipairs(tool.export_series(timeline_dir, "timeouts", {A1}) as {{string: any}}) do
+check(
+    "tl-anchors-add-time-columns",
+    lkfirst ~= nil
+        and lkfirst.t_rel_ms == -2.0
+        and lkfirst.t_fmt == hhmmss(BASE_MS + 1),
+    tostring(lkfirst and lkfirst.t_rel_ms) .. "/" .. tostring(lkfirst)
+)
+local ph: {{string: any}} = {}
+for _, e in ipairs(tool.export_series(timeline_dir, "timeouts", {A1}, nil, nil, nil)) do
     if e.kind == "timeouts" then
         ph[#ph + 1] = e
     end
 end
 local phrow = ph[1]
-check("tl-anchors-timeouts-now-ms-fallback", phrow ~= nil
-    and phrow.t_rel_ms == 100.0 - A1
-    and phrow.t_fmt == hhmmss(100),
-    tostring(phrow and phrow.t_rel_ms) .. "/" .. tostring(phrow))
+check(
+    "tl-anchors-timeouts-now-ms-fallback",
+    phrow ~= nil and phrow.t_rel_ms == 100.0 - A1 and phrow.t_fmt == hhmmss(100),
+    tostring(phrow and phrow.t_rel_ms) .. "/" .. tostring(phrow)
+)
 
 -- no anchors, no relative columns (existing rows stay untouched)
-local lkn = tool.export_series(timeline_dir, "locks")
-check("tl-no-anchors-keeps-rows", lkn[1] ~= nil and lkn[1].t_rel_ms == nil
-    and lkn[1].t_fmt == nil, tostring(lkn[1]))
+local lkn = tool.export_series(timeline_dir, "locks", nil, nil, nil, nil)
+check(
+    "tl-no-anchors-keeps-rows",
+    lkn[1] ~= nil and lkn[1].t_rel_ms == nil and lkn[1].t_fmt == nil,
+    tostring(lkn[1])
+)
 
 -- aof-noise: gap/arrival stats + the 9 ms stall (--hb-ms floor)
-local noise = tool.export_series(timeline_dir, "aof-noise")
-check("tl-aof-noise-one-row", #noise == 1 and noise[1] ~= nil
-    and noise[1].kind == "aof-noise", tostring(#noise))
-local gn = noise[1] ~= nil and noise[1].gaps or nil
-check("tl-aof-noise-gaps", gn ~= nil and gn.count == 9 and gn.min_ms == 1.0
-    and gn.max_ms == 9.0 and gn.p50_ms == 1.0 and gn.p95_ms == 9.0
-    and gn.mean_ms == 17.0 / 9.0, tostring(gn))
-local stalls = (noise[1] ~= nil) and noise[1].stalls or nil
-local okstall = stalls ~= nil and #stalls == 1
+local noise = tool.export_series(timeline_dir, "aof-noise", nil, nil, nil, nil)
+check(
+    "tl-aof-noise-one-row",
+    #noise == 1 and noise[1] ~= nil and noise[1].kind == "aof-noise",
+    tostring(#noise)
+)
+local gn = ((noise[1] ~= nil and noise[1].gaps) or nil) as {string: any}
+check(
+    "tl-aof-noise-gaps",
+    gn ~= nil
+        and gn.count == 9
+        and gn.min_ms == 1.0
+        and gn.max_ms == 9.0
+        and gn.p50_ms == 1.0
+        and gn.p95_ms == 9.0
+        and gn.mean_ms == 17.0 / 9.0,
+    tostring(gn)
+)
+local stalls = ((noise[1] ~= nil and noise[1].stalls) or nil) as {{string: any}}
+local okstall = stalls ~= nil
+    and #stalls == 1
     and stalls[1].a_ns == BASE_NS + 3e6
     and stalls[1].b_ns == BASE_NS + 12e6
     and stalls[1].gap_ms == 9.0
@@ -340,24 +498,40 @@ check("tl-aof-noise-stalls", okstall, tostring(stalls))
 
 -- cli: the main verb writes the anchor echo and summary lines
 local cli_err = ""
-local cli_ok, cli_rc = pcall(function()
-    local out_path = timeline_dir .. "/out.jsonl"
-    local rc = tool.main({"prog", "--anchor", tostring(BASE_MS + 1),
-        "--kind", "locks-timeline", timeline_dir, out_path})
-    local lines: {string} = {}
-    local fh = io.open(out_path, "r")
-    if fh ~= nil then
-        for line in fh:lines() do
-            lines[#lines + 1] = line
+local cli_ok, cli_rc = pcall(
+    function(): any
+        local out_path = timeline_dir .. "/out.jsonl"
+        local rc = tool.main(
+            {
+                "prog",
+                "--anchor",
+                tostring(BASE_MS + 1),
+                "--kind",
+                "locks-timeline",
+                timeline_dir,
+                out_path,
+            }
+        )
+        local lines: {string} = {}
+        local fh = io.open(out_path, "r")
+        if fh ~= nil then
+            for line in fh:lines() do
+                lines[#lines + 1] = line
+            end
+            fh:close()
         end
-        fh:close()
+        cli_err = tostring(rc) .. " " .. tostring(lines[1])
+        check(
+            "tl-cli-anchor-echo",
+            rc == 0
+                and #lines > 0
+                and lines[1]:find('"kind": "anchor"') ~= nil
+                and lines[1]:find('"t_fmt": "' .. hhmmss(BASE_MS + 1) .. '"') ~= nil,
+            cli_err
+        )
+        return nil
     end
-    cli_err = tostring(rc) .. " " .. tostring(lines[1])
-    check("tl-cli-anchor-echo", rc == 0 and #lines > 0
-        and lines[1]:find('"kind": "anchor"') ~= nil
-        and lines[1]:find('"t_fmt": "' .. hhmmss(BASE_MS + 1) .. '"') ~= nil,
-        cli_err)
-end)
+)
 if not cli_ok then
     check("tl-cli-anchor-echo", false, "main errored: " .. tostring(cli_rc))
 end
@@ -377,38 +551,54 @@ local function read_lines(p: string): {string}
     end
     return out
 end
-local oku, erru = pcall(function()
-    local u1 = timeline_dir .. "/union1.jsonl"
-    local rcu1 = tool.main({"prog", "--kind", "timeouts", "--kind", "aof-noise",
-        timeline_dir, u1})
-    local u2 = timeline_dir .. "/union2.jsonl"
-    local rcu2 = tool.main({"prog", "--kind", "timeouts aof-noise", timeline_dir, u2})
-    local l1 = read_lines(u1)
-    local l2 = read_lines(u2)
-    local n_to, n_noise = 0, 0
-    for _, l in ipairs(l1) do
-        if l:find('"kind": "timeouts"', 1, true) ~= nil then
-            n_to = n_to + 1
-        end
-        if l:find('"kind": "aof-noise"', 1, true) ~= nil then
-            n_noise = n_noise + 1
-        end
-    end
-    check("kind-union-repeatable", rcu1 == 0 and #l1 == 2
-        and n_to == 1 and n_noise == 1,
-        tostring(rcu1) .. " lines=" .. tostring(#l1) .. " timeouts=" .. tostring(n_to)
-            .. " noise=" .. tostring(n_noise))
-    local same = #l1 == #l2
-    if same then
-        for i = 1, #l1 do
-            if l1[i] ~= l2[i] then
-                same = false
+local oku, erru = pcall(
+    function(): any
+        local u1 = timeline_dir .. "/union1.jsonl"
+        local rcu1 = tool.main(
+            {"prog", "--kind", "timeouts", "--kind", "aof-noise", timeline_dir, u1}
+        )
+        local u2 = timeline_dir .. "/union2.jsonl"
+        local rcu2 = tool.main(
+            {"prog", "--kind", "timeouts aof-noise", timeline_dir, u2}
+        )
+        local l1 = read_lines(u1)
+        local l2 = read_lines(u2)
+        local n_to, n_noise = 0, 0
+        for _, l in ipairs(l1) do
+            if l:find('"kind": "timeouts"', 1, true) ~= nil then
+                n_to = n_to + 1
+            end
+            if l:find('"kind": "aof-noise"', 1, true) ~= nil then
+                n_noise = n_noise + 1
             end
         end
+        check(
+            "kind-union-repeatable",
+            rcu1 == 0 and #l1 == 2 and n_to == 1 and n_noise == 1,
+            tostring(rcu1)
+                .. " lines="
+                .. tostring(#l1)
+                .. " timeouts="
+                .. tostring(n_to)
+                .. " noise="
+                .. tostring(n_noise)
+        )
+        local same = #l1 == #l2
+        if same then
+            for i = 1, #l1 do
+                if l1[i] ~= l2[i] then
+                    same = false
+                end
+            end
+        end
+        check(
+            "kind-union-joined-matches-repeatable",
+            rcu2 == 0 and same,
+            "joined and repeatable are one contract"
+        )
+        return nil
     end
-    check("kind-union-joined-matches-repeatable", rcu2 == 0 and same,
-        "joined and repeatable are one contract")
-end)
+)
 if not oku then
     check("kind-union-cli", false, "main errored: " .. tostring(erru))
 end
@@ -431,14 +621,13 @@ for k = 0, LARGE_N - 1 do
         if k % 4096 == 0 then
             g = g + 5008914641
         end
-        lns = lns + g
+        lns = (lns as integer) + g
     end
     tool.append(hw, envelope_u64(1, lns, wire(4, 4, 1, 5)))
 end
 tool.close_writer(hw)
 local ltl_out = ldir .. "/tl.jsonl"
-local rcl = tool.main({"prog", "--kind", "aof-noise",
-    "--hb-ms", "6000", ldir, ltl_out})
+local rcl = tool.main({"prog", "--kind", "aof-noise", "--hb-ms", "6000", ldir, ltl_out})
 local ph3 = io.popen("command -v python3")
 local has_py3 = (ph3:read("*l") or "") ~= ""
 ph3:close()
@@ -446,9 +635,14 @@ if not has_py3 then
     print("SKIP: python3 not on PATH — the large-scale twin cross-check needs it")
 end
 if has_py3 then
-    os.execute("python3 tools/aof-trace-tool.py --kind aof-noise"
-        .. " --hb-ms 6000 " .. ldir .. " " .. ldir
-        .. "/py.jsonl > /dev/null 2>&1")
+    os.execute(
+        "python3 tools/aof-trace-tool.py --kind aof-noise"
+            .. " --hb-ms 6000 "
+            .. ldir
+            .. " "
+            .. ldir
+            .. "/py.jsonl > /dev/null 2>&1"
+    )
     local ltl = read_lines(ltl_out)
     local lpy = read_lines(ldir .. "/py.jsonl")
     local ident = #ltl == #lpy
@@ -457,8 +651,12 @@ if has_py3 then
         for i = 1, #ltl do
             if ltl[i] ~= lpy[i] then
                 ident = false
-                firstdiff = "line " .. tostring(i) .. ":\ntl: "
-                    .. ltl[i]:sub(1, 160) .. "\npy: " .. lpy[i]:sub(1, 160)
+                firstdiff = "line "
+                    .. tostring(i)
+                    .. ":\ntl: "
+                    .. ltl[i]:sub(1, 160)
+                    .. "\npy: "
+                    .. lpy[i]:sub(1, 160)
                 break
             end
         end
@@ -466,8 +664,8 @@ if has_py3 then
     check("large-parity-byte-identical", rcl == 0 and #ltl == 1 and ident, firstdiff)
     -- the exported aof-noise mean is the compensated (Neumaier) sum over
     -- the sorted gaps, NOT the naive accumulation the old twin shipped
-    local mean_txt = (ltl[1] ~= nil)
-        and (ltl[1]:match('"mean_ms": ([%d%.]+)') or "?") or "?"
+    local mean_txt = (ltl[1] ~= nil) and (ltl[1]:match('"mean_ms": ([%d%.]+)') or "?")
+        or "?"
     local exported_mean = tonumber(mean_txt)
     local gaps: {number} = {}
     for i = 1, LARGE_N - 1 do
@@ -490,9 +688,11 @@ if has_py3 then
         end
         tot = t
     end
-    check("large-parity-compensated-mean", exported_mean == (tot + cor) / #gaps
-        and exported_mean ~= naive / #gaps,
-        "mean=" .. tostring(mean_txt) .. " naive=" .. tostring(naive / #gaps))
+    check(
+        "large-parity-compensated-mean",
+        exported_mean == (tot + cor) / #gaps and exported_mean ~= naive / #gaps,
+        "mean=" .. tostring(mean_txt) .. " naive=" .. tostring(naive / #gaps)
+    )
 end
 
 -- 11. the JSON log series instruments: leader-lag (the leader_ms
@@ -504,322 +704,449 @@ local jdir = tool.fixture_dir()
 os.execute("mkdir -p " .. jdir .. "/logs")
 local JBASE = 1789214915000
 local jf66 = io.open(jdir .. "/logs/n66.log", "w")
-jf66:write('{"level":"INFO","ts":' .. JBASE
-    .. ',"event":"heartbeat-commit","node":66,"era":4,"view":1,'
-    .. '"leader":66,"state":"normal","slot":5,"request_num":1}\n')
-jf66:write('{"level":"INFO","ts":' .. (JBASE + 10)
-    .. ',"event":"heartbeat-commit","node":66,"era":4,"view":1,'
-    .. '"leader":66,"state":"normal","slot":6,"request_num":2}\n')
+jf66:write(
+    '{"level":"INFO","ts":'
+        .. JBASE
+        .. ',"event":"heartbeat-commit","node":66,"era":4,"view":1,'
+        .. '"leader":66,"state":"normal","slot":5,"request_num":1}\n'
+)
+jf66:write(
+    '{"level":"INFO","ts":'
+        .. (JBASE + 10)
+        .. ',"event":"heartbeat-commit","node":66,"era":4,"view":1,'
+        .. '"leader":66,"state":"normal","slot":6,"request_num":2}\n'
+)
 -- an unmatched heartbeat: no commit-in carries (4, 1, 6.5)
-jf66:write('{"level":"INFO","ts":' .. (JBASE + 24) .. '.5'
-    .. ',"event":"heartbeat-commit","node":66,"era":4,"view":1,'
-    .. '"leader":66,"state":"normal","slot":7,"request_num":3}\n')
+jf66:write(
+    '{"level":"INFO","ts":'
+        .. (JBASE + 24)
+        .. ".5"
+        .. ',"event":"heartbeat-commit","node":66,"era":4,"view":1,'
+        .. '"leader":66,"state":"normal","slot":7,"request_num":3}\n'
+)
 jf66:write("not json at all\n")
 jf66:close()
 local jf99 = io.open(jdir .. "/logs/n99.log", "w")
-jf99:write('{"level":"INFO","ts":' .. (JBASE + 2)
-    .. ',"event":"commit-in","node":99,"from":66,"era":4,"view":1,'
-    .. '"slot":5,"leader":66,"state":"normal"}\n')
-jf99:write('{"level":"INFO","ts":' .. (JBASE + 15)
-    .. ',"event":"commit-in","node":99,"from":66,"era":4,"view":1,'
-    .. '"slot":6,"leader":66,"state":"normal"}\n')
+jf99:write(
+    '{"level":"INFO","ts":'
+        .. (JBASE + 2)
+        .. ',"event":"commit-in","node":99,"from":66,"era":4,"view":1,'
+        .. '"slot":5,"leader":66,"state":"normal"}\n'
+)
+jf99:write(
+    '{"level":"INFO","ts":'
+        .. (JBASE + 15)
+        .. ',"event":"commit-in","node":99,"from":66,"era":4,"view":1,'
+        .. '"slot":6,"leader":66,"state":"normal"}\n'
+)
 jf99:close()
 
-local okj, errj = pcall(function()
-    -- The fixture's non-JSON neighbour is a legitimate line: the
-    -- leniency flag is the only way past it (the strict default fails
-    -- it — asserted right after).
-    local lenient = tool.policy_new(true)
-    local lag_rows = tool.export_series(jdir, "leader-lag", nil, nil,
-        {jdir .. "/logs"}, lenient) as {{string: any}}
-    check("leader-lag-rows", #lag_rows == 2, "rows=" .. tostring(#lag_rows))
-    local l1 = lag_rows[1]
-    local l2 = lag_rows[2]
-    check("leader-lag-first", l1 ~= nil and l1.kind == "leader-lag"
-        and l1.leader == 66 and l1.node == 99 and l1.era == 4
-        and l1.view == 1 and l1.slot == 5 and l1.leader_ms == 2,
-        "first=" .. tostring(l1 and l1.leader_ms))
-    check("leader-lag-second", l2 ~= nil and l2.slot == 6
-        and l2.leader_ms == 5, "second=" .. tostring(l2 and l2.leader_ms))
+local okj, errj = pcall(
+    function(): any
+        -- The fixture's non-JSON neighbour is a legitimate line: the
+        -- leniency flag is the only way past it (the strict default fails
+        -- it — asserted right after).
+        local lenient = tool.policy_new(true)
+        local lag_rows = tool.export_series(
+            jdir, "leader-lag", nil, nil, {jdir .. "/logs"}, lenient
+        ) as {{string: any}}
+        check("leader-lag-rows", #lag_rows == 2, "rows=" .. tostring(#lag_rows))
+        local l1 = lag_rows[1]
+        local l2 = lag_rows[2]
+        check(
+            "leader-lag-first",
+            l1 ~= nil
+                and l1.kind == "leader-lag"
+                and l1.leader == 66
+                and l1.node == 99
+                and l1.era == 4
+                and l1.view == 1
+                and l1.slot == 5
+                and l1.leader_ms == 2,
+            "first=" .. tostring(l1 and l1.leader_ms)
+        )
+        check(
+            "leader-lag-second",
+            l2 ~= nil and l2.slot == 6 and l2.leader_ms == 5,
+            "second=" .. tostring(l2 and l2.leader_ms)
+        )
 
-    local strict_ok, strict_err = pcall(tool.export_series, jdir,
-        "leader-lag", nil, nil, {jdir .. "/logs"})
-    check("strict-default-fails", strict_ok == false
-        and (strict_err as string):find("n66%.log:4") ~= nil
-        and (strict_err as string):find("not one JSON object") ~= nil,
-        tostring(strict_err))
+        local strict_ok, strict_err = pcall(
+            tool.export_series, jdir, "leader-lag", nil, nil, {jdir .. "/logs"}, nil
+        )
+        check(
+            "strict-default-fails",
+            strict_ok == false
+                and (strict_err as string):find("n66%.log:4") ~= nil
+                and (strict_err as string):find("not one JSON object") ~= nil,
+            tostring(strict_err)
+        )
 
-    local hb_rows = tool.export_series(jdir, "hb-spacing", nil, nil,
-        {jdir .. "/logs"}, tool.policy_new(true)) as {{string: any}}
-    check("hb-spacing-rows", #hb_rows == 2, "rows=" .. tostring(#hb_rows))
-    local h1 = hb_rows[1]
-    local h2 = hb_rows[2]
-    check("hb-spacing-standby", h1 ~= nil and h1.event == "commit-in"
-        and h1.node == 99 and h1.count == 1 and h1.min_ms == 13.0,
-        "standby count=" .. tostring(h1 and h1.count)
-            .. " min=" .. tostring(h1 and h1.min_ms))
-    check("hb-spacing-leader", h2 ~= nil and h2.event == "heartbeat-commit"
-        and h2.node == 66 and h2.count == 2 and h2.min_ms == 10.0
-        and h2.p50_ms == 10.0 and h2.p95_ms == 14.5 and h2.max_ms == 14.5
-        and h2.mean_ms == 12.25,
-        "leader count=" .. tostring(h2 and h2.count)
-            .. " p50=" .. tostring(h2 and h2.p50_ms)
-            .. " max=" .. tostring(h2 and h2.max_ms)
-            .. " mean=" .. tostring(h2 and h2.mean_ms))
+        local hb_rows = tool.export_series(
+            jdir, "hb-spacing", nil, nil, {jdir .. "/logs"}, tool.policy_new(true)
+        ) as {{string: any}}
+        check("hb-spacing-rows", #hb_rows == 2, "rows=" .. tostring(#hb_rows))
+        local h1 = hb_rows[1]
+        local hb2 = hb_rows[2]
+        check(
+            "hb-spacing-standby",
+            h1 ~= nil
+                and h1.event == "commit-in"
+                and h1.node == 99
+                and h1.count == 1
+                and h1.min_ms == 13.0,
+            "standby count="
+                .. tostring(h1 and h1.count)
+                .. " min="
+                .. tostring(h1 and h1.min_ms)
+        )
+        check(
+            "hb-spacing-leader",
+            hb2 ~= nil
+                and hb2.event == "heartbeat-commit"
+                and hb2.node == 66
+                and hb2.count == 2
+                and hb2.min_ms == 10.0
+                and hb2.p50_ms == 10.0
+                and hb2.p95_ms == 14.5
+                and hb2.max_ms == 14.5
+                and hb2.mean_ms == 12.25,
+            "leader count="
+                .. tostring(hb2 and hb2.count)
+                .. " p50="
+                .. tostring(hb2 and hb2.p50_ms)
+                .. " max="
+                .. tostring(hb2 and hb2.max_ms)
+                .. " mean="
+                .. tostring(hb2 and hb2.mean_ms)
+        )
 
-    -- the CLI surface: --logs PATH, --allow-skips (the fixture's
-    -- non-JSON neighbour needs it), the kinds riding the union contract
-    local jout = jdir .. "/cli.jsonl"
-    local rcj = tool.main({"prog", "--allow-skips", "--kind",
-        "hb-spacing leader-lag",
-        "--logs", jdir .. "/logs", jdir, jout})
-    local jlines = read_lines(jout)
-    local kinds_seen: {string} = {}
-    for _, l in ipairs(jlines) do
-        kinds_seen[#kinds_seen + 1] = (l:match('"kind": "([%w-]+)"')) or "?"
-    end
-    check("logs-cli-union", rcj == 0 and #jlines == 4
-        and kinds_seen[1] == "hb-spacing" and kinds_seen[2] == "hb-spacing"
-        and kinds_seen[3] == "leader-lag" and kinds_seen[4] == "leader-lag",
-        "rc=" .. tostring(rcj) .. " lines=" .. tostring(#jlines)
-            .. " kinds=" .. table.concat(kinds_seen, ","))
+        -- the CLI surface: --logs PATH, --allow-skips (the fixture's
+        -- non-JSON neighbour needs it), the kinds riding the union contract
+        local jout = jdir .. "/cli.jsonl"
+        local rcj = tool.main(
+            {
+                "prog",
+                "--allow-skips",
+                "--kind",
+                "hb-spacing leader-lag",
+                "--logs",
+                jdir .. "/logs",
+                jdir,
+                jout,
+            }
+        )
+        local jlines = read_lines(jout)
+        local kinds_seen: {string} = {}
+        for _, l in ipairs(jlines) do
+            kinds_seen[#kinds_seen + 1] = (l:match('"kind": "([%w-]+)"')) or "?"
+        end
+        check(
+            "logs-cli-union",
+            rcj == 0
+                and #jlines == 4
+                and kinds_seen[1] == "hb-spacing"
+                and kinds_seen[2] == "hb-spacing"
+                and kinds_seen[3] == "leader-lag"
+                and kinds_seen[4] == "leader-lag",
+            "rc="
+                .. tostring(rcj)
+                .. " lines="
+                .. tostring(#jlines)
+                .. " kinds="
+                .. table.concat(kinds_seen, ",")
+        )
 
-    -- byte parity with the python twin on the same fixture: the CLI
-    -- exports of both twins over the same logs must be identical lines.
-    local ph4 = io.popen("command -v python3")
-    local has_py4 = (ph4:read("*l") or "") ~= ""
-    ph4:close()
-    if has_py4 then
-        local py_out = jdir .. "/py.jsonl"
-        os.execute("python3 tools/aof-trace-tool.py"
-            .. " --allow-skips --kind 'hb-spacing leader-lag' --logs "
-            .. jdir .. "/logs"
-            .. " " .. jdir .. " " .. py_out .. " > /dev/null 2>&1")
-        local tl_lines = read_lines(jout)
-        local py_lines = read_lines(py_out)
-        local ident = #tl_lines == #py_lines
-        local why = "line counts " .. tostring(#tl_lines) .. "/"
-            .. tostring(#py_lines)
-        if ident then
-            for i = 1, #tl_lines do
-                if tl_lines[i] ~= py_lines[i] then
-                    ident = false
-                    why = "line " .. tostring(i) .. ":\ntl: "
-                        .. tl_lines[i]:sub(1, 160) .. "\npy: "
-                        .. py_lines[i]:sub(1, 160)
-                    break
+        -- byte parity with the python twin on the same fixture: the CLI
+        -- exports of both twins over the same logs must be identical lines.
+        local ph4 = io.popen("command -v python3")
+        local has_py4 = (ph4:read("*l") or "") ~= ""
+        ph4:close()
+        if has_py4 then
+            local py_out = jdir .. "/py.jsonl"
+            os.execute(
+                "python3 tools/aof-trace-tool.py"
+                    .. " --allow-skips --kind 'hb-spacing leader-lag' --logs "
+                    .. jdir
+                    .. "/logs"
+                    .. " "
+                    .. jdir
+                    .. " "
+                    .. py_out
+                    .. " > /dev/null 2>&1"
+            )
+            local tl_lines = read_lines(jout)
+            local py_lines = read_lines(py_out)
+            local ident = #tl_lines == #py_lines
+            local why = "line counts "
+                .. tostring(#tl_lines)
+                .. "/"
+                .. tostring(#py_lines)
+            if ident then
+                for i = 1, #tl_lines do
+                    if tl_lines[i] ~= py_lines[i] then
+                        ident = false
+                        why = "line "
+                            .. tostring(i)
+                            .. ":\ntl: "
+                            .. tl_lines[i]:sub(1, 160)
+                            .. "\npy: "
+                            .. py_lines[i]:sub(1, 160)
+                        break
+                    end
                 end
             end
+            check("logs-cli-byte-identical", ident, why)
         end
-        check("logs-cli-byte-identical", ident, why)
+        return nil
     end
-end)
+)
 if not okj then
     check("json-log-series", false, "block errored: " .. tostring(errj))
 end
 
-
-
 -- 12. STRICT BY DEFAULT (row 519): the generated corpus of every real
 -- shape, the flag the only skip path, the per-event integrity counts.
 local CORPUS_BASE = 1789725518000
-local function real_shape_lines()
+local function real_shape_lines(): {string: string}
     local b = CORPUS_BASE
     return {
-        ["heartbeat-commit"] =
-            '{"ts":' .. (b + 10) .. ',"level":"INFO","event":"heartbeat-commit",'
+        ["heartbeat-commit"] = '{"ts":'
+            .. (b + 10)
+            .. ',"level":"INFO","event":"heartbeat-commit",'
             .. '"node":102,"era":4,"view":41,"leader":102,"state":"Normal",'
             .. '"slot":5201,"request_num":61,"message":"heartbeat-commit"}',
-        ["commit-in"] =
-            '{"ts":' .. b .. ',"level":"INFO","event":"commit-in","node":101,'
+        ["commit-in"] = '{"ts":'
+            .. b
+            .. ',"level":"INFO","event":"commit-in","node":101,'
             .. '"from":102,"era":4,"view":41,"slot":5201,"leader":102,'
             .. '"state":"Normal","message":"commit-in"}',
-        ["leader-timeout-detect"] =
-            '{"ts":' .. (b + 200) .. ',"level":"INFO","event":"leader-timeout-detect",'
+        ["leader-timeout-detect"] = '{"ts":'
+            .. (b + 200)
+            .. ',"level":"INFO","event":"leader-timeout-detect",'
             .. '"node":101,"era":4,"view":41,"config_era":4,"leader":102,'
             .. '"state":"Normal","silence_ms":720,'
             .. '"deadline_ms":1789725518150,"addr":"127.0.0.1:7002",'
             .. '"message":"leader-timeout-detect"}',
-        ["election-wait-fire"] =
-            '{"ts":' .. (b + 190) .. ',"level":"INFO","event":"election-wait-fire",'
+        ["election-wait-fire"] = '{"ts":'
+            .. (b + 190)
+            .. ',"level":"INFO","event":"election-wait-fire",'
             .. '"node":103,"era":4,"view":41,"leader":102,"state":"Normal",'
             .. '"wait_ms":820,"stagger_ms":15,"fired_ms":835,'
             .. '"message":"election-wait-fire"}',
-        ["nominate-out"] =
-            '{"ts":' .. (b + 215) .. ',"level":"INFO","event":"nominate-out",'
+        ["nominate-out"] = '{"ts":'
+            .. (b + 215)
+            .. ',"level":"INFO","event":"nominate-out",'
             .. '"node":103,"to":101,"era":4,"view":42,"slot":5290,'
             .. '"tag":"StartViewChange","bytes":31}',
-        ["nominate-in"] =
-            '{"ts":' .. (b + 230) .. ',"level":"INFO","event":"nominate-in",'
+        ["nominate-in"] = '{"ts":'
+            .. (b + 230)
+            .. ',"level":"INFO","event":"nominate-in",'
             .. '"node":101,"from":103,"era":4,"view":42,"slot":5290,'
             .. '"tag":"StartViewChange","len":31}',
-        ["lease-grant"] =
-            '{"ts":' .. (b + 123) .. ',"level":"INFO","event":"lease-grant",'
+        ["lease-grant"] = '{"ts":'
+            .. (b + 123)
+            .. ',"level":"INFO","event":"lease-grant",'
             .. '"node":101,"era":4,"view":41,"leader":102,"state":"Normal",'
             .. '"op":"renew","expiry":1789725518623,'
             .. '"message":"lease-grant"}',
-        ["forward-request"] =
-            '{"ts":' .. (b + 300) .. ',"level":"INFO","event":"forward-request",'
+        ["forward-request"] = '{"ts":'
+            .. (b + 300)
+            .. ',"level":"INFO","event":"forward-request",'
             .. '"node":103,"era":4,"view":41,"leader":102,'
             .. '"state":"Normal","peer":"127.0.0.1:7002",'
             .. '"message_id":"0f8e2d61-9c34-4b57-a6d8-2e5f1c9b0123",'
             .. '"bytes":96,"message":"forward-request"}',
-        ["forward-not-leader"] =
-            '{"ts":' .. (b + 310) .. ',"level":"INFO","event":"forward-not-leader",'
+        ["forward-not-leader"] = '{"ts":'
+            .. (b + 310)
+            .. ',"level":"INFO","event":"forward-not-leader",'
             .. '"node":103,"era":4,"view":41,"leader":102,'
             .. '"state":"Normal","peer":"127.0.0.1:7002",'
             .. '"message_id":"0f8e2d61-9c34-4b57-a6d8-2e5f1c9b0124"}',
-        ["forward-response"] =
-            '{"ts":' .. (b + 320) .. ',"level":"INFO","event":"forward-response",'
+        ["forward-response"] = '{"ts":'
+            .. (b + 320)
+            .. ',"level":"INFO","event":"forward-response",'
             .. '"node":102,"era":4,"view":41,"leader":102,'
             .. '"state":"Normal","peer":"127.0.0.1:7001",'
             .. '"message_id":"0f8e2d61-9c34-4b57-a6d8-2e5f1c9b0123",'
             .. '"bytes":88,"message":"forward-response"}',
-        ["forward-request-in"] =
-            '{"ts":' .. (b + 340) .. ',"level":"INFO","event":"forward-request-in",'
+        ["forward-request-in"] = '{"ts":'
+            .. (b + 340)
+            .. ',"level":"INFO","event":"forward-request-in",'
             .. '"node":102,"era":4,"view":41,"leader":102,'
             .. '"state":"Normal","peer":"127.0.0.1:7003",'
             .. '"message_id":"0f8e2d61-9c34-4b57-a6d8-2e5f1c9b0125",'
             .. '"bytes":96}',
-        ["forward-response-in"] =
-            '{"ts":' .. (b + 350) .. ',"level":"INFO","event":"forward-response-in",'
+        ["forward-response-in"] = '{"ts":'
+            .. (b + 350)
+            .. ',"level":"INFO","event":"forward-response-in",'
             .. '"node":103,"era":4,"view":41,"leader":102,'
             .. '"state":"Normal","peer":"127.0.0.1:7002",'
             .. '"message_id":"0f8e2d61-9c34-4b57-a6d8-2e5f1c9b0123",'
             .. '"bytes":89}',
-        ["late-ack"] =
-            '{"ts":' .. (b + 330) .. ',"level":"WARN","event":"late-ack","node":102,'
+        ["late-ack"] = '{"ts":'
+            .. (b + 330)
+            .. ',"level":"WARN","event":"late-ack","node":102,'
             .. '"era":4,"view":41,"leader":102,"state":"Normal",'
             .. '"late_acks":1,'
             .. '"message_id":"0f8e2d61-9c34-4b57-a6d8-2e5f1c9b0999",'
             .. '"bytes":88}',
-        ["late-ack-forward"] =
-            '{"ts":' .. (b + 360) .. ',"level":"WARN","event":"late-ack-forward",'
+        ["late-ack-forward"] = '{"ts":'
+            .. (b + 360)
+            .. ',"level":"WARN","event":"late-ack-forward",'
             .. '"node":103,"era":4,"view":41,"leader":102,'
             .. '"state":"Normal","late_acks":1,'
             .. '"message_id":"0f8e2d61-9c34-4b57-a6d8-2e5f1c9b0126",'
             .. '"len":89}',
-        ["note"] =
-            '{"ts":' .. (b + 1) .. ',"level":"INFO","event":"note","text":'
+        ["note"] = '{"ts":'
+            .. (b + 1)
+            .. ',"level":"INFO","event":"note","text":'
             .. '"a signal, a no-op, a foreign datagram dropped"}',
-        ["slot-frontier"] =
-            '{"ts":' .. (b + 400) .. ',"event":"slot-frontier","era":4,"view":41,'
+        ["slot-frontier"] = '{"ts":'
+            .. (b + 400)
+            .. ',"event":"slot-frontier","era":4,"view":41,'
             .. '"leader":102,"state":"Normal","slot":5204}',
-        ["non-json-neighbour"] =
-            "advisory-lock membership fingerprint=84f2957f69449a2b "
+        ["non-json-neighbour"] = "advisory-lock membership fingerprint=84f2957f69449a2b "
             .. "encoding=lunet-advisory-lock/membership/v1",
     }
 end
 
-local ok519, err519 = pcall(function()
-    local shapes = real_shape_lines()
-    local json_shapes = {}
-    for name, _ in pairs(shapes) do
-        if name ~= "non-json-neighbour" then
-            json_shapes[#json_shapes + 1] = name
+local ok519, err519 = pcall(
+    function(): any
+        local shapes = real_shape_lines()
+        local json_shapes: {string} = {}
+        for name, _ in pairs(shapes) do
+            if name ~= "non-json-neighbour" then
+                json_shapes[#json_shapes + 1] = name
+            end
         end
-    end
-    table.sort(json_shapes)
-    check("corpus-shapes-named", #json_shapes == 16,
-        "shapes=" .. tostring(#json_shapes))
-    -- every real shape, one file per shape, scanned clean: the strict
-    -- scan never fires on what the producers actually emit.
-    local all_green = true
-    local why = ""
-    for _, name in ipairs(json_shapes) do
-        local d = tool.fixture_dir()
-        local logs = d .. "/logs"
-        os.execute("mkdir -p " .. logs)
-        local fh = io.open(logs .. "/n1.log", "w")
-        fh:write(shapes[name] .. "\n")
-        fh:close()
-        local policy = tool.policy_new(false)
-        local ok, rows = pcall(tool.export_series, d, "log-integrity",
-            nil, nil, {logs}, policy)
-        if not ok then
-            all_green = false
-            why = name .. ": " .. tostring(rows)
-        elseif policy.count ~= 0 or #rows ~= 1
-            or rows[1].parse_failures ~= 0 or rows[1].lines ~= 1 then
-            all_green = false
-            why = name .. ": rows=" .. tostring(rows)
+        table.sort(json_shapes)
+        check(
+            "corpus-shapes-named",
+            #json_shapes == 16,
+            "shapes=" .. tostring(#json_shapes)
+        )
+        -- every real shape, one file per shape, scanned clean: the strict
+        -- scan never fires on what the producers actually emit.
+        local all_green = true
+        local why = ""
+        for _, name in ipairs(json_shapes) do
+            local d = tool.fixture_dir()
+            local logs = d .. "/logs"
+            os.execute("mkdir -p " .. logs)
+            local fh = io.open(logs .. "/n1.log", "w")
+            fh:write(shapes[name] .. "\n")
+            fh:close()
+            local policy = tool.policy_new(false)
+            local ok, rows = pcall(
+                tool.export_series, d, "log-integrity", nil, nil, {logs}, policy
+            )
+            if not ok then
+                all_green = false
+                why = name .. ": " .. tostring(rows)
+            elseif
+                policy.count ~= 0
+                or #rows ~= 1
+                or rows[1].parse_failures ~= 0
+                or rows[1].lines ~= 1
+            then
+                all_green = false
+                why = name .. ": rows=" .. tostring(rows)
+            end
         end
-    end
-    check("corpus-every-real-shape-strict-green", all_green, why)
+        check("corpus-every-real-shape-strict-green", all_green, why)
 
-    -- the corrupted variant of EVERY shape fails strict, and the flag
-    -- is the only path past it (counted).
-    local flag_only = true
-    local why2 = ""
-    for name, text in pairs(shapes) do
-        local corrupted = text
-        if name ~= "non-json-neighbour" then
-            corrupted = text:sub(1, #text - 1)
+        -- the corrupted variant of EVERY shape fails strict, and the flag
+        -- is the only path past it (counted).
+        local flag_only = true
+        local why2 = ""
+        for name, text in pairs(shapes) do
+            local corrupted: string = text
+            if name ~= "non-json-neighbour" then
+                corrupted = text:sub(1, #text - 1)
+            end
+            local d = tool.fixture_dir()
+            local logs = d .. "/logs"
+            os.execute("mkdir -p " .. logs)
+            local fh = io.open(logs .. "/n1.log", "w")
+            fh:write(corrupted .. "\n")
+            fh:close()
+            local strict_ok = pcall(
+                tool.export_series, d, "log-integrity", nil, nil, {logs}, nil
+            )
+            local policy = tool.policy_new(true)
+            local ok, rows = pcall(
+                tool.export_series, d, "log-integrity", nil, nil, {logs}, policy
+            )
+            if strict_ok then
+                flag_only = false
+                why2 = name .. ": corrupted line did not fail strict"
+            elseif not ok then
+                flag_only = false
+                why2 = name .. ": flag run errored: " .. tostring(rows)
+            elseif policy.count ~= 1 or rows[1].skipped ~= 1 or rows[1].lines ~= 0 then
+                flag_only = false
+                why2 = name
+                    .. ": rows="
+                    .. tostring(rows)
+                    .. " count="
+                    .. tostring(policy.count)
+            end
         end
-        local d = tool.fixture_dir()
-        local logs = d .. "/logs"
-        os.execute("mkdir -p " .. logs)
-        local fh = io.open(logs .. "/n1.log", "w")
-        fh:write(corrupted .. "\n")
-        fh:close()
-        local strict_ok = pcall(tool.export_series, d, "log-integrity",
-            nil, nil, {logs})
-        local policy = tool.policy_new(true)
-        local ok, rows = pcall(tool.export_series, d, "log-integrity",
-            nil, nil, {logs}, policy)
-        if strict_ok then
-            flag_only = false
-            why2 = name .. ": corrupted line did not fail strict"
-        elseif not ok then
-            flag_only = false
-            why2 = name .. ": flag run errored: " .. tostring(rows)
-        elseif policy.count ~= 1 or rows[1].skipped ~= 1
-            or rows[1].lines ~= 0 then
-            flag_only = false
-            why2 = name .. ": rows=" .. tostring(rows)
-                .. " count=" .. tostring(policy.count)
+        check("corpus-flag-is-the-only-skip-path", flag_only, why2)
+
+        -- the integrity kind's per-event counts and parse-failure count
+        local d3 = tool.fixture_dir()
+        local logs3 = d3 .. "/logs"
+        os.execute("mkdir -p " .. logs3)
+        local fh3 = io.open(logs3 .. "/n1.log", "w")
+        local event_lines: {string} = {}
+        for _, name in ipairs(json_shapes) do
+            event_lines[#event_lines + 1] = shapes[name]
         end
-    end
-    check("corpus-flag-is-the-only-skip-path", flag_only, why2)
+        fh3:write(table.concat(event_lines, "\n") .. "\n")
+        fh3:close()
+        local policy3 = tool.policy_new(true)
+        local rows3 = tool.export_series(
+            d3, "log-integrity", nil, nil, {logs3}, policy3
+        ) as {{string: any}}
+        check(
+            "integrity-per-event-counts",
+            #rows3 == 1
+                and rows3[1].lines == 16
+                and rows3[1].parse_failures == 0
+                and policy3.count == 0,
+            tostring(rows3[1])
+        )
 
-    -- the integrity kind's per-event counts and parse-failure count
-    local d3 = tool.fixture_dir()
-    local logs3 = d3 .. "/logs"
-    os.execute("mkdir -p " .. logs3)
-    local fh3 = io.open(logs3 .. "/n1.log", "w")
-    local event_lines = {}
-    for _, name in ipairs(json_shapes) do
-        event_lines[#event_lines + 1] = shapes[name]
+        -- a memberless JSON object is a parse failure of the kind's
+        -- contract; the non-JSON neighbour is a counted skip
+        local d4 = tool.fixture_dir()
+        local logs4 = d4 .. "/logs"
+        os.execute("mkdir -p " .. logs4)
+        local fh4 = io.open(logs4 .. "/n1.log", "w")
+        fh4:write(shapes["heartbeat-commit"] .. "\n")
+        fh4:write(shapes["non-json-neighbour"] .. "\n")
+        fh4:write('{"ts":' .. (CORPUS_BASE + 2) .. ',"level":"INFO"}\n')
+        fh4:write(shapes["commit-in"] .. "\n")
+        fh4:close()
+        local policy4 = tool.policy_new(true)
+        local rows4 = tool.export_series(
+            d4, "log-integrity", nil, nil, {logs4}, policy4
+        ) as {{string: any}}
+        check(
+            "integrity-parse-failures-counted",
+            #rows4 == 1
+                and rows4[1].lines == 3
+                and rows4[1].parse_failures == 1
+                and policy4.count == 1
+                and (rows4[1].events as {string: any})["heartbeat-commit"] == 1
+                and (rows4[1].events as {string: any})["commit-in"] == 1,
+            tostring(rows4[1])
+        )
+        return nil
     end
-    fh3:write(table.concat(event_lines, "\n") .. "\n")
-    fh3:close()
-    local policy3 = tool.policy_new(true)
-    local rows3 = tool.export_series(d3, "log-integrity", nil, nil,
-        {logs3}, policy3) as {{string: any}}
-    check("integrity-per-event-counts", #rows3 == 1
-        and rows3[1].lines == 16 and rows3[1].parse_failures == 0
-        and policy3.count == 0, tostring(rows3[1]))
-
-    -- a memberless JSON object is a parse failure of the kind's
-    -- contract; the non-JSON neighbour is a counted skip
-    local d4 = tool.fixture_dir()
-    local logs4 = d4 .. "/logs"
-    os.execute("mkdir -p " .. logs4)
-    local fh4 = io.open(logs4 .. "/n1.log", "w")
-    fh4:write(shapes["heartbeat-commit"] .. "\n")
-    fh4:write(shapes["non-json-neighbour"] .. "\n")
-    fh4:write('{"ts":' .. (CORPUS_BASE + 2) .. ',"level":"INFO"}\n')
-    fh4:write(shapes["commit-in"] .. "\n")
-    fh4:close()
-    local policy4 = tool.policy_new(true)
-    local rows4 = tool.export_series(d4, "log-integrity", nil, nil,
-        {logs4}, policy4) as {{string: any}}
-    check("integrity-parse-failures-counted", #rows4 == 1
-        and rows4[1].lines == 3 and rows4[1].parse_failures == 1
-        and policy4.count == 1
-        and rows4[1].events["heartbeat-commit"] == 1
-        and rows4[1].events["commit-in"] == 1, tostring(rows4[1]))
-end)
+)
 if not ok519 then
     check("strict-by-default", false, "block errored: " .. tostring(err519))
 end

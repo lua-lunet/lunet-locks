@@ -26,15 +26,13 @@ endif
 
 LUNET_URL := https://github.com/lua-lunet/lunet/releases/download/$(LUNET_VERSION)/$(LUNET_ARCHIVE)
 LUNET_ARCHIVE_PATH := $(LUNET_ROOT)/$(LUNET_ARCHIVE)
-# Teal outside source_dir, which `cyan build` does not reach.
-CHECK_SOURCES = tests/teal_learning_test.tl \
-                tests/advisory_lock_ffi_test.tl \
-                tests/advisory_lock_pure_test.tl \
-                tests/cluster_config_test.tl \
-                tests/admin_test.tl \
-                tests/remap_test.tl \
-                tests/snapshot_test.tl
-TOOL_SOURCES = $(wildcard tools/lib/*.tl)
+# Every tracked .tl in the tree is gate source: src, tests, tools, and
+# console — one cyan check gate covers them all (`cyan build` alone does
+# not reach outside its source_dir, and no .tl may sit outside a gate).
+# tests/fixtures is test DATA, not source: two fixtures are deliberately
+# type-broken, and their failing check output is what
+# tests/teal_learning_test.tl asserts — the directory stays out of the gate.
+TEAL_SOURCES = $(filter-out tests/fixtures/%,$(shell git ls-files '*.tl'))
 # POSIX bin helpers carry no logic and still get the discipline: shellcheck
 # plus the client-signal behavioural smoke.
 SIGNAL_BIN := examples/lease-sequencer/bin
@@ -67,10 +65,10 @@ deps:
 	$(LUAROCKS) install luasocket
 
 fmt:
-	$(CERU) src tests
+	$(CERU) src tests tools console
 
 lint:
-	$(CERU) --check src tests
+	$(CERU) --check src tests tools console
 
 hooks:
 	git config core.hooksPath .githooks
@@ -85,8 +83,7 @@ sh-smoke:
 	$(SIGNAL_BIN)/client-signal-smoke.sh
 
 check: build lint example-check sh-check sh-smoke
-	$(CYAN) check $(CHECK_SOURCES)
-	$(CYAN) check $(TOOL_SOURCES)
+	$(CYAN) check $(TEAL_SOURCES)
 
 test: check
 	LUA_PATH="$(abspath build)/?.lua;;" $(TESTED) tests
