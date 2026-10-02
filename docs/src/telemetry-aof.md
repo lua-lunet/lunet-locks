@@ -130,3 +130,22 @@ prod, UI-facing plane; the Flight Recorder is the feature-flagged,
 debug-only plane whose internal format is unstable and whose deep read
 is same-commit-readable only. Each streamer's from/to derivation rules
 are printed in its `--help`.
+
+A wire row's `from` is the sender the recorder's own JSON log series
+names: with `--logs PATH` (the recorder's log files, repeatable) the
+tape joins each Commit wire frame's `(era, view, slot)` to the
+recorder's `commit-in` line carrying the same key and takes the line's
+`from` member — the observability contract's arrival line, logged by a
+standby for every Commit it accepts from its leader. A frame with no
+matching line keeps `?`, never a guessed id; the join claims Commit
+frames only.
+
+The `aof-trace-tool` twins export the same series' two clock-side
+measurements over `--logs`: the `hb-spacing` kind (the cadence between
+successive `heartbeat-commit` / `commit-in` lines per node, one stats
+row per node and side of the wire) and the `leader-lag` kind (one row
+per matched leader `heartbeat-commit` ↔ standby `commit-in` exchange,
+joined on the `(era, view, slot)` both lines carry, carrying
+`leader_ms` — the difference between the leader's send clock and the
+standby's record clock, the measurement that separates "the leader
+sent late" from "the standby recorded late").

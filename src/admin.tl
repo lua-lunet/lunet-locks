@@ -273,6 +273,21 @@ local function encode_deadline_ack(action: string, id: integer): string
         .. ',"accepted":false,"reason":"deadline"}'
 end
 
+-- The acknowledgment for a verb the leader refused at admission -- the
+-- voting floor: the verb would leave fewer than three voting members, so
+-- the leader refused it on its own authority over its membership model,
+-- before the adapter was driven. Nothing entered the log. Duplicates of
+-- the verb replay this exact line from the dedup cache like every settled
+-- outcome.
+local function encode_refused_ack(action: string, id: integer): string
+    assert(valid_action(action), "admin: invalid ack action")
+    return '{"action":"'
+        .. action
+        .. '","id":'
+        .. tostring(id)
+        .. ',"accepted":false,"reason":"voting-floor"}'
+end
+
 -- The verb dedup cache: correlates a driven verb by its message_id so the
 -- leader answers a duplicate with the FIRST outcome instead of re-driving
 -- it into a racing refusal. A claimed verb is in flight until its outcome
@@ -407,6 +422,7 @@ return {
     decode_change = decode_change,
     encode_ack = encode_ack,
     encode_deadline_ack = encode_deadline_ack,
+    encode_refused_ack = encode_refused_ack,
     new_cache = cache.new,
     next_in_rotation = next_in_rotation,
 }

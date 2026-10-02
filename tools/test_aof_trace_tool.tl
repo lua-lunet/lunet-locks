@@ -495,5 +495,114 @@ if has_py3 then
         "mean=" .. tostring(mean_txt) .. " naive=" .. tostring(naive / #gaps))
 end
 
+-- 11. the JSON log series instruments: leader-lag (the leader_ms
+-- column) and hb-spacing, both measured from the hosts' JSON log lines
+-- (the observability contract) — the leader's heartbeat-commit ts vs
+-- the standby's commit-in ts, joined on the (era, view, slot) both
+-- lines carry, and the per-(node, event) heartbeat cadence.
+local jdir = tool.fixture_dir()
+os.execute("mkdir -p " .. jdir .. "/logs")
+local JBASE = 1789214915000
+local jf66 = io.open(jdir .. "/logs/n66.log", "w")
+jf66:write('{"level":"INFO","ts":' .. JBASE
+    .. ',"event":"heartbeat-commit","node":66,"era":4,"view":1,'
+    .. '"leader":66,"state":"normal","slot":5,"request_num":1}\n')
+jf66:write('{"level":"INFO","ts":' .. (JBASE + 10)
+    .. ',"event":"heartbeat-commit","node":66,"era":4,"view":1,'
+    .. '"leader":66,"state":"normal","slot":6,"request_num":2}\n')
+-- an unmatched heartbeat: no commit-in carries (4, 1, 6.5)
+jf66:write('{"level":"INFO","ts":' .. (JBASE + 24) .. '.5'
+    .. ',"event":"heartbeat-commit","node":66,"era":4,"view":1,'
+    .. '"leader":66,"state":"normal","slot":7,"request_num":3}\n')
+jf66:write("not json at all\n")
+jf66:close()
+local jf99 = io.open(jdir .. "/logs/n99.log", "w")
+jf99:write('{"level":"INFO","ts":' .. (JBASE + 2)
+    .. ',"event":"commit-in","node":99,"from":66,"era":4,"view":1,'
+    .. '"slot":5,"leader":66,"state":"normal"}\n')
+jf99:write('{"level":"INFO","ts":' .. (JBASE + 15)
+    .. ',"event":"commit-in","node":99,"from":66,"era":4,"view":1,'
+    .. '"slot":6,"leader":66,"state":"normal"}\n')
+jf99:close()
+
+local okj, errj = pcall(function()
+    local lag_rows = tool.export_series(jdir, "leader-lag", nil, nil,
+        {jdir .. "/logs"}) as {{string: any}}
+    check("leader-lag-rows", #lag_rows == 2, "rows=" .. tostring(#lag_rows))
+    local l1 = lag_rows[1]
+    local l2 = lag_rows[2]
+    check("leader-lag-first", l1 ~= nil and l1.kind == "leader-lag"
+        and l1.leader == 66 and l1.node == 99 and l1.era == 4
+        and l1.view == 1 and l1.slot == 5 and l1.leader_ms == 2,
+        "first=" .. tostring(l1 and l1.leader_ms))
+    check("leader-lag-second", l2 ~= nil and l2.slot == 6
+        and l2.leader_ms == 5, "second=" .. tostring(l2 and l2.leader_ms))
+
+    local hb_rows = tool.export_series(jdir, "hb-spacing", nil, nil,
+        {jdir .. "/logs"}) as {{string: any}}
+    check("hb-spacing-rows", #hb_rows == 2, "rows=" .. tostring(#hb_rows))
+    local h1 = hb_rows[1]
+    local h2 = hb_rows[2]
+    check("hb-spacing-standby", h1 ~= nil and h1.event == "commit-in"
+        and h1.node == 99 and h1.count == 1 and h1.min_ms == 13.0,
+        "standby count=" .. tostring(h1 and h1.count)
+            .. " min=" .. tostring(h1 and h1.min_ms))
+    check("hb-spacing-leader", h2 ~= nil and h2.event == "heartbeat-commit"
+        and h2.node == 66 and h2.count == 2 and h2.min_ms == 10.0
+        and h2.p50_ms == 10.0 and h2.p95_ms == 14.5 and h2.max_ms == 14.5
+        and h2.mean_ms == 12.25,
+        "leader count=" .. tostring(h2 and h2.count)
+            .. " p50=" .. tostring(h2 and h2.p50_ms)
+            .. " max=" .. tostring(h2 and h2.max_ms)
+            .. " mean=" .. tostring(h2 and h2.mean_ms))
+
+    -- the CLI surface: --logs PATH, the kinds riding the union contract
+    local jout = jdir .. "/cli.jsonl"
+    local rcj = tool.main({"prog", "--kind", "hb-spacing leader-lag",
+        "--logs", jdir .. "/logs", jdir, jout})
+    local jlines = read_lines(jout)
+    local kinds_seen: {string} = {}
+    for _, l in ipairs(jlines) do
+        kinds_seen[#kinds_seen + 1] = (l:match('"kind": "([%w-]+)"')) or "?"
+    end
+    check("logs-cli-union", rcj == 0 and #jlines == 4
+        and kinds_seen[1] == "hb-spacing" and kinds_seen[2] == "hb-spacing"
+        and kinds_seen[3] == "leader-lag" and kinds_seen[4] == "leader-lag",
+        "rc=" .. tostring(rcj) .. " lines=" .. tostring(#jlines)
+            .. " kinds=" .. table.concat(kinds_seen, ","))
+
+    -- byte parity with the python twin on the same fixture: the CLI
+    -- exports of both twins over the same logs must be identical lines.
+    local ph4 = io.popen("command -v python3")
+    local has_py4 = (ph4:read("*l") or "") ~= ""
+    ph4:close()
+    if has_py4 then
+        local py_out = jdir .. "/py.jsonl"
+        os.execute("python3 tools/aof-trace-tool.py"
+            .. " --kind 'hb-spacing leader-lag' --logs " .. jdir .. "/logs"
+            .. " " .. jdir .. " " .. py_out .. " > /dev/null 2>&1")
+        local tl_lines = read_lines(jout)
+        local py_lines = read_lines(py_out)
+        local ident = #tl_lines == #py_lines
+        local why = "line counts " .. tostring(#tl_lines) .. "/"
+            .. tostring(#py_lines)
+        if ident then
+            for i = 1, #tl_lines do
+                if tl_lines[i] ~= py_lines[i] then
+                    ident = false
+                    why = "line " .. tostring(i) .. ":\ntl: "
+                        .. tl_lines[i]:sub(1, 160) .. "\npy: "
+                        .. py_lines[i]:sub(1, 160)
+                    break
+                end
+            end
+        end
+        check("logs-cli-byte-identical", ident, why)
+    end
+end)
+if not okj then
+    check("json-log-series", false, "block errored: " .. tostring(errj))
+end
+
 print(("aof-trace-tool.tl: %d passed, %d failed"):format(passed, failed))
 os.exit(failed == 0 and 0 or 1)

@@ -307,12 +307,18 @@ end
 -- and touch nothing.
 --
 -- The ruling (docs/src/decisions.md): a cluster never runs with fewer than
--- three VOTING members. A decrement of a voter and a leave of a voter are
--- refused when they would leave fewer than three at positive weight. A
+-- three VOTING members. The leader refuses a floor-crossing verb at
+-- admission, BEFORE the adapter drive: `crosses_the_floor` below is the
+-- host's own authority over its membership model, so a decrement of a
+-- voter and a leave of a voter are refused before the adapter is ever
+-- asked, never inherited from the adapter's after-the-fact refusal. A
 -- member already at weight 0 is not a voter and its departure moves the
--- count not at all, so it proceeds. This mirrors the adapter's reconfigure
--- guard; the membership model records the floor for every path that
--- reconfigures through the model.
+-- count not at all, so it proceeds. The adapter holds the same floor at
+-- its reconfigure gate (defence in depth: a lagging model admits, the
+-- core's folded configuration still refuses), and the model's recorder
+-- (`apply_change`) refuses a floor-crossing change as its own invariant:
+-- the model never records a sub-three configuration, whatever path
+-- reaches it.
 local VOTING_MINIMUM: integer = 3
 
 local function voting_members(members: {SnapshotMember}): integer
@@ -325,6 +331,9 @@ local function voting_members(members: {SnapshotMember}): integer
     return voting
 end
 
+-- The admission predicate: true when the verb must be refused before the
+-- adapter drive -- a departure or demotion of a voter at or below the
+-- voting minimum would leave fewer than three voters.
 local function crosses_the_floor(
     members: {SnapshotMember}, action: string, id: integer
 ): boolean
@@ -490,6 +499,7 @@ return {
     member_weight = member_weight,
     quorum_reached = quorum_reached,
     voting_members = voting_members,
+    crosses_the_floor = crosses_the_floor,
     VOTING_MINIMUM = VOTING_MINIMUM,
     descriptor_model = descriptor_model,
     apply_change = apply_change,

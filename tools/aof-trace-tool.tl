@@ -17,6 +17,13 @@
 -- - distribution means use one documented summation algorithm: Neumaier
 --   compensated summation over the sorted values (compensated_sum).
 --
+-- The log-derived kinds (`hb-spacing`, `leader-lag`) read the JSON log
+-- series the observability contract produces (the leader's
+-- `heartbeat-commit` lines, the standbys' `commit-in` lines) through
+-- the repeatable `--logs PATH` flag — a log file, or a directory
+-- contributing its sorted *.log entries. A line that is not one JSON
+-- object, or misses a member it needs, is skipped, never guessed.
+--
 -- The CLI is tools/tl-driver.lua — tl gen of this module alone is NOT
 -- a CLI (the generated file only runs under the Teal loader and a
 -- plain luajit run silently no-ops). Run it from the repo root:
@@ -584,6 +591,10 @@ local function scalar_json(key: string, v: any): string
     elseif ffi.istype("uint64_t", v) then
         -- exact past 2^53: the cdata formats itself, no ULL suffix
         return ('"%s": %s'):format(key, string.format("%d", v))
+    elseif ffi.istype("int64_t", v) then
+        -- the exact signed difference of two integral ts stamps (the
+        -- python twin's int): prints as an integer, never a .0 float
+        return ('"%s": %s'):format(key, string.format("%d", v))
     elseif type(v) == "number" then
         return ('"%s": %s'):format(key, float_repr(v))
     else
@@ -649,6 +660,10 @@ local ROW_ORDER: {string: {string}} = {
     ["anchor"] = {"kind", "anchor", "ts_ms", "t_rel_ms", "t_fmt"},
     ["aof-noise"] = {"kind", "dir", "gaps", "stalls",
                      "t_rel_ms", "t_fmt"},
+    ["hb-spacing"] = {"kind", "node", "event", "min_ms", "mean_ms",
+                      "p50_ms", "p95_ms", "max_ms", "count"},
+    ["leader-lag"] = {"kind", "leader", "node", "era", "view", "slot",
+                      "leader_ms"},
 }
 
 local function ev_json(e: {string: any}): string
@@ -687,15 +702,18 @@ local function kind_wanted(kinds: string, kind: string): boolean
     return false
 end
 
--- Forward declarations: the extras (timeline/aof-noise) and
--- the anchored export read export_series, but export_series appends
--- their rows — declared here, defined below.
+-- Forward declarations: the extras (timeline/aof-noise/hb-spacing/
+-- leader-lag) and the anchored export read export_series, but
+-- export_series appends their rows — declared here, defined below.
 local timeline_rows
 local aof_noise_rows
+local hb_spacing_rows
+local leader_lag_rows
 local takeover_row
 local anchor_rows_and_takeovers
 
-local function export_series(dir_path: string, kinds: string, anchors: any, hb_ms: any): {{string: any}}
+local function export_series(dir_path: string, kinds: string, anchors: any,
+                             hb_ms: any, logs: any): {{string: any}}
     local wanted_names: {string} = {}
     local p = io.popen("ls -1 " .. dir_path .. "/*.aof 2>/dev/null")
     for f in p:lines() do
@@ -818,6 +836,16 @@ local function export_series(dir_path: string, kinds: string, anchors: any, hb_m
             floor = 5.0
         end
         for _, r in ipairs(aof_noise_rows(dir_path, floor) as {{string: any}}) do
+            events[#events + 1] = r
+        end
+    end
+    if type(logs) == "table" and kind_wanted(kinds, "hb-spacing") then
+        for _, r in ipairs(hb_spacing_rows(logs as {string}) as {{string: any}}) do
+            events[#events + 1] = r
+        end
+    end
+    if type(logs) == "table" and kind_wanted(kinds, "leader-lag") then
+        for _, r in ipairs(leader_lag_rows(logs as {string}) as {{string: any}}) do
             events[#events + 1] = r
         end
     end
@@ -1166,9 +1194,209 @@ aof_noise_rows = function(dir_path: string, hb_ms: number): {{string: any}}
     return {row}
 end
 
+-- ------------------------------------------------------ JSON log series --
+-- The observability contract's log lines (one JSON object per line):
+-- the leader logs `event="heartbeat-commit"` per heartbeat Commit it
+-- sends (its own clock in `ts`, the slot it put on the wire in `slot`),
+-- a standby logs `event="commit-in"` per Commit it accepts from its
+-- leader (its own clock in `ts`, the sender in `from`, the Commit's
+-- (era, view, slot) it keys on). The two log-derived kinds read that
+-- series; a line that is not one JSON object, or misses a member it
+-- needs, is skipped — never guessed.
+
+local LOG_EVENTS: {string: boolean} = {
+    ["heartbeat-commit"] = true,
+    ["commit-in"] = true,
+}
+
+-- The --logs surface: a file contributes itself, a directory its
+-- sorted *.log entries (the python twin's iterdir/sorted rule).
+local function log_files(paths: {string}): {string}
+    local out: {string} = {}
+    for _, p in ipairs(paths) do
+        if is_dir(p) then
+            local ph = io.popen("ls -1 " .. p .. "/*.log 2>/dev/null")
+            for f in ph:lines() do
+                out[#out + 1] = f
+            end
+            ph:close()
+        else
+            out[#out + 1] = p
+        end
+    end
+    return out
+end
+
+-- Every line of every log file, in file order (the producer emits one
+-- JSON object per line; the builders gate on the members they need).
+local function log_all_lines(paths: {string}): {string}
+    local out: {string} = {}
+    for _, path in ipairs(log_files(paths)) do
+        local fh = io.open(path, "r")
+        if fh ~= nil then
+            local data = fh:read("*a") as string
+            fh:close()
+            for line in (data .. "\n"):gmatch("(.-)\n") do
+                out[#out + 1] = line
+            end
+        end
+    end
+    return out
+end
+
+-- One line's member as a non-null value, or nil: a null saturates the
+-- same way an absent member does (the python twin's None gate).
+local function log_num(line: string, key: string): any
+    local v = json_num(line, key)
+    if v == JSON_NULL then
+        return nil
+    end
+    return v
+end
+
+-- The exact difference of two ts stamps: an integral stamp parses as
+-- cdata (exact) and the difference of two integrals stays an exact
+-- int64 (the python twin's int); a fractional stamp rides as a double
+-- on both sides (the python twin's float).
+local function ts_diff(a: any, b: any): any
+    if type(a) == "number" or type(b) == "number" then
+        return tonumber(a) - tonumber(b)
+    end
+    return ffi.new("int64_t", tonumber(a)) - ffi.new("int64_t", tonumber(b))
+end
+
+-- leader_ms: the leader's own heartbeat-commit `ts` vs the standby's
+-- commit-in `ts` for the SAME Commit exchange, joined on the
+-- (era, view, slot) both lines carry — the leader's send clock and the
+-- standby's record clock, measured, not inferred.
+leader_lag_rows = function(logs: {string}): {{string: any}}
+    local heartbeat: {string: {any}} = {}
+    local arrivals: {{string: any}} = {}
+    for _, line in ipairs(log_all_lines(logs)) do
+        if line:sub(1, 1) == "{" and line:sub(-1) == "}" then
+            local event = json_str(line, "event")
+            if LOG_EVENTS[event] == true then
+                local ts = log_num(line, "ts")
+                local era = log_num(line, "era")
+                local view = log_num(line, "view")
+                local slot = log_num(line, "slot")
+                if ts ~= nil and era ~= nil and view ~= nil and slot ~= nil then
+                    local key = tostring(era) .. "|" .. tostring(view)
+                        .. "|" .. tostring(slot)
+                    if event == "heartbeat-commit" then
+                        local node = log_num(line, "node")
+                        if node ~= nil then
+                            heartbeat[key] = {node, ts}
+                        end
+                    else
+                        local node = log_num(line, "node")
+                        local from = log_num(line, "from")
+                        if node ~= nil and from ~= nil then
+                            arrivals[#arrivals + 1] = {
+                                leader = from, node = node, era = era,
+                                view = view, slot = slot, key = key, ts = ts,
+                            }
+                        end
+                    end
+                end
+            end
+        end
+    end
+    local rows: {{string: any}} = {}
+    for _, arr in ipairs(arrivals) do
+        local sent = heartbeat[arr.key as string]
+        if sent ~= nil and sent[1] == arr.leader then
+            rows[#rows + 1] = {
+                kind = "leader-lag", leader = arr.leader, node = arr.node,
+                era = arr.era, view = arr.view, slot = arr.slot,
+                leader_ms = ts_diff(arr.ts, sent[2]),
+            }
+        end
+    end
+    table.sort(rows, function(x: {string: any}, y: {string: any}): boolean
+        local xa = {tonumber(x.leader), tonumber(x.node), tonumber(x.era),
+                    tonumber(x.view), tonumber(x.slot)}
+        local ya = {tonumber(y.leader), tonumber(y.node), tonumber(y.era),
+                    tonumber(y.view), tonumber(y.slot)}
+        for i = 1, 5 do
+            if xa[i] ~= ya[i] then
+                return (xa[i] as number) < (ya[i] as number)
+            end
+        end
+        return false
+    end)
+    return rows
+end
+
+-- The cadence between successive heartbeat-commit / commit-in lines
+-- per node: one stats row per (event, node) with two or more lines —
+-- the leader's send cadence and the standby's arrival cadence, one
+-- row each (two different clocks, never mixed).
+hb_spacing_rows = function(logs: {string}): {{string: any}}
+    local ts_by: {string: {any}} = {}
+    local meta_by: {string: {string: any}} = {}
+    for _, line in ipairs(log_all_lines(logs)) do
+        if line:sub(1, 1) == "{" and line:sub(-1) == "}" then
+            local event = json_str(line, "event")
+            if LOG_EVENTS[event] == true then
+                local ts = log_num(line, "ts")
+                local node = log_num(line, "node")
+                if ts ~= nil and node ~= nil then
+                    local key = event .. "|" .. tostring(node)
+                    local list: {any} = ts_by[key]
+                    if list == nil then
+                        list = {} as {any}
+                        ts_by[key] = list
+                        -- the original member values ride the key: the
+                        -- row's node keeps its int typing (a re-parse of
+                        -- the key string would widen it to a float)
+                        meta_by[key] = {event = event, node = node}
+                    end
+                    list[#list + 1] = ts
+                end
+            end
+        end
+    end
+    local keys: {string} = {}
+    for k, _ in pairs(ts_by) do
+        keys[#keys + 1] = k
+    end
+    table.sort(keys, function(x: string, y: string): boolean
+        local xe = (x:match("^([^|]+)") as string)
+        local xn = (x:match("|(.+)$") as string)
+        local ye = (y:match("^([^|]+)") as string)
+        local yn = (y:match("|(.+)$") as string)
+        if xe ~= ye then
+            return xe < ye
+        end
+        return tonumber(xn) < tonumber(yn)
+    end)
+    local rows: {{string: any}} = {}
+    for _, k in ipairs(keys) do
+        local list = ts_by[k]
+        if #list >= 2 then
+            local meta = meta_by[k]
+            table.sort(list, function(a: any, b: any): boolean
+                return tonumber(a) < tonumber(b)
+            end)
+            local gaps: {number} = {}
+            for i = 2, #list do
+                gaps[#gaps + 1] = tonumber(list[i]) - tonumber(list[i - 1])
+            end
+            local st = stats(gaps)
+            rows[#rows + 1] = {
+                kind = "hb-spacing", node = meta.node, event = meta.event,
+                min_ms = st.min_ms, mean_ms = st.mean_ms, p50_ms = st.p50_ms,
+                p95_ms = st.p95_ms, max_ms = st.max_ms, count = st.count,
+            }
+        end
+    end
+    return rows
+end
+
 local function export_to(out_path: string, series_dir: string, kinds: string,
-                         anchors: any, hb_ms: any): number
-    local events = export_series(series_dir, kinds, anchors, hb_ms)
+                         anchors: any, hb_ms: any, logs: any): number
+    local events = export_series(series_dir, kinds, anchors, hb_ms, logs)
     local handle = io.open(out_path, "w")
     if handle == nil then
         error("cannot write " .. out_path)
@@ -1184,10 +1412,12 @@ local function main(argv: {string}): number
     -- Usage parity with the python twin: --lib is accepted (the cdylib
     -- is loaded at require time), --json, --kind KIND (repeatable AND
     -- space-joined, union semantics — one contract with the python
-    -- twin), repeatable --anchor EPOCHMS, --hb-ms N, FILE_OR_DIR
-    -- [OUT.jsonl].
+    -- twin), repeatable --anchor EPOCHMS, repeatable --logs PATH (the
+    -- JSON log series the hb-spacing and leader-lag kinds read), --hb-ms
+    -- N, FILE_OR_DIR [OUT.jsonl].
     local follow_json = false
     local anchors: {number} = {}
+    local logs: {string} = {}
     local hb_ms = 5.0
     local paths: {string} = {}
     local kind_parts: {string} = {}
@@ -1216,6 +1446,9 @@ local function main(argv: {string}): number
         elseif a == "--anchor" then
             anchors[#anchors + 1] = tonumber(argv[i + 1])
             i = i + 2
+        elseif a == "--logs" then
+            logs[#logs + 1] = argv[i + 1]
+            i = i + 2
         elseif a == "--hb-ms" then
             hb_ms = tonumber(argv[i + 1])
             i = i + 2
@@ -1227,8 +1460,8 @@ local function main(argv: {string}): number
     local export_kinds = #kind_parts > 0 and table.concat(kind_parts, " ") or "all"
     if #paths < 1 then
         print("usage: aof-trace-tool.tl [--lib PATH] [--json] "
-            .. "[--kind KIND ...] [--anchor EPOCHMS ...] [--hb-ms N] "
-            .. "FILE_OR_DIR [OUT.jsonl]")
+            .. "[--kind KIND ...] [--anchor EPOCHMS ...] [--logs PATH ...] "
+            .. "[--hb-ms N] FILE_OR_DIR [OUT.jsonl]")
         return 2
     end
     local export_out: (string | nil) = nil
@@ -1253,7 +1486,8 @@ local function main(argv: {string}): number
             print("anchor " .. fmt_ts_ms(a))
         end
         local n = export_to(export_out, paths[1], export_kinds,
-                            #anchors > 0 and anchors or nil, hb_ms)
+                            #anchors > 0 and anchors or nil, hb_ms,
+                            #logs > 0 and logs or nil)
         print(("exported %d events to %s"):format(n, export_out))
         return 0
     end

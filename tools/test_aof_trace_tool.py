@@ -416,6 +416,86 @@ class KindCliContract(unittest.TestCase):
         self.assertEqual(kinds[-1], "aof-noise")
 
 
+def write_logs_fixture(d):
+    """The JSON log series fixture (the observability contract's shape):
+    node 66 (the leader) logging heartbeat-commit lines, node 99 (the
+    standby) logging commit-in lines, an unmatched heartbeat, a
+    fractional ts, and a non-JSON line that must be skipped."""
+    logs = d / "logs"
+    logs.mkdir()
+    base = 1789214915000
+    (logs / "n66.log").write_text("\n".join([
+        '{"level":"INFO","ts":%d,"event":"heartbeat-commit","node":66,'
+        '"era":4,"view":1,"leader":66,"state":"normal","slot":5,'
+        '"request_num":1}' % base,
+        '{"level":"INFO","ts":%d,"event":"heartbeat-commit","node":66,'
+        '"era":4,"view":1,"leader":66,"state":"normal","slot":6,'
+        '"request_num":2}' % (base + 10),
+        # an unmatched heartbeat: no commit-in carries (4, 1, 6.5)
+        '{"level":"INFO","ts":%d.5,"event":"heartbeat-commit","node":66,'
+        '"era":4,"view":1,"leader":66,"state":"normal","slot":7,'
+        '"request_num":3}' % (base + 24),
+        'not json at all',
+    ]) + "\n")
+    (logs / "n99.log").write_text("\n".join([
+        '{"level":"INFO","ts":%d,"event":"commit-in","node":99,"from":66,'
+        '"era":4,"view":1,"slot":5,"leader":66,"state":"normal"}' % (base + 2),
+        '{"level":"INFO","ts":%d,"event":"commit-in","node":99,"from":66,'
+        '"era":4,"view":1,"slot":6,"leader":66,"state":"normal"}' % (base + 15),
+    ]) + "\n")
+    return logs
+
+
+class JsonLogSeries(unittest.TestCase):
+    # The JSON log series instruments (the observability contract):
+    # leader_ms from the leader's own heartbeat-commit ts vs the standby's
+    # commit-in ts, joined on the (era, view, slot) both lines carry, and
+    # the per-(node, event) heartbeat cadence.
+    BASE_MS = 1789214915000
+
+    def setUp(self):
+        d = tool.FixtureDir()
+        self.dir, self.addCleanup = d, d.cleanup
+        self.logs = write_logs_fixture(d)
+
+    def test_leader_lag_measures_both_clocks(self):
+        out = tool.export_series(self.dir, LIB, kinds="leader-lag",
+                                 logs=[self.logs])
+        self.assertEqual(out, [
+            {"kind": "leader-lag", "leader": 66, "node": 99, "era": 4,
+             "view": 1, "slot": 5, "leader_ms": 2},
+            {"kind": "leader-lag", "leader": 66, "node": 99, "era": 4,
+             "view": 1, "slot": 6, "leader_ms": 5},
+        ], "the unmatched fractional-ts heartbeat joins to nothing")
+
+    def test_hb_spacing_per_node_and_event(self):
+        out = tool.export_series(self.dir, LIB, kinds="hb-spacing",
+                                 logs=[self.logs])
+        self.assertEqual([(r["event"], r["node"]) for r in out],
+                         [("commit-in", 99), ("heartbeat-commit", 66)])
+        standby = out[0]
+        self.assertEqual(standby["count"], 1)
+        self.assertEqual(standby["min_ms"], 13.0)
+        self.assertEqual(standby["max_ms"], 13.0)
+        leader = out[1]
+        self.assertEqual(leader["count"], 2)
+        self.assertEqual(leader["min_ms"], 10.0)
+        self.assertEqual(leader["p50_ms"], 10.0)
+        self.assertEqual(leader["p95_ms"], 14.5)
+        self.assertEqual(leader["max_ms"], 14.5,
+                         "the fractional ts line counts for cadence")
+        self.assertEqual(leader["mean_ms"], 12.25)
+
+    def test_cli_logs_flag_exports_both_kinds(self):
+        out_path = self.dir / "out.jsonl"
+        rc = tool.main(["prog", "--lib", str(LIB), "--kind", "hb-spacing leader-lag",
+                        "--logs", str(self.logs), str(self.dir), str(out_path)])
+        self.assertEqual(rc, 0)
+        kinds = [json.loads(line)["kind"] for line in out_path.read_text().splitlines()]
+        self.assertEqual(kinds, ["hb-spacing", "hb-spacing", "leader-lag",
+                                "leader-lag"])
+
+
 class LargeScaleTwinParity(unittest.TestCase):
     # Regression: the real-w1b dry run (56,385 records) drifted
     # in aof-noise gaps.mean_ms at the last repr digit — the tl twin's

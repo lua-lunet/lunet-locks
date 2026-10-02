@@ -90,18 +90,23 @@ fn header_fields(front: &[u8]) -> Option<(u32, u32, u32, u64)> {
 /// One message's trace JSON: the third CSV field. VRR datagrams carry
 /// their header fields plus the full wire bytes (the wire-as-carried
 /// evidence); application frames decode the forward kind and the
-/// embedded op; client ops are their own JSON.
-fn payload_json(chan: u8, rest: &[u8]) -> String {
+/// embedded op; client ops are their own JSON. Every node-to-node
+/// protocol line carries `received_at_ms`: the driver's wall-ms at the
+/// frame's receive — the switch fabric's own clock. The trace's
+/// continuity evidence is therefore the standby-side record, never the
+/// sender's claim; the leader's own log owns the send side, and the two
+/// clocks together separate a late send from a late record.
+fn payload_json(chan: u8, rest: &[u8], received_at_ms: u64) -> String {
     match chan {
         CHAN_VRR => match header_fields(rest) {
             Some((tag, era, view, slot)) => format!(
                 "{{\"chan\":\"vrr\",\"tag\":{tag},\"era\":{era},\"view\":{view},\
-                     \"slot\":{slot},\"len\":{},\"hex\":\"{}\"}}",
+                 \"slot\":{slot},\"received_at_ms\":{received_at_ms},\"len\":{},\"hex\":\"{}\"}}",
                 rest.len(),
                 hex(rest)
             ),
             None => format!(
-                "{{\"chan\":\"vrr\",\"len\":{},\"hex\":\"{}\"}}",
+                "{{\"chan\":\"vrr\",\"received_at_ms\":{received_at_ms},\"len\":{},\"hex\":\"{}\"}}",
                 rest.len(),
                 hex(rest)
             ),
@@ -119,7 +124,8 @@ fn payload_json(chan: u8, rest: &[u8]) -> String {
                 String::new()
             };
             format!(
-                "{{\"chan\":\"app\",\"kind\":\"{kind}\",\"len\":{},\"hex\":\"{}\",\"op\":{}}}",
+                "{{\"chan\":\"app\",\"kind\":\"{kind}\",\"received_at_ms\":{received_at_ms},\
+                 \"len\":{},\"hex\":\"{}\",\"op\":{}}}",
                 rest.len(),
                 hex(rest),
                 if op.is_empty() {
@@ -1161,7 +1167,7 @@ impl Cluster {
         let started = std::time::Instant::now();
         match chan {
             CHAN_VRR | CHAN_APP => {
-                let payload = payload_json(chan, rest);
+                let payload = payload_json(chan, rest, now);
                 let from_name = self.node_tag(from);
                 let to_name = self.node_tag(peer);
                 self.record(&from_name, &to_name, &payload);
@@ -1650,6 +1656,34 @@ fn leader_view_window(lines: &[String]) -> bool {
     }
 }
 
+/// The leader Commit stream's largest gap (the heartbeat noise floor's
+/// continuity), on the driver receive-clock column: the wall-ms the
+/// switch fabric recorded each Commit. The stamp is the fabric's own
+/// clock — the standby-side record, never the leader's send claim — so
+/// a red gap means the recorded stream broke; whether the leader SENT
+/// late is the leader's own log's question, and the two clocks
+/// together separate a late send from a late record. None when no
+/// Commit line carries the column: the verdict refuses to pass on
+/// absent evidence.
+fn max_commit_gap(lines: &[String]) -> Option<u64> {
+    let mut stamps: Vec<u64> = lines
+        .iter()
+        .filter_map(|line| parse_line(line))
+        .filter(|l| l.json.get("tag").and_then(|v| v.as_u64()) == Some(4))
+        .filter_map(|l| l.json.get("received_at_ms").and_then(|v| v.as_u64()))
+        .collect();
+    if stamps.is_empty() {
+        return None;
+    }
+    stamps.sort_unstable();
+    stamps.dedup();
+    let mut max_gap = 0;
+    for pair in stamps.windows(2) {
+        max_gap = max_gap.max(pair[1] - pair[0]);
+    }
+    Some(max_gap)
+}
+
 /// STAGE 1: a genesis two-node cluster; the driver feeds a raw GET and a
 /// raw SET down the UDS and asserts the reply shapes and the trace line
 /// shapes. This proves the host speaks ANYTHING we tell it. (A one-member
@@ -2023,6 +2057,22 @@ pub fn stage3(mut cluster: Cluster) -> Vec<Verdict> {
         format!(
             "view_change_frames={storms} leader_stable={leader_slots} window_lines={}",
             storms_window.len()
+        ),
+    ));
+    // The heartbeat noise floor: the Commit stream the standby side
+    // records stays continuous — the leader's idle heartbeat rides a
+    // Commit every follower's leader timeout re-arms on. The gap is
+    // measured on the driver receive-clock column (the fabric's own
+    // stamp — what the standby recorded), so a red names the recorded
+    // stream's break; the leader's own log separates a late send from
+    // a late record.
+    let gap = max_commit_gap(&cluster.lines);
+    out.push(verdict(
+        "stage3: heartbeat noise floor continuous",
+        gap.is_some_and(|g| g <= 5 * cluster.config.heartbeat_ms),
+        format!(
+            "max_commit_gap_ms={gap:?} heartbeat_ms={} clock=received_at_ms",
+            cluster.config.heartbeat_ms
         ),
     ));
     out

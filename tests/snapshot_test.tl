@@ -82,6 +82,77 @@ tested.test(
 )
 
 tested.test(
+    "the leader's admission floor refuses a sub-three change before the drive",
+    function()
+        local snapshot = require("snapshot")
+        local Member = snapshot.SnapshotMember
+        local function voter(id: integer, weight: integer): Member
+            return {
+                id = id,
+                weight = weight,
+                endpoint = "127.0.0.1:" .. tostring(7000 + id),
+            }
+        end
+        local three: {Member} = {voter(1, 1), voter(2, 1), voter(3, 1)}
+        local four: {Member} = {voter(1, 1), voter(2, 1), voter(3, 1), voter(4, 1)}
+        local with_learner: {Member} = {
+            voter(1, 1),
+            voter(2, 1),
+            voter(3, 1),
+            voter(9, 0),
+        }
+        tested.assert(
+            {
+                given = "three voters, a leave and a decrement of one of them",
+                should = "refuse both at admission: the host drives no floor-crossing verb",
+                expected = "true:true",
+                actual = tostring(snapshot.crosses_the_floor(three, "leave", 2))
+                    .. ":"
+                    .. tostring(snapshot.crosses_the_floor(three, "decrement", 2)),
+            }
+        )
+        tested.assert(
+            {
+                given = "four voters, the same two departures",
+                should = "admit both: four minus one stands above the floor",
+                expected = "false:false",
+                actual = tostring(snapshot.crosses_the_floor(four, "leave", 4))
+                    .. ":"
+                    .. tostring(snapshot.crosses_the_floor(four, "decrement", 4)),
+            }
+        )
+        tested.assert(
+            {
+                given = "three voters and one weight-0 learner, a leave of the learner",
+                should = "admit: a learner is not a voter, the floor counts voters only",
+                expected = "false",
+                actual = tostring(
+                    snapshot.crosses_the_floor(with_learner, "leave", 9)
+                ),
+            }
+        )
+        tested.assert(
+            {
+                given = "three voters, a join and an increment",
+                should = "admit both: the floor bounds departures only, never additions",
+                expected = "false:false",
+                actual = tostring(snapshot.crosses_the_floor(three, "join", 5))
+                    .. ":"
+                    .. tostring(snapshot.crosses_the_floor(three, "increment", 2)),
+            }
+        )
+        tested.assert(
+            {
+                given = "the admission decision taken over the pre-change model",
+                should = "touch nothing: the decision consults, the model keeps its voters",
+                expected = "3",
+                actual = tostring(snapshot.voting_members(three)),
+            }
+        )
+    end
+)
+
+tested.test(
     "the membership sidecar round-trips and refuses a malformed series",
     function()
         error(

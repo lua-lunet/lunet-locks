@@ -65,6 +65,12 @@ request/response streams are all transparent, every heartbeat commit is
 a line carrying its slot, view and era, and the slot frontier rides the
 telemetry tape as well as the log.
 
+The console's telemetry panel reads this series over the admin API: the
+`aof-console-bridge` (`--aof-dir` plus `--log-dir`) serves it at
+`/api/v1/telemetry/log`, folding the telemetry tape's slot-frontier
+records in with their envelope ns floored to ms; the loopback mock
+serves the same shape.
+
 **Loss window.** `NonBlocking` is drop-on-overflow: when a node writes
 faster than the worker drains, events are dropped, never backpressured
 and never blocking the datagram path. Events written in the last moments

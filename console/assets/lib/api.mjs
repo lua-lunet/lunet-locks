@@ -35,4 +35,8 @@ export const api = {
   breakLock: (id) => call("POST", "/locks/" + id + "/break", null, { actor: "admin@console" }),
   events: (params) => call("GET", "/events", params),
   series: (params) => call("GET", "/metrics/series", params),
+  // The telemetry panel's data source: the observability contract's JSON
+  // log series (the named protocol events plus the tape's slot-frontier
+  // records). The mock and the aof-console-bridge serve the same shape.
+  telemetryLog: (params) => call("GET", "/telemetry/log", params),
 };

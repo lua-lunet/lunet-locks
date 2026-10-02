@@ -18,9 +18,11 @@
 //! 3. Serve the console's OpenAPI shapes over loopback HTTP:
 //!    `/api/v1/health`, `/locks` (state replayed from the committed
 //!    stream), `/events` (the append-only log derived from the committed
-//!    work), `/metrics` (every message kind counted), and a live
-//!    WebSocket push at `/api/v1/live` while `--follow` re-scans the
-//!    series as it grows.
+//!    work), `/metrics` (every message kind counted), the telemetry
+//!    panel's `/telemetry/log` (the observability contract's JSON log
+//!    series — the `--log-dir` rolling `.log` files plus the telemetry
+//!    tape's slot-frontier records), and a live WebSocket push at
+//!    `/api/v1/live` while `--follow` re-scans the series as it grows.
 //!
 //! # Time at the boundary
 //!
@@ -232,12 +234,56 @@ impl BridgeMetrics {
 }
 
 /// The replay snapshot: the derived event log (ns order), the lock state,
-/// and the counters.
+/// the counters, and the telemetry panel's log series.
 #[derive(Debug, Clone, Default)]
 pub struct Replay {
     pub events: Vec<LockEvent>,
     pub state: LockState,
     pub metrics: BridgeMetrics,
+    pub log: TelemetryLog,
+}
+
+/// The console telemetry panel's data source: the observability
+/// contract's JSON log series (`docs/src/test-scaffold.md`) — every
+/// JSON-object line of the `--log-dir` rolling `.log` files (the named
+/// protocol events, each carrying `ts`), plus the telemetry tape's
+/// state-transition JSON records (the slot-frontier records, `ts`
+/// injected from the envelope ns floored to ms), in ts order.
+#[derive(Debug, Clone, Default)]
+pub struct TelemetryLog {
+    /// The ts-ordered JSON lines — every line an object carrying `ts`
+    /// and `event`.
+    pub lines: Vec<Value>,
+    /// Lines that did not parse as a JSON object carrying a `ts` (the
+    /// Lua host's stdout captured beside the node's own log) — stated,
+    /// never served.
+    pub unparsed: u64,
+}
+
+impl TelemetryLog {
+    /// The `/api/v1/telemetry/log` body: the lines in the `[from_ms,
+    /// to_ms]` window (the whole span when absent), the unparsed-neighbor
+    /// count, and the served window's own bounds.
+    pub fn to_json(&self, from_ms: Option<u64>, to_ms: Option<u64>) -> Value {
+        let lines: Vec<&Value> = self
+            .lines
+            .iter()
+            .filter(|line| {
+                let Some(ts) = line.get("ts").and_then(Value::as_u64) else {
+                    return false;
+                };
+                from_ms.is_none_or(|from| ts >= from) && to_ms.is_none_or(|to| ts <= to)
+            })
+            .collect();
+        json!({
+            "lines": lines,
+            "unparsed": self.unparsed,
+            "span": {
+                "first_ms": lines.first().and_then(|line| line["ts"].as_u64()),
+                "last_ms": lines.last().and_then(|line| line["ts"].as_u64()),
+            },
+        })
+    }
 }
 
 /// One decoded committed op: everything the replay needs.
@@ -606,6 +652,82 @@ fn series_files(dir: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+/// Read the telemetry panel's log series. The log half: every `*.log`
+/// file of `log_dir` (the daily-rolling `<node>.<date>.log` appender
+/// files, file order), every line one JSON object carrying `ts` — a line
+/// that is not one (the Lua host's stdout captured beside the node's own
+/// log) is counted `unparsed`, never served. The tape half: every
+/// telemetry state-transition record's JSON payload of the AOF series —
+/// the slot-frontier records — with `ts` injected from the envelope ns
+/// floored to ms when the payload carries none. Read-only on both halves;
+/// the writers own the files.
+fn read_telemetry_log(log_dir: Option<&Path>, aof_dir: &Path) -> TelemetryLog {
+    let mut log = TelemetryLog::default();
+
+    if let Some(dir) = log_dir {
+        let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .filter_map(|entry| entry.ok())
+                    .map(|entry| entry.path())
+                    .filter(|path| {
+                        path.is_file()
+                            && path.extension().is_some_and(|extension| extension == "log")
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        files.sort();
+        for path in files {
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                log.unparsed += 1;
+                continue;
+            };
+            for line in text.lines() {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                match serde_json::from_str::<Value>(trimmed) {
+                    Ok(value)
+                        if value.is_object()
+                            && value.get("ts").is_some_and(|ts| ts.as_u64().is_some()) =>
+                    {
+                        log.lines.push(value);
+                    }
+                    _ => log.unparsed += 1,
+                }
+            }
+        }
+    }
+
+    // The tape half: the state-transition records' JSON payloads (the
+    // slot-frontier records), ts injected from the envelope ns.
+    let mut scan = BridgeMetrics::default();
+    for file in series_files(aof_dir) {
+        for record in read_file_records(&file, &mut scan) {
+            if record.marker != Marker::TelemetryStateTransition {
+                continue;
+            }
+            let Ok(mut value) = serde_json::from_slice::<Value>(&record.payload) else {
+                continue;
+            };
+            let Some(map) = value.as_object_mut() else {
+                continue;
+            };
+            map.entry("ts".to_string())
+                .or_insert_with(|| json!(ns_to_ms(record.ns)));
+            if map.get("ts").is_some_and(|ts| ts.as_u64().is_some()) {
+                log.lines.push(value);
+            }
+        }
+    }
+
+    log.lines
+        .sort_by_key(|line| line.get("ts").and_then(Value::as_u64));
+    log
+}
+
 /// Every envelope record of one AOF file through the checksum-validating
 /// iterator and the typed envelope decoder. Unknown markers and torn
 /// entries are counted undecodable — stated, never guessed.
@@ -656,11 +778,18 @@ pub struct Server {
 
 impl Server {
     /// Spawn the server bound to `bind` (host:port; port 0 picks a free
-    /// ephemeral port). With `follow`, a background thread re-scans the
-    /// series and pushes new events to the live sockets.
-    pub fn spawn(dir: &Path, bind: &str, follow: bool) -> std::io::Result<Self> {
+    /// ephemeral port). `log_dir` names the telemetry panel's JSON log
+    /// series directory (the rolling `.log` appender files). With
+    /// `follow`, a background thread re-scans the series and pushes new
+    /// events to the live sockets.
+    pub fn spawn(
+        dir: &Path,
+        log_dir: Option<&Path>,
+        bind: &str,
+        follow: bool,
+    ) -> std::io::Result<Self> {
         let listener = TcpListener::bind(bind)?;
-        let snapshot = Arc::new(Mutex::new(replay_snapshot(dir)));
+        let snapshot = Arc::new(Mutex::new(replay_snapshot(dir, log_dir)));
         let live: Arc<Mutex<Vec<TcpStream>>> = Arc::new(Mutex::new(Vec::new()));
         let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
 
@@ -693,13 +822,14 @@ impl Server {
             // The follow thread: re-scan the series; new events push to
             // every live socket.
             let dir = dir.to_path_buf();
+            let log_dir = log_dir.map(Path::to_path_buf);
             let snapshot_follow = Arc::clone(&snapshot);
             let live_follow = Arc::clone(&live);
             let running_follow = Arc::clone(&running);
             std::thread::spawn(move || {
                 while running_follow.load(std::sync::atomic::Ordering::Relaxed) {
                     std::thread::sleep(Duration::from_millis(200));
-                    let fresh = replay_snapshot(&dir);
+                    let fresh = replay_snapshot(&dir, log_dir.as_deref());
                     let mut guard = snapshot_follow.lock().unwrap();
                     // New events: everything past the previous snapshot's
                     // length (the replay is deterministic and append-only,
@@ -742,13 +872,17 @@ impl Server {
     }
 }
 
-/// A fresh full replay of one series directory.
-fn replay_snapshot(dir: &Path) -> Replay {
+/// A fresh full replay of one series directory, with the telemetry
+/// panel's log series (`log_dir`'s rolling files plus the tape's
+/// state-transition records).
+fn replay_snapshot(dir: &Path, log_dir: Option<&Path>) -> Replay {
     let (events, state, metrics) = replay_series(dir);
+    let log = read_telemetry_log(log_dir, dir);
     Replay {
         events,
         state,
         metrics,
+        log,
     }
 }
 
@@ -788,7 +922,10 @@ fn handle_connection(
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or_default().to_string();
     let path = parts.next().unwrap_or_default().to_string();
-    let path = path.split('?').next().unwrap_or(&path).to_string();
+    let (path, query) = match path.split_once('?') {
+        Some((path, query)) => (path.to_string(), Some(query.to_string())),
+        None => (path, None),
+    };
 
     // WebSocket upgrade on /api/v1/live.
     if path == "/api/v1/live" && request.contains("Upgrade: websocket") {
@@ -813,7 +950,7 @@ fn handle_connection(
         return;
     }
 
-    let (status, body) = route(&method, &path, &snapshot);
+    let (status, body) = route(&method, &path, query.as_deref(), &snapshot);
     let response = format!(
         "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
         body.len(),
@@ -827,7 +964,12 @@ fn handle_connection(
 }
 
 /// The route table: the console's OpenAPI surface, read-only.
-fn route(method: &str, path: &str, snapshot: &Arc<Mutex<Replay>>) -> (u16, String) {
+fn route(
+    method: &str,
+    path: &str,
+    query: Option<&str>,
+    snapshot: &Arc<Mutex<Replay>>,
+) -> (u16, String) {
     if method != "GET" {
         return (
             405,
@@ -861,6 +1003,13 @@ fn route(method: &str, path: &str, snapshot: &Arc<Mutex<Replay>>) -> (u16, Strin
         }
         "/api/v1/metrics" => (200, replay.metrics.to_json().to_string()),
         "/api/v1/metrics/series" => (200, series_json(&replay, unix_millis()).to_string()),
+        "/api/v1/telemetry/log" => (
+            200,
+            replay
+                .log
+                .to_json(query_ms(query, "fromMs"), query_ms(query, "toMs"))
+                .to_string(),
+        ),
         path if path.starts_with("/api/v1/locks/") => {
             let id: u64 = path
                 .trim_start_matches("/api/v1/locks/")
@@ -894,6 +1043,14 @@ fn unix_millis() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+/// One query parameter's u64 value (the `/telemetry/log` window bounds).
+fn query_ms(query: Option<&str>, key: &str) -> Option<u64> {
+    query?.split('&').find_map(|pair| {
+        let (name, value) = pair.split_once('=')?;
+        (name == key).then(|| value.parse().ok()).flatten()
+    })
 }
 
 /// The openapi `/metrics/series` shape, derived from the event log: the

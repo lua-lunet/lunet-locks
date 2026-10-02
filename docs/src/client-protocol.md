@@ -162,13 +162,21 @@ other three name only the id:
 ```
 
 A non-leader replica forwards a verb through the ordinary redirect machinery.
-The leader drives the reconfiguration through the native adapter and answers
-with one of three acknowledgment shapes:
+The leader first applies the deployment's voting floor over its own membership
+model — a `decrement` or `leave` of a voter that would leave fewer than three
+voting members is refused at admission, before the adapter is driven — then
+drives the reconfiguration through the native adapter and answers with one of
+four acknowledgment shapes:
 
 - `{"action":"join","id":404,"accepted":true}` — the establishing operation
   committed and the leader's era advanced. The acknowledgment therefore
   arrives only after the commit and can take longer than a lock operation;
   a stop-the-world era entry in particular awaits the ordinary fence.
+- `{"action":"leave","id":404,"accepted":false,"reason":"voting-floor"}` — the
+  leader refused the verb at admission, on its own authority: it would leave
+  fewer than three voting members. The adapter was never driven and nothing
+  entered the log. The adapter holds the same floor at its reconfigure gate,
+  so a lagging leader model still cannot commit a floor-crossing change.
 - `{"action":"leave","id":404,"accepted":false}` — the core refused the
   reconfiguration (fold gate, transition-outstanding gate); nothing entered
   the log.
@@ -182,5 +190,7 @@ The operator's sequences follow the weight rules: add a member with `join`
 (the member enters at weight 0, a learner) then `increment` (the learner
 becomes a voter); remove a member with `decrement` (the voter returns to
 weight 0), wait for that era to commit, then `leave` — a leave of a member
-above weight 0 is refused. Ids are the deployment descriptor's
+above weight 0 is refused, and a `decrement` or `leave` that would leave
+fewer than three voters is refused at the leader's admission with the
+`voting-floor` acknowledgment. Ids are the deployment descriptor's
 admin-assigned, never-recycled member ids.

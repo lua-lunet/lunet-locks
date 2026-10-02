@@ -2,21 +2,6 @@
 //! facts, the commit gate's refusal, and the recorder's tape mechanics.
 //! These run under the `flight-recorder` feature only.
 
-use super::*;
-
-fn temp_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "lunet-flight-{name}-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    dir
-}
-
 /// The first record of every flight recording is the header, and it names
 /// the commit hash this very build was compiled from.
 #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
@@ -113,11 +98,4 @@ fn an_open_over_the_rotation_threshold_rotates_before_the_fresh_header() {
     panic!(
         "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
     )
-}
-
-/// The seq values of one tape's event records (the header carries none).
-fn seqs_of(text: &str) -> Vec<u64> {
-    text.lines()
-        .filter_map(|line| serde_json::from_str::<Value>(line).unwrap()["seq"].as_u64())
-        .collect()
 }

@@ -8,89 +8,6 @@
 
 #![cfg(feature = "flight-recorder")]
 
-use lunet_advisory_lock::flight::{self, FlightReadError, FlightRecorder};
-use lunet_advisory_lock::{Node, OK};
-use serde_json::Value;
-use std::sync::Mutex;
-use uuid::Uuid;
-
-/// The env var is process-global; every test serializes on this lock so
-/// the nodes under test never read a foreign flight directory.
-static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-fn members() -> String {
-    ["10:n1", "11:n2", "12:n3"].join("\0")
-}
-
-fn temp_dir(name: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "lunet-flight-test-{name}-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
-
-fn request_json(message_id: Uuid) -> Vec<u8> {
-    serde_json::to_vec(&lunet_advisory_lock::locks::Request::Get {
-        message_id,
-        client_id: 11,
-        request_num: 13,
-        lock_id: 17,
-    })
-    .unwrap()
-}
-
-/// One flight-taped node, driven, with its recording read back as parsed
-/// JSON lines. The env is restored before the lock drops.
-fn record_a_node(name: &str) -> (Vec<Value>, std::path::PathBuf) {
-    let guard = ENV_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let dir = temp_dir(name);
-    // SAFETY: the ENV_LOCK serializes every env access in this process;
-    // no other test thread reads the flight dir var concurrently.
-    unsafe {
-        std::env::set_var(flight::FLIGHT_DIR_ENV, &dir);
-    }
-    let mut node = Node::open(
-        &members(),
-        "n1",
-        dir.join("state").to_str().unwrap(),
-        None,
-        0,
-        lunet_advisory_lock::PRIMARY_TIMEOUT_MS,
-    )
-    .expect("the node boots");
-    // The genesis primary self-promotes on its first tick, then one
-    // client request: propose → publish → the prepare Send leaves
-    // the node. The host drains the queued sends (each pop records the
-    // emission byte-exact). The stop path writes its markers and drains
-    // the sink.
-    assert_eq!(node.idle(), OK);
-    let code = node.request(&request_json(Uuid::from_bytes([42; 16])));
-    assert_eq!(code, OK);
-    while node.next_output().is_some() {}
-    assert_eq!(node.stop(), OK);
-    unsafe {
-        std::env::remove_var(flight::FLIGHT_DIR_ENV);
-    }
-    drop(guard);
-
-    let path = dir.join("flight-10.jsonl");
-    let text = std::fs::read_to_string(&path).expect("the recording exists");
-    let lines: Vec<Value> = text
-        .lines()
-        .map(|line| serde_json::from_str(line).expect("every line is one JSON record"))
-        .collect();
-    (lines, dir)
-}
-
 /// The FIRST record of every flight recording is the header, naming the
 /// commit hash this build was compiled from.
 #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
@@ -154,8 +71,3 @@ fn the_flight_file_lives_one_per_node_in_the_env_dir() {
         "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
     )
 }
-
-/// Unused in the flag-OFF build (the whole file is cfg'd out there); the
-/// recorder type keeps the import honest.
-#[allow(unused)]
-fn _type_surface(_: fn(u32) -> Option<FlightRecorder>) {}

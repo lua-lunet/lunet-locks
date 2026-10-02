@@ -112,7 +112,13 @@ authentication, and any client that can acquire locks can propose membership
 changes to the leader.
 
 A non-leader replica forwards a verb through the ordinary
-forward/redirect machinery. The leader drives the reconfiguration through
+forward/redirect machinery. Before the drive, the leader applies the
+deployment's voting floor over its own membership model: a `decrement` or
+`leave` of a voter that would leave fewer than three voting members is
+refused at admission, on the host's own authority — the adapter is never
+asked and nothing enters the log. The adapter holds the same floor at its
+reconfigure gate, so a lagging leader model cannot drive a floor-crossing
+change past the core. The leader then drives the reconfiguration through
 the native ABI (`Input::Reconfigure` with the operation the verb names —
 `Join` at weight 0, `Increment`, `Decrement`, or `Leave`), deriving the
 non-stop overlap pivot with the core's own `construct_pivot` against the
@@ -128,6 +134,10 @@ The acknowledgment shapes are exact:
   only after the establishing commit has advanced the leader's era (the
   leader polls its status, whose era comes from the core's folded
   configuration);
+- a floor-crossing verb answers
+  `{"action":...,"id":...,"accepted":false,"reason":"voting-floor"}` — the
+  leader refused it at admission, before the adapter was driven; nothing
+  entered the log;
 - a core refusal (fold gate, transition-outstanding gate, poisoned replica)
   answers `{"action":...,"id":...,"accepted":false}` — nothing entered the
   log;
@@ -147,7 +157,10 @@ The operator's sequences follow the core's weight rules:
   `increment` (the learner becomes a voter);
 - to remove a member: `decrement` (the voter returns to weight 0), wait for
   that era to commit, then `leave` — a leave of a member above weight 0 is
-  refused by the core's fold gate and reported as a rejected verb.
+  refused by the core's fold gate and reported as a rejected verb. A
+  `decrement` or `leave` that would leave fewer than three voters is
+  refused at the leader's admission with the `voting-floor` acknowledgment,
+  and again at the adapter's reconfigure gate.
 
 Endpoint addressing moves with two of the verbs. A `join` adds the joining
 member's addressing row on every replica: the leader adds it before driving
@@ -340,6 +353,26 @@ of ingestion order.
 See [the event journal reference](event-journal.md) for record and metafile
 byte layouts, file naming, resume-on-reopen semantics, corrupt-tail
 tolerance, and the full console catch-up model.
+
+## The console telemetry panel
+
+The console's telemetry view charts the observability contract's JSON log
+series ([the test scaffold](test-scaffold.md)): the named protocol events —
+the heartbeat cadence (`heartbeat-commit`, `commit-in`), the timeout events
+(`leader-timeout-detect` with its measured silence, `election-wait-fire`
+with its armed wait), the NOMINATE traffic, the lease grants — plus the
+telemetry tape's `slot-frontier` records. The panel reads the series over
+the admin API at `GET /api/v1/telemetry/log` ([the OpenAPI
+contract](../console/openapi.yaml)), with optional `fromMs`/`toMs` window
+bounds. The loopback mock and the `aof-console-bridge`
+(`--aof-dir` plus `--log-dir`) serve the same shape: the bridge reads the
+daily-rolling `<node>.<date>.log` appender files and folds the tape's
+state-transition records in with their envelope ns floored to ms. The
+charts are the ones the series carries: the per-node heartbeat arrival
+intervals (1 s candlestick buckets), the detection silences and election
+waits over time, and the per-node slot frontiers. A line that is not a
+JSON object carrying `ts` (the Lua host's stdout captured beside a node's
+own log) is counted `unparsed`, never served.
 
 ## The lock telemetry capture file: the write-behind series
 

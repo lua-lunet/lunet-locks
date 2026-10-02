@@ -5,12 +5,14 @@
 //!
 //! ```text
 //! skaffold_aof_tape --dir PATH [--recorder N] [--from N] [--to N]
-//!                   [--from-any] [--to-any] [--kinds KINDS] [--out PATH]
+//!                   [--from-any] [--to-any] [--kinds KINDS] [--logs PATH]
+//!                   [--out PATH]
 //! ```
 //!
 //! The acceptance shape: the plain output feeds a shell filter
-//! directly — `skaffold_aof_tape --dir D --recorder 99 | grep "^66,99,"`
-//! reads the leader-66 → node-99 stream as raw jsonl lines.
+//! directly — `skaffold_aof_tape --dir D --recorder 99 --logs L
+//! | grep "^66,99,"` reads the leader-66 → node-99 stream as raw jsonl
+//! lines (the sender named by the recorder's own commit-in log lines).
 
 use lease_sequencer::tape::{Kind, TapeOptions, stream_dir};
 use std::io::{BufWriter, Write};
@@ -21,20 +23,24 @@ const HELP: &str = "\
 skaffold_aof_tape — stream a rig telemetry AOF directory as the replay tape
 
 usage: skaffold_aof_tape --dir PATH [--recorder N] [--from N] [--to N]
-                         [--from-any] [--to-any] [--kinds KINDS] [--out PATH]
+                         [--from-any] [--to-any] [--kinds KINDS] [--logs PATH]
+                         [--out PATH]
 
 The output: one CSV line per record, `from,to,{jsonl}`, stdout (or --out),
 in file order (epoch order = ns order). The trivial shell filter works on
 the plain output:
 
-  skaffold_aof_tape --dir .tmp/telemetry/run4/dc3 | grep '^66,99,'
+  skaffold_aof_tape --dir .tmp/telemetry/run4/dc3 --recorder 99 --logs logs | grep '^66,99,'
 
-from/to derivation rules (the envelope carries no sender; the endpoints
-come from what each record actually carries):
+from/to derivation rules (the endpoints come from what each record
+actually carries):
 
   marker-1 wire      to = the recorder's node id;
-                     from = '?' — the wire header (tag|era|view|slot) names
-                     no sender.
+                     from = the sender the recorder's own commit-in
+                     JSON log line names for the frame's (era, view,
+                     slot), when --logs supplies the recorder's JSON
+                     log series (the join claims Commit frames only);
+                     else '?' — never guessed.
   marker-2 decision  from = the recorder (the deciding node), to = the
                      recorder.
   marker-3 transition from = the recorder, to = the recorder.
@@ -60,6 +66,10 @@ flags:
   --kinds KINDS     a comma/space-joined union of
                     wire|decision|transition|outbound|all.
                     Default: all.
+  --logs PATH       the recorder's JSON log series (repeatable): a log
+                    file, or a directory contributing its sorted *.log
+                    entries. The wire rows' sender is derived from the
+                    commit-in lines' 'from' member.
   --out PATH        write the tape to PATH (else stdout).
   --help            this text.
 ";
@@ -107,6 +117,7 @@ fn main() {
             "--from-any" => options.from_any = true,
             "--to-any" => options.to_any = true,
             "--kinds" => kind_text.push_str(&value("--kinds")),
+            "--logs" => options.logs.push(PathBuf::from(value("--logs"))),
             "--out" => out = Some(PathBuf::from(value("--out"))),
             other => die(&format!("unknown option {other} (see --help)")),
         }

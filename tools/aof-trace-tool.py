@@ -13,6 +13,13 @@
 # - distribution means use one documented summation algorithm: Neumaier
 #   compensated summation over the sorted values (_compensated_sum).
 #
+# The log-derived kinds (`hb-spacing`, `leader-lag`) read the JSON log
+# series the observability contract produces (the leader's
+# `heartbeat-commit` lines, the standbys' `commit-in` lines) through the
+# repeatable `--logs PATH` flag — a log file, or a directory contributing
+# its sorted *.log entries. A line that does not parse, or misses a
+# member it needs, is skipped, never guessed.
+#
 # The LuaJIT twin's CLI is tools/tl-driver.lua (tl gen of the .tl alone
 # is NOT a CLI — it silently no-ops). Run it from the repo root:
 #   LUA_PATH="./?.tl;./?.lua;.rocks/share/lua/5.1/?.lua;;" \
@@ -493,6 +500,99 @@ def _aof_noise_rows(dir_path, lib=None, hb_ms=5.0) -> list:
     return rows
 
 
+# --------------------------------------------------- the JSON log series ----
+# The observability contract's log lines (one JSON object per line): the
+# leader logs `event="heartbeat-commit"` per heartbeat Commit it sends
+# (its own clock in `ts`, the slot it put on the wire in `slot`), a
+# standby logs `event="commit-in"` per Commit it accepts from its leader
+# (its own clock in `ts`, the sender in `from`, the Commit's
+# (era, view, slot) it keys on). The two log-derived kinds read that
+# series; a line that does not parse, or misses a member it needs, is
+# skipped — never guessed.
+
+LOG_EVENTS = ("heartbeat-commit", "commit-in")
+
+
+def _log_files(paths) -> list:
+    # The --logs surface: a file contributes itself, a directory its
+    # sorted *.log entries.
+    out = []
+    for p in paths or []:
+        p = Path(str(getattr(p, "path", p)))
+        if p.is_dir():
+            out += sorted(q for q in p.iterdir() if q.name.endswith(".log"))
+        else:
+            out.append(p)
+    return out
+
+
+def _log_lines(paths):
+    # Every JSON-object line of the --logs surface, in file order.
+    for path in _log_files(paths):
+        for line in Path(path).read_text().splitlines():
+            try:
+                value = json.loads(line)
+            except (ValueError, UnicodeDecodeError):
+                continue
+            if isinstance(value, dict):
+                yield value
+
+
+def _leader_lag_rows(paths) -> list:
+    # leader_ms: the leader's own heartbeat-commit `ts` vs the standby's
+    # commit-in `ts` for the SAME Commit exchange, joined on the
+    # (era, view, slot) both lines carry — the leader's send clock and
+    # the standby's record clock, measured, not inferred.
+    heartbeat = {}
+    arrivals = []
+    for value in _log_lines(paths):
+        event = value.get("event")
+        if event not in LOG_EVENTS or value.get("ts") is None:
+            continue
+        key = (value.get("era"), value.get("view"), value.get("slot"))
+        if None in key:
+            continue
+        if event == "heartbeat-commit":
+            if value.get("node") is not None:
+                heartbeat[key] = (value["node"], value["ts"])
+        elif value.get("node") is not None and value.get("from") is not None:
+            arrivals.append((value["from"], value["node"], key, value["ts"]))
+    rows = []
+    for leader, node, (era, view, slot), ts in arrivals:
+        sent = heartbeat.get((era, view, slot))
+        if sent is None or sent[0] != leader:
+            continue
+        rows.append({"kind": "leader-lag", "leader": leader, "node": node,
+                     "era": era, "view": view, "slot": slot,
+                     "leader_ms": ts - sent[1]})
+    rows.sort(key=lambda r: (r["leader"], r["node"], r["era"], r["view"],
+                             r["slot"]))
+    return rows
+
+
+def _hb_spacing_rows(paths) -> list:
+    # The cadence between successive heartbeat-commit / commit-in lines
+    # per node: one stats row per (event, node) with two or more lines —
+    # the leader's send cadence and the standby's arrival cadence, one
+    # row each (two different clocks, never mixed).
+    ts_by: dict = {}
+    for value in _log_lines(paths):
+        event = value.get("event")
+        if (event in LOG_EVENTS and value.get("ts") is not None
+                and value.get("node") is not None):
+            ts_by.setdefault((event, value["node"]), []).append(value["ts"])
+    rows = []
+    for (event, node) in sorted(ts_by):
+        ts_list = ts_by[(event, node)]
+        if len(ts_list) < 2:
+            continue
+        ts_list.sort()
+        gaps = [b - a for a, b in zip(ts_list, ts_list[1:])]
+        rows.append({"kind": "hb-spacing", "node": node, "event": event,
+                     **_stats(gaps)})
+    return rows
+
+
 def _anchor_rows_and_takeovers(events, anchors):
     """The anchored export: time columns on every row, anchor echoes
     first, then takeover summary lines when the locks-timeline ran."""
@@ -518,16 +618,20 @@ def _anchor_rows_and_takeovers(events, anchors):
             takeovers.append(_takeover_row(window, a))
     return echoes + timed + takeovers
 
-def export_series(dir_path, lib=None, kinds="all", anchors=None, hb_ms=5.0):
+def export_series(dir_path, lib=None, kinds="all", anchors=None, hb_ms=5.0,
+                  logs=None):
     """The trace of what happened: one JSON dict per line-worthy event,
     ordered as the trace recorded them (file order = epoch order = ns
     order). Kinds: all | both (reconfig+locks) | timeouts |
-    reconfig | locks | locks-timeline | aof-noise; the
-    kinds string is a whitespace-joined UNION (the repeatable --kind
-    CLI flag accumulates into it, one contract with the LuaJIT twin).
-    With anchors (unix ms, repeatable), every exported row gains
-    t_rel_ms / t_fmt and the locks-timeline export gains per-anchor
-    takeover summary lines."""
+    reconfig | locks | locks-timeline | aof-noise | hb-spacing |
+    leader-lag; the kinds string is a whitespace-joined UNION (the
+    repeatable --kind CLI flag accumulates into it, one contract with
+    the LuaJIT twin). With anchors (unix ms, repeatable), every exported
+    row gains t_rel_ms / t_fmt and the locks-timeline export gains
+    per-anchor takeover summary lines. The log-derived kinds
+    (hb-spacing, leader-lag) read the JSON log series supplied as
+    `logs` (the repeatable --logs CLI flag: a log file, or a directory
+    contributing its sorted *.log entries)."""
     dir_path = Path(str(getattr(dir_path, "path", dir_path)))
     wanted = set(kinds.split()) if kinds != "all" else {"locks", "reconfig", "timeouts"}
     if kinds == "both":
@@ -593,19 +697,23 @@ def export_series(dir_path, lib=None, kinds="all", anchors=None, hb_ms=5.0):
         events += _timeline_rows(dir_path, lib)
     if "aof-noise" in wanted:
         events += _aof_noise_rows(dir_path, lib, hb_ms)
+    if "hb-spacing" in wanted:
+        events += _hb_spacing_rows(logs)
+    if "leader-lag" in wanted:
+        events += _leader_lag_rows(logs)
     if anchors:
         events = _anchor_rows_and_takeovers(events, anchors)
     return events
 
 
 KINDS = ("all", "both", "timeouts", "reconfig", "locks",
-         "locks-timeline", "aof-noise")
+         "locks-timeline", "aof-noise", "hb-spacing", "leader-lag")
 
 
 def export_to(path_out: str, series_dir, lib=None, kinds="all",
-              anchors=None, hb_ms=5.0):
+              anchors=None, hb_ms=5.0, logs=None):
     events = export_series(series_dir, lib, kinds,
-                           anchors=anchors, hb_ms=hb_ms)
+                           anchors=anchors, hb_ms=hb_ms, logs=logs)
     with open(path_out, "w") as handle:
         for line in events:
             handle.write(json.dumps(line) + "\n")
@@ -618,6 +726,7 @@ def main(argv):
     follow_json = False
     export_out = None
     anchors = []
+    logs = []
     hb_ms = 5.0
     paths = []
     kind_parts: list = []  # --kind is repeatable AND space-joined: union
@@ -641,6 +750,11 @@ def main(argv):
         elif args[i] == "--anchor":
             anchors.append(int(args[i + 1]))
             i += 2
+        elif args[i] == "--logs":
+            # the JSON log series the hb-spacing and leader-lag kinds
+            # read: a log file, or a directory of them (repeatable).
+            logs.append(args[i + 1])
+            i += 2
         elif args[i] == "--hb-ms":
             hb_ms = float(args[i + 1])
             i += 2
@@ -653,15 +767,15 @@ def main(argv):
         paths = paths[:1]
     if not paths:
         print("usage: aof-trace-tool.py [--lib PATH] [--json] "
-              "[--kind KIND ...] [--anchor EPOCHMS ...] [--hb-ms N] "
-              "FILE_OR_DIR [OUT.jsonl]")
+              "[--kind KIND ...] [--anchor EPOCHMS ...] [--logs PATH ...] "
+              "[--hb-ms N] FILE_OR_DIR [OUT.jsonl]")
         return 2
     lib = load(lib_path)
     if export_out is not None:
         for a in sorted(anchors):
             print(f"anchor {fmt_ts_ms(a)}")
         n = export_to(export_out, Path(paths[0]), lib, export_kinds,
-                      anchors=anchors, hb_ms=hb_ms)
+                      anchors=anchors, hb_ms=hb_ms, logs=logs)
         print(f"exported {n} events to {export_out}")
         return 0
     for p in paths:

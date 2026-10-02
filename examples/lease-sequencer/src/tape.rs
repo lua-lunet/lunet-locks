@@ -13,12 +13,17 @@
 //!
 //! The telemetry envelope carries no sender: the wire header's 20-byte
 //! prefix is `tag(4 BE) era(4) view(4) slot(8)` and uVRR's wire contract
-//! names no sender (the receiver derives it from the socket). The tape
-//! derives the endpoint labels from what each record actually carries:
+//! names no sender on the datagram. The tape derives the endpoint labels
+//! from what each record actually carries:
 //!
 //! - marker-1 `Wire` (a raw uVRR datagram the recorder RECEIVED):
-//!   `to` = the recorder's node id; `from` = `?` — no datagram names a
-//!   sender on the wire (a Prepare, a NewState, and a Commit alike).
+//!   `to` = the recorder's node id; `from` = the sender the recorder's
+//!   own `commit-in` JSON log line names for the frame's
+//!   `(era, view, slot)`, when `--logs` supplies the recorder's JSON
+//!   log series (the observability contract: a standby logs one line
+//!   per Commit it accepts from its leader, the sender in its `from`
+//!   member) — the join claims Commit frames only, and a frame with no
+//!   matching line keeps `?`, never guessed.
 //! - marker-2 `TelemetryTimeoutDecision`: `from` = the recorder (the
 //!   deciding node), `to` = the recorder.
 //! - marker-3 `TelemetryStateTransition`: `from` = the recorder, `to` =
@@ -41,8 +46,9 @@
 use lunet_locks_aof::envelope::{Marker, Record};
 use lunet_locks_aof::retention;
 use serde_json::{Map, Value};
+use std::collections::HashMap;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// The wire tag table (uVRR `wire.rs`), for the line's honest `tag`.
 pub fn tag_name(tag: u32) -> &'static str {
@@ -92,6 +98,10 @@ pub struct TapeOptions {
     /// dropped unless `to_any`.
     pub to: Option<u32>,
     pub to_any: bool,
+    /// The recorder's JSON log series (the repeatable `--logs` flag): a
+    /// log file, or a directory contributing its sorted `*.log` entries.
+    /// The wire rows' sender is derived from the `commit-in` lines.
+    pub logs: Vec<PathBuf>,
     /// The marker kinds to keep; empty keeps every kind.
     pub kinds: Vec<Kind>,
 }
@@ -223,6 +233,65 @@ fn series(dir: &Path) -> Vec<lunet_locks_aof::retention::ListedAofFile> {
     retention::list_aof_files(dir).unwrap_or_default()
 }
 
+/// The `--logs` surface expanded: a file contributes itself, a directory
+/// its sorted `*.log` entries.
+fn log_files(paths: &[PathBuf]) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for path in paths {
+        if path.is_dir() {
+            let mut entries: Vec<PathBuf> = std::fs::read_dir(path)
+                .into_iter()
+                .flatten()
+                .filter_map(|entry| entry.ok())
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.is_file()
+                        && path
+                            .file_name()
+                            .is_some_and(|name| name.as_encoded_bytes().ends_with(b".log"))
+                })
+                .collect();
+            entries.sort();
+            out.extend(entries);
+        } else {
+            out.push(path.clone());
+        }
+    }
+    out
+}
+
+/// The wire rows' senders, from the recorder's own JSON log series: one
+/// `(era, view, slot) -> from` entry per `commit-in` line (the arrival
+/// line a standby logs for every Commit it accepts from its leader, the
+/// sender in its `from` member). A line that does not parse, or misses
+/// a member, is skipped — never guessed.
+fn senders_from_logs(paths: &[PathBuf]) -> HashMap<(u32, u32, u64), u32> {
+    let mut senders = HashMap::new();
+    for path in log_files(paths) {
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for line in text.lines() {
+            let Ok(value) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
+            if value.get("event").and_then(Value::as_str) != Some("commit-in") {
+                continue;
+            }
+            let (Some(from), Some(era), Some(view), Some(slot)) = (
+                value.get("from").and_then(Value::as_u64),
+                value.get("era").and_then(Value::as_u64),
+                value.get("view").and_then(Value::as_u64),
+                value.get("slot").and_then(Value::as_u64),
+            ) else {
+                continue;
+            };
+            senders.insert((era as u32, view as u32, slot), from as u32);
+        }
+    }
+    senders
+}
+
 /// Streams one telemetry AOF directory as the tape: one `from,to,{json}`
 /// line per record, in file order, through `out`. Returns the counts.
 pub fn stream_dir(
@@ -231,6 +300,7 @@ pub fn stream_dir(
     out: &mut dyn Write,
 ) -> std::io::Result<TapeCounts> {
     let recorder = options.recorder;
+    let senders = senders_from_logs(&options.logs);
     let wanted: Option<Vec<Kind>> = if options.kinds.is_empty() {
         None
     } else {
@@ -265,7 +335,7 @@ pub fn stream_dir(
             {
                 continue;
             }
-            let Some(line) = tape_line(kind, ns, &record.payload, recorder) else {
+            let Some(line) = tape_line(kind, ns, &record.payload, recorder, &senders) else {
                 counts.unnamed += 1;
                 continue;
             };
@@ -315,8 +385,15 @@ fn keeps(line: &TapeLine, options: &TapeOptions) -> bool {
     true
 }
 
-/// One record's tape line from its kind, clock, and payload bytes.
-pub fn tape_line(kind: Kind, ns: u64, payload: &[u8], recorder: Option<u32>) -> Option<TapeLine> {
+/// One record's tape line from its kind, clock, payload bytes, and the
+/// wire senders table (the `commit-in` join; empty when no `--logs`).
+pub fn tape_line(
+    kind: Kind,
+    ns: u64,
+    payload: &[u8],
+    recorder: Option<u32>,
+    senders: &HashMap<(u32, u32, u64), u32>,
+) -> Option<TapeLine> {
     let recorder_text = recorder.map(|id| id.to_string());
     let ts_ms = ns / 1_000_000;
     let mut json = Map::new();
@@ -338,9 +415,20 @@ pub fn tape_line(kind: Kind, ns: u64, payload: &[u8], recorder: Option<u32>) -> 
                 json.insert("lock".into(), Value::Object(lock));
             }
             json.insert("frame_hex".into(), Value::from(hex(payload)));
+            // The sender the recorder's own commit-in log line names for
+            // this frame's (era, view, slot) — the join claims Commits
+            // only (the arrival line is a Commit's), never a guessed id.
+            let from = if body.tag == 4 {
+                senders
+                    .get(&(body.era, body.view, body.slot))
+                    .map(|id| id.to_string())
+            } else {
+                None
+            }
+            .unwrap_or_else(|| "?".to_string());
             let to = recorder_text.clone()?;
             Some(TapeLine {
-                from: "?".to_string(),
+                from,
                 to,
                 json: Value::Object(json),
             })
@@ -405,4 +493,104 @@ fn hex(bytes: &[u8]) -> String {
         text.push_str(&format!("{byte:02x}"));
     }
     text
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lunet_locks_aof::{AofFile, Options};
+    use std::path::Path;
+
+    /// One uVRR Commit frame: tag(4 BE) | era | view | slot, the body
+    /// discriminant repeating the tag's low byte, the committed frontier.
+    fn commit_frame(era: u32, view: u32, slot: u64) -> Vec<u8> {
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&4u32.to_be_bytes());
+        frame.extend_from_slice(&era.to_be_bytes());
+        frame.extend_from_slice(&view.to_be_bytes());
+        frame.extend_from_slice(&slot.to_be_bytes());
+        frame.push(4);
+        frame.extend_from_slice(&slot.to_be_bytes());
+        frame
+    }
+
+    /// One uVRR Prepare frame: the 20-byte header plus the tag's low byte.
+    fn prepare_frame(era: u32, view: u32, slot: u64) -> Vec<u8> {
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&2u32.to_be_bytes());
+        frame.extend_from_slice(&era.to_be_bytes());
+        frame.extend_from_slice(&view.to_be_bytes());
+        frame.extend_from_slice(&slot.to_be_bytes());
+        frame.push(2);
+        frame
+    }
+
+    /// The wire rows' sender, restored from the recorder's own JSON log
+    /// lines: the `commit-in` line names the sender (`from`) keyed by the
+    /// `(era, view, slot)` the Commit wire record's header carries. A
+    /// frame with no matching line keeps `?` — never guessed.
+    #[test]
+    fn wire_row_sender_comes_from_the_commit_in_log_lines() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.tmp/tape-sender-test");
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("aof");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut file = AofFile::open_with(
+            &dir,
+            Options {
+                force_flush: false,
+                retention_bytes: u64::MAX / 2,
+            },
+        )
+        .unwrap();
+        // A Commit the recorder's logs name (era 4, view 1, slot 5, from
+        // 66), a Commit they do not (slot 6), and a Prepare (slot 7) the
+        // commit-in join never claims — only Commits carry the arrival.
+        file.append(&Record::wire(1_000, &commit_frame(4, 1, 5)).encode())
+            .unwrap();
+        file.append(&Record::wire(2_000, &commit_frame(4, 1, 6)).encode())
+            .unwrap();
+        file.append(&Record::wire(3_000, &prepare_frame(4, 1, 7)).encode())
+            .unwrap();
+        file.close().unwrap();
+        let logs = root.join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::write(
+            logs.join("n99.log"),
+            concat!(
+                "{\"level\":\"INFO\",\"ts\":1789214915002,\"event\":\"commit-in\",",
+                "\"node\":99,\"from\":66,\"era\":4,\"view\":1,\"slot\":5,",
+                "\"leader\":66,\"state\":\"normal\"}\n",
+                "not json at all\n",
+            ),
+        )
+        .unwrap();
+        let options = TapeOptions {
+            recorder: Some(99),
+            logs: vec![logs],
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        let counts = stream_dir(&dir, &options, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(counts.lines, 3, "{counts:?}");
+        assert_eq!(
+            lines[0].split(',').take(2).collect::<Vec<_>>(),
+            vec!["66", "99"],
+            "the sender is the commit-in line's from: {}",
+            lines[0]
+        );
+        assert!(
+            lines[1].starts_with("?,99,"),
+            "no matching commit-in line: never guessed: {}",
+            lines[1]
+        );
+        assert!(
+            lines[2].starts_with("?,99,"),
+            "the join claims Commits only, never a Prepare: {}",
+            lines[2]
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
 }

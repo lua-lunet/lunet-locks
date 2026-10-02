@@ -185,7 +185,7 @@ paths:
       parameters:
         - { name: fromMs, in: query, schema: { type: integer, format: int64 }, description: 'Start of window; defaults to now − 1h' }
         - { name: toMs, in: query, schema: { type: integer, format: int64 }, description: 'End of window; defaults to now' }
-        - { name: bucketMs, in: query, schema: { type: integer, format: int64, default: 5000 } }
+        - { name: bucketMs, in: query, schema: { type: integer, format: int64 }, default: 5000 }
       responses:
         '200':
           description: Time-ordered buckets
@@ -199,6 +199,39 @@ paths:
                   buckets:
                     type: array
                     items: { $ref: '#/components/schemas/Bucket' }
+  /telemetry/log:
+    get:
+      summary: The telemetry panel's log series (the observability contract's JSON lines)
+      operationId: getTelemetryLog
+      tags: [metrics]
+      description: |-
+        The ts-ordered JSON log lines of the observability contract: the
+        named protocol events (heartbeat-commit, commit-in,
+        leader-timeout-detect, election-wait-fire, nominate-out/in,
+        lease-grant, forward-*, late-ack) from the daily-rolling
+        `<node>.<date>.log` appender files, plus the telemetry tape's
+        state-transition records (the slot-frontier records) with their
+        envelope ns floored to ms. A line that is not a JSON object
+        carrying `ts` (the Lua host's stdout captured beside a node's own
+        log) is counted `unparsed`, never served. Served by the loopback
+        mock and the aof-console-bridge with the same shape.
+      parameters:
+        - { name: fromMs, in: query, schema: { type: integer, format: int64 }, description: 'Start of window; the whole span when absent' }
+        - { name: toMs, in: query, schema: { type: integer, format: int64 }, description: 'End of window; the whole span when absent' }
+      responses:
+        '200':
+          description: The ts-ordered series with the unparsed-neighbor count and the served span
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [lines, unparsed, span]
+                properties:
+                  lines:
+                    type: array
+                    items: { $ref: '#/components/schemas/LogLine' }
+                  unparsed: { type: integer, description: Lines counted, not served (not a JSON object carrying ts) }
+                  span: { $ref: '#/components/schemas/TelemetrySpan' }
 components:
   securitySchemes:
     basicAuth:
@@ -291,3 +324,30 @@ components:
         expire: { type: integer }
         break: { type: integer }
         deny: { type: integer }
+    LogLine:
+      type: object
+      description: |-
+        One observability-contract JSON log line, the event's own fields
+        flattened into the root object beside `ts`, `level` and `event`.
+        `era` and `view` ride every line that concerns the protocol; the
+        tape's state-transition records carry the injected `ts` (the
+        envelope ns floored to ms) and no `level`.
+      additionalProperties: true
+      required: [ts, event]
+      properties:
+        ts: { type: integer, format: int64, description: The host's millis clock }
+        event: { type: string, description: The event's name (the series' named events) }
+        level: { type: string, enum: [INFO, WARN, ERROR, DEBUG, TRACE] }
+        node: { type: integer, description: The emitting node's id }
+        era: { type: integer }
+        view: { type: integer }
+        slot: { type: integer, format: int64 }
+        leader: { type: integer }
+        state: { type: string }
+        message: { type: string }
+    TelemetrySpan:
+      type: object
+      required: [first_ms, last_ms]
+      properties:
+        first_ms: { type: integer, format: int64, nullable: true, description: The served series' first ts; null when empty }
+        last_ms: { type: integer, format: int64, nullable: true, description: The served series' last ts; null when empty }

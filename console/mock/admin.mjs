@@ -225,6 +225,114 @@ const pub = (l) => {
   return rest;
 };
 
+// --- the telemetry panel's log series ----------------------------------------
+// One synthetic 120 s series per process, in the observability contract's
+// line shape (one JSON object per line, `ts` and `event` on every line,
+// `era` and `view` on every protocol line): a stable leader's heartbeat
+// cadence, one failover window (the detections, the election fire, the
+// NOMINATE traffic, the era fold), lease grants and forwards around it,
+// and the slot-frontier records the telemetry tape carries. The same
+// served shape the aof-console-bridge reads off real `--log-dir` rolling
+// files plus the tape's state-transition records (`/api/v1/telemetry/log`).
+const logSeries = (() => {
+  const end = Date.now();
+  const start = end - 120e3;
+  const leaderA = 102;
+  const leaderB = 103;
+  const followers = [101, 103];
+  const lines = [];
+  let slot = 5000;
+  let requestNum = 60;
+  let era = 4;
+  let view = 41;
+  let ts = start;
+  const line = (at, event, fields) =>
+    lines.push(Object.assign({ ts: Math.round(at), level: "INFO", event }, fields));
+  const frontier = (at, leader) =>
+    line(at, "slot-frontier", { era, view, leader, state: "Normal", slot });
+
+  // Phase 1: the stable leader's cadence (heartbeats, arrivals, grants).
+  const failoverAt = start + 75e3;
+  while (ts < failoverAt) {
+    ts += 45 + Math.floor(rnd() * 10);
+    slot += 1 + Math.floor(rnd() * 3);
+    requestNum++;
+    line(ts, "heartbeat-commit", {
+      node: leaderA, era, view, leader: leaderA, state: "Normal", slot, request_num: requestNum,
+      message: "heartbeat-commit",
+    });
+    for (const follower of followers) {
+      line(ts + 1 + Math.floor(rnd() * 3), "commit-in", {
+        node: follower, from: leaderA, era, view, slot, leader: leaderA, state: "Normal",
+        message: "commit-in",
+      });
+    }
+    if (rnd() < 0.04) {
+      const follower = pick(followers);
+      line(ts + 2, "lease-grant", {
+        node: follower, era, view, leader: leaderA, state: "Normal",
+        op: pick(["set", "renew"]), expiry: ts + 500, message: "lease-grant",
+      });
+    }
+    if (rnd() < 0.02) {
+      line(ts + 3, "forward-request", {
+        node: pick(followers), era, view, leader: leaderA, state: "Normal",
+        peer: "127.0.0.1:7002", message_id: "0f8e2d61-9c34-4b57-a6d8-2e5f1c9b" + (1000 + Math.floor(rnd() * 8999)),
+        bytes: 96, message: "forward-request",
+      });
+    }
+    if (rnd() < 0.1) frontier(ts + 4, leaderA);
+  }
+
+  // Phase 2: the failover — the stall, the detections, the election fire,
+  // the NOMINATE traffic, the era fold onto the successor.
+  const stallFrom = ts;
+  const silence = 620 + Math.floor(rnd() * 120);
+  const detectAt = stallFrom + silence;
+  for (const follower of [101, 103]) {
+    line(detectAt + follower % 2, "leader-timeout-detect", {
+      node: follower, era, view, config_era: era, leader: leaderA, state: "Normal",
+      silence_ms: silence, deadline_ms: detectAt, addr: "127.0.0.1:7002",
+      message: "leader-timeout-detect",
+    });
+  }
+  const waitMs = 780 + Math.floor(rnd() * 120);
+  line(detectAt + 30, "election-wait-fire", {
+    node: 103, era, view, leader: leaderA, state: "Normal",
+    wait_ms: waitMs, stagger_ms: 15, fired_ms: waitMs + 15, message: "election-wait-fire",
+  });
+  slot += 5;
+  line(detectAt + 45, "nominate-out", {
+    node: 103, to: 101, era, view: view + 1, slot, tag: "StartViewChange", bytes: 31,
+  });
+  line(detectAt + 60, "nominate-in", {
+    node: 101, from: 103, era, view: view + 1, slot, tag: "StartViewChange", len: 31,
+  });
+  era += 1;
+  view += 1;
+  ts = detectAt + 600;
+
+  // Phase 3: the successor's cadence.
+  while (ts < end) {
+    ts += 45 + Math.floor(rnd() * 10);
+    slot += 1 + Math.floor(rnd() * 3);
+    requestNum++;
+    line(ts, "heartbeat-commit", {
+      node: leaderB, era, view, leader: leaderB, state: "Normal", slot, request_num: requestNum,
+      message: "heartbeat-commit",
+    });
+    for (const follower of [101, 102]) {
+      line(ts + 1 + Math.floor(rnd() * 3), "commit-in", {
+        node: follower, from: leaderB, era, view, slot, leader: leaderB, state: "Normal",
+        message: "commit-in",
+      });
+    }
+    if (rnd() < 0.1) frontier(ts + 4, leaderB);
+  }
+  lines.sort((a, b) => a.ts - b.ts);
+  return lines;
+})();
+
 // --- routes -------------------------------------------------------------------
 Bun.serve({
   hostname: "127.0.0.1",
@@ -336,6 +444,21 @@ Bun.serve({
         if (b) b.held = s.held; // last sample in the bucket wins
       }
       return json(200, { bucketMs, buckets });
+    }
+
+
+    if (p === "/api/v1/telemetry/log") {
+      const fromMs = Number(url.searchParams.get("fromMs") ?? 0);
+      const toMs = Number(url.searchParams.get("toMs") ?? Number.MAX_SAFE_INTEGER);
+      const lines = logSeries.filter((l) => l.ts >= fromMs && l.ts <= toMs);
+      return json(200, {
+        lines,
+        unparsed: 0,
+        span: {
+          first_ms: lines.length ? lines[0].ts : null,
+          last_ms: lines.length ? lines[lines.length - 1].ts : null,
+        },
+      });
     }
 
 

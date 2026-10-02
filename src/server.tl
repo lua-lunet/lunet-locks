@@ -651,8 +651,13 @@ local function main(options: Options)
         end
     end
 
-    -- Drives one admin verb on this node. Returns (true, ack) when the
-    -- reconfiguration was proposed and either its establishing operation
+    -- Drives one admin verb on this node. A floor-crossing verb -- a
+    -- decrement or leave of a voter that would leave fewer than three
+    -- voters -- is refused at admission, over the leader's own
+    -- membership model, BEFORE the adapter drive: the host's own
+    -- authority, never the adapter's after-the-fact refusal inherited
+    -- past acceptance. Returns (true, ack) when the reconfiguration
+    -- was proposed and either its establishing operation
     -- committed (the era advances at the commit — the core's folded
     -- configuration is the commit truth) or the client deadline expired
     -- first (the honest ack: accepted:false with a reason, since the verb
@@ -668,10 +673,19 @@ local function main(options: Options)
     -- broadcasts nothing (the increment path); the operator's departure
     -- sequence is decrement, wait for the era to commit, then leave — a
     -- leave of a weight>0 member is refused by the core's fold gate and
-    -- reported as a rejected verb.
+    -- reported as a rejected verb. The adapter keeps its own voting
+    -- floor at the reconfigure gate (defence in depth: a lagging model
+    -- admits, the core's folded configuration still refuses).
     local function handle_admin(
         action: string, id: integer, name: string, endpoint: string
     ): (boolean, string)
+        -- The admission floor, before anything moves: no addressing row,
+        -- no adapter drive, nothing in the log. The refusal settles in
+        -- the dedup cache like every driven outcome, so duplicates
+        -- replay the same refused ack.
+        if snapshot.crosses_the_floor(model_members, action, id) then
+            return true, admin.encode_refused_ack(action, id)
+        end
         if action == "join" and endpoint_by_id[id] == nil then
             endpoint_by_id[id] = endpoint
             id_by_endpoint[endpoint] = id

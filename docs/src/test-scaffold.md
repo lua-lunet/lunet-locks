@@ -102,6 +102,10 @@ written to the tape and logged periodically — every heartbeat commit
 is logged. The NOMINATE computations, the cluster gossip, the
 timeouts, and the request/response streams are all transparent in the
 log. Telemetry output is downstream of the recorder, never load-bearing.
+The console's telemetry panel reads this series over the admin API
+(`/api/v1/telemetry/log`, served by the loopback mock and the
+aof-console-bridge with the same shape) — the named events plus the
+tape's slot-frontier records ([the architecture](architecture.md)).
 
 ## The timeout-policy audit
 
