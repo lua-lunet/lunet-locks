@@ -2,7 +2,7 @@
 name = "lease-sequencer"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.96" # uvrr-core 0.11.0's floor; let-chains in src/main.rs are older news
+rust-version = "1.96" # uvrr-core 0.13.0's floor; let-chains in src/main.rs are older news
 
 # The test target: the integration tests link the pure modules
 # (timeouts, bridge, telemetry, embedded_client) through this thin lib
@@ -19,7 +19,7 @@ lunet-advisory-lock = { path = "../../ext/advisory_lock" }
 lunet-locks-aof = { path = "../../ext/lunet-locks-aof" }
 # The bridge decodes Wire records through the core's own
 # `Message::unpack_from`; the [patch] below resolves it to the submodule.
-vrr = { package = "uvrr-core", git = "https://github.com/lua-lunet/uvrr-core.git", tag = "v0.11.0" }
+vrr = { package = "uvrr-core", git = "https://github.com/lua-lunet/uvrr-core.git", tag = "v0.13.0" }
 serde_json = "1"
 # The run-state snapshot archives (the snapshot rule): the check tool
 # reads `snapshot_run.lua`'s gzip tars transparently next to raw run dirs.
@@ -44,7 +44,7 @@ flight-recorder = ["lunet-advisory-lock/flight-recorder"]
 # The [patch] section is honored only in a workspace root's manifest — a
 # dependency's own [patch] is ignored — so the consumer restates it here.
 # It resolves the tagged dependency to the vendored submodule copy
-# (ext/uvrr-core, checked out at bef2d42 = upstream tag v0.11.0), so every
+# (ext/uvrr-core, checked out at 9dcafc0 = upstream tag v0.13.0), so every
 # build lane — including Docker with no network fetch — builds against
 # content byte-identical to the released tag. The dependency alias stays
 # `vrr`: the local binding name, so the source keeps its `use vrr::` paths.

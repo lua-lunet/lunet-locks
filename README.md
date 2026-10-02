@@ -101,12 +101,12 @@ re-derived against the floor. See
 [`docs/src/decisions.md`](docs/src/decisions.md).
 
 The core is vendored as the `ext/uvrr-core` git submodule, checked out on
-upstream main at tag `v0.7.4` (commit `e5b0a79`, released 2026-09-19): the
+upstream main at tag `v0.13.0` (commit `9dcafc0`, released 2026-10-01): the
 lifecycle boot gate, the learner acquisition that lets a weight-0 member
 fold the era that admitted it so a joined learner converges, and the
 fence-under-load completion that lets a stop-the-world era transition
 complete under the leader's own client stream. The adapter manifest pins
-upstream tag `v0.7.4` and its `[patch]` section builds the dependency from
+upstream tag `v0.13.0` and its `[patch]` section builds the dependency from
 the submodule, so this tree always builds against the vendored tag.
 
 ## The lock telemetry capture file

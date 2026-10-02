@@ -26,7 +26,7 @@ re-asking).
 ## The matcher's table, tool-produced
 
 The upstream `timeout-policy` tool (a `[[bin]]` of `uvrr-core`, pinned
-`v0.11.0`) prints the opinion for one pair, and its usage enumerates the
+`v0.13.0`) prints the opinion for one pair, and its usage enumerates the
 domain: eight states, eight timeout flavours. The table below is the
 tool's output over the whole domain, each cell being the tool's own
 verdict:

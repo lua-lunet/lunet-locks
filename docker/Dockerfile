@@ -1,7 +1,7 @@
 # Plain multi-stage Docker build, intentionally compatible with Colima's legacy
 # builder: it uses no BuildKit-only mounts, secrets, or cache directives.
 # `tools/docker_prepare_context.sh` vendors the transitive dependency sources
-# and the uvrr-core submodule source (the upstream tag v0.11.0 the manifest's
+# and the uvrr-core submodule source (the upstream tag v0.13.0 the manifest's
 # dependency names), so no git fetch happens inside Docker. The runtime stage
 # carries the diagnosis kit: the NTP/capture/RTT
 # tooling packages and the demo crate's binaries from the kit stage.

@@ -13,10 +13,10 @@ this audit" instead of asserted.
 
 | Path | Upstream | Version | Licence |
 |---|---|---|---|
-| `ext/uvrr-core/` (git submodule) | [lua-lunet/uvrr-core](https://github.com/lua-lunet/uvrr-core) | content of upstream tag `v0.7.4` (submodule commit `e5b0a79`) | MIT (see `ext/uvrr-core/LICENSE` and `ext/uvrr-core/Cargo.toml`, `license = "MIT"`) |
+| `ext/uvrr-core/` (git submodule) | [lua-lunet/uvrr-core](https://github.com/lua-lunet/uvrr-core) | content of upstream tag `v0.13.0` (submodule commit `9dcafc0`) | MIT (see `ext/uvrr-core/LICENSE` and `ext/uvrr-core/Cargo.toml`, `license = "MIT"`) |
 
-The submodule checkout is upstream main at tag `v0.7.4` (released
-2026-09-19), carrying the lifecycle boot gate, the learner-acquisition
+The submodule checkout is upstream main at tag `v0.13.0` (released
+2026-10-01), carrying the lifecycle boot gate, the learner-acquisition
 rule, and the fence-under-load completion. Upstream copyright (Copyright
 (c) 2026 Simon Massey) and licence text are preserved in the submodule.
 
@@ -61,7 +61,7 @@ were verified against the crates.io licence field for each pinned version.
 | `tracing-attributes` | 0.1.31 | MIT | proc-macro of `tracing` |
 | `tracing-core` | 0.1.36 | MIT | dependency of `tracing` |
 | `io-uring` | 0.7.15 | MIT OR Apache-2.0 | Linux-only direct dependency, compiled into the cdylib |
-| `vrr-core` | upstream tag `v0.7.4` content | MIT | resolved by `[patch]` to the `ext/uvrr-core` submodule, linked into the cdylib |
+| `vrr-core` | upstream tag `v0.13.0` content | MIT | resolved by `[patch]` to the `ext/uvrr-core` submodule, linked into the cdylib |
 | `proptest` | 1.11.0 | MIT OR Apache-2.0 | dev-dependency; tests only, not shipped |
 
 ### `ext/lock_feed` — `lock-feed` (smoke/tooling, not in the release archive)
