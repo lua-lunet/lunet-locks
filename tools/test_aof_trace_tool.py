@@ -420,7 +420,9 @@ def write_logs_fixture(d):
     """The JSON log series fixture (the observability contract's shape):
     node 66 (the leader) logging heartbeat-commit lines, node 99 (the
     standby) logging commit-in lines, an unmatched heartbeat, a
-    fractional ts, and a non-JSON line that must be skipped."""
+    fractional ts, and a non-JSON line (the Lua host's stdout captured
+    beside the node's own log — the non-JSON neighbour that legitimately
+    exists; the strict reader skips it only under the flag)."""
     logs = d / "logs"
     logs.mkdir()
     base = 1789214915000
@@ -459,8 +461,12 @@ class JsonLogSeries(unittest.TestCase):
         self.logs = write_logs_fixture(d)
 
     def test_leader_lag_measures_both_clocks(self):
+        # The fixture's non-JSON neighbour is a legitimate line: the
+        # leniency flag is the only way past it.
+        ctx = tool.SkipPolicy(allow=True)
         out = tool.export_series(self.dir, LIB, kinds="leader-lag",
-                                 logs=[self.logs])
+                                 logs=[self.logs], ctx=ctx)
+        self.assertEqual(ctx.count, 1, "one skipped neighbour line")
         self.assertEqual(out, [
             {"kind": "leader-lag", "leader": 66, "node": 99, "era": 4,
              "view": 1, "slot": 5, "leader_ms": 2},
@@ -468,9 +474,19 @@ class JsonLogSeries(unittest.TestCase):
              "view": 1, "slot": 6, "leader_ms": 5},
         ], "the unmatched fractional-ts heartbeat joins to nothing")
 
+    def test_strict_is_the_default_and_names_the_line(self):
+        with self.assertRaises(ValueError) as caught:
+            tool.export_series(self.dir, LIB, kinds="leader-lag",
+                               logs=[self.logs])
+        self.assertIn("n66.log:4", str(caught.exception))
+        self.assertIn("not one JSON object", str(caught.exception))
+        self.assertIn("'not json at all'", str(caught.exception))
+
     def test_hb_spacing_per_node_and_event(self):
+        ctx = tool.SkipPolicy(allow=True)
         out = tool.export_series(self.dir, LIB, kinds="hb-spacing",
-                                 logs=[self.logs])
+                                 logs=[self.logs], ctx=ctx)
+        self.assertEqual(ctx.count, 1, "one skipped neighbour line")
         self.assertEqual([(r["event"], r["node"]) for r in out],
                          [("commit-in", 99), ("heartbeat-commit", 66)])
         standby = out[0]
@@ -488,12 +504,214 @@ class JsonLogSeries(unittest.TestCase):
 
     def test_cli_logs_flag_exports_both_kinds(self):
         out_path = self.dir / "out.jsonl"
-        rc = tool.main(["prog", "--lib", str(LIB), "--kind", "hb-spacing leader-lag",
+        rc = tool.main(["prog", "--lib", str(LIB), "--allow-skips",
+                        "--kind", "hb-spacing leader-lag",
                         "--logs", str(self.logs), str(self.dir), str(out_path)])
         self.assertEqual(rc, 0)
         kinds = [json.loads(line)["kind"] for line in out_path.read_text().splitlines()]
         self.assertEqual(kinds, ["hb-spacing", "hb-spacing", "leader-lag",
                                 "leader-lag"])
+
+
+class LogIntegrityKind(unittest.TestCase):
+    # The first-class readability scan: per-event counts and the
+    # parse-failure count, one row per file. The generated corpus of the
+    # real emitted shapes rides as the readable baseline; the corrupted
+    # variants prove the strict/flag contract per shape.
+    BASE_MS = 1789725518000
+
+    def setUp(self):
+        d = tool.FixtureDir()
+        self.dir, self.addCleanup = d, d.cleanup
+
+    def real_shape_lines(self):
+        # One line per shape the system ACTUALLY emits (the JSON log
+        # series from 5ec7446 / 0b52936: the sequencer's info!/warn!
+        # sites and the tape's slot-frontier record), the exact member
+        # sets the emitters write, plus the non-JSON neighbour that
+        # legitimately exists (the Lua host's stdout capture).
+        b = self.BASE_MS
+        return {
+            "heartbeat-commit":
+                '{"ts":%d,"level":"INFO","event":"heartbeat-commit",'
+                '"node":102,"era":4,"view":41,"leader":102,"state":"Normal",'
+                '"slot":5201,"request_num":61,"message":"heartbeat-commit"}' % (b + 10),
+            "commit-in":
+                '{"ts":%d,"level":"INFO","event":"commit-in","node":101,'
+                '"from":102,"era":4,"view":41,"slot":5201,"leader":102,'
+                '"state":"Normal","message":"commit-in"}' % (b + 0),
+            "leader-timeout-detect":
+                '{"ts":%d,"level":"INFO","event":"leader-timeout-detect",'
+                '"node":101,"era":4,"view":41,"config_era":4,"leader":102,'
+                '"state":"Normal","silence_ms":720,'
+                '"deadline_ms":1789725518150,"addr":"127.0.0.1:7002",'
+                '"message":"leader-timeout-detect"}' % (b + 200),
+            "election-wait-fire":
+                '{"ts":%d,"level":"INFO","event":"election-wait-fire",'
+                '"node":103,"era":4,"view":41,"leader":102,"state":"Normal",'
+                '"wait_ms":820,"stagger_ms":15,"fired_ms":835,'
+                '"message":"election-wait-fire"}' % (b + 190),
+            "nominate-out":
+                '{"ts":%d,"level":"INFO","event":"nominate-out","node":103,'
+                '"to":101,"era":4,"view":42,"slot":5290,'
+                '"tag":"StartViewChange","bytes":31}' % (b + 215),
+            "nominate-in":
+                '{"ts":%d,"level":"INFO","event":"nominate-in","node":101,'
+                '"from":103,"era":4,"view":42,"slot":5290,'
+                '"tag":"StartViewChange","len":31}' % (b + 230),
+            "lease-grant":
+                '{"ts":%d,"level":"INFO","event":"lease-grant","node":101,'
+                '"era":4,"view":41,"leader":102,"state":"Normal",'
+                '"op":"renew","expiry":1789725518623,'
+                '"message":"lease-grant"}' % (b + 123),
+            "forward-request":
+                '{"ts":%d,"level":"INFO","event":"forward-request",'
+                '"node":103,"era":4,"view":41,"leader":102,'
+                '"state":"Normal","peer":"127.0.0.1:7002",'
+                '"message_id":"0f8e2d61-9c34-4b57-a6d8-2e5f1c9b0123",'
+                '"bytes":96,"message":"forward-request"}' % (b + 300),
+            "forward-not-leader":
+                '{"ts":%d,"level":"INFO","event":"forward-not-leader",'
+                '"node":103,"era":4,"view":41,"leader":102,'
+                '"state":"Normal","peer":"127.0.0.1:7002",'
+                '"message_id":"0f8e2d61-9c34-4b57-a6d8-2e5f1c9b0124"}'
+                % (b + 310),
+            "forward-response":
+                '{"ts":%d,"level":"INFO","event":"forward-response",'
+                '"node":102,"era":4,"view":41,"leader":102,'
+                '"state":"Normal","peer":"127.0.0.1:7001",'
+                '"message_id":"0f8e2d61-9c34-4b57-a6d8-2e5f1c9b0123",'
+                '"bytes":88,"message":"forward-response"}' % (b + 320),
+            "forward-request-in":
+                '{"ts":%d,"level":"INFO","event":"forward-request-in",'
+                '"node":102,"era":4,"view":41,"leader":102,'
+                '"state":"Normal","peer":"127.0.0.1:7003",'
+                '"message_id":"0f8e2d61-9c34-4b57-a6d8-2e5f1c9b0125",'
+                '"bytes":96}' % (b + 340),
+            "forward-response-in":
+                '{"ts":%d,"level":"INFO","event":"forward-response-in",'
+                '"node":103,"era":4,"view":41,"leader":102,'
+                '"state":"Normal","peer":"127.0.0.1:7002",'
+                '"message_id":"0f8e2d61-9c34-4b57-a6d8-2e5f1c9b0123",'
+                '"bytes":89}' % (b + 350),
+            "late-ack":
+                '{"ts":%d,"level":"WARN","event":"late-ack","node":102,'
+                '"era":4,"view":41,"leader":102,"state":"Normal",'
+                '"late_acks":1,'
+                '"message_id":"0f8e2d61-9c34-4b57-a6d8-2e5f1c9b0999",'
+                '"bytes":88}' % (b + 330),
+            "late-ack-forward":
+                '{"ts":%d,"level":"WARN","event":"late-ack-forward",'
+                '"node":103,"era":4,"view":41,"leader":102,'
+                '"state":"Normal","late_acks":1,'
+                '"message_id":"0f8e2d61-9c34-4b57-a6d8-2e5f1c9b0126",'
+                '"len":89}' % (b + 360),
+            "note":
+                '{"ts":%d,"level":"INFO","event":"note","text":"a signal, '
+                'a no-op, a foreign datagram dropped"}' % (b + 1),
+            "slot-frontier":
+                '{"ts":%d,"event":"slot-frontier","era":4,"view":41,'
+                '"leader":102,"state":"Normal","slot":5204}' % (b + 400),
+            "non-json-neighbour":
+                'advisory-lock membership fingerprint=84f2957f69449a2b '
+                'encoding=lunet-advisory-lock/membership/v1',
+        }
+
+    def test_generated_corpus_every_real_shape_is_integrity_green(self):
+        # Every real shape, one file per shape, scanned clean: the strict
+        # scan never fires on what the producers actually emit.
+        lines = self.real_shape_lines()
+        shapes = [name for name in lines if name != "non-json-neighbour"]
+        self.assertEqual(len(shapes), 16, "every emitted JSON shape named")
+        for name in shapes:
+            d = self.dir.path / ("corpus-" + name)
+            logs = d / "logs"
+            logs.mkdir(parents=True)
+            (logs / "n1.log").write_text(lines[name] + "\n")
+            ctx = tool.SkipPolicy(allow=False)
+            rows = tool.export_series(d, LIB, kinds="log-integrity",
+                                      logs=[logs], ctx=ctx)
+            self.assertEqual(ctx.count, 0, name)
+            self.assertEqual(len(rows), 1, name)
+            self.assertEqual(rows[0]["parse_failures"], 0, name)
+            self.assertEqual(rows[0]["lines"], 1, name)
+
+    def test_generated_corpus_flag_is_the_only_skip_path(self):
+        # The corrupted variant of EVERY shape fails strict, and the
+        # flag is the only path that gets past it (counted).
+        lines = self.real_shape_lines()
+        for name, text in lines.items():
+            # corrupt: drop the closing brace (JSON-parse failure for
+            # the JSON shapes; the neighbour is already a parse failure)
+            corrupted = text if name == "non-json-neighbour" else text[:-1]
+            d = self.dir.path / ("bad-" + name)
+            logs = d / "logs"
+            logs.mkdir(parents=True)
+            (logs / "n1.log").write_text(corrupted + "\n")
+            with self.assertRaises(ValueError, msg=name):
+                tool.export_series(d, LIB, kinds="log-integrity",
+                                   logs=[logs])
+            ctx = tool.SkipPolicy(allow=True)
+            rows = tool.export_series(d, LIB, kinds="log-integrity",
+                                      logs=[logs], ctx=ctx)
+            self.assertEqual(ctx.count, 1, name)
+            self.assertEqual(rows[0]["skipped"], 1, name)
+            self.assertEqual(rows[0]["lines"], 0, name)
+
+    def test_integrity_reports_per_event_counts(self):
+        lines = self.real_shape_lines()
+        json_lines = [t for n, t in lines.items() if n != "non-json-neighbour"]
+        d = self.dir.path / "events"
+        logs = d / "logs"
+        logs.mkdir(parents=True)
+        (logs / "n1.log").write_text("\n".join(json_lines) + "\n")
+        ctx = tool.SkipPolicy(allow=True)
+        rows = tool.export_series(d, LIB, kinds="log-integrity",
+                                  logs=[logs], ctx=ctx)
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row["lines"], len(json_lines))
+        self.assertEqual(row["parse_failures"], 0)
+        self.assertEqual(row["events"]["heartbeat-commit"], 1)
+        self.assertEqual(row["events"]["commit-in"], 1)
+        self.assertEqual(row["events"]["leader-timeout-detect"], 1)
+        self.assertEqual(row["events"]["election-wait-fire"], 1)
+        self.assertEqual(row["events"]["nominate-out"], 1)
+        self.assertEqual(row["events"]["nominate-in"], 1)
+        self.assertEqual(row["events"]["lease-grant"], 1)
+        self.assertEqual(row["events"]["forward-request"], 1)
+        self.assertEqual(row["events"]["forward-not-leader"], 1)
+        self.assertEqual(row["events"]["forward-response"], 1)
+        self.assertEqual(row["events"]["forward-request-in"], 1)
+        self.assertEqual(row["events"]["forward-response-in"], 1)
+        self.assertEqual(row["events"]["late-ack"], 1)
+        self.assertEqual(row["events"]["late-ack-forward"], 1)
+        self.assertEqual(row["events"]["note"], 1)
+        self.assertEqual(row["events"]["slot-frontier"], 1)
+        self.assertEqual(len(row["events"]), 16)
+
+    def test_integrity_counts_parse_failures_under_the_flag(self):
+        lines = self.real_shape_lines()
+        d = self.dir.path / "pf"
+        logs = d / "logs"
+        logs.mkdir(parents=True)
+        # one real shape + the non-JSON neighbour + a memberless JSON
+        # object (an event-shaped parse failure)
+        (logs / "n1.log").write_text("\n".join([
+            lines["heartbeat-commit"],
+            lines["non-json-neighbour"],
+            '{"ts":%d,"level":"INFO"}' % (self.BASE_MS + 2),
+            lines["commit-in"].replace('"from":102,', '"from":102,'),
+        ]) + "\n")
+        ctx = tool.SkipPolicy(allow=True)
+        rows = tool.export_series(d, LIB, kinds="log-integrity",
+                                  logs=[logs], ctx=ctx)
+        row = rows[0]
+        self.assertEqual(row["lines"], 3, "three parsed lines")
+        self.assertEqual(row["parse_failures"], 1, "the memberless object")
+        self.assertEqual(row["events"]["heartbeat-commit"], 1)
+        self.assertEqual(row["events"]["commit-in"], 1)
+        self.assertEqual(row["skipped"], 1, "the neighbour, counted")
 
 
 class LargeScaleTwinParity(unittest.TestCase):

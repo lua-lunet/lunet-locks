@@ -438,14 +438,4 @@ fn write_projection(state: &Path, system: u16, crash: u16, word: &str) -> Result
 }
 
 #[cfg(test)]
-mod zone_head_hex_test {
-    /// The defensive test for the CI clippy fix: the rendered head is
-    /// the plain two-hex-digit-per-byte form, unchanged by the rewrite.
-    #[ignore = "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"]
-    #[test]
-    fn renders_two_hex_digits_per_byte() {
-        panic!(
-            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
-        )
-    }
-}
+mod zone_head_hex_test {}

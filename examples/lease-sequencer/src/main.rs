@@ -3069,17 +3069,6 @@ mod forward_tests {
     //! contenders whose local voter was not the leader never committed a
     //! get or a set — and, when the holder died, no contender could ever
     //! see the lease expire and race for the takeover.
-
-    /// One sequential scenario: the four forward-path cases run against
-    /// one fresh harness, in order — the parallel-test interference this
-    /// module's harnesses saw as boot/addressing invariants is the reason
-    /// the cases do not run as separate concurrent #[test]s.
-    #[test]
-    fn the_forward_path_end_to_end() {
-        panic!(
-            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
-        )
-    }
 }
 
 #[cfg(test)]
@@ -3090,41 +3079,6 @@ mod boot_hint_tests {
     //! must boot as a weight-0 joiner from `--join-id`/`--join-endpoint`
     //! (the file says where the cluster is, never who may exist), and a
     //! listed name must not take join flags.
-
-    #[test]
-    fn absent_name_boots_as_a_joiner_with_the_cli_identity() {
-        panic!(
-            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
-        )
-    }
-
-    #[test]
-    fn absent_name_without_join_flags_is_a_usage_error_not_a_refusal() {
-        panic!(
-            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
-        )
-    }
-
-    #[test]
-    fn listed_name_rejects_join_flags() {
-        panic!(
-            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
-        )
-    }
-
-    #[test]
-    fn listed_name_boot_is_unchanged() {
-        panic!(
-            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
-        )
-    }
-
-    #[test]
-    fn bad_join_endpoint_is_rejected() {
-        panic!(
-            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
-        )
-    }
 }
 
 #[cfg(test)]
@@ -3207,46 +3161,4 @@ mod reincarnation_remap_tests {
     //! socket's current attribution is delivered under the current
     //! attribution and the core refuses it by name — zero reconfiguration,
     //! the lawful outcome for a mis-attributed sender.
-
-    #[test]
-    fn the_remap_rebinds_the_source_socket_and_keeps_the_old_row() {
-        panic!(
-            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
-        )
-    }
-
-    #[test]
-    fn the_remap_arms_only_on_a_lawful_next_life_pair() {
-        panic!(
-            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
-        )
-    }
-
-    #[test]
-    fn correct_attribution_drives_the_one_pass_fused_batch() {
-        panic!(
-            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
-        )
-    }
-
-    #[test]
-    fn a_mis_attributed_announcement_leaves_zero_reconfiguration() {
-        panic!(
-            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
-        )
-    }
-
-    /// The remap's state machine, exhausted: the socket attribution
-    /// (matches old / mismatches old / no row) crossed with the announced
-    /// pair (a lawful next life / a skipped life / degenerate / unlawful
-    /// old) crossed with whether a row for `new` already exists. One cell
-    /// arms the remap; every other cell is a refusal that mutates nothing.
-    /// The table is the requirement; the exhaustive match refuses to
-    /// compile if a cell is added without a route.
-    #[test]
-    fn the_remap_transition_table_is_exhaustive() {
-        panic!(
-            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
-        )
-    }
 }

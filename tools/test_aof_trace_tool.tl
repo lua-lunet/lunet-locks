@@ -526,8 +526,12 @@ jf99:write('{"level":"INFO","ts":' .. (JBASE + 15)
 jf99:close()
 
 local okj, errj = pcall(function()
+    -- The fixture's non-JSON neighbour is a legitimate line: the
+    -- leniency flag is the only way past it (the strict default fails
+    -- it — asserted right after).
+    local lenient = tool.policy_new(true)
     local lag_rows = tool.export_series(jdir, "leader-lag", nil, nil,
-        {jdir .. "/logs"}) as {{string: any}}
+        {jdir .. "/logs"}, lenient) as {{string: any}}
     check("leader-lag-rows", #lag_rows == 2, "rows=" .. tostring(#lag_rows))
     local l1 = lag_rows[1]
     local l2 = lag_rows[2]
@@ -538,8 +542,15 @@ local okj, errj = pcall(function()
     check("leader-lag-second", l2 ~= nil and l2.slot == 6
         and l2.leader_ms == 5, "second=" .. tostring(l2 and l2.leader_ms))
 
+    local strict_ok, strict_err = pcall(tool.export_series, jdir,
+        "leader-lag", nil, nil, {jdir .. "/logs"})
+    check("strict-default-fails", strict_ok == false
+        and (strict_err as string):find("n66%.log:4") ~= nil
+        and (strict_err as string):find("not one JSON object") ~= nil,
+        tostring(strict_err))
+
     local hb_rows = tool.export_series(jdir, "hb-spacing", nil, nil,
-        {jdir .. "/logs"}) as {{string: any}}
+        {jdir .. "/logs"}, tool.policy_new(true)) as {{string: any}}
     check("hb-spacing-rows", #hb_rows == 2, "rows=" .. tostring(#hb_rows))
     local h1 = hb_rows[1]
     local h2 = hb_rows[2]
@@ -556,9 +567,11 @@ local okj, errj = pcall(function()
             .. " max=" .. tostring(h2 and h2.max_ms)
             .. " mean=" .. tostring(h2 and h2.mean_ms))
 
-    -- the CLI surface: --logs PATH, the kinds riding the union contract
+    -- the CLI surface: --logs PATH, --allow-skips (the fixture's
+    -- non-JSON neighbour needs it), the kinds riding the union contract
     local jout = jdir .. "/cli.jsonl"
-    local rcj = tool.main({"prog", "--kind", "hb-spacing leader-lag",
+    local rcj = tool.main({"prog", "--allow-skips", "--kind",
+        "hb-spacing leader-lag",
         "--logs", jdir .. "/logs", jdir, jout})
     local jlines = read_lines(jout)
     local kinds_seen: {string} = {}
@@ -579,7 +592,8 @@ local okj, errj = pcall(function()
     if has_py4 then
         local py_out = jdir .. "/py.jsonl"
         os.execute("python3 tools/aof-trace-tool.py"
-            .. " --kind 'hb-spacing leader-lag' --logs " .. jdir .. "/logs"
+            .. " --allow-skips --kind 'hb-spacing leader-lag' --logs "
+            .. jdir .. "/logs"
             .. " " .. jdir .. " " .. py_out .. " > /dev/null 2>&1")
         local tl_lines = read_lines(jout)
         local py_lines = read_lines(py_out)
@@ -602,6 +616,212 @@ local okj, errj = pcall(function()
 end)
 if not okj then
     check("json-log-series", false, "block errored: " .. tostring(errj))
+end
+
+
+
+-- 12. STRICT BY DEFAULT (row 519): the generated corpus of every real
+-- shape, the flag the only skip path, the per-event integrity counts.
+local CORPUS_BASE = 1789725518000
+local function real_shape_lines()
+    local b = CORPUS_BASE
+    return {
+        ["heartbeat-commit"] =
+            '{"ts":' .. (b + 10) .. ',"level":"INFO","event":"heartbeat-commit",'
+            .. '"node":102,"era":4,"view":41,"leader":102,"state":"Normal",'
+            .. '"slot":5201,"request_num":61,"message":"heartbeat-commit"}',
+        ["commit-in"] =
+            '{"ts":' .. b .. ',"level":"INFO","event":"commit-in","node":101,'
+            .. '"from":102,"era":4,"view":41,"slot":5201,"leader":102,'
+            .. '"state":"Normal","message":"commit-in"}',
+        ["leader-timeout-detect"] =
+            '{"ts":' .. (b + 200) .. ',"level":"INFO","event":"leader-timeout-detect",'
+            .. '"node":101,"era":4,"view":41,"config_era":4,"leader":102,'
+            .. '"state":"Normal","silence_ms":720,'
+            .. '"deadline_ms":1789725518150,"addr":"127.0.0.1:7002",'
+            .. '"message":"leader-timeout-detect"}',
+        ["election-wait-fire"] =
+            '{"ts":' .. (b + 190) .. ',"level":"INFO","event":"election-wait-fire",'
+            .. '"node":103,"era":4,"view":41,"leader":102,"state":"Normal",'
+            .. '"wait_ms":820,"stagger_ms":15,"fired_ms":835,'
+            .. '"message":"election-wait-fire"}',
+        ["nominate-out"] =
+            '{"ts":' .. (b + 215) .. ',"level":"INFO","event":"nominate-out",'
+            .. '"node":103,"to":101,"era":4,"view":42,"slot":5290,'
+            .. '"tag":"StartViewChange","bytes":31}',
+        ["nominate-in"] =
+            '{"ts":' .. (b + 230) .. ',"level":"INFO","event":"nominate-in",'
+            .. '"node":101,"from":103,"era":4,"view":42,"slot":5290,'
+            .. '"tag":"StartViewChange","len":31}',
+        ["lease-grant"] =
+            '{"ts":' .. (b + 123) .. ',"level":"INFO","event":"lease-grant",'
+            .. '"node":101,"era":4,"view":41,"leader":102,"state":"Normal",'
+            .. '"op":"renew","expiry":1789725518623,'
+            .. '"message":"lease-grant"}',
+        ["forward-request"] =
+            '{"ts":' .. (b + 300) .. ',"level":"INFO","event":"forward-request",'
+            .. '"node":103,"era":4,"view":41,"leader":102,'
+            .. '"state":"Normal","peer":"127.0.0.1:7002",'
+            .. '"message_id":"0f8e2d61-9c34-4b57-a6d8-2e5f1c9b0123",'
+            .. '"bytes":96,"message":"forward-request"}',
+        ["forward-not-leader"] =
+            '{"ts":' .. (b + 310) .. ',"level":"INFO","event":"forward-not-leader",'
+            .. '"node":103,"era":4,"view":41,"leader":102,'
+            .. '"state":"Normal","peer":"127.0.0.1:7002",'
+            .. '"message_id":"0f8e2d61-9c34-4b57-a6d8-2e5f1c9b0124"}',
+        ["forward-response"] =
+            '{"ts":' .. (b + 320) .. ',"level":"INFO","event":"forward-response",'
+            .. '"node":102,"era":4,"view":41,"leader":102,'
+            .. '"state":"Normal","peer":"127.0.0.1:7001",'
+            .. '"message_id":"0f8e2d61-9c34-4b57-a6d8-2e5f1c9b0123",'
+            .. '"bytes":88,"message":"forward-response"}',
+        ["forward-request-in"] =
+            '{"ts":' .. (b + 340) .. ',"level":"INFO","event":"forward-request-in",'
+            .. '"node":102,"era":4,"view":41,"leader":102,'
+            .. '"state":"Normal","peer":"127.0.0.1:7003",'
+            .. '"message_id":"0f8e2d61-9c34-4b57-a6d8-2e5f1c9b0125",'
+            .. '"bytes":96}',
+        ["forward-response-in"] =
+            '{"ts":' .. (b + 350) .. ',"level":"INFO","event":"forward-response-in",'
+            .. '"node":103,"era":4,"view":41,"leader":102,'
+            .. '"state":"Normal","peer":"127.0.0.1:7002",'
+            .. '"message_id":"0f8e2d61-9c34-4b57-a6d8-2e5f1c9b0123",'
+            .. '"bytes":89}',
+        ["late-ack"] =
+            '{"ts":' .. (b + 330) .. ',"level":"WARN","event":"late-ack","node":102,'
+            .. '"era":4,"view":41,"leader":102,"state":"Normal",'
+            .. '"late_acks":1,'
+            .. '"message_id":"0f8e2d61-9c34-4b57-a6d8-2e5f1c9b0999",'
+            .. '"bytes":88}',
+        ["late-ack-forward"] =
+            '{"ts":' .. (b + 360) .. ',"level":"WARN","event":"late-ack-forward",'
+            .. '"node":103,"era":4,"view":41,"leader":102,'
+            .. '"state":"Normal","late_acks":1,'
+            .. '"message_id":"0f8e2d61-9c34-4b57-a6d8-2e5f1c9b0126",'
+            .. '"len":89}',
+        ["note"] =
+            '{"ts":' .. (b + 1) .. ',"level":"INFO","event":"note","text":'
+            .. '"a signal, a no-op, a foreign datagram dropped"}',
+        ["slot-frontier"] =
+            '{"ts":' .. (b + 400) .. ',"event":"slot-frontier","era":4,"view":41,'
+            .. '"leader":102,"state":"Normal","slot":5204}',
+        ["non-json-neighbour"] =
+            "advisory-lock membership fingerprint=84f2957f69449a2b "
+            .. "encoding=lunet-advisory-lock/membership/v1",
+    }
+end
+
+local ok519, err519 = pcall(function()
+    local shapes = real_shape_lines()
+    local json_shapes = {}
+    for name, _ in pairs(shapes) do
+        if name ~= "non-json-neighbour" then
+            json_shapes[#json_shapes + 1] = name
+        end
+    end
+    table.sort(json_shapes)
+    check("corpus-shapes-named", #json_shapes == 16,
+        "shapes=" .. tostring(#json_shapes))
+    -- every real shape, one file per shape, scanned clean: the strict
+    -- scan never fires on what the producers actually emit.
+    local all_green = true
+    local why = ""
+    for _, name in ipairs(json_shapes) do
+        local d = tool.fixture_dir()
+        local logs = d .. "/logs"
+        os.execute("mkdir -p " .. logs)
+        local fh = io.open(logs .. "/n1.log", "w")
+        fh:write(shapes[name] .. "\n")
+        fh:close()
+        local policy = tool.policy_new(false)
+        local ok, rows = pcall(tool.export_series, d, "log-integrity",
+            nil, nil, {logs}, policy)
+        if not ok then
+            all_green = false
+            why = name .. ": " .. tostring(rows)
+        elseif policy.count ~= 0 or #rows ~= 1
+            or rows[1].parse_failures ~= 0 or rows[1].lines ~= 1 then
+            all_green = false
+            why = name .. ": rows=" .. tostring(rows)
+        end
+    end
+    check("corpus-every-real-shape-strict-green", all_green, why)
+
+    -- the corrupted variant of EVERY shape fails strict, and the flag
+    -- is the only path past it (counted).
+    local flag_only = true
+    local why2 = ""
+    for name, text in pairs(shapes) do
+        local corrupted = text
+        if name ~= "non-json-neighbour" then
+            corrupted = text:sub(1, #text - 1)
+        end
+        local d = tool.fixture_dir()
+        local logs = d .. "/logs"
+        os.execute("mkdir -p " .. logs)
+        local fh = io.open(logs .. "/n1.log", "w")
+        fh:write(corrupted .. "\n")
+        fh:close()
+        local strict_ok = pcall(tool.export_series, d, "log-integrity",
+            nil, nil, {logs})
+        local policy = tool.policy_new(true)
+        local ok, rows = pcall(tool.export_series, d, "log-integrity",
+            nil, nil, {logs}, policy)
+        if strict_ok then
+            flag_only = false
+            why2 = name .. ": corrupted line did not fail strict"
+        elseif not ok then
+            flag_only = false
+            why2 = name .. ": flag run errored: " .. tostring(rows)
+        elseif policy.count ~= 1 or rows[1].skipped ~= 1
+            or rows[1].lines ~= 0 then
+            flag_only = false
+            why2 = name .. ": rows=" .. tostring(rows)
+                .. " count=" .. tostring(policy.count)
+        end
+    end
+    check("corpus-flag-is-the-only-skip-path", flag_only, why2)
+
+    -- the integrity kind's per-event counts and parse-failure count
+    local d3 = tool.fixture_dir()
+    local logs3 = d3 .. "/logs"
+    os.execute("mkdir -p " .. logs3)
+    local fh3 = io.open(logs3 .. "/n1.log", "w")
+    local event_lines = {}
+    for _, name in ipairs(json_shapes) do
+        event_lines[#event_lines + 1] = shapes[name]
+    end
+    fh3:write(table.concat(event_lines, "\n") .. "\n")
+    fh3:close()
+    local policy3 = tool.policy_new(true)
+    local rows3 = tool.export_series(d3, "log-integrity", nil, nil,
+        {logs3}, policy3) as {{string: any}}
+    check("integrity-per-event-counts", #rows3 == 1
+        and rows3[1].lines == 16 and rows3[1].parse_failures == 0
+        and policy3.count == 0, tostring(rows3[1]))
+
+    -- a memberless JSON object is a parse failure of the kind's
+    -- contract; the non-JSON neighbour is a counted skip
+    local d4 = tool.fixture_dir()
+    local logs4 = d4 .. "/logs"
+    os.execute("mkdir -p " .. logs4)
+    local fh4 = io.open(logs4 .. "/n1.log", "w")
+    fh4:write(shapes["heartbeat-commit"] .. "\n")
+    fh4:write(shapes["non-json-neighbour"] .. "\n")
+    fh4:write('{"ts":' .. (CORPUS_BASE + 2) .. ',"level":"INFO"}\n')
+    fh4:write(shapes["commit-in"] .. "\n")
+    fh4:close()
+    local policy4 = tool.policy_new(true)
+    local rows4 = tool.export_series(d4, "log-integrity", nil, nil,
+        {logs4}, policy4) as {{string: any}}
+    check("integrity-parse-failures-counted", #rows4 == 1
+        and rows4[1].lines == 3 and rows4[1].parse_failures == 1
+        and policy4.count == 1
+        and rows4[1].events["heartbeat-commit"] == 1
+        and rows4[1].events["commit-in"] == 1, tostring(rows4[1]))
+end)
+if not ok519 then
+    check("strict-by-default", false, "block errored: " .. tostring(err519))
 end
 
 print(("aof-trace-tool.tl: %d passed, %d failed"):format(passed, failed))

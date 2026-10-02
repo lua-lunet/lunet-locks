@@ -21,8 +21,14 @@
 -- series the observability contract produces (the leader's
 -- `heartbeat-commit` lines, the standbys' `commit-in` lines) through
 -- the repeatable `--logs PATH` flag — a log file, or a directory
--- contributing its sorted *.log entries. A line that is not one JSON
--- object, or misses a member it needs, is skipped, never guessed.
+-- contributing its sorted *.log entries. Reading is STRICT by default:
+-- a line that is not one JSON object, or a JSON line missing a member
+-- the requested kind needs, is a hard failure naming the file, the
+-- line number and the reason (exit non-zero). The repeatable
+-- `--allow-skips` flag opts into leniency: the line is skipped with a
+-- warning on stderr and the skip count is reported in the summary. The
+-- `log-integrity` kind scans the whole series for readability:
+-- per-event counts and the parse-failure count, one row per file.
 --
 -- The CLI is tools/tl-driver.lua — tl gen of this module alone is NOT
 -- a CLI (the generated file only runs under the Teal loader and a
@@ -662,6 +668,8 @@ local ROW_ORDER: {string: {string}} = {
                      "t_rel_ms", "t_fmt"},
     ["hb-spacing"] = {"kind", "node", "event", "min_ms", "mean_ms",
                       "p50_ms", "p95_ms", "max_ms", "count"},
+    ["log-integrity"] = {"kind", "file", "lines", "events",
+                         "parse_failures", "skipped"},
     ["leader-lag"] = {"kind", "leader", "node", "era", "view", "slot",
                       "leader_ms"},
 }
@@ -702,6 +710,49 @@ local function kind_wanted(kinds: string, kind: string): boolean
     return false
 end
 
+-- The skip policy: strict raises the failure; allow warns on stderr and
+-- counts. Every skip is counted in BOTH modes (a silent skip is the
+-- same defect); strict only forbids the continue. The count is
+-- DISTINCT file:line pairs — the kinds each pass the series once, and a
+-- bad line is one bad line, not one per reader pass.
+local record SkipPolicy
+    allow: boolean
+    count: number
+    _seen: {string: boolean}
+end
+
+local function policy_new(allow: boolean): SkipPolicy
+    return {allow = allow, count = 0, _seen = {}}
+end
+
+local STAMP_MAX = 60
+
+local function policy_skip(policy: SkipPolicy, path: string, lineno: number,
+                           line: string, why: string)
+    local stamp = path .. ":" .. tostring(lineno)
+    if policy._seen[stamp] then
+        return
+    end
+    policy._seen[stamp] = true
+    policy.count = policy.count + 1
+    local text = line:gsub("^%s+", ""):gsub("%s+$", "")
+    if #text > STAMP_MAX then
+        text = text:sub(1, STAMP_MAX)
+    end
+    if policy.allow then
+        io.stderr:write(("skipped line %s (%s): %s\n")
+            :format(stamp, why, text))
+    else
+        error(("%s: %s (offending text: %q)")
+            :format(stamp, why, text), 0)
+    end
+end
+
+-- The module default: strict. A library caller that wants leniency
+-- builds policy_new(true) and passes it as `ctx`.
+local STRICT = policy_new(false)
+
+
 -- Forward declarations: the extras (timeline/aof-noise/hb-spacing/
 -- leader-lag) and the anchored export read export_series, but
 -- export_series appends their rows — declared here, defined below.
@@ -709,11 +760,14 @@ local timeline_rows
 local aof_noise_rows
 local hb_spacing_rows
 local leader_lag_rows
+local log_integrity_rows
 local takeover_row
 local anchor_rows_and_takeovers
 
 local function export_series(dir_path: string, kinds: string, anchors: any,
-                             hb_ms: any, logs: any): {{string: any}}
+                             hb_ms: any, logs: any,
+                             policy: SkipPolicy): {{string: any}}
+    policy = policy or STRICT
     local wanted_names: {string} = {}
     local p = io.popen("ls -1 " .. dir_path .. "/*.aof 2>/dev/null")
     for f in p:lines() do
@@ -840,12 +894,17 @@ local function export_series(dir_path: string, kinds: string, anchors: any,
         end
     end
     if type(logs) == "table" and kind_wanted(kinds, "hb-spacing") then
-        for _, r in ipairs(hb_spacing_rows(logs as {string}) as {{string: any}}) do
+        for _, r in ipairs(hb_spacing_rows(logs as {string}, policy) as {{string: any}}) do
             events[#events + 1] = r
         end
     end
     if type(logs) == "table" and kind_wanted(kinds, "leader-lag") then
-        for _, r in ipairs(leader_lag_rows(logs as {string}) as {{string: any}}) do
+        for _, r in ipairs(leader_lag_rows(logs as {string}, policy) as {{string: any}}) do
+            events[#events + 1] = r
+        end
+    end
+    if type(logs) == "table" and kind_wanted(kinds, "log-integrity") then
+        for _, r in ipairs(log_integrity_rows(logs as {string}, policy) as {{string: any}}) do
             events[#events + 1] = r
         end
     end
@@ -978,7 +1037,7 @@ end
 -- One row per lock-operation event in trace order. set resolves to
 -- acquire or renew against the holder in force; release/break clear it.
 timeline_rows = function(dir_path: string): {{string: any}}
-    local locks = export_series(dir_path, "locks")
+    local locks = export_series(dir_path, "locks", nil, nil, nil, STRICT)
     local rows: {{string: any}} = {}
     local tenure: {any: any} = {} -- lock_id -> holder in force
     for _, r in ipairs(locks) do
@@ -1203,6 +1262,12 @@ end
 -- (era, view, slot) it keys on). The two log-derived kinds read that
 -- series; a line that is not one JSON object, or misses a member it
 -- needs, is skipped — never guessed.
+--
+-- Reading is STRICT by default: a non-object line, or a line missing a
+-- member a kind needs, is a hard failure (file, line number, reason).
+-- --allow-skips restores the skip with a counted warning;
+-- `log-integrity` is the first-class readability scan (per-event
+-- counts, the parse-failure count).
 
 local LOG_EVENTS: {string: boolean} = {
     ["heartbeat-commit"] = true,
@@ -1229,15 +1294,50 @@ end
 
 -- Every line of every log file, in file order (the producer emits one
 -- JSON object per line; the builders gate on the members they need).
-local function log_all_lines(paths: {string}): {string}
-    local out: {string} = {}
+-- Strict by default: a line that is not exactly one JSON object is a
+-- hard failure (file, line number, offending text truncated); under
+-- the leniency policy it is a counted warning and the scan moves on.
+-- The provenance (path, lineno, line) rides the returned record so the
+-- member gates can name the line exactly.
+local record LogLine
+    path: string
+    lineno: number
+    line: string
+end
+
+local function log_is_object(line: string): boolean
+    -- One compact check in the twins' shared dialect: the line's own
+    -- scanner reads `{ ... }` with balanced quotes; a leading `{` with
+    -- a trailing `}` and a member scan is the object test.
+    return line:sub(1, 1) == "{" and line:sub(-1) == "}"
+end
+
+local function log_all_lines(paths: {string}, policy: SkipPolicy): {LogLine}
+    local out: {LogLine} = {}
     for _, path in ipairs(log_files(paths)) do
         local fh = io.open(path, "r")
         if fh ~= nil then
             local data = fh:read("*a") as string
             fh:close()
-            for line in (data .. "\n"):gmatch("(.-)\n") do
-                out[#out + 1] = line
+            -- The python twin's read_text().splitlines(): a trailing
+            -- newline does not add a phantom empty line; an interior
+            -- blank line does. The old loop's (data .. "\n") created
+            -- one phantom per file (an empty chunk before the added
+            -- \n) — a line that is not one JSON object, warned and
+            -- counted twice per file. The added \n only when absent.
+            if data:sub(-1) ~= "\n" then
+                data = data .. "\n"
+            end
+            local lineno = 0
+            for line in data:gmatch("(.-)\n") do
+                lineno = lineno + 1
+                if log_is_object(line) then
+                    out[#out + 1] = {path = path, lineno = lineno,
+                                     line = line}
+                else
+                    policy_skip(policy, path, lineno, line,
+                                "not one JSON object")
+                end
             end
         end
     end
@@ -1245,11 +1345,23 @@ local function log_all_lines(paths: {string}): {string}
 end
 
 -- One line's member as a non-null value, or nil: a null saturates the
--- same way an absent member does (the python twin's None gate).
+-- same way an absent member does (the python twin's None gate). The
+-- member gate a kind states as data: the value, or the named failure
+-- (strict) / counted warning (leniency).
 local function log_num(line: string, key: string): any
     local v = json_num(line, key)
     if v == JSON_NULL then
         return nil
+    end
+    return v
+end
+
+local function require_num(l: LogLine, policy: SkipPolicy,
+                           key: string): any
+    local v = log_num(l.line, key)
+    if v == nil then
+        policy_skip(policy, l.path, l.lineno, l.line,
+                    "missing member '" .. key .. "'")
     end
     return v
 end
@@ -1269,34 +1381,31 @@ end
 -- commit-in `ts` for the SAME Commit exchange, joined on the
 -- (era, view, slot) both lines carry — the leader's send clock and the
 -- standby's record clock, measured, not inferred.
-leader_lag_rows = function(logs: {string}): {{string: any}}
+leader_lag_rows = function(logs: {string}, policy: SkipPolicy): {{string: any}}
+    policy = policy or STRICT
     local heartbeat: {string: {any}} = {}
     local arrivals: {{string: any}} = {}
-    for _, line in ipairs(log_all_lines(logs)) do
-        if line:sub(1, 1) == "{" and line:sub(-1) == "}" then
-            local event = json_str(line, "event")
-            if LOG_EVENTS[event] == true then
-                local ts = log_num(line, "ts")
-                local era = log_num(line, "era")
-                local view = log_num(line, "view")
-                local slot = log_num(line, "slot")
-                if ts ~= nil and era ~= nil and view ~= nil and slot ~= nil then
-                    local key = tostring(era) .. "|" .. tostring(view)
-                        .. "|" .. tostring(slot)
-                    if event == "heartbeat-commit" then
-                        local node = log_num(line, "node")
-                        if node ~= nil then
-                            heartbeat[key] = {node, ts}
-                        end
-                    else
-                        local node = log_num(line, "node")
-                        local from = log_num(line, "from")
-                        if node ~= nil and from ~= nil then
-                            arrivals[#arrivals + 1] = {
-                                leader = from, node = node, era = era,
-                                view = view, slot = slot, key = key, ts = ts,
-                            }
-                        end
+    for _, l in ipairs(log_all_lines(logs, policy)) do
+        local event = json_str(l.line, "event")
+        if LOG_EVENTS[event] == true then
+            local ts = require_num(l, policy, "ts")
+            local era = require_num(l, policy, "era")
+            local view = require_num(l, policy, "view")
+            local slot = require_num(l, policy, "slot")
+            local node = require_num(l, policy, "node")
+            if ts ~= nil and era ~= nil and view ~= nil and slot ~= nil
+                and node ~= nil then
+                local key = tostring(era) .. "|" .. tostring(view)
+                    .. "|" .. tostring(slot)
+                if event == "heartbeat-commit" then
+                    heartbeat[key] = {node, ts}
+                else
+                    local from = require_num(l, policy, "from")
+                    if from ~= nil then
+                        arrivals[#arrivals + 1] = {
+                            leader = from, node = node, era = era,
+                            view = view, slot = slot, key = key, ts = ts,
+                        }
                     end
                 end
             end
@@ -1332,28 +1441,27 @@ end
 -- per node: one stats row per (event, node) with two or more lines —
 -- the leader's send cadence and the standby's arrival cadence, one
 -- row each (two different clocks, never mixed).
-hb_spacing_rows = function(logs: {string}): {{string: any}}
+hb_spacing_rows = function(logs: {string}, policy: SkipPolicy): {{string: any}}
+    policy = policy or STRICT
     local ts_by: {string: {any}} = {}
     local meta_by: {string: {string: any}} = {}
-    for _, line in ipairs(log_all_lines(logs)) do
-        if line:sub(1, 1) == "{" and line:sub(-1) == "}" then
-            local event = json_str(line, "event")
-            if LOG_EVENTS[event] == true then
-                local ts = log_num(line, "ts")
-                local node = log_num(line, "node")
-                if ts ~= nil and node ~= nil then
-                    local key = event .. "|" .. tostring(node)
-                    local list: {any} = ts_by[key]
-                    if list == nil then
-                        list = {} as {any}
-                        ts_by[key] = list
-                        -- the original member values ride the key: the
-                        -- row's node keeps its int typing (a re-parse of
-                        -- the key string would widen it to a float)
-                        meta_by[key] = {event = event, node = node}
-                    end
-                    list[#list + 1] = ts
+    for _, l in ipairs(log_all_lines(logs, policy)) do
+        local event = json_str(l.line, "event")
+        if LOG_EVENTS[event] == true then
+            local ts = require_num(l, policy, "ts")
+            local node = require_num(l, policy, "node")
+            if ts ~= nil and node ~= nil then
+                local key = event .. "|" .. tostring(node)
+                local list: {any} = ts_by[key]
+                if list == nil then
+                    list = {} as {any}
+                    ts_by[key] = list
+                    -- the original member values ride the key: the
+                    -- row's node keeps its int typing (a re-parse of
+                    -- the key string would widen it to a float)
+                    meta_by[key] = {event = event, node = node}
                 end
+                list[#list + 1] = ts
             end
         end
     end
@@ -1394,9 +1502,78 @@ hb_spacing_rows = function(logs: {string}): {{string: any}}
     return rows
 end
 
+-- The first-class readability scan: every line of the --logs surface
+-- one row per file — the total line count, the per-event member
+-- counts, and the parse-failure count. The scan itself rides the
+-- strict/lenient policy: in strict mode a bad line stops the whole
+-- scan; under leniency the row's `skipped` carries the count. A JSON
+-- object with no usable `event` member IS a parse failure of the
+-- kind's contract (the emitters always name the event) — counted,
+-- never guessed into another bucket. Every file in the surface gets
+-- its row even when every line of it was skipped — the row is the
+-- file's record, not the parsed lines'.
+log_integrity_rows = function(logs: {string}, policy: SkipPolicy): {{string: any}}
+    policy = policy or STRICT
+    local files: {string} = log_files(logs)
+    local by_file: {string: {string: any}} = {}
+    for _, path in ipairs(files) do
+        local fresh: {string: any} = {lines = 0, events = {} as {string: number},
+                                      _order = {} as {string}, parse_failures = 0}
+        by_file[path] = fresh
+    end
+    for _, l in ipairs(log_all_lines(logs, policy)) do
+        local entry = by_file[l.path]
+        if entry == nil then
+            entry = {lines = 0, events = {} as {string: number},
+                     _order = {} as {string}, parse_failures = 0}
+            by_file[l.path] = entry
+        end
+        local lines_n = entry.lines as number
+        entry.lines = lines_n + 1
+        local event = json_str(l.line, "event")
+        if event ~= nil and event ~= "" then
+            local events_map = entry.events as {string: number}
+            if events_map[event] == nil then
+                (entry._order as {string})[#entry._order as {string} + 1] = event
+            end
+            events_map[event] = (events_map[event] or 0) + 1
+        else
+            local pf = entry.parse_failures as number
+            entry.parse_failures = pf + 1
+        end
+    end
+    local rows: {{string: any}} = {}
+    table.sort(files)
+    for _, path in ipairs(files) do
+        local entry = by_file[path]
+        -- The nested events map serialises through the _o contract
+        -- (the _stats machinery's shape): the key order is the
+        -- FIRST-APPEARANCE order (the python twin's json.dumps
+        -- insertion order — the parity contract), the values the
+        -- counts, carried in the events record itself.
+        local order = entry._order as {string}
+        local events_out: any = {}
+        events_out._o = order
+        local counts = entry.events as {string: number}
+        for _, k in ipairs(order) do
+            events_out[k] = require_ffi_u64(tostring(counts[k]))
+        end
+        rows[#rows + 1] = {
+            kind = "log-integrity", file = path,
+            lines = require_ffi_u64(tostring(entry.lines as number)),
+            events = events_out,
+            parse_failures = require_ffi_u64(tostring(entry.parse_failures as number)),
+            skipped = require_ffi_u64(tostring(policy.count)),
+        }
+    end
+    return rows
+end
+
 local function export_to(out_path: string, series_dir: string, kinds: string,
-                         anchors: any, hb_ms: any, logs: any): number
-    local events = export_series(series_dir, kinds, anchors, hb_ms, logs)
+                         anchors: any, hb_ms: any, logs: any,
+                         policy: SkipPolicy): number
+    local events = export_series(series_dir, kinds, anchors, hb_ms, logs,
+                                 policy)
     local handle = io.open(out_path, "w")
     if handle == nil then
         error("cannot write " .. out_path)
@@ -1410,12 +1587,15 @@ end
 
 local function main(argv: {string}): number
     -- Usage parity with the python twin: --lib is accepted (the cdylib
-    -- is loaded at require time), --json, --kind KIND (repeatable AND
-    -- space-joined, union semantics — one contract with the python
-    -- twin), repeatable --anchor EPOCHMS, repeatable --logs PATH (the
-    -- JSON log series the hb-spacing and leader-lag kinds read), --hb-ms
-    -- N, FILE_OR_DIR [OUT.jsonl].
+    -- is loaded at require time), --json, --allow-skips (the log
+    -- reading's opt-in leniency: skip with a counted warning instead of
+    -- failing hard), --kind KIND (repeatable AND space-joined, union
+    -- semantics — one contract with the python twin), repeatable
+    -- --anchor EPOCHMS, repeatable --logs PATH (the JSON log series the
+    -- hb-spacing and leader-lag kinds read), --hb-ms N, FILE_OR_DIR
+    -- [OUT.jsonl].
     local follow_json = false
+    local allow_skips = false
     local anchors: {number} = {}
     local logs: {string} = {}
     local hb_ms = 5.0
@@ -1428,6 +1608,9 @@ local function main(argv: {string}): number
             i = i + 2
         elseif a == "--json" then
             follow_json = true
+            i = i + 1
+        elseif a == "--allow-skips" then
+            allow_skips = true
             i = i + 1
         elseif a == "--kind" then
             for token in argv[i + 1]:gmatch("%S+") do
@@ -1460,8 +1643,8 @@ local function main(argv: {string}): number
     local export_kinds = #kind_parts > 0 and table.concat(kind_parts, " ") or "all"
     if #paths < 1 then
         print("usage: aof-trace-tool.tl [--lib PATH] [--json] "
-            .. "[--kind KIND ...] [--anchor EPOCHMS ...] [--logs PATH ...] "
-            .. "[--hb-ms N] FILE_OR_DIR [OUT.jsonl]")
+            .. "[--allow-skips] [--kind KIND ...] [--anchor EPOCHMS ...] "
+            .. "[--logs PATH ...] [--hb-ms N] FILE_OR_DIR [OUT.jsonl]")
         return 2
     end
     local export_out: (string | nil) = nil
@@ -1485,10 +1668,22 @@ local function main(argv: {string}): number
         for _, a in ipairs(anchors) do
             print("anchor " .. fmt_ts_ms(a))
         end
-        local n = export_to(export_out, paths[1], export_kinds,
-                            #anchors > 0 and anchors or nil, hb_ms,
-                            #logs > 0 and logs or nil)
-        print(("exported %d events to %s"):format(n, export_out))
+        local policy = policy_new(allow_skips)
+        local ok, n_or_err = pcall(export_to, export_out, paths[1],
+            export_kinds, #anchors > 0 and anchors or nil, hb_ms,
+            #logs > 0 and logs or nil, policy)
+        if not ok then
+            -- The strict reader's failure IS the tool's answer: the
+            -- named line, on stderr, exit non-zero — never a traceback.
+            io.stderr:write("aof-trace-tool: " .. tostring(n_or_err) .. "\n")
+            return 1
+        end
+        print(("exported %d events to %s")
+            :format(math.floor(n_or_err as number), export_out))
+        print(("skipped lines: %d"):format(math.floor(policy.count)))
+        if policy.count > 0 and not allow_skips then
+            return 1
+        end
         return 0
     end
     for _, p in ipairs(paths) do
@@ -1516,5 +1711,6 @@ return {
     append = append,
     close_writer = close_writer,
     is_dir = is_dir,
+    policy_new = policy_new,
     main = main,
 }

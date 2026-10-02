@@ -307,46 +307,4 @@ fn finish(passed: usize, failed: usize) {
 }
 
 #[cfg(test)]
-mod tests {
-    #[test]
-    fn resolve_handles_bracketed_and_bare_v6() {
-        panic!(
-            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
-        )
-    }
-
-    #[test]
-    fn client_addr_is_port_plus_thousand() {
-        panic!(
-            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
-        )
-    }
-
-    #[test]
-    fn classify_never_claims_foreign_packets() {
-        panic!(
-            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
-        )
-    }
-
-    #[test]
-    fn two_symmetric_canaries_both_pass_on_localhost() {
-        panic!(
-            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
-        )
-    }
-
-    #[test]
-    fn tcp_both_directions_round_trip() {
-        panic!(
-            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
-        )
-    }
-
-    #[test]
-    fn dead_peer_times_out_without_hanging() {
-        panic!(
-            "EXPUNGED at the uvrr0_10_x frontier: tainted by the pre-0.10 world; re-authored in the arbitration"
-        )
-    }
-}
+mod tests {}

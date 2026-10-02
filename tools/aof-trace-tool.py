@@ -17,8 +17,14 @@
 # series the observability contract produces (the leader's
 # `heartbeat-commit` lines, the standbys' `commit-in` lines) through the
 # repeatable `--logs PATH` flag — a log file, or a directory contributing
-# its sorted *.log entries. A line that does not parse, or misses a
-# member it needs, is skipped, never guessed.
+# its sorted *.log entries. Reading is STRICT by default: a line that
+# does not parse as one JSON object, or a JSON line missing a member the
+# requested kind needs, is a hard failure naming the file, the line
+# number and the reason (exit non-zero). The repeatable --allow-skips
+# flag opts into leniency: the line is skipped with a warning on stderr
+# and the skip count is reported in the summary. The `log-integrity` kind
+# scans the whole series for readability: per-event counts and the
+# parse-failure count, one row per file.
 #
 # The LuaJIT twin's CLI is tools/tl-driver.lua (tl gen of the .tl alone
 # is NOT a CLI — it silently no-ops). Run it from the repo root:
@@ -509,6 +515,12 @@ def _aof_noise_rows(dir_path, lib=None, hb_ms=5.0) -> list:
 # (era, view, slot) it keys on). The two log-derived kinds read that
 # series; a line that does not parse, or misses a member it needs, is
 # skipped — never guessed.
+#
+# Reading is STRICT by default: a non-object line, or a line missing a
+# member a kind needs, is a hard failure (file, line number, reason).
+# --allow-skips restores the skip with a counted warning; `log-integrity`
+# is the first-class readability scan (per-event counts, the
+# parse-failure count).
 
 LOG_EVENTS = ("heartbeat-commit", "commit-in")
 
@@ -526,37 +538,112 @@ def _log_files(paths) -> list:
     return out
 
 
-def _log_lines(paths):
+def _log_lines(paths, ctx=None):
     # Every JSON-object line of the --logs surface, in file order.
+    # Strict by default: a line that is not exactly one JSON object is a
+    # hard failure (file, line number, offending text truncated); under
+    # the leniency policy it is a counted warning and the scan moves on.
+    # The `_src` provenance (path, lineno, text) rides the yielded dict
+    # so the member gates can name the line exactly, and is stripped
+    # before the row builders see the members only.
     for path in _log_files(paths):
-        for line in Path(path).read_text().splitlines():
+        text = Path(path).read_text()
+        for lineno, line in enumerate(text.splitlines(), 1):
             try:
                 value = json.loads(line)
             except (ValueError, UnicodeDecodeError):
+                _policy_skip(ctx, path, lineno, line,
+                             "not one JSON object")
                 continue
             if isinstance(value, dict):
+                value["_src"] = (str(path), lineno, line)
                 yield value
+            else:
+                _policy_skip(ctx, path, lineno, line,
+                             "parsed but not a JSON object")
 
 
-def _leader_lag_rows(paths) -> list:
+class SkipPolicy:
+    # The leniency policy: `strict` raises the failure; `allow` warns on
+    # stderr and counts. Every skip is counted in BOTH modes (a silent
+    # skip is the same defect); strict only forbids the continue. The
+    # count is DISTINCT file:line pairs — the kinds each pass the series
+    # once, and a bad line is one bad line, not one per reader pass.
+    def __init__(self, allow):
+        self.allow = allow
+        self.count = 0
+        self._seen = set()
+
+    def skip(self, path, lineno, text, why):
+        stamp = "%s:%d" % (path, lineno)
+        if stamp in self._seen:
+            return
+        self._seen.add(stamp)
+        self.count += 1
+        if self.allow:
+            sys.stderr.write(
+                "skipped line %s (%s): %s\n"
+                % (stamp, why, text.strip()[:60]))
+        else:
+            raise ValueError(
+                "%s: %s (offending text: %r)"
+                % (stamp, why, text.strip()[:60]))
+
+
+# The module default: strict. A library caller that wants leniency
+# builds SkipPolicy(allow=True) and passes it as `ctx`.
+STRICT = SkipPolicy(allow=False)
+
+
+def _policy_skip(ctx, path, lineno, line, why):
+    (ctx or STRICT).skip(path, lineno, line, why)
+
+
+def _require(value, ctx, path, lineno, line, member):
+    # The member-gate a kind states as data: the value, or the named
+    # failure (strict) / counted warning (leniency). None rides only
+    # under leniency, so a row is never built from a missing member.
+    if value is None:
+        _policy_skip(ctx, path, lineno, line,
+                     "missing member '%s'" % member)
+    return value
+
+
+def _leader_lag_rows(paths, ctx=None) -> list:
     # leader_ms: the leader's own heartbeat-commit `ts` vs the standby's
     # commit-in `ts` for the SAME Commit exchange, joined on the
     # (era, view, slot) both lines carry — the leader's send clock and
     # the standby's record clock, measured, not inferred.
     heartbeat = {}
     arrivals = []
-    for value in _log_lines(paths):
+    for value in _log_lines(paths, ctx):
         event = value.get("event")
-        if event not in LOG_EVENTS or value.get("ts") is None:
+        if event not in LOG_EVENTS:
             continue
-        key = (value.get("era"), value.get("view"), value.get("slot"))
-        if None in key:
+        path, lineno, line = value["_src"]
+        ts = _require(value.get("ts"), ctx, path, lineno, line, "ts")
+        if ts is None:
             continue
+        node = _require(value.get("node"), ctx, path, lineno, line, "node")
+        if node is None:
+            continue
+        era = value.get("era")
+        view = value.get("view")
+        slot = value.get("slot")
+        if era is None or view is None or slot is None:
+            missing = ("era" if era is None else
+                       "view" if view is None else "slot")
+            _require(None, ctx, path, lineno, line, missing)
+            continue
+        key = (era, view, slot)
         if event == "heartbeat-commit":
-            if value.get("node") is not None:
-                heartbeat[key] = (value["node"], value["ts"])
-        elif value.get("node") is not None and value.get("from") is not None:
-            arrivals.append((value["from"], value["node"], key, value["ts"]))
+            heartbeat[key] = (node, ts)
+        else:
+            src = value.get("from")
+            if src is None:
+                _require(None, ctx, path, lineno, line, "from")
+                continue
+            arrivals.append((src, node, key, ts))
     rows = []
     for leader, node, (era, view, slot), ts in arrivals:
         sent = heartbeat.get((era, view, slot))
@@ -570,17 +657,22 @@ def _leader_lag_rows(paths) -> list:
     return rows
 
 
-def _hb_spacing_rows(paths) -> list:
+def _hb_spacing_rows(paths, ctx=None) -> list:
     # The cadence between successive heartbeat-commit / commit-in lines
     # per node: one stats row per (event, node) with two or more lines —
     # the leader's send cadence and the standby's arrival cadence, one
     # row each (two different clocks, never mixed).
     ts_by: dict = {}
-    for value in _log_lines(paths):
+    for value in _log_lines(paths, ctx):
         event = value.get("event")
-        if (event in LOG_EVENTS and value.get("ts") is not None
-                and value.get("node") is not None):
-            ts_by.setdefault((event, value["node"]), []).append(value["ts"])
+        if event not in LOG_EVENTS:
+            continue
+        path, lineno, line = value["_src"]
+        ts = _require(value.get("ts"), ctx, path, lineno, line, "ts")
+        node = _require(value.get("node"), ctx, path, lineno, line, "node")
+        if ts is None or node is None:
+            continue
+        ts_by.setdefault((event, node), []).append(ts)
     rows = []
     for (event, node) in sorted(ts_by):
         ts_list = ts_by[(event, node)]
@@ -619,19 +711,21 @@ def _anchor_rows_and_takeovers(events, anchors):
     return echoes + timed + takeovers
 
 def export_series(dir_path, lib=None, kinds="all", anchors=None, hb_ms=5.0,
-                  logs=None):
+                  logs=None, ctx=None):
     """The trace of what happened: one JSON dict per line-worthy event,
     ordered as the trace recorded them (file order = epoch order = ns
     order). Kinds: all | both (reconfig+locks) | timeouts |
     reconfig | locks | locks-timeline | aof-noise | hb-spacing |
-    leader-lag; the kinds string is a whitespace-joined UNION (the
-    repeatable --kind CLI flag accumulates into it, one contract with
-    the LuaJIT twin). With anchors (unix ms, repeatable), every exported
-    row gains t_rel_ms / t_fmt and the locks-timeline export gains
-    per-anchor takeover summary lines. The log-derived kinds
-    (hb-spacing, leader-lag) read the JSON log series supplied as
-    `logs` (the repeatable --logs CLI flag: a log file, or a directory
-    contributing its sorted *.log entries)."""
+    leader-lag | log-integrity; the kinds string is a whitespace-joined
+    UNION (the repeatable --kind CLI flag accumulates into it, one
+    contract with the LuaJIT twin). With anchors (unix ms, repeatable),
+    every exported row gains t_rel_ms / t_fmt and the locks-timeline
+    export gains per-anchor takeover summary lines. The log-derived
+    kinds (hb-spacing, leader-lag, log-integrity) read the JSON log
+    series supplied as `logs` (the repeatable --logs CLI flag: a log
+    file, or a directory contributing its sorted *.log entries). Log
+    reading is strict by default: pass ctx=SkipPolicy(allow=True) to
+    skip-with-a-counted-warning instead of failing hard."""
     dir_path = Path(str(getattr(dir_path, "path", dir_path)))
     wanted = set(kinds.split()) if kinds != "all" else {"locks", "reconfig", "timeouts"}
     if kinds == "both":
@@ -698,22 +792,68 @@ def export_series(dir_path, lib=None, kinds="all", anchors=None, hb_ms=5.0,
     if "aof-noise" in wanted:
         events += _aof_noise_rows(dir_path, lib, hb_ms)
     if "hb-spacing" in wanted:
-        events += _hb_spacing_rows(logs)
+        events += _hb_spacing_rows(logs, ctx)
     if "leader-lag" in wanted:
-        events += _leader_lag_rows(logs)
+        events += _leader_lag_rows(logs, ctx)
+    if "log-integrity" in wanted:
+        events += _log_integrity_rows(logs, ctx)
     if anchors:
         events = _anchor_rows_and_takeovers(events, anchors)
     return events
 
 
+# --------------------------------------------------- log-integrity kind ----
+# The first-class readability scan: every line of the --logs surface is
+# one row per file — the total line count, the per-event member counts,
+# and the parse-failure count. The member gates a kind needs are the
+# union the readers use: ts on every JSON line, node on the LOG_EVENTS
+# lines, from on commit-in, era/view/slot on both protocol lines.
+
+
+def _log_integrity_rows(paths, ctx=None) -> list:
+    # The first-class readability scan: every line of the --logs surface
+    # one row per file — the total line count, the per-event member
+    # counts, and the parse-failure count. The scan itself rides the
+    # strict/lenient policy (ctx): in strict mode a bad line stops the
+    # whole scan; under leniency the row's `skipped` carries the count.
+    # A JSON object with no usable `event` member IS a parse failure of
+    # the kind's contract (the emitters always name the event) — counted,
+    # never guessed into another bucket. Every file in the surface gets
+    # its row even when every line of it was skipped — the row is the
+    # file's record, not the parsed lines'.
+    by_file: dict = {}
+    for path in _log_files(paths):
+        by_file[str(path)] = {"lines": 0, "events": {}, "parse_failures": 0}
+    for value in _log_lines(paths, ctx):
+        path, lineno, line = value["_src"]
+        value.pop("_src", None)
+        entry = by_file.setdefault(str(path), {"lines": 0, "events": {},
+                                               "parse_failures": 0})
+        entry["lines"] += 1
+        event = value.get("event")
+        if isinstance(event, str) and event:
+            entry["events"][event] = entry["events"].get(event, 0) + 1
+        else:
+            entry["parse_failures"] += 1
+    rows = []
+    for path in sorted(by_file):
+        entry = by_file[path]
+        rows.append({"kind": "log-integrity", "file": path,
+                     "lines": entry["lines"], "events": entry["events"],
+                     "parse_failures": entry["parse_failures"],
+                     "skipped": ctx.count if ctx is not None else 0})
+    return rows
+
+
 KINDS = ("all", "both", "timeouts", "reconfig", "locks",
-         "locks-timeline", "aof-noise", "hb-spacing", "leader-lag")
+         "locks-timeline", "aof-noise", "hb-spacing", "leader-lag",
+         "log-integrity")
 
 
 def export_to(path_out: str, series_dir, lib=None, kinds="all",
-              anchors=None, hb_ms=5.0, logs=None):
+              anchors=None, hb_ms=5.0, logs=None, ctx=None):
     events = export_series(series_dir, lib, kinds,
-                           anchors=anchors, hb_ms=hb_ms, logs=logs)
+                           anchors=anchors, hb_ms=hb_ms, logs=logs, ctx=ctx)
     with open(path_out, "w") as handle:
         for line in events:
             handle.write(json.dumps(line) + "\n")
@@ -721,6 +861,16 @@ def export_to(path_out: str, series_dir, lib=None, kinds="all",
 
 
 def main(argv):
+    try:
+        return _main(argv)
+    except ValueError as e:
+        # The strict reader's failure IS the tool's answer: the named
+        # line, on stderr, exit non-zero — never a traceback.
+        print(f"aof-trace-tool: {e}", file=sys.stderr)
+        return 1
+
+
+def _main(argv):
     args = [a for a in argv[1:]]
     lib_path = None
     follow_json = False
@@ -730,6 +880,7 @@ def main(argv):
     hb_ms = 5.0
     paths = []
     kind_parts: list = []  # --kind is repeatable AND space-joined: union
+    allow_skips = False
     i = 0
     while i < len(args):
         if args[i] == "--lib":
@@ -737,6 +888,9 @@ def main(argv):
             i += 2
         elif args[i] == "--json":
             follow_json = True
+            i += 1
+        elif args[i] == "--allow-skips":
+            allow_skips = True
             i += 1
         elif args[i] == "--kind":
             for token in args[i + 1].split():
@@ -767,17 +921,19 @@ def main(argv):
         paths = paths[:1]
     if not paths:
         print("usage: aof-trace-tool.py [--lib PATH] [--json] "
-              "[--kind KIND ...] [--anchor EPOCHMS ...] [--logs PATH ...] "
-              "[--hb-ms N] FILE_OR_DIR [OUT.jsonl]")
+              "[--allow-skips] [--kind KIND ...] [--anchor EPOCHMS ...] "
+              "[--logs PATH ...] [--hb-ms N] FILE_OR_DIR [OUT.jsonl]")
         return 2
     lib = load(lib_path)
+    ctx = SkipPolicy(allow=allow_skips)
     if export_out is not None:
         for a in sorted(anchors):
             print(f"anchor {fmt_ts_ms(a)}")
         n = export_to(export_out, Path(paths[0]), lib, export_kinds,
-                      anchors=anchors, hb_ms=hb_ms, logs=logs)
+                      anchors=anchors, hb_ms=hb_ms, logs=logs, ctx=ctx)
         print(f"exported {n} events to {export_out}")
-        return 0
+        print(f"skipped lines: {ctx.count}")
+        return 0 if (ctx.count == 0 or allow_skips) else 1
     for p in paths:
         target = Path(p)
         out = summarize(target, lib) if target.is_file() else summarize_series(target, lib)
