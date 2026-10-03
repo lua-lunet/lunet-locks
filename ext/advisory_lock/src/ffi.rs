@@ -1733,16 +1733,16 @@ impl Node {
         // The deployment ruling (docs/src/decisions.md): a cluster never
         // drops below three VOTING members. A departure (Leave) or a
         // demotion (Decrement) that would is refused before it drives.
-        if matches!(op, RECONFIGURE_DECREMENT | RECONFIGURE_LEAVE) {
-            if let Some((ids, weights)) = self.membership() {
-                let voting = weights.iter().filter(|weight| **weight > 0).count();
-                let member_voting = ids
-                    .iter()
-                    .zip(&weights)
-                    .any(|(id, weight)| id.0 == member && *weight > 0);
-                if member_voting && voting <= 3 {
-                    return CONFIG;
-                }
+        if matches!(op, RECONFIGURE_DECREMENT | RECONFIGURE_LEAVE)
+            && let Some((ids, weights)) = self.membership()
+        {
+            let voting = weights.iter().filter(|weight| **weight > 0).count();
+            let member_voting = ids
+                .iter()
+                .zip(&weights)
+                .any(|(id, weight)| id.0 == member && *weight > 0);
+            if member_voting && voting <= 3 {
+                return CONFIG;
             }
         }
         // The host's pivot policy (W5 is sizing; this is its transition

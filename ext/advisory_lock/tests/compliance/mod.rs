@@ -214,7 +214,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 
 fn hex_decode(text: &str) -> Result<Vec<u8>, String> {
     let bytes = text.as_bytes();
-    if bytes.len() % 2 != 0 {
+    if !bytes.len().is_multiple_of(2) {
         return Err("odd hex length".into());
     }
     let value = |b: u8| -> Result<u8, String> {

@@ -156,12 +156,12 @@ fn validate_identity(
     name: &Option<String>,
     labels: &Option<Vec<String>>,
 ) -> Result<(), serde_json::Error> {
-    if let Some(name) = name {
-        if !valid_name(name) {
-            return Err(<serde_json::Error as serde::de::Error>::custom(
-                "invalid lock name",
-            ));
-        }
+    if let Some(name) = name
+        && !valid_name(name)
+    {
+        return Err(<serde_json::Error as serde::de::Error>::custom(
+            "invalid lock name",
+        ));
     }
     if let Some(labels) = labels {
         if labels.len() > 8 {
