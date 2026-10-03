@@ -1,5 +1,5 @@
 //! Host-side FFI adapter between the LuaJIT host and the uVRR core
-//! (uvrr-core tag v0.13.1 @ 37549d1 — the lifecycle boot gate; the core's constructors all sit in `node_from_sink` in this file: `node_from_sink` :2831, `lifecycle::boot` :2593, `Replica::reincarnate` :3070, `Replica::resume` :3113, `Replica::join` :3129, `Replica::provision` :3141).
+//! (uvrr-core tag v0.13.1 @ 37549d1 — the lifecycle boot gate. The core's constructors are called from this file at `lifecycle::boot` :2593, in `boot_gate`, and, in `node_from_sink` :2831, at `Replica::provision` :3141, `Replica::join` :3129, `Replica::resume` :3113 and `Replica::reincarnate` :3070; the core's own definitions are `lifecycle::boot` in its `src/lifecycle.rs` and the four `Replica` constructors in its `src/replica/mod.rs`.)
 //!
 //! Concrete core: `Replica<SegmentedLog, WeightedMajority>` running
 //! `Stability::Volatile` — nothing is persisted but the boot gate's
@@ -3982,10 +3982,10 @@ mod tests {
     /// The wait is the whole contract of a reconfiguration: a transition
     /// is complete only once the view has entered the folded era, and an
     /// operation driven inside a still-establishing era refuses with
-    /// `SERVICE` (`reconfigure`'s `POSITION_APPEND` fold at ffi.rs:1545
-    /// is the same shape of refusal). Waiting on the configuration era
-    /// alone is waiting on nothing — it advances the moment the
-    /// transition is proposed, not the moment it commits.
+    /// `SERVICE` (`reconfigure`'s `POSITION_APPEND` fold at
+    /// ffi.rs:1707-1722 is the same shape of refusal). Waiting on the
+    /// configuration era alone is waiting on nothing — it advances the
+    /// moment the transition is proposed, not the moment it commits.
     fn drive_on_leader(
         nodes: &mut [&mut Node],
         clock: &mut u64,

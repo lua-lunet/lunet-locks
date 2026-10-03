@@ -150,7 +150,8 @@ local function half(text: string): integer, string
 end
 
 -- The packed identity an explicit `system:counter` pair names
--- (`ids.rs:124-127`: MSB system identifier, LSB crash counter).
+-- (`NodeId::new`, `ext/uvrr-core/src/ids.rs:135-137`: MSB system
+-- identifier, LSB crash counter).
 local function identity(pair: string): integer, string
     local system_text, counter_text = pair:match("^([^:]+):([^:]+)$")
     if system_text == nil then
@@ -173,7 +174,8 @@ local function pair_of(id: integer): string
 end
 
 -- The next life of the same system: the counter incremented. A counter
--- at the packing's last slot has no next life (`ids.rs:157-168`).
+-- at the packing's last slot has no next life (`NodeId::next_life`,
+-- `ext/uvrr-core/src/ids.rs:160-174`).
 local function next_life(id: integer): integer, string
     if id % 65536 >= 65535 then
         return nil, "the identity space is spent"
@@ -327,7 +329,8 @@ local function system_operation(value: any): string, string
 end
 
 -- The core's own rendering of a typed cluster operation
--- (`mod.rs:252-282`), used for the journal's system entries.
+-- (`ext/uvrr-core/src/conformance/corpus.rs:352-382`, `system_op_name`),
+-- used for the journal's system entries.
 local function system_op_name(value: any): string, string
     if json.is_text(value) then
         local tag = json.text_of(value)
@@ -396,7 +399,8 @@ local function system_op_name(value: any): string, string
 end
 
 -- A journal entry's payload as corpus text: an operation's bytes ride
--- opaque, a system operation its own rendering (`mod.rs:308-313`).
+-- opaque, a system operation its own rendering
+-- (`ext/uvrr-core/src/conformance/corpus.rs:407-412`, `render_payload`).
 local function render_payload(entry: any): string, string
     local payload = json.field(entry, "payload")
     local operation = json.field(payload, "Operation")

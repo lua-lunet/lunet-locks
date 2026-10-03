@@ -10,7 +10,7 @@
 -- module at the compliance shape and a production boot never loads it.
 --
 -- Every vector read follows the pull-style buffer contract of
--- `lunet_lock_node_fault` (`ffi.rs:3451-3478`): a sizing call with a
+-- `lunet_lock_node_fault` (`ffi.rs:3500`): a sizing call with a
 -- null buffer answers `TOO_LARGE` and the length it needs, and nothing
 -- allocates across the boundary.
 

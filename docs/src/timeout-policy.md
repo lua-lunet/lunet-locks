@@ -79,17 +79,17 @@ drive is:
 | `(in-the-cluster, steady)` | the leader's idle beat: a synthetic client GET proposed through the full phase-2 path, whose commit fan-out the followers observe | `examples/lease-sequencer/src/main.rs:883-901` |
 | `(steady, steady)` | the suspicion: the leader-failure detector's §14.2 forced view, then the core's suspicion input | `examples/lease-sequencer/src/main.rs:779-854`; the harness's `leader_timeout_step` at `src/uds_harness.rs:609-657`; the Teal host's election loop at `src/server.tl:1234-1239` |
 | `(steady, steady)` while `timedout` holds | the cluster viewchange poll: inside the view-change limbo the poll drives the §14.2 forced view at the next view number, a fresh commit disarming it | `examples/lease-sequencer/src/main.rs:2000-2019` |
-| `(booted, *)` | the recovery drive on `recovery_ms`: the §8 re-announce of the `Reincarnation(old, new)` pair, then the tick | `examples/lease-sequencer/src/main.rs:2087-2094`; the adapter's drive at `ext/advisory_lock/src/ffi.rs:1503-1524`; the Teal host at `src/server.tl:1244-1258` |
+| `(booted, *)` | the recovery drive on `recovery_ms`: the §8 re-announce of the `Reincarnation(old, new)` pair, then the tick | `examples/lease-sequencer/src/main.rs:2087-2094`; the adapter's drive at `ext/advisory_lock/src/ffi.rs:1668-1696` (`Node::recover`); the Teal host at `src/server.tl:1244-1258` |
 | `(booted, booted)` | the rejoin gossip's resend on `GOSSIP_RESEND_MS`: the entry ticket to every peer, until the cluster's answer installs | `examples/lease-sequencer/src/main.rs:2106-2111`, the send at `main.rs:948-964` |
 | `(booted, booted)` | the boot-time discovery rounds on the 100 ms cadence, bounded by the 15 s deadline, after which the ordinary fenced boot proceeds | `examples/lease-sequencer/src/main.rs:1149-1172`; the Teal host at `src/server.tl:492-527` |
 | `(stopping, *)` | none: the stop is signal-driven, the loop break is the drain point, and no timer re-drives the drain | `examples/lease-sequencer/src/main.rs:1437-1481` (`Lifecycle::register`), the stop at `main.rs:1949`; the Teal host's stop hook at `src/server.tl:310-321` |
-| `(stopping-not-flushed, *)` | the stop failure surface: the failed round or drain prints its failure and reports `SERVICE`; no timer re-drives the flush | `ext/advisory_lock/src/ffi.rs:1636-1716`; the host's code report at `examples/lease-sequencer/src/main.rs:1949-1958` |
+| `(stopping-not-flushed, *)` | the stop failure surface: the failed round or drain prints its failure and reports `SERVICE`; no timer re-drives the flush | `ext/advisory_lock/src/ffi.rs:1813-1957` (`Node::stop`); the host's code report at `examples/lease-sequencer/src/main.rs:1949-1958` |
 
 The witness, unknown, and crashed states carry no host drive: a witness
 is a passive data sink, a node unknown to the others has no addressing
 row, and a crashed node's clock belongs to whatever the next boot does
 about the marker. The adapter's status plane (`status`,
-`ext/advisory_lock/src/ffi.rs:1732-1743`) reports the node's
+`ext/advisory_lock/src/ffi.rs:1966-1977`) reports the node's
 replication state, leader, era, view, and folded configuration era, and
 the hosts read it to pick the drive; the pairing above is exhaustive
 over the drives the hosts own.

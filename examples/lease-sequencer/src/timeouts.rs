@@ -269,8 +269,9 @@ pub enum PollActuation {
 /// leader timeout. A node inside a view change
 /// (`state == STATE_VIEW_CHANGE_HOST`) whose attempt's designated
 /// primary may never arrive cannot be advanced by an ordinary tick —
-/// the core's tick suspicion gate admits only `Normal` nodes
-/// (`ext/uvrr-core/src/replica/mod.rs:1546-1547`) — so the limbo's poll
+/// the core's tick suspicion gate, `Replica::plan_tick`'s `suspects`
+/// binding in `ext/uvrr-core/src/replica/mod.rs:1784-1791`, admits only
+/// a `Normal` or a `Restarting` node — so the limbo's poll
 /// carries the §14.2 forced view instead: a NEW attempt re-broadcasts
 /// its fence, the peers join and vote, and a live primary installs. A
 /// fresh commit disarms the poll and the leader timeout resumes.
