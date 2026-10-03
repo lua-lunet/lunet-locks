@@ -36,7 +36,7 @@ const DRAIN_BOUND: usize = 1_000;
 
 /// The vector operations' fixed identity half: part of the fixture
 /// (`docs/uvrr-host-compliance.md` §4), never zero, never privileged.
-const OP_MSB: u64 = 0x7665_6374;
+pub const OP_MSB: u64 = 0x7665_6374;
 
 /// The marker-store root for every case's node state: inside the repo,
 /// under the scratch tree.
@@ -203,7 +203,7 @@ pub fn pair_of(id: NodeId) -> String {
 
 const HEX: &[u8; 16] = b"0123456789abcdef";
 
-fn hex_encode(bytes: &[u8]) -> String {
+pub fn hex_encode(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
         out.push(HEX[(byte >> 4) as usize] as char);
@@ -212,7 +212,7 @@ fn hex_encode(bytes: &[u8]) -> String {
     out
 }
 
-fn hex_decode(text: &str) -> Result<Vec<u8>, String> {
+pub fn hex_decode(text: &str) -> Result<Vec<u8>, String> {
     let bytes = text.as_bytes();
     if !bytes.len().is_multiple_of(2) {
         return Err("odd hex length".into());
@@ -236,7 +236,7 @@ fn hex_decode(text: &str) -> Result<Vec<u8>, String> {
 
 /// The corpus's status vocabulary, stated once: the protocol's own
 /// status names, never a Rust debug rendering.
-fn status_name(status: Status) -> &'static str {
+pub fn status_name(status: Status) -> &'static str {
     match status {
         Status::Normal => "Normal",
         Status::ViewChange => "ViewChange",
@@ -249,7 +249,7 @@ fn status_name(status: Status) -> &'static str {
 /// The abstract operation name of a typed cluster operation
 /// (`docs/uvrr-host-compliance.md` §3): the corpus's vocabulary, never
 /// Rust debug formatting.
-fn system_op_name(op: &SystemOperation) -> String {
+pub fn system_op_name(op: &SystemOperation) -> String {
     match op {
         SystemOperation::Void => "void".into(),
         SystemOperation::Init { order } => format!(
@@ -283,7 +283,7 @@ fn system_op_name(op: &SystemOperation) -> String {
 
 /// The typed operation an abstract name names, with the argument
 /// identities resolved.
-fn system_op_of(op: &SystemOp) -> Result<SystemOperation, String> {
+pub fn system_op_of(op: &SystemOp) -> Result<SystemOperation, String> {
     Ok(match op {
         SystemOp::Increment { node } => SystemOperation::Increment(identity(node)?),
         SystemOp::Decrement { node } => SystemOperation::Decrement(identity(node)?),
@@ -305,7 +305,7 @@ fn system_op_of(op: &SystemOp) -> Result<SystemOperation, String> {
 }
 
 /// Renders a journal entry's payload as corpus text.
-fn render_payload(entry: &LogEntry) -> String {
+pub fn render_payload(entry: &LogEntry) -> String {
     match &entry.payload {
         Payload::Operation { payload, .. } => String::from_utf8_lossy(payload).into_owned(),
         Payload::System(op) => system_op_name(op),
@@ -773,31 +773,6 @@ impl Executor {
         Err("the drain did not quiet inside the bound".into())
     }
 
-    /// The boot-gate marker schedule a known identity's post record
-    /// carries: the machine rounds of the slot's most recent gate, as
-    /// `<Marker>@<system>:<counter>` with the `drain` between the halt's
-    /// rounds. A slot whose schedule a restart moved away carries none.
-    fn marker_states(markers: &Option<Arc<Mutex<Vec<String>>>>) -> Vec<String> {
-        let Some(log) = markers else {
-            return Vec::new();
-        };
-        log.lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .iter()
-            .filter_map(|line| {
-                if line == "drain" {
-                    return Some("drain".to_string());
-                }
-                let rest = line.strip_prefix("commit:")?;
-                let (name, packed) = rest.split_once('@')?;
-                let identity = NodeId(packed.parse().ok()?);
-                let system = identity.system_id()?.get();
-                let counter = identity.crash_counter()?.get();
-                Some(format!("{name}@{system}:{counter}"))
-            })
-            .collect()
-    }
-
     /// One node's full post record, every field captured.
     #[must_use]
     pub fn post_of(&self, id: NodeId) -> PostNode {
@@ -805,40 +780,86 @@ impl Executor {
             return PostNode::default();
         };
         let slot = &self.slots[index];
-        let Some(node) = slot.node.as_ref() else {
-            return PostNode {
-                node: pair_of(id),
-                markers: Some(Self::marker_states(&slot.markers)),
-                ..PostNode::default()
-            };
-        };
-        let status = node.status();
-        let (accepted, committed, applied) = node.frontiers();
-        let (members, weights) = node
-            .membership()
-            .map(|(order, weights)| {
-                (
-                    order.iter().map(|m| pair_of(*m)).collect::<Vec<_>>(),
-                    weights,
-                )
-            })
-            .unwrap_or((Vec::new(), Vec::new()));
-        PostNode {
+        post_record(slot.node.as_ref(), &slot.markers, id)
+    }
+}
+
+/// The boot-gate marker schedule a known identity's post record carries:
+/// the machine rounds of the slot's most recent gate, as
+/// `<Marker>@<system>:<counter>` with the `drain` between the halt's
+/// rounds. A schedule a restart moved away carries none.
+///
+/// Free and public so the message-fed seam (tests/seam/mod.rs) names a
+/// marker round exactly as the corpus does — one rendering, stated once.
+pub fn marker_states(markers: &Option<Arc<Mutex<Vec<String>>>>) -> Vec<String> {
+    let Some(log) = markers else {
+        return Vec::new();
+    };
+    log.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .filter_map(|line| {
+            if line == "drain" {
+                return Some("drain".to_string());
+            }
+            let rest = line.strip_prefix("commit:")?;
+            let (name, packed) = rest.split_once('@')?;
+            let identity = NodeId(packed.parse().ok()?);
+            let system = identity.system_id()?.get();
+            let counter = identity.crash_counter()?.get();
+            Some(format!("{name}@{system}:{counter}"))
+        })
+        .collect()
+}
+
+/// One adapter node's full post record, every field captured: the
+/// corpus's `post` grammar (`docs/uvrr-host-compliance.md` §4) over a
+/// live node, its down-state record when the slot is down, and the empty
+/// default for an identity the harness never seated. `markers` is the
+/// boot-gate schedule handle the seat's own boot produced.
+///
+/// Free and public so the message-fed seam (tests/seam/mod.rs) captures
+/// the observable state exactly as the corpus does — one capture, stated
+/// once.
+#[must_use]
+pub fn post_record(
+    node: Option<&Node>,
+    markers: &Option<Arc<Mutex<Vec<String>>>>,
+    id: NodeId,
+) -> PostNode {
+    let Some(node) = node else {
+        return PostNode {
             node: pair_of(id),
-            status: Status::from_word(status.state)
-                .map(status_name)
-                .map(str::to_string),
-            era: Some(status.era),
-            view: Some(status.view),
-            accepted: Some(accepted),
-            committed: Some(committed),
-            applied: Some(applied),
-            journal: Some(node.journal_entries().iter().map(render_payload).collect()),
-            members: Some(members),
-            weights: Some(weights),
-            markers: Some(Self::marker_states(&slot.markers)),
-            witnesses: Some(node.witnesses().iter().map(|w| pair_of(*w)).collect()),
-        }
+            markers: Some(marker_states(markers)),
+            ..PostNode::default()
+        };
+    };
+    let status = node.status();
+    let (accepted, committed, applied) = node.frontiers();
+    let (members, weights) = node
+        .membership()
+        .map(|(order, weights)| {
+            (
+                order.iter().map(|m| pair_of(*m)).collect::<Vec<_>>(),
+                weights,
+            )
+        })
+        .unwrap_or((Vec::new(), Vec::new()));
+    PostNode {
+        node: pair_of(id),
+        status: Status::from_word(status.state)
+            .map(status_name)
+            .map(str::to_string),
+        era: Some(status.era),
+        view: Some(status.view),
+        accepted: Some(accepted),
+        committed: Some(committed),
+        applied: Some(applied),
+        journal: Some(node.journal_entries().iter().map(render_payload).collect()),
+        members: Some(members),
+        weights: Some(weights),
+        markers: Some(marker_states(markers)),
+        witnesses: Some(node.witnesses().iter().map(|w| pair_of(*w)).collect()),
     }
 }
 
@@ -883,13 +904,24 @@ fn field<T: PartialEq + std::fmt::Debug>(
 /// Asserts a captured expectation against a case's named expectation:
 /// the delivery sequence exactly, the named post fields exactly.
 pub fn assert_expectation(case: &Case, captured: &Expect) -> Result<(), String> {
-    if captured.deliveries != case.expect.deliveries {
+    assert_named(&case.expect, captured)
+}
+
+/// Asserts a captured expectation against a NAMED one: the delivery
+/// sequence exactly, the named post fields exactly, the unconstrained
+/// ones free.
+///
+/// Free and public so the message-fed seam (tests/seam/mod.rs) states its
+/// post-state expectations in the corpus's own grammar and compares them
+/// by this function — one comparison, stated once.
+pub fn assert_named(named: &Expect, captured: &Expect) -> Result<(), String> {
+    if captured.deliveries != named.deliveries {
         return Err(format!(
             "the delivery sequence differs: expected {:?}, captured {:?}",
-            case.expect.deliveries, captured.deliveries
+            named.deliveries, captured.deliveries
         ));
     }
-    for named in &case.expect.post {
+    for named in &named.post {
         let Some(captured_post) = captured.post.iter().find(|p| p.node == named.node) else {
             return Err(format!("no post record for node {}", named.node));
         };

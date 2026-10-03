@@ -39,9 +39,47 @@ The layer's guarantees:
   process's outside.
 
 The layer is the home of the protocol-state expectations: view-change
-flow, NOMINATE leader assignment, the fence, reincarnation seating,
-the drop discipline (every refusal named), the marker emission gate,
-the flavoured-timeout transitions — each as a force-fed exchange.
+flow, NOMINATE leader assignment, the fence, reincarnation seating, the
+drop discipline (every refusal named), the marker emission gate, the
+flavoured-timeout transitions — each as a force-fed exchange.
+
+### The seam
+
+The layer has one harness: `ext/advisory_lock/tests/seam/mod.rs`, a
+message-fed cluster of adapter `Node`s. It is included by path into
+every test binary that drives it, the same shape the compliance
+executor's own module has (`tests/compliance/mod.rs`).
+
+A scenario is a list of calls on it:
+
+| Call | What it is |
+|---|---|
+| `Seam::boot(members, primary_timeout)` | the boot: one `Node` per roster member over a fresh marker store |
+| `Seam::advance(ticks)`, `Seam::clock()` | the logical clock, a parameter; nothing sleeps |
+| `Seam::tick(id)`, `Seam::tick_all()`, `Seam::leader_timeout(id)` | the timer events, driven at the named tick |
+| `Seam::feed(&Inbound)`, `Seam::feed_all(&[Inbound])`, `Seam::gossip(wire)` | the force-fed exchange: the inbound frames, by identity pair and by hex wire |
+| `Seam::deliver()` | the queued wire, delivered to quiet |
+| `Seam::propose(id, payload)`, `Seam::reconfigure(id, op)`, `Seam::request(id, json)` | the application-boundary drives |
+| `Seam::force_view(id, era, view)`, `Seam::announce(id)`, `Seam::note_timeout(id, …)` | the host-forced transitions |
+| `Seam::shutdown(id)` | the stop contract |
+| `Seam::crash(id)` | a drop with no stop contract taken |
+| `Seam::restart(id, Restart::Clean \| Restart::Crashed)` | a reopen over the same markers |
+| `Seam::join(id)` | a fresh identity over its own marker store |
+| `Seam::settle()` | the timer sweep, until the cluster is quiet and every seat `Normal` |
+| `Seam::emissions()` / `mark()` / `emissions_since()` | the frames the wire carried |
+| `Seam::refusals()` / `refusals_since()` | the refusals, each named by node, call and code |
+| `Seam::state(id)` / `states()` / `identities()` / `is_live(id)` | the observable state |
+| `Seam::assert_emissions(named)` / `assert_emissions_since(mark, named)` | the exact named multiset |
+| `Seam::assert_refusals(named)` / `assert_refusals_since(mark, named)` | the exact named refusal set |
+| `Seam::assert_state(&Expect)` / `expectation_since(mark)` | the post state, in the compliance corpus's own `post` grammar |
+
+Its vocabulary is the compliance executor's, not a second one: the
+`system:counter` identity pairs, the lower-case hex wire bytes, the
+`<Marker>@<system>:<counter>` marker rounds, the delivery record, the
+post-state record and the refusal-code names all come from
+`tests/compliance/mod.rs` and `src/advisory_lock.tl`. A scenario written
+against the seam and a corpus case written against the executor name the
+same things the same way.
 
 ## The pure-Rust networked harness
 
@@ -124,6 +162,8 @@ kill) are surfaced to the operator wherever `stop` fails.
 |---|---|---|
 | `ext/advisory_lock/tests/compliance.rs` | gate | the uVRR compliance suite: 73 cases over the real adapter |
 | `ext/advisory_lock/src/*.rs` inline tests | 1 | the disk-IO units: aof, journal, recovery flush, marker store |
+| `ext/advisory_lock/tests/seam/mod.rs` | 1 | the message-fed seam: the lifecycle calls, the logical clock, the exact emission multiset |
+| `ext/advisory_lock/tests/seam_test.rs` | 1 | the seam's own laws: determinism, the named multiset, the source-level seam-only gate |
 | `examples/lease-sequencer/tests/*.rs` | 1 + 2 | the message-fed expectations and the networked ladders |
 | `ext/advisory_lock/tests/*_roundtrip_test.rs` | boundary | the wire, marker, and AOF roundtrips at exact normative lengths |
 | `tests/` | 3 | the Teal learning tests and the pure-module suites |
@@ -135,6 +175,8 @@ kill) are surfaced to the operator wherever `stop` fails.
 | File | Responsibility |
 |---|---|
 | `ext/advisory_lock/src/ffi.rs` | the adapter: the `Node`, the boot gate, the emission gate, the drain-point stops |
+| `ext/advisory_lock/tests/compliance/mod.rs` | the compliance executor: the corpus's grammar, the naming vocabulary the seam shares |
+| `ext/advisory_lock/tests/seam/mod.rs` | the message-fed seam of the in-memory layer |
 | `ext/advisory_lock/src/marker_store.rs` | the marker pair mechanics, `GateStore`, the projection |
 | `ext/advisory_lock/src/aof.rs` | the AOF: append, drain, roll, the erasure-block trap, torn-tail truncation |
 | `ext/uvrr-core/src/timeout.rs` | the flavoured-timeout model: the matcher, the `Sorry{runbook}` verdicts |
