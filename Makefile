@@ -227,7 +227,7 @@ sanity:
 	env DOCKER_BUILDKIT=0 docker build \
 		--build-arg LUNET_LOCKS_HEAD=$$(git rev-parse HEAD) \
 		--target check -t lunet-locks:sanity \
-		-f docker/Dockerfile.fastbuild .; \
+		-f docker/Dockerfile.fastbuild . && \
 	echo "SANITY: cargo check green on colima for aarch64-unknown-linux-gnu + x86_64-unknown-linux-gnu (cdylib + rig crates, prod and flight-recorder shapes; paxe-core prod and kat shapes) at commit $$(git rev-parse --short=12 HEAD). Nothing deployed, nothing run from the image — the build is the proof."
 
 # The RELEASE dual-arch image gate (docs/src/build-and-release.md):
