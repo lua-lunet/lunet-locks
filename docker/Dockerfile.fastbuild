@@ -30,7 +30,14 @@
 #   docker create --name fastbuild lunet-locks:artifacts
 #   docker cp fastbuild:/out ./release-staging
 #   docker rm fastbuild
-FROM rust:1.96-slim AS toolchain
+# The repo's rust-toolchain.toml pins the exact patch toolchain (1.96.0), and
+# this image copies the whole tree (`COPY . .`) into the cargo stages, so
+# rustup honours that file over the image's default toolchain. The image's
+# base must therefore BE the pinned toolchain: a floating `rust:1.96-slim`
+# resolves to a newer patch (1.96.1 today), the toml then switches the build
+# to 1.96.0 mid-image, and the cross std added above is left behind on the
+# abandoned toolchain — the x86_64 leg dies on `can't find crate for std`.
+FROM rust:1.96.0-slim AS toolchain
 
 # The x86 cross-linker kit: the cross gcc driver suite (runs natively on
 # aarch64, emits and links x86 through its own sysroot — the crt objects

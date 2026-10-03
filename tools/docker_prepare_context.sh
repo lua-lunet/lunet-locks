@@ -21,7 +21,12 @@ mkdir -p "$context/.cargo" "$context/ext/advisory_lock"
 cargo vendor --manifest-path "$root/ext/advisory_lock/Cargo.toml" --locked --versioned-dirs "$context/vendor" >"$context/.cargo/config.toml.generated"
 sed "s|directory = \".*\"|directory = \"/app/vendor\"|" "$context/.cargo/config.toml.generated" >"$context/.cargo/config.toml"
 
-cp "$root/ext/advisory_lock/Cargo.toml" "$root/ext/advisory_lock/Cargo.lock" "$context/ext/advisory_lock/"
+# The build script travels with the crate: it stamps the build's identity
+# facts (`FLIGHT_*`, `LUNET_INFO_*`) that `src/info.rs` reads back through
+# `env!`. A context without it leaves those macros undefined and the cdylib
+# stage fails to compile.
+cp "$root/ext/advisory_lock/Cargo.toml" "$root/ext/advisory_lock/Cargo.lock" \
+    "$root/ext/advisory_lock/build.rs" "$context/ext/advisory_lock/"
 cp -R "$root/ext/advisory_lock/src" "$context/ext/advisory_lock/src"
 # The vendored uvrr-core submodule: the [patch] section of the manifest
 # resolves vrr-core to it, so the vendored context
