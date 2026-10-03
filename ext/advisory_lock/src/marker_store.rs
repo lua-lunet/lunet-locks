@@ -1,7 +1,7 @@
 //! The routed lifecycle marker: the engine's `LifecycleStore` over the
 //! superblock copies.
 //!
-//! The engine (`vrr::lifecycle`, uvrr-core tag v0.13.0 @ 9dcafc0) owns the marker
+//! The engine (`vrr::lifecycle`, uvrr-core tag v0.13.1 @ 37549d1) owns the marker
 //! machine — which marker, which copies, when, and in what order
 //! (docs/uvrr-io-obligations.md, the boot-gate chapter §3).
 //! This module is the host's durable

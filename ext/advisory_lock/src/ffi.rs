@@ -1,5 +1,5 @@
 //! Host-side FFI adapter between the LuaJIT host and the uVRR core
-//! (uvrr-core tag v0.13.0 @ 9dcafc0 — the lifecycle boot gate; the core's constructors all sit in `node_from_sink` in this file: `lifecycle::boot` :2035, `Replica::reincarnate` :2379, `Replica::resume` :2393, `Replica::join` :2407, `Replica::provision` :2418).
+//! (uvrr-core tag v0.13.1 @ 37549d1 — the lifecycle boot gate; the core's constructors all sit in `node_from_sink` in this file: `node_from_sink` :2831, `lifecycle::boot` :2593, `Replica::reincarnate` :3070, `Replica::resume` :3113, `Replica::join` :3129, `Replica::provision` :3141).
 //!
 //! Concrete core: `Replica<SegmentedLog, WeightedMajority>` running
 //! `Stability::Volatile` — nothing is persisted but the boot gate's
@@ -4197,7 +4197,7 @@ mod tests {
         // `SuperblockCopies` or refuses outright, so the engine's
         // `QuorumLost` verdict never arises on this store.
         "boot.refuse.quorum-lost",
-        // `vrr::lifecycle::boot` (uvrr-core 9dcafc0) returns only
+        // `vrr::lifecycle::boot` (uvrr-core 37549d1) returns only
         // `QuorumLost` or `Store`; `BootError::Exhausted` is produced
         // only by the deferred latch, which `settle_deferred_latch`
         // handles.

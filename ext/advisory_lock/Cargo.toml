@@ -2,7 +2,7 @@
 name = "lunet-advisory-lock"
 version = "0.2.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.96"
 
 [lib]
 name = "lunet_advisory_lock"
@@ -13,14 +13,14 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"
 uuid = { version = "1", features = ["serde"] }
-vrr = { package = "uvrr-core", git = "https://github.com/lua-lunet/uvrr-core.git", tag = "v0.13.0" }
+vrr = { package = "uvrr-core", git = "https://github.com/lua-lunet/uvrr-core.git", tag = "v0.13.1" }
 # The `lunet_locks_nuke` admin tool's argument parsing (the operator
 # review gate's flags). Library code depends on none of it; the
 # dependency exists for the bin.
 clap = { version = "4", features = ["derive"] }
 
 # The [patch] resolves the tagged dependency to the vendored submodule copy
-# (ext/uvrr-core, checked out at 9dcafc0 = upstream tag v0.13.0, released
+# (ext/uvrr-core, checked out at 37549d1 = upstream tag v0.13.1, released
 # 2026-10-01), so every build lane — including Docker with no network
 # fetch — builds hermetically against content byte-identical to the
 # released tag. The dependency alias stays `vrr`: the local binding name,

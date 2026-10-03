@@ -30,7 +30,7 @@
 #   docker create --name fastbuild lunet-locks:artifacts
 #   docker cp fastbuild:/out ./release-staging
 #   docker rm fastbuild
-FROM rust:1-slim AS toolchain
+FROM rust:1.96-slim AS toolchain
 
 # The x86 cross-linker kit: the cross gcc driver suite (runs natively on
 # aarch64, emits and links x86 through its own sysroot — the crt objects
