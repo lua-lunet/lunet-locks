@@ -14,6 +14,7 @@ nav = [
   { "Build and tests" = "build-and-tests.md" },
   { "The test scaffold" = "test-scaffold.md" },
   { "The Compliance ABI and the information console" = "compliance-abi.md" },
+  { "The compliance corpus suite" = "compliance-suite.md" },
   { "Decisions" = "decisions.md" },
   { "The timeout policy" = "timeout-policy.md" },
   { "Bench harness" = "bench-harness.md" },

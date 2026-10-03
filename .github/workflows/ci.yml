@@ -99,6 +99,36 @@ jobs:
           else
             make deps
           fi
+      # `make check` replays the upstream uVRR compliance corpus over the
+      # transport with the `hurl` binary (docs/src/compliance-suite.md).
+      # The version and its per-target SHA-256 are pins, like the Lunet
+      # runtime's: the corpus suite is evidence, and evidence that moves
+      # under the runner proves nothing.
+      - name: Install the Hurl corpus driver
+        shell: bash
+        run: |
+          set -euo pipefail
+          HURL_VERSION=8.0.1
+          case "$(uname -s)-$(uname -m)" in
+            Darwin-arm64) target=aarch64-apple-darwin; sha=b57928e246617df73cb1b2157f31f507dcbde6ae12e828cc53dde0e40e05bbbb ;;
+            Darwin-x86_64) target=x86_64-apple-darwin; sha=55e95bb7a8d61ae6919eaaf96f260f0836f5b34c1b0f7731e38be803f6984367 ;;
+            Linux-aarch64) target=aarch64-unknown-linux-gnu; sha=bc4732df4754748e9bf296aa3832ec019f798afb399f1279b72ed37b6e04525c ;;
+            Linux-x86_64) target=x86_64-unknown-linux-gnu; sha=cac7c4670d69444db120edb21fe06c97ba8c80dcc52279957c8dd18f05fb0c06 ;;
+            *) echo "ERROR: no pinned Hurl build for $(uname -s)-$(uname -m)" >&2; exit 1 ;;
+          esac
+          archive="hurl-$HURL_VERSION-$target.tar.gz"
+          base="https://github.com/Orange-OpenSource/hurl/releases/download/$HURL_VERSION"
+          # The download lands in the repo's own scratch tree, like the
+          # pinned Lunet runtime's, never in a system temporary.
+          work="$PWD/.tmp/ci-hurl"
+          mkdir -p "$work"
+          curl --fail --location --retry 3 --output "$work/$archive" "$base/$archive"
+          actual="$(sha256sum "$work/$archive" | cut -d' ' -f1)"
+          test "$actual" = "$sha" || { \
+            echo "ERROR: $archive SHA-256 mismatch: $actual" >&2; exit 1; }
+          tar -xzf "$work/$archive" -C "$work"
+          sudo install -m 0755 "$work/bin/hurl" /usr/local/bin/hurl
+          hurl --version
       - name: Format and lint
         run: make fmt && git diff --exit-code && make lint
       - name: Rust, Cyan, and advisory tests

@@ -293,6 +293,18 @@ byte-exact named deliveries plus the full post-state record
 marker schedule, witnesses). Emissions beyond the named multiset fail
 the case; no host-loop autonomous drive ever runs inside the executor.
 
+### The same corpus over the transport
+
+`make compliance-suite`, part of `make check`, replays the same corpus a
+second time: through this tree's own Teal compliance host, over the HTTP
+transport of the same document's §8, driven by the upstream `hurl` suite
+beside the corpus. The host's executor is held to the reference executor
+operation for operation, and its verdict is its own capture compared
+against the expectation the request carries. The suite is two shapes —
+the production library's symbol table must still carry zero `unsafe_`
+symbols, and the gated library must carry all nine and pass all 73. See
+[the compliance corpus suite](compliance-suite.md).
+
 ## Relevant files
 
 | File | Responsibility |
@@ -302,6 +314,12 @@ the case; no host-loop autonomous drive ever runs inside the executor.
 | `ext/advisory_lock/tests/compliance.rs` | the uVRR compliance suite's runner: the corpus target |
 | `ext/advisory_lock/tests/compliance/` | the compliance executor: the abstract host interface over the adapter |
 | `src/advisory_lock.tl` | Teal wrapper and owned output draining |
+| `src/compliance_abi.tl` | the Compliance ABI bindings: the nine `unsafe_*` exports |
+| `src/compliance_executor.tl` | the abstract host interface over the Compliance ABI |
+| `src/compliance_host.tl` | the §8 case and session endpoints, and the verdict |
+| `src/compliance_server.tl` | the corpus host on a socket, separate from the lock's client port |
+| `src/compliance_json.tl` | the corpus's JSON codec: ordered objects, exact integers |
+| `tools/lib/compliance_gate.tl` | the gate: both feature shapes and the corpus run |
 | `src/cluster_config.tl` | JSONL deployment descriptor: parse, encode, genesis succession |
 | `src/admin.tl` | Admin verb decode, ADMIN peer payload, acknowledgments, dedup cache |
 | `src/server.tl` | TCP NDJSON server, UDP peers, leader forwarding, reconfiguration drives |
