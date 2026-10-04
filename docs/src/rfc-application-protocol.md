@@ -21,6 +21,15 @@ above it that it cannot know (`ext/uvrr-core/docs/architecture.md:3,34,151`)
 — but has no name for the role within a host that terminates alien
 application traffic. This RFC supplies both.
 
+The upstream note now names it too: `docs/uvrr-application-protocol.md`
+(carried by uvrr-core v0.14.0, landed with this document as its worked
+example) adopts the same terminology and obligations 1 through 5 below, and
+states the balancer rule and the datagram shape as this document's balancer
+and datagram sections do. Two obligations this document carries are not in
+the upstream note and remain in force here: the sweeper and the release of
+every nexus entry and socket on every exit path, and the join's audit
+metadata committed under the same `session_id` that the bearer derives from.
+
 ## Terminology
 
 The key words MUST, MUST NOT, REQUIRED, SHALL, SHOULD, SHOULD NOT, RECOMMENDED,

@@ -12,7 +12,11 @@ The client protocol itself — request shapes, replies, lease counters, the
 membership verbs — is [the external client protocol](client-protocol.md). The
 replication, forwarding and membership machinery is
 [architecture and operations](architecture.md). The layering and the
-observability contract are [the test scaffold](test-scaffold.md).
+observability contract are [the test scaffold](test-scaffold.md). The same
+circuit is stated as the upstream reference deployment in uvrr-core's
+`docs/clients.md` (carried by v0.14.0): two sites, two nodes each, behind a
+layer-4 load balancer, the VRR-2012 one-outstanding client rule landing in
+the host.
 
 ## The topology
 
