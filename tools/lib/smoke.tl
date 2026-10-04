@@ -13,6 +13,7 @@ local fs = require("tools.lib.fs")
 local logs = require("tools.lib.logs")
 local proc = require("tools.lib.proc")
 local shell = require("tools.lib.shell")
+local stale_binary = require("tools.lib.stale_binary")
 
 local record M
     main: function(string, {string}): integer
@@ -279,6 +280,13 @@ function M.main(root: string, _argv: {string}): integer
         if not shell.run(shell.quote(cyan) .. " build --prune") then
             fail("cyan build failed")
         end
+
+        -- The stale-binary rule: the lane rebuilds the binary it boots, and
+        -- then proves that the binary it is about to boot is the one this
+        -- tree builds. Asking before the rebuild would refuse artifacts the
+        -- rebuild was about to replace; asking after it can only catch an
+        -- artifact that survived the rebuild without matching its source.
+        stale_binary.check(root, stale_binary.cdylib(root))
 
         start("n1")
         start("n2")

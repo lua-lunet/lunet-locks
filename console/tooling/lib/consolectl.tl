@@ -3,6 +3,8 @@
 -- pidfiles. All paths live under console/tmp; the only logic-free shell is
 -- in bin/.
 
+local stale_binary = require("tools.lib.stale_binary")
+
 local record Paths
     root: string
     assets: string
@@ -290,6 +292,10 @@ local function up(root: string): integer
     -- Start lock-feed if FEED_DIR is set; otherwise skip with a note.
     if feedDir ~= "" then
         local feedBin = resolveFeedBin(root)
+        -- The stale-binary rule: the feed is built only when it is absent,
+        -- so without this an edit to lock_feed's source would be served by
+        -- whatever binary an earlier run happened to leave.
+        stale_binary.check(root .. "/..", stale_binary.lock_feed(feedBin))
         startFeed(p, feedPort, feedDir, feedBin)
         if not waitFeedHealthy(feedPort) then
             io.stderr:write(

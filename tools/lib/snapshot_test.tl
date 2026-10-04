@@ -10,6 +10,7 @@
 local fs = require("tools.lib.fs")
 local shell = require("tools.lib.shell")
 local snapshot = require("tools.lib.snapshot")
+local stale_binary = require("tools.lib.stale_binary")
 
 local record M
     main: function(string, {string}): integer
@@ -46,6 +47,11 @@ end
 function M.main(argv_root: string, argv: {string}): integer
     root = argv_root
     local _argv = argv
+    -- The stale-binary rule: the two tools this acceptance drives are built
+    -- only when absent, so without this an edit to either crate's source
+    -- would be measured against the binaries the last run happened to leave.
+    stale_binary.check(root, stale_binary.snapshot_tools(root))
+
     work = fs.unique_sibling(fs.join(root, ".tmp"), "snapshot-test")
     fs.mkdir_p(work)
 

@@ -124,7 +124,7 @@ check: build lint example-check sh-check sh-smoke compliance-suite
 	$(CYAN) check $(TEAL_SOURCES)
 
 test: check
-	LUA_PATH="$(abspath build)/?.lua;;" $(TESTED) tests
+	LUA_PATH="$(abspath build)/?.lua;$(CURDIR)/tools/lib/?.tl;;" $(TESTED) tests
 
 # Official, project-local Lunet runtime. Do not substitute a host installation:
 # all service/smoke work must use this exact release and its adjacent `types/` docs.
@@ -158,6 +158,7 @@ simulation-test: tools/lease_failover_sim.rs
 	.tmp/lease-failover-sim-test
 
 simulation: lunet-runtime build $(SIM_BIN)
+	tools/check_stale.lua cdylib
 	SIM_ROOT=$(CURDIR) LUNET_RUN=$(abspath $(LUNET_RUN)) $(SIM_BIN) --duration $(SIM_DURATION)
 
 # The on-the-bench harness (docs/src/bench-harness.md): the
@@ -199,6 +200,7 @@ docker-build: build lunet-runtime
 	}
 
 docker-simulation: docker-build $(SIM_BIN)
+	tools/check_stale.lua image $(DOCKER_IMAGE)
 	SIM_BIN=$(abspath $(SIM_BIN)) DOCKER_IMAGE=$(DOCKER_IMAGE) DOCKER_PLATFORM=$(DOCKER_PLATFORM) SIM_DURATION=$(SIM_DURATION) tests/docker_simulation.sh
 
 # The build-confirmation gate: MANDATORY before every cloud test run

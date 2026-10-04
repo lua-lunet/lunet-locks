@@ -16,6 +16,7 @@ local logs = require("tools.lib.logs")
 local proc = require("tools.lib.proc")
 local shell = require("tools.lib.shell")
 local snapshot = require("tools.lib.snapshot")
+local stale_binary = require("tools.lib.stale_binary")
 
 local record NodeSpec
     id: integer
@@ -129,6 +130,18 @@ end
 -- after a successful snapshot of it; a failed snapshot refuses the wipe
 -- loudly and the run stops rather than writing over unvouched state.
 local function prepare_run(rig: Rig, with_aof: boolean)
+    -- The stale-binary rule: every rig entry (stability, takeover,
+    -- acceptance, standby) prepares its run here, so this is the one place
+    -- the check runs and nothing is booted before it has passed. The
+    -- standby's AOF feed is the one rig path that boots a binary from
+    -- another crate, so it is also the one path that has to prove that
+    -- crate's binary fresh too.
+    if with_aof then
+        stale_binary.check(rig.root, stale_binary.standby_stack(rig.root))
+    else
+        stale_binary.check(rig.root, stale_binary.lease_node(rig.root))
+    end
+
     local ok, message = snapshot.snapshot_then_wipe(rig.run_dir)
     if not ok then
         gate.fail("the run stops: " .. message)

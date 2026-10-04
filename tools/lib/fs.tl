@@ -145,6 +145,8 @@ local record Stat
     st_gid: integer
     st_rdev: integer
     st_size: integer
+    st_mtime: integer
+    st_mtime_nsec: integer
 end
 
 local record LibC
@@ -173,6 +175,7 @@ local record M
     is_dir: function(string): boolean
     is_lnk: function(string): boolean
     mode_of: function(string): integer
+    mtime: function(string): integer, integer
     read_all: function(string): string, string
     write_all: function(string, string): boolean
     append_all: function(string, string): boolean
@@ -244,6 +247,19 @@ function M.mode_of(path: string): integer
         return 0
     end
     return bit.band(stat[0].st_mode, 0xFFF)
+end
+
+-- The last modification time as whole seconds and nanoseconds. The pair is
+-- returned rather than a single nanosecond count on purpose: epoch
+-- nanoseconds overflow a double's exact integer range, and a comparison that
+-- silently loses the low digits is worse than no comparison at all. A path
+-- that cannot be stat'ed reports (-1, -1), which sorts before every real
+-- time.
+function M.mtime(path: string): integer, integer
+    if not lstat_ok(path) then
+        return -1, -1
+    end
+    return stat[0].st_mtime, stat[0].st_mtime_nsec
 end
 
 -- Reads a whole file. A failure returns "" and the error string.

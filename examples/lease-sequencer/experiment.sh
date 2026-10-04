@@ -30,6 +30,10 @@
 set -u
 cd "$(dirname "$0")" || exit 1
 
+# The stale-binary rule: the experiment records latency percentiles, so it
+# may not measure binaries left behind by an earlier build.
+"$(dirname "$0")/../../tools/check_stale.lua" lease-ladder || exit 1
+
 BIN=./target/release/lease-sequencer
 CLIENT=./target/release/lease-client
 LOAD=./target/release/lease-load

@@ -19,6 +19,7 @@ if not ok then
 end
 tl.loader()
 
-package.path = here .. "/?.lua;" .. here .. "/?.tl;" .. package.path
+package.path = here .. "/?.lua;" .. here .. "/?.tl;"
+   .. here .. "/../../tools/lib/?.tl;" .. package.path
 
 return here

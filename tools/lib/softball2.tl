@@ -22,6 +22,7 @@ local logs = require("tools.lib.logs")
 local proc = require("tools.lib.proc")
 local shell = require("tools.lib.shell")
 local snapshot = require("tools.lib.snapshot")
+local stale_binary = require("tools.lib.stale_binary")
 
 local record Spec
     id: integer
@@ -1455,6 +1456,9 @@ end
 function M.run(root_path: string, run_dir_path: string): integer
     root = root_path
     run_dir = run_dir_path
+    -- The stale-binary rule: nothing is booted before the ladder binaries
+    -- are proved to be the ones this tree builds.
+    stale_binary.check(root, stale_binary.lease_ladder(root))
     parse_specs(
         fs.join(root, "examples/lease-sequencer/config/cluster-softball2.jsonl")
     )
