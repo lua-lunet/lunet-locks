@@ -5,8 +5,8 @@ in total, each datacentre fronted by one provider's layer-4 load balancer. The
 load balancer is the only thing a client ever addresses; the nodes are its
 backends. This document states the topology, the verified behaviour of each
 provider's balancer that the topology relies on, the client circuit from
-connect to reply, the uuid-to-socket nexus that holds a command's reply against
-the socket it arrived on, and the UDP path's multiplexing point.
+connect to reply, and the uuid-to-socket nexus that holds a command's reply
+against the socket it arrived on.
 
 The client protocol itself — request shapes, replies, lease counters, the
 membership verbs — is [the external client protocol](client-protocol.md). The
@@ -309,41 +309,6 @@ the replacement socket is a different socket with a different entry in the
 balancer's connection tracking. The nexus is per-command and per-connection, so
 nothing carries over except the client's own envelope.
 
-## The UDP path
-
-The client-facing UDP transport is PAXE: authenticated, encrypted,
-connectionless datagrams between peers ([the pinned runtime's PAXE
-reference](../.lunet/v0.10.0/PAXE.md)). Every frame is a 9-byte prefix of
-`fromId` (u16), `toId` (u16) and `channel` (u32), all big-endian
-(`ext/paxe-core/src/codec.rs:124-128`), and the prefix is inside the
-authenticated span, so addressing cannot be altered without failing
-authentication.
-
-**Its multiplexing point is the channel field.** A channel is a u32 chosen per
-frame, one recipient per frame, keys addressed by `(peer node id, epoch)`.
-Channels 1–99 are reserved for system traffic and application channels start
-at 100. Because the frame names exactly one recipient in an authenticated
-field, a PAXE datagram cannot be broadcast to the two nodes behind a VIP: a
-frame sealed `toId = n1` delivered to `n2` is not opened by `n2`, and the
-receiver's own check is explicit — a datagram is opened only when "its header
-`toId` equals the configured local id", anything else being counted and dropped
-(`ext/paxe-core/src/ffi.rs:719`).
-
-That makes the UDP path, as specified here, a per-node path rather than a
-per-VIP path, and the deployment that carries it is a **UDP listener per node
-addressed directly**, with no load balancer in front of it. The 2x2 topology's
-balancer fronts the TCP client channel; the UDP channel is addressed node to
-node.
-
-Failure handling on this path is drop-with-policy by design: a receiver that
-cannot parse, authenticate or decrypt a frame drops it and never returns the
-reason to the caller, because a receiver that explains why a forgery failed is
-a decryption oracle. The counters are the only diagnostic channel, and the
-invariant is `rx_total == rx_ok + sum(all reject reasons)`. A client's read of
-"nothing came back" is therefore indistinguishable between a lost datagram, a
-dropped forgery and a node that is gone — the client re-drives on its deadline,
-which is the same recovery the TCP path uses.
-
 ## What this topology proves, and what it does not
 
 **It proves.** That a client can hold a connection to a datacentre VIP, have a
@@ -365,8 +330,7 @@ preserves the client source address only where its own defaults allow it
 (AWS disables client IP preservation by default for IP-type TCP target groups
 and cannot disable it for UDP,
 [target group attributes](https://docs.aws.amazon.com/elasticloadbalancing/latest/network/edit-target-group-attributes.html);
-GCP's passthrough balancer preserves it by not proxying at all). That the UDP
-path is load-balanced — it is not, and the PAXE recipient field is why. And
+GCP's passthrough balancer preserves it by not proxying at all). And
 nothing here says anything about the peer protocol between datacentres, which
 [architecture](architecture.md) specifies and which is expected to run on a
 private network with encryption supplied by the deployment.
