@@ -20,8 +20,9 @@ unreproducible and no change is made.
 A patch is reviewed only when the repository gates pass:
 
 ```console
-make check    # Cyan type checks and Cerulean formatting verification
-make test     # the gate above plus the tested suite
+make check    # Cyan type checks, Cerulean formatting verification, Rust lint/test lanes,
+              # the compliance corpus, and the Teal suite
+make test     # the same gate under its validation name
 ```
 
 Teal sources are formatted with Cerulean (`make fmt` formats in place,

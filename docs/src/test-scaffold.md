@@ -318,7 +318,7 @@ kill) are surfaced to the operator wherever `stop` fails.
 | `ext/uvrr-core/src/timeout.rs` | the flavoured-timeout model: the matcher, the `Sorry{runbook}` verdicts |
 | `ext/uvrr-core/src/bin/timeout-policy/` | the timeout-policy tool: the opinion for a (state, timeout) pair |
 | `examples/lease-sequencer/src/main.rs` | the host loop: the drives, the signals, the stop contract |
-| `examples/lease-sequencer/tests/shutdown_check.rs` | the shutdown-restart consistency check |
+| `examples/lease-sequencer/src/shutdown_check.rs` | the shutdown-restart consistency check |
 | `ext/advisory_lock/src/info.rs` | the read-only information console: the facts the build stamped, handed back on request |
 | `tools/lib/stale_binary.tl` | the stale-binary rule: identity and age, one refusal, one rebuild command |
 | `tools/check_stale.lua` | the same check as a command, for the lanes a Makefile target boots |

@@ -56,7 +56,7 @@ COMPAT_SOEXT := $(if $(filter Darwin,$(LUNET_OS)),dylib,so)
 COMPAT_LIB := $(COMPAT_TARGET)/debug/liblunet_advisory_lock.$(COMPAT_SOEXT)
 COMPAT_RUN_DIR := $(CURDIR)/.tmp/compliance/gate
 
-.PHONY: init deps build check test smoke simulation simulation-test lunet-runtime docs clean ext ext-check ext-test example-check fmt lint hooks sh-check sh-smoke docker-build docker-simulation sanity release-images build-proof package package-verify bench compliance-lib compliance-production-shape compliance-suite-shape compliance-suite
+.PHONY: init deps build check test teal-suite smoke simulation simulation-test lunet-runtime docs clean ext ext-check ext-test example-check fmt lint hooks sh-check sh-smoke docker-build docker-simulation sanity release-images build-proof package package-verify bench compliance-lib compliance-production-shape compliance-suite-shape compliance-suite
 
 init:
 	@command -v mise >/dev/null 2>&1 || { echo "ERROR: mise is not on PATH. Install it from https://mise.jdx.dev and try again."; exit 1; }
@@ -120,11 +120,23 @@ compliance-suite-shape: build lunet-runtime compliance-lib
 
 compliance-suite: compliance-production-shape compliance-suite-shape
 
-check: build lint example-check sh-check sh-smoke compliance-suite
+# The Teal suite, a prerequisite of `check` rather than a lane beside it, so
+# a test file that rots turns the gate red. `LUA_PATH` carries the compiled
+# production modules and the repository root, and the repository root is
+# where the tooling libraries are addressed from (`tools.lib.<name>`).
+# Nothing puts `tools/lib/` itself on the path: tested's Teal handler calls
+# `tl.loader()`, which installs its searcher ahead of the plain-Lua one, so
+# a `tools/lib/?.tl` entry would let a tooling module shadow the production
+# module that shares its name.
+teal-suite: build
+	LUA_PATH="$(abspath build)/?.lua;$(CURDIR)/?.tl;;" $(TESTED) tests
+
+check: build lint teal-suite example-check sh-check sh-smoke compliance-suite
 	$(CYAN) check $(TEAL_SOURCES)
 
+# The gate under its validation name. The suite runs once, as `check`'s
+# prerequisite.
 test: check
-	LUA_PATH="$(abspath build)/?.lua;$(CURDIR)/tools/lib/?.tl;;" $(TESTED) tests
 
 # Official, project-local Lunet runtime. Do not substitute a host installation:
 # all service/smoke work must use this exact release and its adjacent `types/` docs.

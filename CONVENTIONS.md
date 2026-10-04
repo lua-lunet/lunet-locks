@@ -60,9 +60,17 @@ reported as **invalid**, not failed: unhandled exceptions, tests with no asserti
 whose declared `expected` result is not actually produced. That behavior is pinned by a learning
 test in [`tests/teal_learning_test.tl`](tests/teal_learning_test.tl).
 
-`make test` is the stable validation entry point: it runs `make check`, the Teal tests, and the
-native extension's `cargo test` suite. Cargo discovers the extension's integration tests, so do
-not add per-suite Make targets that merely repeat `cargo test`.
+`make check` is the stable validation gate: the type checks, the Rust lint and test lanes, the
+compliance corpus, and the Teal suite (`teal-suite`) are all prerequisites of it, so a test file
+that rots turns the gate red. `make test` is that same gate under its validation name. Cargo
+discovers the extension's integration tests, so do not add per-suite Make targets that merely
+repeat `cargo test`.
+
+The suite's `LUA_PATH` puts the compiled production modules (`build/?.lua`) and the repository
+root (`?.tl`) on the path, and the repository root is where the tooling libraries are addressed
+from: `tools.lib.<name>`. Nothing puts `tools/lib/` itself on the path, because `tl.loader()`
+installs its searcher ahead of the plain-Lua one and a bare `tools/lib/?.tl` entry would let a
+tooling module shadow the production module of the same name.
 
 The shipped Teal, FFI ABI, core Rust crate, and default test path use stable Rust and long-lived
 dependencies. A stable test-only Rust dependency belongs in `[dev-dependencies]` and must not add

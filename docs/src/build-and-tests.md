@@ -134,8 +134,8 @@ mechanics are in [build-and-release.md](build-and-release.md).
 make fmt             # format Teal with Cerulean
 make lint            # reject unformatted Teal
 make build           # Rust checks/tests/release cdylib, then Cyan output
-make check           # build plus all Teal type checks
-make test            # check plus tested
+make check           # build, all Teal type checks, and the Teal suite
+make test            # the same gate under its validation name
 make lunet-runtime   # fetch and verify Lunet v0.10.0 locally
 make smoke           # build and run the three-process service smoke test
 make simulation      # 30s TCP-NDJSON three-datacenter lease failover demo
