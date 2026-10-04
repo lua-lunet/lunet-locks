@@ -32,6 +32,11 @@ tracing-appender = "0.2"
 # line, the event's fields flattened into the root object.
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1", features = ["v4"] }
+# The bearer's keyed hash (the RFC's obligation 3): HMAC-SHA-256 over the
+# session_id under the gateway's key, from the RustCrypto crates — a keyed
+# hash is never hand-rolled.
+hmac = "0.12"
+sha2 = "0.10"
 
 [features]
 default = []
