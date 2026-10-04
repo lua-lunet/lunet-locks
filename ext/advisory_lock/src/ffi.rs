@@ -238,6 +238,7 @@ use vrr::replica::{
     Input, PersistedProgress, Pivot, PlanRefusal, PublishOutcome, PublishRefusal, Replica,
     TimedInput, ViewChangeKnobs,
 };
+use vrr::timeout::UNFLUSHED_RUNBOOK;
 use vrr::wire::{Pack, Tag, Unpack, UnpackError};
 
 use crate::marker_store::{GateStore, SinkDoor, drain_sink, sink_guard};
@@ -1852,7 +1853,7 @@ impl Node {
                 trace_line!("stop.refuse.unseated-drain");
                 eprintln!(
                     "lunet-advisory-lock: the stop drain failed ({error}); \
-                           the markers hold the crash's evidence"
+                           the markers hold the crash's evidence; {UNFLUSHED_RUNBOOK}"
                 );
                 #[cfg(feature = "flight-recorder")]
                 self.flight_log(
@@ -1887,7 +1888,10 @@ impl Node {
             Ok(halting) => halting,
             Err((_, error)) => {
                 trace_line!("stop.refuse.first-round");
-                eprintln!("lunet-advisory-lock: the stop's first marker round failed ({error:?})");
+                eprintln!(
+                    "lunet-advisory-lock: the stop's first marker round failed ({error:?}); \
+                     {UNFLUSHED_RUNBOOK}"
+                );
                 return SERVICE;
             }
         };
@@ -1906,7 +1910,7 @@ impl Node {
             trace_line!("stop.refuse.drain-window");
             eprintln!(
                 "lunet-advisory-lock: the stop's view-record write failed ({error}); \
-                        the markers hold the halt's first round"
+                        the markers hold the halt's first round; {UNFLUSHED_RUNBOOK}"
             );
             return SERVICE;
         }
@@ -1917,7 +1921,7 @@ impl Node {
                 trace_line!("stop.refuse.drain");
                 eprintln!(
                     "lunet-advisory-lock: the stop drain failed ({error}); \
-                           the marker stays at the first round"
+                        the marker stays at the first round; {UNFLUSHED_RUNBOOK}"
                 );
                 #[cfg(feature = "flight-recorder")]
                 self.flight_log(
@@ -1940,7 +1944,10 @@ impl Node {
         );
         if let Err((_, error)) = draining.finish_stop() {
             trace_line!("stop.refuse.second-round");
-            eprintln!("lunet-advisory-lock: the stop's second marker round failed ({error:?})");
+            eprintln!(
+                "lunet-advisory-lock: the stop's second marker round failed ({error:?}); \
+                 {UNFLUSHED_RUNBOOK}"
+            );
             return SERVICE;
         }
         trace_line!("stop.complete");

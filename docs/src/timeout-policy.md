@@ -70,26 +70,73 @@ pair):
 
 ## The pairs our host acts on
 
-The hosts drive a subset of the table. Where the host names a pair, the
-drive is:
+The hosts drive a subset of the table. The census below is enumerated
+from the hosts' own timer code — every cadence, deadline and forced
+transition in the adapter, the Rust example host and the Teal host — and
+asserted as a test
+(`ext/advisory_lock/tests/timeout_policy_audit_test.rs`). A pair no host
+acts on is not a row: the witness, the unknown node and the crashed node
+carry no clock-driven drive at all, a witness being a passive data sink,
+an unknown node having no addressing row, and a crashed node's clock
+belonging to whatever the next boot does about the marker. The adapter's
+status plane (`status`, `ext/advisory_lock/src/ffi.rs`) reports the
+node's replication state, leader, era, view and folded configuration
+era, and the hosts read it to choose the drive.
 
-| Pair | The drive | Where |
+Each row names the matcher's opinion for the pair, the host's own drive,
+and its disposition: the drive is the opinion, or it is one of the named
+divergences below with its reason.
+
+| Pair | Opinion | The drive | Where |
+|---|---|---|---|
+| `(in-the-cluster, cluster)` | `retransmit` | the lease driver's op correlation deadline: the pending op is dropped and a fresh one scheduled on the backoff | `examples/lease-sequencer/src/main.rs:1547` (`driver_step`), the deadline at `main.rs:1562-1568` |
+| `(in-the-cluster, cluster)` | `retransmit` | the embedded client's op deadline: the overdue pending expires into the backoff and the next due action is submitted afresh | `examples/lease-sequencer/src/embedded_client.rs:473` |
+| `(in-the-cluster, cluster)` | `retransmit` | the client connection's pending deadline: the lock reply's correlation window closes the connection, the admin verb's answers `deadline` | `examples/lease-sequencer/src/main.rs:2886` (`pending_deadline`), the 30 s pendings at `main.rs:2568`, `main.rs:2960`, `main.rs:2978` |
+| `(in-the-cluster, steady)` | `heartbeat` | the leader's idle beat: a synthetic client `get` proposed through the full phase-2 path, whose commit fan-out the followers observe | `examples/lease-sequencer/src/main.rs:940` (`heartbeat_op`), the cadence at `main.rs:2238-2243` |
+| `(steady, steady)` | `start-view-change` | the leader-failure detector's conclusion that its primary is dead: the §14.2 host-forced view at the next view number, then the timeout toggle | `examples/lease-sequencer/src/main.rs:807` (`leader_timeout_step`), the drive at `main.rs:874-886` |
+| `(steady, steady)` | `start-view-change` | the tick loop's own election wait: the core's ordinary suspicion input, then the timeout toggle | `examples/lease-sequencer/src/main.rs:2219` (`timers`), the wait at `main.rs:2315-2337` |
+| `(steady, cluster)` | `retransmit` | the cluster viewchange poll while the timeout toggle holds: inside the view-change limbo the §14.2 host-forced view at the next view number | `examples/lease-sequencer/src/main.rs:2264-2300` |
+| `(booted, booted)` | `do-nothing` | the recovery cadence: the fenced-boot drive's §8 re-announce of the `Reincarnation(old, new)` pair, then the tick | `examples/lease-sequencer/src/main.rs:2392-2399` |
+| `(booted, booted)` | `do-nothing` | the rejoin gossip's resend: the entry ticket to every peer, until the cluster's answer installs | `examples/lease-sequencer/src/main.rs:2411-2416`, the send at `main.rs:1103` |
+| `(booted, booted)` | `do-nothing` | the boot-time discovery rounds on the 100 ms cadence, bounded by the 15 s deadline, after which the ordinary fenced boot proceeds | `examples/lease-sequencer/src/main.rs:1347` (`discovery_step`), driven at `main.rs:2186` |
+| `(booted, booted)` | `do-nothing` | the fenced-boot drive: the §8 re-announce of the reincarnation pair on every fenced drive until the node stops being fenced, then the tick | `ext/advisory_lock/src/ffi.rs:1669` (`Node::recover`) |
+| `(stopping, stopping)` | `do-nothing` | the stop contract: the wire closes before any marker write, the first marker round, the drain window, the drain-proven second round | `ext/advisory_lock/src/ffi.rs:1814` (`Node::stop`), taken by the host at `examples/lease-sequencer/src/main.rs:2165` and `main.rs:2206` |
+| `(stopping-not-flushed, stopping-not-flushed)` | `sorry` | the stop failure surface: every refusal arm prints the failure it hit with the runbook statement and reports `SERVICE`; no timer re-drives the flush | `ext/advisory_lock/src/ffi.rs:1814-1964` |
+| `(in-the-cluster, steady)` | `heartbeat` | the idle beat: the cadence drives the core's liveness input and flushes its outputs | `src/server.tl:1244` (`heartbeat_loop`) |
+| `(steady, steady)` | `start-view-change` | the election loop: the staggered election wait drives the leader-silence detection | `src/server.tl:1254` (`election_loop`) |
+| `(booted, booted)` | `do-nothing` | the recovery loop: the fenced-boot drive while the replica is recovering | `src/server.tl:1277` (`recovery_loop`) |
+| `(booted, booted)` | `do-nothing` | the boot-time discovery rounds across the remembered set, bounded by the discovery deadline | `src/server.tl:511` (`discovery_loop`) |
+| `(stopping, stopping)` | `do-nothing` | the stop hook: the runtime's teardown machinery runs the hosted node's graceful stop exactly once, synchronous only | `src/server.tl:329` |
+
+The pair is the host's own: a node reading its status plane and firing
+its own timer names the condition it is in and the wait that expired, and
+that is the pair the matcher is asked about. Where a host has no clock
+of its own for a state, the row says so by naming the flavour the state
+would have to be waited on — a stopping node's own wait never fires
+because no timer re-drives the drain, which is the `do-nothing` the
+matcher answers on a stopping node.
+
+### The named divergences
+
+Five of the seventeen rows do not do what the matcher answers. Each is
+named here with its reason; the audit test refuses a divergence that is
+not named, so a silent exception cannot enter the census.
+
+| Divergence | Rows | The reason |
 |---|---|---|
-| `(in-the-cluster\|steady, cluster)` | the client op's correlation deadline: the pending is dropped and a fresh op scheduled on the backoff; no un-acknowledged datagram is relayed | `examples/lease-sequencer/src/main.rs:1333-1338`, the deadline at `main.rs:1191`; the TCP conn's 30 s pending at `main.rs:2541`; the Teal host's client deadline at `src/server.tl:1279-1300` |
-| `(in-the-cluster, steady)` | the leader's idle beat: a synthetic client GET proposed through the full phase-2 path, whose commit fan-out the followers observe | `examples/lease-sequencer/src/main.rs:883-901` |
-| `(steady, steady)` | the suspicion: the leader-failure detector's §14.2 forced view, then the core's suspicion input | `examples/lease-sequencer/src/main.rs:779-854`; the harness's `leader_timeout_step` at `src/uds_harness.rs:609-657`; the Teal host's election loop at `src/server.tl:1234-1239` |
-| `(steady, steady)` while `timedout` holds | the cluster viewchange poll: inside the view-change limbo the poll drives the §14.2 forced view at the next view number, a fresh commit disarming it | `examples/lease-sequencer/src/main.rs:2000-2019` |
-| `(booted, *)` | the recovery drive on `recovery_ms`: the §8 re-announce of the `Reincarnation(old, new)` pair, then the tick | `examples/lease-sequencer/src/main.rs:2087-2094`; the adapter's drive at `ext/advisory_lock/src/ffi.rs:1668-1696` (`Node::recover`); the Teal host at `src/server.tl:1244-1258` |
-| `(booted, booted)` | the rejoin gossip's resend on `GOSSIP_RESEND_MS`: the entry ticket to every peer, until the cluster's answer installs | `examples/lease-sequencer/src/main.rs:2106-2111`, the send at `main.rs:948-964` |
-| `(booted, booted)` | the boot-time discovery rounds on the 100 ms cadence, bounded by the 15 s deadline, after which the ordinary fenced boot proceeds | `examples/lease-sequencer/src/main.rs:1149-1172`; the Teal host at `src/server.tl:492-527` |
-| `(stopping, *)` | none: the stop is signal-driven, the loop break is the drain point, and no timer re-drives the drain | `examples/lease-sequencer/src/main.rs:1437-1481` (`Lifecycle::register`), the stop at `main.rs:1949`; the Teal host's stop hook at `src/server.tl:310-321` |
-| `(stopping-not-flushed, *)` | the stop failure surface: the failed round or drain prints its failure and reports `SERVICE`; no timer re-drives the flush | `ext/advisory_lock/src/ffi.rs:1813-1957` (`Node::stop`); the host's code report at `examples/lease-sequencer/src/main.rs:1949-1958` |
+| `client-deadline-retry` | the three `(in-the-cluster, cluster)` rows | the correlation deadline retires the pending operation and schedules a fresh one; the un-acknowledged protocol traffic is never relayed |
+| `barren-heartbeat` | the Rust host's `(in-the-cluster, steady)` row | the heartbeat option is taken with a synthetic client transaction rather than with the leader's last commit |
+| `silent-leader-heartbeat` | the Teal host's `(in-the-cluster, steady)` row | the heartbeat option is not taken at all: the cadence drives a bare tick and no heartbeat reaches the wire |
+| `fresh-attempt-manufacture` | the `(steady, cluster)` row | the poll fires a new view change at the next view number instead of re-asking the attempt already armed |
+| `boot-machine-reask` | the five `(booted, booted)` rows | a booted node's cadence re-asks what the boot machine owes, and the matcher answers do-nothing on every flavour of a booted node because the machine owns its own progress |
 
-The witness, unknown, and crashed states carry no host drive: a witness
-is a passive data sink, a node unknown to the others has no addressing
-row, and a crashed node's clock belongs to whatever the next boot does
-about the marker. The adapter's status plane (`status`,
-`ext/advisory_lock/src/ffi.rs:1966-1977`) reports the node's
-replication state, leader, era, view, and folded configuration era, and
-the hosts read it to pick the drive; the pairing above is exhaustive
-over the drives the hosts own.
+The remaining twelve rows are the matcher's own opinion, and the audit
+test proves the three the seam can reach by observation: the steady
+member's wait puts the exact view-change fence exchange on the wire
+(`StartViewChange` out, the leader's own back, `DoViewChange` with the
+evidence, `StartView` installing the ballot) and advances the ballot by
+exactly one view; the host-forced view advances the ballot to the view
+it names and the core refuses one that does not strictly advance; the
+booted node's cadence puts the `Reincarnation(old, new)` re-announce on
+the wire to every peer; and the stopping node's own wait emits nothing
+at all while its marker rounds land.
