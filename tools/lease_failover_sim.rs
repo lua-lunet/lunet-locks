@@ -261,9 +261,21 @@ fn one_outstanding_stage(port: u16) -> io::Result<()> {
             r#"{{"op":"get","message_id":"{message_id}","client_id":404,"request_num":{request_num},"lock_id":{SENTINEL_LOCK}}}"#
         )
     };
-    send(&mut stream, &command(first, 1))?;
-    send(&mut stream, &command(second, 2))?;
-    send(&mut stream, &command(third, 3))?;
+    // One client identity, increasing request numbers, distinct message ids —
+    // the shape a pipelining client produces. The three lines leave in ONE
+    // write: the premise of this stage is that the second and third arrive
+    // while the first is outstanding, and three separate sends race the whole
+    // replication round trip — the first command can commit between two
+    // sends, freeing the connection, and the third would be served legally.
+    // One write makes the premise true by construction.
+    let pipelined = format!(
+        "{}\n{}\n{}\n",
+        command(first, 1),
+        command(second, 2),
+        command(third, 3)
+    );
+    stream.write_all(pipelined.as_bytes())?;
+    stream.flush()?;
     let one = read_reply(&mut stream)?;
     let two = read_reply(&mut stream)?;
     let three = read_reply(&mut stream)?;
