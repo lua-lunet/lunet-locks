@@ -275,7 +275,18 @@ every (state, timeout) pair to an opinion; the upstream
 `timeout-policy` tool prints the map for a pair. The audit pins the
 matcher's table in our tree as living documentation and asserts — as a
 test — that the host's actual drives match the matcher's opinion for
-every pair the host acts on. The `Sorry{runbook}` verdicts
+every pair the host acts on, each row naming the site it lands at and
+the tokens that site must still carry. The three relay drives are pinned
+twice over: the audit forbids each of them the shape it would take to
+manufacture protocol (`no_relay_drive_mints_anything` — the idle beat may
+not open a client transaction, the viewchange poll may not force a view,
+a correlation deadline may not retire an op whose traffic is in flight),
+and `examples/lease-sequencer/tests/relay_test.rs` proves the relay
+itself against real nodes: the resend multiset byte for byte with nothing
+re-proposed, the heartbeat's frontier re-announced across any number of
+beats with the replication journal standing still, and the armed
+view-change attempt re-asked at one unchanged ballot across ten timeouts.
+The `Sorry{runbook}` verdicts
 (`StoppingNotFlushed`: free disk space and retry the flush, or a hard
 kill) are surfaced to the operator wherever `stop` fails.
 

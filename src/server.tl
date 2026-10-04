@@ -131,6 +131,32 @@ local record Output
     bytes: string
 end
 
+-- One re-announceable commit: the bytes the core released, and the
+-- ballot that authorised them. A commit from a ballot the node has left
+-- is history, never a frontier to announce.
+local record Commit
+    era: integer
+    view: integer
+    slot: integer
+    bytes: string
+end
+
+-- The core's Commit tag (`Tag::Commit` in the wire vocabulary): a
+-- commit-frontier advance carrying no new operation — the heartbeat's own
+-- datagram.
+local COMMIT_TAG = 4
+
+-- A VRR datagram's header tag: the first four bytes, big-endian, read
+-- off the bytes the core released. -1 when the payload is too short to
+-- carry a header, and never a guess past what the bytes carry.
+local function vrr_tag(payload: string): integer
+    if #payload < 4 then
+        return -1
+    end
+    local b1, b2, b3, b4 = string.byte(payload, 1, 4)
+    return b1 * 16777216 + b2 * 65536 + b3 * 256 + b4
+end
+
 local function usage(): string
     return "usage: lunet-run build/server.lua --node NAME --client IPv4:PORT "
         .. "--state PATH --cluster PATH (JSONL deployment descriptor, "
@@ -350,6 +376,13 @@ local function main(options: Options)
     local active_clients: {string: any} = {}
     local admin_cache = admin.new_cache(ADMIN_CACHE_LIMIT)
     local leader_elapsed_ms = 0
+    -- The heartbeat of a commit: the leader's LAST commit per peer, with
+    -- the ballot that authorised it, and whether the last beat interval
+    -- carried a Commit out of this node. The idle beat re-announces
+    -- those bytes instead of opening a client transaction, so an idle
+    -- leader costs the journal no slots.
+    local last_commit: {integer: Commit} = {}
+    local commit_since_beat = false
     -- Forward declarations: the discovery loop and the admin drive are
     -- defined before the send helpers they route through.
     local send_endpoint: function(string, string)
@@ -834,6 +867,19 @@ local function main(options: Options)
                 -- The core emits one unicast send per destination; route as
                 -- addressed (a self-addressed send is delivered like any other).
                 send_vrr(output.replica, output.bytes)
+                -- The heartbeat of a commit: the last Commit this node put
+                -- on the wire, kept per peer for the idle beat to
+                -- re-announce. The tag is the header's own first word
+                -- (the 20-byte big-endian `(tag, era, view, slot)`).
+                if vrr_tag(output.bytes) == COMMIT_TAG then
+                    last_commit[output.replica] = {
+                        era = output.era,
+                        view = output.view,
+                        slot = output.slot,
+                        bytes = output.bytes,
+                    }
+                    commit_since_beat = true
+                end
             elseif output.kind == "reply" then
                 local origin = forwarded_from[output.message_id]
                 if origin ~= nil then
@@ -1247,6 +1293,46 @@ local function main(options: Options)
             -- this loop supplies the heartbeat cadence.
             node:idle()
             flush(node:outputs() as {Output})
+            -- The heartbeat option, taken the way the matcher names it: a
+            -- leader with no Commit left in the last interval re-announces
+            -- its LAST COMMIT — the frontier announcement and the proof of
+            -- life in one datagram, byte-identical to the commit it
+            -- repeats. No client transaction is opened and no proposal is
+            -- minted, so an idle leader's beats advance no journal slot. A
+            -- leader that has committed nothing at this ballot, or whose
+            -- frontier belongs to a ballot it has left, beats with
+            -- nothing.
+            local status = node:status()
+            if
+                not commit_since_beat
+                and status.state == "normal"
+                and status.leader == own_id
+            then
+                local peers = 0
+                local announced = 0
+                for replica, commit in pairs(last_commit) do
+                    if commit.era == status.era and commit.view == status.view then
+                        send_vrr(replica, commit.bytes)
+                        peers = peers + 1
+                        announced = commit.slot
+                    end
+                end
+                if peers > 0 then
+                    log_event(
+                        "heartbeat-commit",
+                        {
+                            '"node":' .. tostring(own_id),
+                            '"era":' .. tostring(status.era),
+                            '"view":' .. tostring(status.view),
+                            '"leader":' .. tostring(status.leader),
+                            '"state":"' .. status.state .. '"',
+                            '"slot":' .. tostring(announced),
+                            '"peers":' .. tostring(peers),
+                        }
+                    )
+                end
+            end
+            commit_since_beat = false
             lunet.sleep(options.heartbeat_ms)
         end
     end

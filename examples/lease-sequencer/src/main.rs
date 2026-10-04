@@ -36,6 +36,7 @@ pub mod telemetry;
 mod transport;
 
 use lease_sequencer::embedded_client::{self, Action, Runner};
+use lease_sequencer::relay;
 use lunet_advisory_lock::{
     NOT_LEADER, Node, OK, POSITION_APPEND, RECONFIGURE_DECREMENT, RECONFIGURE_INCREMENT,
     RECONFIGURE_JOIN, RECONFIGURE_LEAVE, RecoveryFlush, maybe_invariant,
@@ -219,8 +220,16 @@ struct Host {
     /// decision reads it.
     frontier_slot: u64,
     /// The keepalive proposer's own client identity and request counter.
-    heartbeat_client_id: u64,
-    heartbeat_request_num: u64,
+    /// The leader's idle beat — the heartbeat of a commit — re-announces
+    /// the last commit instead of opening a client transaction, so there
+    /// is no keepalive client identity left to mint.
+    ///
+    /// The relay ledger (`relay`): every datagram this node released that
+    /// the protocol gives a response to, minus the ones a response has
+    /// retired. The cluster wait relays it, the steady quiet re-announces
+    /// its last commit from it, and the view-change poll re-asks the
+    /// armed attempt from it.
+    relay: relay::Ledger,
     /// The (config era, leader) the current detection is latched for. A
     /// fresh era or a new leader re-arms; an arriving heartbeat from the
     /// SAME leader does not — one detection per key.
@@ -933,11 +942,63 @@ impl Host {
         self.leader_timeout.rearm(now, rng.unit());
     }
 
-    /// The leader's idle heartbeat: when otherwise idle — no Commit left
-    /// this node in the last interval — the leader proposes a read-only
-    /// `get`, whose commit fan-out emits the heartbeat Commit every
-    /// follower's leader timeout re-arms on.
-    fn heartbeat_op(&mut self, now: u64, rng: &mut Rng) {
+    /// One relayed datagram onto the wire: the exact bytes the core released
+    /// earlier, re-sent to the same peer — a transport replay, never a
+    /// message this host composed. The `relay-out` line is the
+    /// operator's evidence that a repeat is a repeat: it names the peer,
+    /// the ballot, the slot and the tag the original carried, so a relay
+    /// is distinguishable from a first send by the event name alone.
+    fn relay_out(&mut self, datagram: &relay::Datagram, why: &str) -> bool {
+        let Some(&addr) = self.peers.get(&datagram.to) else {
+            return false;
+        };
+        let packet =
+            transport::encode_peer(transport::PEER_VRR, &self.fingerprint, &datagram.bytes);
+        let _ = self.sock.send_to(&packet, addr);
+        info!(
+            ts = millis(),
+            event = "relay-out",
+            node = self.own_id,
+            to = datagram.to,
+            era = datagram.era,
+            view = datagram.view,
+            slot = datagram.slot,
+            tag = datagram.tag.name(),
+            bytes = datagram.bytes.len(),
+            why,
+            unacknowledged = self.relay.unacknowledged(),
+            relay_dropped = self.relay.dropped(),
+            "relay-out"
+        );
+        true
+    }
+
+    /// The cluster wait's drive (`docs/src/timeout-policy.md`): the
+    /// matcher's opinion for the node's own condition and this wait, and
+    /// the host obeys it. On an agent the opinion is the relay of
+    /// everything released and not answered — phase 1 and phase 2 from a
+    /// leader, a view change's fence votes and evidence from any member —
+    /// and on a node walking the boot machine it is do-nothing. The count
+    /// returned is the relay multiset's size.
+    fn cluster_timeout(&mut self, why: &str) -> usize {
+        let status = self.node.status();
+        let sends = relay::cluster_timeout(status.state, &mut self.relay, status.era, status.view);
+        let mut sent = 0usize;
+        for datagram in &sends {
+            if self.relay_out(datagram, why) {
+                sent += 1;
+            }
+        }
+        sent
+    }
+
+    /// The leader's idle beat — the heartbeat of a commit. A leader with
+    /// no Commit left in the last interval re-announces its LAST COMMIT:
+    /// the frontier announcement and the proof of life in one datagram,
+    /// byte-identical to the commit it repeats. No client transaction is
+    /// opened and no proposal is minted, so an idle leader's beats cost
+    /// the journal no slots at all.
+    fn heartbeat_op(&mut self, now: u64) {
         let status = self.node.status();
         if status.state != STATE_NORMAL
             || status.leader != self.own_id
@@ -946,33 +1007,36 @@ impl Host {
         {
             return;
         }
-        self.heartbeat_request_num += 1;
-        let message_id = *uuid::Uuid::new_v4().as_bytes();
-        let mid = uuid::Uuid::from_bytes(message_id).to_string();
-        let json = format!(
-            "{{\"op\":\"get\",\"message_id\":\"{mid}\",\"client_id\":{},\"request_num\":{},\"lock_id\":{LOCK_ID}}}",
-            self.heartbeat_client_id, self.heartbeat_request_num
-        );
-        let _ = self.node.request(json.as_bytes());
-        self.flush_outputs(now, rng);
-        // The heartbeat's own line, and the periodic frontier record: the
-        // slot this node has put on the wire, the ballot that authorised
-        // it, and the leader that drove it. The drive is unchanged — this
-        // is visibility of the drive, not a change to it.
-        let status = self.node.status();
+        let beat = relay::heartbeat(self.relay.last_commit(status.era, status.view));
+        let Some(beat) = beat else {
+            // A leader that has committed nothing at this ballot has no
+            // frontier to announce: the beat is empty, never a minted op.
+            return;
+        };
+        let slot = beat.first().map(|datagram| datagram.slot).unwrap_or(0);
+        let era = beat.first().map(|datagram| datagram.era).unwrap_or(0);
+        let view = beat.first().map(|datagram| datagram.view).unwrap_or(0);
+        let mut peers = 0u32;
+        for datagram in &beat {
+            if self.relay_out(datagram, "heartbeat") {
+                peers += 1;
+            }
+        }
+        if peers == 0 {
+            return;
+        }
         info!(
             ts = millis(),
             event = "heartbeat-commit",
             node = self.own_id,
-            era = status.era,
-            view = status.view,
+            era,
+            view,
             leader = status.leader,
             state = status.state_name(),
-            slot = self.frontier_slot,
-            request_num = self.heartbeat_request_num,
+            slot,
+            peers,
             "heartbeat-commit"
         );
-        let _ = rng;
     }
 
     /// The slot frontier onto the telemetry tape: one periodic record
@@ -1165,6 +1229,22 @@ impl Host {
                 let packet =
                     transport::encode_peer(transport::PEER_VRR, &self.fingerprint, &payload);
                 let _ = self.sock.send_to(&packet, addr);
+                // The relay ledger: this datagram joins the un-answered
+                // set the cluster wait relays and the steady quiet
+                // re-announces (`docs/src/timeout-policy.md`). Recorded
+                // after the send, from the bytes the core released.
+                if let Some(header) = transport::vrr_header(&out.bytes)
+                    && let Some(tag) = vrr::wire::Tag::from_u32(header.tag)
+                {
+                    self.relay.record(relay::Datagram {
+                        to: out.to,
+                        era: header.era,
+                        view: header.view,
+                        slot: header.slot,
+                        tag,
+                        bytes: out.bytes.clone(),
+                    });
+                }
                 // The outbound trace: what this node decided it
                 // was — one TelemetryOutbound record per sent datagram
                 // while the AOF gate is active.
@@ -1561,6 +1641,22 @@ impl Host {
         }
         if let Some(pending) = &self.driver.pending {
             if now < pending.deadline {
+                return;
+            }
+            // The correlation window closed: the cluster wait fired, and
+            // its opinion is the relay of the un-acknowledged traffic
+            // (`docs/src/timeout-policy.md`). While the relay has
+            // something to send the operation is STILL IN FLIGHT — its
+            // traffic is on the wire and its reply is still expected — so
+            // the pending op is re-armed on the same window and NOTHING
+            // is re-proposed on the client's behalf. Only when the relay
+            // is empty is the op retired and the next one scheduled on the
+            // backoff, which is the client's own recovery for traffic the
+            // relay could not cover.
+            if self.cluster_timeout("op-deadline") > 0 {
+                if let Some(pending) = &mut self.driver.pending {
+                    pending.deadline = now + OP_DEADLINE_MS;
+                }
                 return;
             }
             self.driver.pending = None;
@@ -2030,8 +2126,7 @@ fn serve(options: &Options, nodes: &[ClusterNode], lifecycle: &Lifecycle) -> Ser
         },
         last_leader_commit_ms: 0,
         frontier_slot: 0,
-        heartbeat_client_id: 0x0BEEF000 + own_desc_id as u64,
-        heartbeat_request_num: 0,
+        relay: relay::Ledger::new(),
         detected_key: None,
         timedout: timeouts::TimeoutToggle::new(),
         viewchange: timeouts::ViewChangeTimer::new(
@@ -2239,7 +2334,7 @@ fn timers(host: &mut Host, now: u64, rng: &mut Rng) {
         host.last_heartbeat = now;
         let _ = host.node.idle();
         host.flush_outputs(now, rng);
-        host.heartbeat_op(now, rng);
+        host.heartbeat_op(now);
     }
     // `docs/src/failure-detection.md`: a node INSIDE a view change has,
     // by definition, issued or joined one (its own fence, a peer's
@@ -2255,29 +2350,44 @@ fn timers(host: &mut Host, now: u64, rng: &mut Rng) {
     // `min + rand * (max - min)` — it may be pleasantly surprised when
     // the partition heals and the SAME leader returns, in which case a
     // fresh commit disarms the poll and the leader timeout resumes. The
-    // poll's drive is `timeouts::poll_actuation`'s decision: inside the
-    // view-change limbo a bare tick cannot advance the attempt (the
-    // core's tick suspicion gate admits only `Normal` nodes), so the
-    // poll carries the §14.2 host-forced view — a NEW attempt
-    // re-broadcasts its fence, the peers join and vote, and a live
-    // primary installs.
+    // poll's drive is the MATCHER's opinion for this node's condition and
+    // this wait (`relay::poll_opinion`): inside the view-change limbo the
+    // attempt is volatile and nothing else re-asks it, so the poll
+    // RE-ASKS THE ARMED ATTEMPT — the same ballot, the same fence votes
+    // and the same evidence, re-sent byte for byte. The view number does
+    // not move on a retransmit: a poll that fired a fresh view change
+    // would manufacture an attempt the protocol never asked for and
+    // inflate the view for as long as the leader stays silent. Outside
+    // the limbo the ordinary suspicion tick is the drive.
     if host.timedout.timed_out() {
         if !host.viewchange.armed() {
             host.viewchange.arm(now, rng.unit());
         } else if host.viewchange.due(now) {
             let fired_ms = host.viewchange.deadline_ms();
             host.viewchange.arm(now, rng.unit());
-            let actuation = timeouts::poll_actuation(true, status.state, true);
-            match actuation {
-                timeouts::PollActuation::ForceView => {
-                    let forced = host.node.force_view(status.era, status.view + 1);
-                    if forced != 0 {
-                        let _ = host.node.leader_timeout();
+            let opinion = relay::poll_opinion(status.state);
+            let relayed = match status.state {
+                STATE_VIEW_CHANGE => {
+                    let sends = relay::cluster_timeout(
+                        status.state,
+                        &mut host.relay,
+                        status.era,
+                        status.view,
+                    );
+                    let mut sent = 0u32;
+                    for datagram in &sends {
+                        if host.relay_out(datagram, "viewchange-poll") {
+                            sent += 1;
+                        }
                     }
+                    sent
                 }
-                timeouts::PollActuation::LeaderTimeout | timeouts::PollActuation::None => {
-                    let _ = host.node.leader_timeout();
-                }
+                _ => 0,
+            };
+            if status.state != STATE_VIEW_CHANGE
+                || !matches!(opinion, vrr::timeout::Opinion::Retransmit)
+            {
+                let _ = host.node.leader_timeout();
             }
             info!(
                 ts = millis(),
@@ -2287,11 +2397,8 @@ fn timers(host: &mut Host, now: u64, rng: &mut Rng) {
                 view = status.view,
                 leader = status.leader,
                 state = status.state_name(),
-                actuation = match actuation {
-                    timeouts::PollActuation::ForceView => "force-view",
-                    timeouts::PollActuation::LeaderTimeout => "leader-timeout",
-                    timeouts::PollActuation::None => "none",
-                },
+                opinion = opinion.name(),
+                relayed,
                 fired_ms,
                 next_deadline_ms = host.viewchange.deadline_ms(),
                 "timeout-poll"
@@ -2419,13 +2526,18 @@ fn timers(host: &mut Host, now: u64, rng: &mut Rng) {
 /// One host-loop tick of the embedded lock client runner: drain
 /// the process signal flags into every embedded client's gate and step
 /// each chase — one op in flight at a time, submitted through the node's
-/// own request path.
+/// own request path. A correlation window that closed on this tick is the
+/// cluster wait firing, and the host relays the un-acknowledged traffic
+/// in answer before the next op goes out.
 fn embedded_step(host: &mut Host, now: u64, rng: &mut Rng) {
     let Some(mut runner) = host.embedded.take() else {
         return;
     };
-    runner.tick(now, &mut |action| host.submit_embedded(now, rng, action));
+    let expired = runner.tick(now, &mut |action| host.submit_embedded(now, rng, action));
     host.embedded = Some(runner);
+    if expired > 0 {
+        host.cluster_timeout("embedded-deadline");
+    }
 }
 
 fn pump_udp(host: &mut Host, now: u64, rng: &mut Rng) {
@@ -2488,6 +2600,12 @@ fn handle_packet(
         // so the core's exact-length wire contract (W3) is untouched.
         // The Commit-from-leader arrival is the heartbeat evidence
         // `on_leader_commit` consumes.
+        if let Some(header) = transport::vrr_header(payload)
+            && let Some(tag) = vrr::wire::Tag::from_u32(header.tag)
+        {
+            host.relay
+                .answered(replica, header.era, header.view, header.slot, tag);
+        }
         host.on_leader_commit(replica, transport::vrr_header(payload), now, rng);
         // The telemetry AOF stream: EVERY VRR datagram this node
         // sees is one `Wire` envelope record — the datagram's VRR payload
@@ -2883,6 +3001,14 @@ fn client_reply(host: &mut Host, index: usize, outcome: &str, bytes: &[u8]) {
 
 /// The pending verb's deadline discipline (the admin ack's era-advance wait,
 /// the lock reply's client deadline); false closes the connection.
+///
+/// The window closing is the cluster wait, and its opinion is the relay
+/// of the un-acknowledged traffic (`docs/src/timeout-policy.md`): the
+/// verb's own protocol traffic is re-sent before the connection is
+/// closed, and nothing is re-proposed for it. A verb whose relay is empty
+/// — a follower whose outstanding traffic is the forwarded request, not
+/// this node's own — still closes on the deadline as the client's own
+/// recovery.
 fn pending_deadline(host: &mut Host, index: usize, now: u64) -> bool {
     let Some(pending) = host.conns[index].pending.clone() else {
         return true;
@@ -2910,6 +3036,7 @@ fn pending_deadline(host: &mut Host, index: usize, now: u64) -> bool {
             } else if now < deadline {
                 return true;
             } else {
+                host.cluster_timeout("admin-deadline");
                 format!(
                     "\"action\":\"{action}\",\"id\":{id},\"accepted\":false,\"reason\":\"deadline\""
                 )
@@ -2918,7 +3045,13 @@ fn pending_deadline(host: &mut Host, index: usize, now: u64) -> bool {
             client_reply(host, index, &action, format!("{{{reply}}}").as_bytes());
             true
         }
-        TcpPending::Lock { deadline, .. } => now < deadline,
+        TcpPending::Lock { deadline, .. } => {
+            if now < deadline {
+                return true;
+            }
+            host.cluster_timeout("lock-deadline");
+            false
+        }
     }
 }
 

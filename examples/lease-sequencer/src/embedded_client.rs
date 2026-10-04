@@ -468,9 +468,18 @@ impl Client {
     /// One pump step under the gate: at most one op is in flight at a
     /// time (the wire loop blocks on its round trip; the runner mirrors
     /// it with the pending discipline) — an overdue pending expires
-    /// into the backoff, and only an idle client submits its next due
-    /// action through the caller's transport.
-    fn step(&mut self, now_ms: u64, deadline_ms: u64, submit: &mut dyn FnMut(&Action) -> bool) {
+    /// into the backoff and is COUNTED for the caller (an expiry is the
+    /// cluster wait firing, and the host relays the un-acknowledged
+    /// traffic in answer), and only an idle client submits its next due
+    /// action through the caller's transport. The count returned is the
+    /// number of pendings that expired on this step.
+    fn step(
+        &mut self,
+        now_ms: u64,
+        deadline_ms: u64,
+        submit: &mut dyn FnMut(&Action) -> bool,
+    ) -> u32 {
+        let mut expired = 0u32;
         if let Some(pending) = &self.pending {
             if now_ms >= pending.deadline {
                 let pending = self
@@ -478,12 +487,13 @@ impl Client {
                     .take()
                     .expect("the deadline check just matched");
                 let _ = self.contender.absorb(now_ms, &pending.action, None);
+                expired += 1;
             } else {
-                return;
+                return expired;
             }
         }
         let Some(action) = self.contender.next_action(now_ms) else {
-            return;
+            return expired;
         };
         if submit(&action) {
             self.pending = Some(Pending {
@@ -495,6 +505,7 @@ impl Client {
             // and the chase backs off.
             let _ = self.contender.absorb(now_ms, &action, None);
         }
+        expired
     }
 
     /// Absorb one pending op's reply and submit the immediate follow-up
@@ -611,8 +622,11 @@ impl Runner {
     /// log line — then step every client. The submit closure routes one
     /// action to the leader and reports whether it was accepted for
     /// proposal (or forwarded); a refusal is absorbed as an error and
-    /// the chase backs off.
-    pub fn tick(&mut self, now_ms: u64, submit: &mut dyn FnMut(&Action) -> bool) {
+    /// the chase backs off. The count returned is the number of
+    /// correlation windows that closed on this tick: each one is the
+    /// cluster wait firing, and the host relays the un-acknowledged
+    /// traffic in answer before the next op goes out.
+    pub fn tick(&mut self, now_ms: u64, submit: &mut dyn FnMut(&Action) -> bool) -> u32 {
         // Silence also abandons any in-flight op (a reply that arrives
         // late is ignored, not absorbed).
         let on = self.signals.on();
@@ -632,9 +646,11 @@ impl Runner {
             self.on = on;
         }
         let deadline_ms = self.deadline_ms;
+        let mut expired = 0u32;
         for client in &mut self.clients {
-            client.step(now_ms, deadline_ms, submit);
+            expired += client.step(now_ms, deadline_ms, submit);
         }
+        expired
     }
 
     /// Feed one reply to the runner: the client whose pending op carries

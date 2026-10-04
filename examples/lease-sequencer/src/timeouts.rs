@@ -253,42 +253,6 @@ impl std::fmt::Display for ViewChangeRange {
 
 impl std::error::Error for ViewChangeRange {}
 
-/// The due poll's actuation: what the due poll drives.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PollActuation {
-    /// Nothing: the poll is not due or the node is not timed out.
-    None,
-    /// The ordinary suspicion tick (`leader_timeout`, `Input::Tick`).
-    LeaderTimeout,
-    /// The §14.2 host-forced view into `view + 1`: the limbo's drive.
-    ForceView,
-}
-
-/// The due poll's actuation decision (`docs/src/failure-detection.md`):
-/// while `timedout` holds the viewchange timer takes over from the
-/// leader timeout. A node inside a view change
-/// (`state == STATE_VIEW_CHANGE_HOST`) whose attempt's designated
-/// primary may never arrive cannot be advanced by an ordinary tick —
-/// the core's tick suspicion gate, `Replica::plan_tick`'s `suspects`
-/// binding in `ext/uvrr-core/src/replica/mod.rs:1784-1791`, admits only
-/// a `Normal` or a `Restarting` node — so the limbo's poll
-/// carries the §14.2 forced view instead: a NEW attempt re-broadcasts
-/// its fence, the peers join and vote, and a live primary installs. A
-/// fresh commit disarms the poll and the leader timeout resumes.
-pub fn poll_actuation(timed_out: bool, state: u32, due: bool) -> PollActuation {
-    if !timed_out || !due {
-        return PollActuation::None;
-    }
-    if state == STATE_VIEW_CHANGE_HOST {
-        return PollActuation::ForceView;
-    }
-    PollActuation::LeaderTimeout
-}
-
-/// The host's replication-state constants (`NodeStatus.state`): the
-/// view-change limbo the poll's forced view carries.
-pub const STATE_VIEW_CHANGE_HOST: u32 = 1;
-
 /// The cluster viewchange timeout (`docs/src/failure-detection.md`): a
 /// node that has SENT a view change / view votes is BY DEFINITION not
 /// talking to the leader it suspects dead — it POLLS on that with its

@@ -273,34 +273,12 @@ struct Drive {
 /// The named divergences, each recorded in `docs/src/timeout-policy.md`
 /// with its reason. A row names no divergence or one of these; the audit
 /// carries no silent exception and no widened tolerance.
-const DIVERGENCES: [(&str, &str); 5] = [
-    (
-        "boot-machine-reask",
-        "a booted node's cadence re-asks what the boot machine owes, and the matcher \
+const DIVERGENCES: [(&str, &str); 1] = [(
+    "boot-machine-reask",
+    "a booted node's cadence re-asks what the boot machine owes, and the matcher \
          answers do-nothing on every flavour of a booted node because the machine owns \
          its own progress",
-    ),
-    (
-        "client-deadline-retry",
-        "the correlation deadline retires the pending operation and schedules a fresh \
-         one; the un-acknowledged protocol traffic is never relayed",
-    ),
-    (
-        "fresh-attempt-manufacture",
-        "the poll fires a new view change at the next view number instead of re-asking \
-         the attempt already armed",
-    ),
-    (
-        "barren-heartbeat",
-        "the heartbeat option is taken with a synthetic client transaction rather than \
-         with the leader's last commit",
-    ),
-    (
-        "silent-leader-heartbeat",
-        "the heartbeat option is not taken at all: the cadence drives a bare tick and \
-         no heartbeat reaches the wire",
-    ),
-];
+)];
 
 /// The census. Enumerated from the hosts' timer code — the adapter's
 /// drives, the Rust example host's timer plane and its client
@@ -312,55 +290,60 @@ const DRIVES: [Drive; 18] = [
     Drive {
         state: State::InTheCluster,
         timeout: Timeout::Cluster,
-        drive: "the lease driver's op correlation deadline: the pending op is dropped and \
-                a fresh one scheduled on the backoff",
+        drive: "the lease driver's op correlation deadline: the un-acknowledged traffic is \
+                relayed and the still-in-flight op is re-armed, never re-proposed",
         host: "the Rust example host",
         file: "examples/lease-sequencer/src/main.rs",
         anchor: &[
             "fn driver_step(&mut self, now: u64, rng: &mut Rng)",
+            "if self.cluster_timeout(\"op-deadline\") > 0 {",
+            "pending.deadline = now + OP_DEADLINE_MS;",
             "self.driver.pending = None;",
-            "self.driver.next_action_at = now + rng.below(80) + 20;",
         ],
-        divergence: Some("client-deadline-retry"),
+        divergence: None,
     },
     Drive {
         state: State::InTheCluster,
         timeout: Timeout::Cluster,
-        drive: "the embedded client's op deadline: the overdue pending expires into the \
-                backoff and the next due action is submitted afresh",
+        drive: "the embedded client's op deadline: the overdue pending is counted for the \
+                host, which relays the un-acknowledged traffic before the next op goes out",
         host: "the Rust example host",
         file: "examples/lease-sequencer/src/embedded_client.rs",
         anchor: &[
-            "fn step(&mut self, now_ms: u64, deadline_ms: u64",
+            "fn step( &mut self, now_ms: u64, deadline_ms: u64, submit: &mut dyn FnMut(&Action) -> bool, ) -> u32 {",
             "if now_ms >= pending.deadline {",
+            "expired += 1;",
         ],
-        divergence: Some("client-deadline-retry"),
+        divergence: None,
     },
     Drive {
         state: State::InTheCluster,
         timeout: Timeout::Cluster,
-        drive: "the client connection's pending deadline: the lock reply's correlation \
-                window closes the connection, the admin verb's answers `deadline`",
+        drive: "the client connection's pending deadline: the verb's own protocol traffic is \
+                relayed before the lock reply's correlation window closes the connection and \
+                the admin verb's answers `deadline`",
         host: "the Rust example host",
         file: "examples/lease-sequencer/src/main.rs",
         anchor: &[
             "fn pending_deadline(host: &mut Host, index: usize, now: u64) -> bool",
-            "TcpPending::Lock { deadline, .. } => now < deadline,",
+            "host.cluster_timeout(\"admin-deadline\");",
+            "host.cluster_timeout(\"lock-deadline\");",
         ],
-        divergence: Some("client-deadline-retry"),
+        divergence: None,
     },
     Drive {
         state: State::InTheCluster,
         timeout: Timeout::Steady,
-        drive: "the leader's idle beat: a synthetic client `get` proposed through the \
-                full phase-2 path, whose commit fan-out the followers observe",
+        drive: "the leader's idle beat: the leader's last commit re-announced, byte for \
+                byte, which every follower's suspicion gate reads as idle-alive evidence",
         host: "the Rust example host",
         file: "examples/lease-sequencer/src/main.rs",
         anchor: &[
-            "fn heartbeat_op(&mut self, now: u64, rng: &mut Rng)",
-            "let _ = self.node.request(json.as_bytes());",
+            "fn heartbeat_op(&mut self, now: u64) {",
+            "relay::heartbeat(self.relay.last_commit(status.era, status.view))",
+            "event = \"heartbeat-commit\"",
         ],
-        divergence: Some("barren-heartbeat"),
+        divergence: None,
     },
     Drive {
         state: State::Steady,
@@ -398,15 +381,17 @@ const DRIVES: [Drive; 18] = [
         state: State::Steady,
         timeout: Timeout::Cluster,
         drive: "the cluster viewchange poll while the timeout toggle holds: inside the \
-                view-change limbo the host-forced view at the next view number",
+                view-change limbo the armed attempt is re-asked, the same ballot and the \
+                same request set, and no view is manufactured",
         host: "the Rust example host",
         file: "examples/lease-sequencer/src/main.rs",
         anchor: &[
             "if host.timedout.timed_out() {",
-            "let actuation = timeouts::poll_actuation(true, status.state, true);",
-            "let forced = host.node.force_view(status.era, status.view + 1);",
+            "let opinion = relay::poll_opinion(status.state);",
+            "host.relay_out(datagram, \"viewchange-poll\")",
+            "opinion = opinion.name(),",
         ],
-        divergence: Some("fresh-attempt-manufacture"),
+        divergence: None,
     },
     Drive {
         state: State::Booted,
@@ -494,16 +479,17 @@ const DRIVES: [Drive; 18] = [
     Drive {
         state: State::InTheCluster,
         timeout: Timeout::Steady,
-        drive: "the idle beat: the cadence drives the core's liveness input and flushes \
-                its outputs",
+        drive: "the idle beat: the cadence drives the core's liveness input, and a leader \
+                with no Commit in the last interval re-announces its last commit",
         host: "the Teal host",
         file: "src/server.tl",
         anchor: &[
             "local function heartbeat_loop()",
             "node:idle()",
+            "send_vrr(replica, commit.bytes)",
             "lunet.sleep(options.heartbeat_ms)",
         ],
-        divergence: Some("silent-leader-heartbeat"),
+        divergence: None,
     },
     Drive {
         state: State::Steady,
@@ -698,6 +684,63 @@ fn the_named_divergences_are_the_documented_ones() {
             "the divergence `{name}` is named by the doc and no drive uses it"
         );
     }
+}
+
+/// A closed divergence cannot come back unnamed. Three drives took the
+/// matcher's opinion by relay, and each one is forbidden the shape it
+/// used to have: the leader's idle beat may not open a client
+/// transaction (it re-announces the last commit), the viewchange poll
+/// may not manufacture a view at the next view number (it re-asks the
+/// armed attempt), and a correlation deadline may not retire an op whose
+/// traffic is still in flight. Each is checked on the drive's OWN body,
+/// so the check cannot be satisfied by a token elsewhere in the file.
+#[test]
+fn no_relay_drive_mints_anything() {
+    let host = fs::read_to_string(repo_file("examples/lease-sequencer/src/main.rs"))
+        .expect("the Rust host is in the tree");
+
+    let beat = body(&host, "fn heartbeat_op(&mut self, now: u64) {");
+    assert!(
+        !beat.contains("node.request(") && !beat.contains("Uuid::new_v4"),
+        "the idle beat re-announces the leader's last commit and opens no client \
+         transaction: {beat}"
+    );
+    assert!(
+        beat.contains("relay::heartbeat("),
+        "and it is the heartbeat of a commit that it sends: {beat}"
+    );
+
+    let poll = body(&host, "if host.timedout.timed_out() {");
+    assert!(
+        !poll.contains("force_view("),
+        "the viewchange poll re-asks the armed attempt and manufactures no view: {poll}"
+    );
+    assert!(
+        poll.contains("relay::poll_opinion(") && poll.contains("relay_out("),
+        "and the retransmit is the poll's own drive: {poll}"
+    );
+
+    let deadline = body(&host, "if let Some(pending) = &self.driver.pending {");
+    assert!(
+        deadline.contains("self.cluster_timeout(\"op-deadline\")"),
+        "the correlation deadline relays before it decides the op's fate: {deadline}"
+    );
+    assert!(
+        deadline.find("self.cluster_timeout(") < deadline.find("self.driver.pending = None;"),
+        "the relay comes first and the retirement only follows an empty relay: {deadline}"
+    );
+
+    let teal =
+        fs::read_to_string(repo_file("src/server.tl")).expect("the Teal host is in the tree");
+    let beat = body(&teal, "local function heartbeat_loop()");
+    assert!(
+        beat.contains("last_commit") && beat.contains("send_vrr(replica, commit.bytes)"),
+        "the Teal host's idle beat re-announces the last commit it released: {beat}"
+    );
+    assert!(
+        !beat.contains("node:request("),
+        "and it opens no client transaction: {beat}"
+    );
 }
 
 // ----------------------------------------------------------------------
@@ -937,6 +980,42 @@ fn states_text(doc: &str, text: &str) -> bool {
 /// happen to carry today.
 fn flattened(source: &str) -> String {
     source.split_whitespace().collect::<Vec<&str>>().join(" ")
+}
+
+/// A named site's own body in a host's source: from the signature to the
+/// line that closes the block, so the tokens read below are the site's
+/// own and not the file's. The block's opening brace is the site's too —
+/// in a Rust signature it is on the signature's own line, and in Teal it
+/// is the next line — so the count starts there and not at the first
+/// brace in sight, which may be a cast's.
+fn body<'a>(source: &'a str, opening: &str) -> &'a str {
+    let start = source
+        .find(opening)
+        .unwrap_or_else(|| panic!("the site `{opening}` is in the host"));
+    let rest = &source[start..];
+    let mut at = 0usize;
+    let mut depth = 0i32;
+    let mut opened = false;
+    for line in rest.split_inclusive('\n') {
+        let opens = opened || at == 0 && line.contains('{') || line.trim() == "{";
+        if opens {
+            opened = true;
+            for character in line.chars() {
+                match character {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return &rest[..at + line.len()];
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        at += line.len();
+    }
+    panic!("the site `{opening}` never closes");
 }
 
 /// A file in the repository, resolved from this crate's manifest

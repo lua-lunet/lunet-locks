@@ -36,8 +36,9 @@ Every build names its compiled-in detector on the boot line and in the
 boot trace JSON: `detector=sloppy-timeout`.
 
 The detection latch is one detection per (era, leader) while the node is
-`Normal`; in the view-change limbo the detection re-fires on each armed
-window until a live primary takes the view.
+`Normal`. Inside the view-change limbo the detector stands down and the
+cluster viewchange timeout takes the polling, whose drive is the
+retransmit of the attempt already armed.
 
 The timing law is Raft's (Ongaro, "In Search of an Understandable
 Consensus Algorithm", 2014 §4.2.3): broadcastTime ≪ electionTimeout ≪
@@ -129,6 +130,19 @@ the viewchange timer takes over, and a fresh commit disarms the poll.
 The delay law is the same `timeouts::random_wait_ms` both the leader
 timeout's deadline and the viewchange schedule arm with.
 
+What a due poll drives inside the limbo is the RETRANSMIT of the attempt
+already armed: the same ballot, the same `StartViewChange` fence votes
+and the same `DoViewChange` evidence, re-sent byte for byte. The attempt
+is volatile and nothing else re-asks it, so a poll that fired a fresh
+view change instead would manufacture an attempt the protocol never
+asked for and inflate the view for as long as the leader stays silent.
+The view number does not move on a retransmit. Outside the limbo the
+poll's drive is the ordinary suspicion tick. The poll's own log line
+carries the matcher's opinion for the pair (`opinion=retransmit`), the
+`relayed` count of datagrams re-sent, and the `view` it held — a view
+that repeats across polls is the property, and a `relay-out` line per
+re-sent datagram says what went out.
+
 Defaults: `min = 100 ms`, `max = 200 ms` — a 150 ms average poll. The
 bounds are config (`--viewchange-timeout-min-ms`,
 `--viewchange-timeout-max-ms`) and validated `min <= max`.
@@ -138,6 +152,39 @@ synchronised fleet would otherwise re-poll in lockstep and stampede
 every recovery. The floor is an RTT law: **the viewchange minimum must
 be greater than 4x RTT.** At the deployment's 20 ms under-load RTT that
 is exactly the 100/200 default.
+
+## The heartbeat of a commit
+
+The heartbeat is the leader's LAST COMMIT re-announced on the heartbeat
+cadence, and it is one of the matcher's options on a seated member's
+steady quiet ([the timeout policy](timeout-policy.md)): the frontier
+announcement and the proof of life in one datagram. A leader whose last
+interval carried no Commit of its own sends the commit it last released,
+byte for byte, to every peer it released it to; nothing else goes out.
+
+Both hosts take it that way. The Rust host keeps the released datagrams
+in the relay ledger (`examples/lease-sequencer/src/relay.rs`) and the
+leader's idle beat re-announces the newest commit per peer from it; the
+Teal host keeps the same frontier per peer as `flush` sends
+(`src/server.tl`) and its `heartbeat_loop` re-announces it while no
+Commit has gone out in the last interval. Neither opens a client
+transaction, so an idle leader's beats advance no journal slot at all: a
+run with an idle leader and N beats advances the replication journal
+zero times, which `examples/lease-sequencer/tests/relay_test.rs` counts
+in the journal's own entries.
+
+What it buys is idle-alive evidence. A backup's suspicion gate reads only
+same-view `Prepare` and `Commit` from the legitimate primary, so a quiet
+leader running the heartbeat is not deposed while a fully silent one
+eventually is. What it costs is datagram flow: one commit's worth per
+peer per beat, and nothing else. The beat is an option and not a
+mechanism the protocol requires — a deployment that prefers silence
+keeps the suspicion instead, and both are correct.
+
+The log lines are `heartbeat-commit` on the leader (the ballot, the
+frontier slot and the peers the commit went to) and `commit-in` on every
+follower that reads it, with a `relay-out` line per re-sent datagram
+beside them, so a re-announce is distinguishable from a first send.
 
 ## The nemesis testing rules
 

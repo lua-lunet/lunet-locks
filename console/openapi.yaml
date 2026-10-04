@@ -206,9 +206,10 @@ paths:
       tags: [metrics]
       description: |-
         The ts-ordered JSON log lines of the observability contract: the
-        named protocol events (heartbeat-commit, commit-in,
-        leader-timeout-detect, election-wait-fire, nominate-out/in,
-        lease-grant, forward-*, late-ack) from the daily-rolling
+        named protocol events (heartbeat-commit, commit-in, relay-out,
+        leader-timeout-detect, election-wait-fire, timeout-poll,
+        nominate-out/in, lease-grant, forward-*, late-ack) from the
+        daily-rolling
         `<node>.<date>.log` appender files, plus the telemetry tape's
         state-transition records (the slot-frontier records) with their
         envelope ns floored to ms. A line that is not a JSON object

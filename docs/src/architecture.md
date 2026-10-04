@@ -367,9 +367,11 @@ tolerance, and the full console catch-up model.
 
 The console's telemetry view charts the observability contract's JSON log
 series ([the test scaffold](test-scaffold.md)): the named protocol events —
-the heartbeat cadence (`heartbeat-commit`, `commit-in`), the timeout events
-(`leader-timeout-detect` with its measured silence, `election-wait-fire`
-with its armed wait), the NOMINATE traffic, the lease grants — plus the
+the heartbeat cadence (`heartbeat-commit`, `commit-in`), the relay of a
+repeated send (`relay-out`, with the wait that fired it), the timeout
+events (`leader-timeout-detect` with its measured silence,
+`election-wait-fire` with its armed wait, `timeout-poll` with its opinion
+and relayed count), the NOMINATE traffic, the lease grants — plus the
 telemetry tape's `slot-frontier` records. The panel reads the series over
 the admin API at `GET /api/v1/telemetry/log` ([the OpenAPI
 contract](../console/openapi.yaml)), with optional `fromMs`/`toMs` window
