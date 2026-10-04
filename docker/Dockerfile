@@ -5,9 +5,48 @@
 # dependency names), so no git fetch happens inside Docker. The runtime stage
 # carries the diagnosis kit: the NTP/capture/RTT
 # tooling packages and the demo crate's binaries from the kit stage.
-ARG AOF_IMAGE=ghcr.io/lua-lunet/lunet-locks/tbio-core:2026.09.25-3539ece-arm64
 ARG LUNET_LOCKS_HEAD=unknown
-FROM ${AOF_IMAGE} AS aof
+
+# The AOF stage: the vendored TigerBeetle AOF (the submodule's zig/ tree,
+# vendored into the context by the prep script) compiled inside the image by
+# the pinned Zig 0.14.1 toolchain (the repo's mise.toml pin, downloaded with
+# its official SHA-256 verified) — the same invocation the AOF crate's own
+# build script runs (ReleaseSafe, an explicit triple never "native", the
+# AES-asserting cpu baseline). The triple and cpu map from the BUILD
+# architecture the same way the build script maps them from the cargo
+# target (x86_64 carries avx too), so one Dockerfile builds both the amd64
+# and arm64 images. The artifact lands at /out — the layout the stages
+# below COPY from.
+FROM debian:trixie-slim AS aof
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl xz-utils \
+    && rm -rf /var/lib/apt/lists/* \
+    && case "$(dpkg --print-architecture)" in \
+        amd64) zig_archive=zig-x86_64-linux-0.14.1.tar.xz; \
+            zig_sha256=24aeeec8af16c381934a6cd7d95c807a8cb2cf7df9fa40d359aa884195c4716c ;; \
+        arm64) zig_archive=zig-aarch64-linux-0.14.1.tar.xz; \
+            zig_sha256=f7a654acc967864f7a050ddacfaa778c7504a0eca8d2b678839c21eea47c992b ;; \
+        *) echo "unsupported Linux architecture: $(dpkg --print-architecture)" >&2; exit 1 ;; \
+    esac \
+    && mkdir -p /opt/zig \
+    && curl --fail --location --retry 3 \
+        "https://ziglang.org/download/0.14.1/${zig_archive}" --output /tmp/zig.tar.xz \
+    && echo "${zig_sha256}  /tmp/zig.tar.xz" | sha256sum -c - \
+    && tar -xJf /tmp/zig.tar.xz -C /opt/zig --strip-components=1 \
+    && rm -f /tmp/zig.tar.xz
+
+WORKDIR /app/ext/lunet-locks-aof/zig
+COPY ext/lunet-locks-aof/zig .
+RUN case "$(dpkg --print-architecture)" in \
+        amd64) zig_target=x86_64-linux-gnu; zig_cpu=baseline+aes+avx ;; \
+        arm64) zig_target=aarch64-linux-gnu; zig_cpu=baseline+aes ;; \
+        *) echo "unsupported Linux architecture: $(dpkg --print-architecture)" >&2; exit 1 ;; \
+    esac \
+    && /opt/zig/zig build -Doptimize=ReleaseSafe \
+        -Dtarget="$zig_target" -Dcpu="$zig_cpu" --prefix /out \
+    && test -f /out/lib/liblunet_locks_aof.so \
+    && test -f /out/lib/liblunet_locks_aof.a
 
 FROM rust:1.96-slim AS native-base
 
@@ -49,8 +88,9 @@ RUN cargo clean --release --manifest-path /app/ext/advisory_lock/Cargo.toml \
 # node, the lease-client control client, the lease-load traffic generator)
 # and the std-only rtt_probe. The demo crate needs let-chains (rustc 1.88+),
 # so this stage pins its own rust above the cdylib stage's 1.85 and vendors
-# from the demo crate's own Cargo.lock. It consumes the same tagged AOF
-# artifact as the native adapter stage.
+# from the demo crate's own Cargo.lock. It consumes the same AOF artifact
+# (built by the image's own aof stage from the submodule) as the native
+# adapter stage.
 FROM rust:1.96-slim AS demo
 
 ARG LUNET_LOCKS_HEAD=unknown

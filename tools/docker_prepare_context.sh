@@ -39,11 +39,11 @@ mkdir -p "$context/ext/uvrr-core"
 cp "$root/ext/uvrr-core/Cargo.toml" "$context/ext/uvrr-core/Cargo.toml"
 cp -R "$root/ext/uvrr-core/src" "$context/ext/uvrr-core/src"
 # The vendored AOF subcrate: the adapter's lifecycle marker rides its
-# quorum-of-copies superblock, which is Zig source compiled by the pinned
-# 0.14.1 toolchain inside the image (the Zig toolchain the Dockerfile
-# installs). The context carries the subcrate's Rust wrapper and its zig/
-# source tree; the zig caches stay behind — they are build state, not
-# source.
+# quorum-of-copies superblock, which is Zig source. The Dockerfile's aof
+# stage compiles that zig/ tree inside the image with the pinned 0.14.1
+# toolchain (downloaded with its official SHA-256 verified), so the context
+# carries the subcrate's Rust wrapper and its zig/ source tree; the zig
+# caches stay behind — they are build state, not source.
 mkdir -p "$context/ext/lunet-locks-aof/zig"
 cp "$root/ext/lunet-locks-aof/Cargo.toml" "$root/ext/lunet-locks-aof/build.rs" \
     "$context/ext/lunet-locks-aof/"

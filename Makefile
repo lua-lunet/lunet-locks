@@ -190,11 +190,12 @@ bench:
 
 # Plain multi-stage `docker build`. The prepared context carries the vendored
 # dependency sources and the ext/uvrr-core submodule source (the manifest's
-# [patch] section resolves vrr-core to the submodule), so nothing is fetched
-# over the network inside Docker and no BuildKit mounts are needed.
+# [patch] section resolves vrr-core to it), so no dependency source is
+# fetched over the network inside Docker and no BuildKit mounts are needed;
+# the image's aof stage compiles the vendored AOF's zig/ tree with the
+# pinned Zig toolchain inside the image.
 DOCKER_IMAGE ?= lunet-advisory-lock
 DOCKER_PLATFORM ?= native
-AOF_IMAGE ?= ghcr.io/lua-lunet/lunet-locks/tbio-core:v0.17.9-lunet.5-arm64
 docker-build: build lunet-runtime
 	@context=$$(mktemp -d "$(CURDIR)/.tmp/docker-context.XXXXXX"); \
 	tools/docker_prepare_context.sh "$$context" || exit 1; \
@@ -204,7 +205,6 @@ docker-build: build lunet-runtime
 	}; \
 	docker build --platform "$$server" \
 		--build-arg LUNET_LOCKS_HEAD=$$(git rev-parse HEAD) \
-		--build-arg AOF_IMAGE=$(AOF_IMAGE) \
 		-f "$$context/docker/Dockerfile" -t $(DOCKER_IMAGE) "$$context"; \
 	image=$$(docker image inspect --format '{{.Os}}/{{.Architecture}}' $(DOCKER_IMAGE)); \
 	[ "$$image" = "$$server" ] || { \
