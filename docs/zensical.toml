@@ -11,6 +11,7 @@ nav = [
   { "Event journal" = "event-journal.md" },
   { "Standby telemetry" = "telemetry-aof.md" },
   { "External client protocol" = "client-protocol.md" },
+  { "RFC: an application protocol over uVRR" = "rfc-application-protocol.md" },
   { "The client topology" = "client-topology.md" },
   { "Build and tests" = "build-and-tests.md" },
   { "The test scaffold" = "test-scaffold.md" },
