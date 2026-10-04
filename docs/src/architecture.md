@@ -212,6 +212,15 @@ client retries attach to that in-flight correlation rather than submit a new
 operation. The normal client deadline is 30 seconds; on expiry the service
 closes the TCP connection, and the client retries the *unchanged* envelope.
 
+A connection carries one outstanding request. A second, different command
+arriving on a connection that already holds one is refused by name
+(`{"error":"request_outstanding","message_id":…}`) and never queued behind it;
+the refused command never enters the replication log and never allocates a
+correlation entry. See [the client topology](client-topology.md) for the
+uuid-to-socket nexus, the two-nodes-per-datacentre deployment in front of a
+cloud L4 load balancer, and the load-balancer failover behaviours that topology
+depends on.
+
 ## LAL Peer Protocol
 
 All cluster-internal traffic uses raw UDP between descriptor endpoints.

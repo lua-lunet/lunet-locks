@@ -195,6 +195,46 @@ local function apply_reincarnation_remap(
     return true
 end
 
+-- The one-outstanding refusal's name, spelled once in the tree. A client
+-- connection holds one outstanding command: a second command bearing a
+-- DIFFERENT `message_id` is refused by name on the same socket and never
+-- queued behind the first, because the command-to-socket nexus holds exactly
+-- one entry per connection and a second would make the reply's socket
+-- ambiguous.
+local CLIENT_REQUEST_OUTSTANDING = "request_outstanding"
+
+-- The command's UUID as the client wrote it: the text form the client
+-- recognises its own command by, which is what a refusal must quote back.
+local function message_id_text(json: string): string
+    local uuid = json:match('"message_id"%s*:%s*"([0-9a-fA-F%-]+)"')
+    assert(uuid ~= nil and #uuid == 36, "transport: request has no UUID message_id")
+    return uuid
+end
+
+-- The one-outstanding decision, a pure function of the connection's
+-- outstanding uuid and the arriving command's. A re-send of the uuid already
+-- outstanding is admitted: a retry attaches to the entry already held rather
+-- than opening a second one, so it is not a second outstanding request.
+local function one_outstanding(
+    outstanding: string, message_id: string
+): (boolean, string)
+    if outstanding == "" or outstanding == message_id then
+        return true, ""
+    end
+    return false, CLIENT_REQUEST_OUTSTANDING
+end
+
+-- The refusal line: the protocol's own error shape, naming the refused
+-- command's uuid so the client can tell which of its commands was refused
+-- and which is still in flight on the socket.
+local function encode_outstanding_refusal(message_id: string): string
+    return '{"error":"'
+        .. CLIENT_REQUEST_OUTSTANDING
+        .. '","message_id":"'
+        .. message_id
+        .. '"}'
+end
+
 local function feed_ndjson(
     buffer: string, chunk: string, max_size: integer
 ): ({string}, string)
@@ -244,5 +284,9 @@ return {
     valid_not_leader = valid_not_leader,
     reincarnation_pair = reincarnation_pair,
     apply_reincarnation_remap = apply_reincarnation_remap,
+    message_id_text = message_id_text,
+    one_outstanding = one_outstanding,
+    encode_outstanding_refusal = encode_outstanding_refusal,
+    CLIENT_REQUEST_OUTSTANDING = CLIENT_REQUEST_OUTSTANDING,
     feed_ndjson = feed_ndjson,
 }

@@ -186,6 +186,20 @@ fn exchange(worker: &mut Worker, port: u16, json: &str) -> io::Result<String> {
     Err(last_error.expect("retry loop records an error"))
 }
 
+/// Read one NDJSON reply line from a socket the simulator owns.
+fn read_reply(stream: &mut TcpStream) -> io::Result<String> {
+    let mut reply = String::new();
+    let mut byte = [0_u8; 1];
+    loop {
+        let read = stream.read(&mut byte)?;
+        if read == 0 || byte[0] == b'\n' {
+            break;
+        }
+        reply.push(byte[0] as char);
+    }
+    Ok(reply)
+}
+
 fn exchange_once(worker: &mut Worker, port: u16, json: &str) -> io::Result<String> {
     if worker.connection.is_none() {
         let address = format!("127.0.0.1:{port}");
@@ -201,15 +215,7 @@ fn exchange_once(worker: &mut Worker, port: u16, json: &str) -> io::Result<Strin
     stream.write_all(json.as_bytes())?;
     stream.write_all(b"\n")?;
     stream.flush()?;
-    let mut reply = String::new();
-    let mut byte = [0_u8; 1];
-    loop {
-        let read = stream.read(&mut byte)?;
-        if read == 0 || byte[0] == b'\n' {
-            break;
-        }
-        reply.push(byte[0] as char);
-    }
+    let reply = read_reply(stream)?;
     if reply.is_empty() {
         worker.connection = None;
         return Err(io::Error::new(
@@ -218,6 +224,81 @@ fn exchange_once(worker: &mut Worker, port: u16, json: &str) -> io::Result<Strin
         ));
     }
     Ok(reply)
+}
+
+/// The client circuit over a real socket: one connection, the nexus holding
+/// each command's reply against the socket it arrived on, and the
+/// one-outstanding rule enforced by name. Three commands are written down the
+/// SAME socket before any reply is read:
+///
+/// 1. the first is the connection's one outstanding command — it is executed
+///    and its reply is serialised onto the socket the command arrived on, the
+///    nexus dropping the entry as it writes;
+/// 2. the second and third both arrived while the first was outstanding, so
+///    both are refused by name and neither is queued behind it or executed.
+///
+/// Then, with the replies read, a fourth command is written and answered: the
+/// refusal cost the connection nothing, and the next read is served normally.
+fn one_outstanding_stage(port: u16) -> io::Result<()> {
+    let address = format!("127.0.0.1:{port}");
+    let mut stream =
+        TcpStream::connect_timeout(&address.parse().unwrap(), Duration::from_secs(2))?;
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+    fn send(stream: &mut TcpStream, json: &str) -> io::Result<()> {
+        stream.write_all(json.as_bytes())?;
+        stream.write_all(b"\n")?;
+        stream.flush()
+    }
+    // One client identity, increasing request numbers, distinct message ids —
+    // the shape a pipelining client produces.
+    let first = "04040404-0404-0404-0404-040404040401";
+    let second = "04040404-0404-0404-0404-040404040402";
+    let third = "04040404-0404-0404-0404-040404040403";
+    let fourth = "04040404-0404-0404-0404-040404040404";
+    let command = |message_id: &str, request_num: u64| {
+        format!(
+            r#"{{"op":"get","message_id":"{message_id}","client_id":404,"request_num":{request_num},"lock_id":{SENTINEL_LOCK}}}"#
+        )
+    };
+    send(&mut stream, &command(first, 1))?;
+    send(&mut stream, &command(second, 2))?;
+    send(&mut stream, &command(third, 3))?;
+    let one = read_reply(&mut stream)?;
+    let two = read_reply(&mut stream)?;
+    let three = read_reply(&mut stream)?;
+    if one.contains("request_outstanding") {
+        return Err(io::Error::other(format!(
+            "the first command on a free connection was refused: {one}"
+        )));
+    }
+    if !one.contains(&format!(r#""message_id":"{first}""#)) {
+        return Err(io::Error::other(format!(
+            "the first command's reply does not carry its own message_id: {one}"
+        )));
+    }
+    let refusal = |message_id: &str| {
+        format!(r#"{{"error":"request_outstanding","message_id":"{message_id}"}}"#)
+    };
+    if two != refusal(second) {
+        return Err(io::Error::other(format!(
+            "the second command on an outstanding connection was not refused by name: {two}"
+        )));
+    }
+    if three != refusal(third) {
+        return Err(io::Error::other(format!(
+            "the third command was not refused by name: {three}"
+        )));
+    }
+    send(&mut stream, &command(fourth, 4))?;
+    let after = read_reply(&mut stream)?;
+    if after.contains("request_outstanding") || !after.contains(&format!(r#""message_id":"{fourth}""#))
+    {
+        return Err(io::Error::other(format!(
+            "the connection did not serve the next command after the refusal: {after}"
+        )));
+    }
+    Ok(())
 }
 
 fn request_get(worker: &mut Worker) -> String {
@@ -253,13 +334,16 @@ fn holder_in(reply: &str, known_holders: &[String]) -> Option<usize> {
 fn start_cluster(root: &Path, runtime: &Path, work: &Path) -> io::Result<Cluster> {
     // The deployment descriptor: sparse, admin-assigned, never-recycled
     // NodeIds; line order is the genesis succession sequence (n1 is the
-    // genesis primary).
+    // genesis primary). Each id is the packed pair (system half, crash
+    // counter 1) — the sysadmin-assigned system identifier in the high
+    // sixteen bits, the genesis life's crash counter in the low sixteen
+    // (docs/src/architecture.md, the deployment descriptor).
     fs::write(
         work.join("cluster.jsonl"),
         concat!(
-            "{\"id\":101,\"name\":\"n1\",\"host\":\"127.0.0.1\",\"port\":29111,\"genesis\":true}\n",
-            "{\"id\":202,\"name\":\"n2\",\"host\":\"127.0.0.1\",\"port\":29112,\"genesis\":true}\n",
-            "{\"id\":303,\"name\":\"n3\",\"host\":\"127.0.0.1\",\"port\":29113,\"genesis\":true}\n",
+            "{\"id\":6619137,\"name\":\"n1\",\"host\":\"127.0.0.1\",\"port\":29111,\"genesis\":true}\n",
+            "{\"id\":13238273,\"name\":\"n2\",\"host\":\"127.0.0.1\",\"port\":29112,\"genesis\":true}\n",
+            "{\"id\":19857409,\"name\":\"n3\",\"host\":\"127.0.0.1\",\"port\":29113,\"genesis\":true}\n",
         ),
     )?;
     let mut children = Vec::new();
@@ -397,6 +481,24 @@ fn main() -> io::Result<()> {
         Worker::new(2, 1, ports[1]),
         Worker::new(3, 1, ports[2]),
     ];
+    // The client circuit over a real socket, before the chaos: the
+    // command-to-socket nexus and the one-outstanding refusal, on a
+    // connection that has nothing else on it.
+    if cluster.is_some() {
+        match one_outstanding_stage(ports[0]) {
+            Ok(()) => log.event(
+                "one-outstanding-stage",
+                &[("verdict", json_string("passed"))],
+            ),
+            Err(error) => {
+                log.detail("one-outstanding-stage", &error.to_string());
+                if let Some(cluster) = &mut cluster {
+                    cluster.stop();
+                }
+                return Err(error);
+            }
+        }
+    }
     for worker in &workers {
         log.event(
             "client-start",

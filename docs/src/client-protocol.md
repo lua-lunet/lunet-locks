@@ -5,6 +5,25 @@ line. Responses are also one JSON object per line. A connection may carry
 sequential requests; a client must wait for each response before sending its
 next request.
 
+One outstanding request per connection is a safety property, not a throughput
+preference. A second command bearing a *different* `message_id`, arriving on a
+connection that already holds one, is refused by name and never queued behind
+it:
+
+```json
+{"error":"request_outstanding","message_id":"02020202-0202-0202-0202-020202020202"}
+```
+
+The refused command never enters the replication log, never reaches the lock
+state machine, and never allocates a reply correlation. A re-send of the command
+that *is* outstanding — the same `message_id` — is not a second outstanding
+request: it attaches to the correlation already held and is answered by it. A
+client that writes two commands before reading the first reply therefore has
+every command after the first refused, because they all arrived while the first
+was outstanding. The connection survives the refusal and the next command,
+written after the reply is read, is served normally. See
+[the client topology](client-topology.md).
+
 Every request has a UUID `message_id`, a stable unsigned `client_id`, an
 increasing unsigned `request_num`, and an unsigned `lock_id`. A retry uses the
 same complete envelope. Replication deduplicates by `(client_id, request_num)`

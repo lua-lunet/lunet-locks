@@ -111,10 +111,10 @@ start() {
 # validated against this file and running processes never reload it); the
 # live membership transition itself is driven by the admin verbs below.
 cat >"$work/cluster.jsonl" <<'EOF'
-{"id":101,"name":"n1","host":"127.0.0.1","port":27101,"genesis":true}
-{"id":202,"name":"n2","host":"127.0.0.1","port":27102,"genesis":true}
-{"id":303,"name":"n3","host":"127.0.0.1","port":27103,"genesis":true}
-{"id":404,"name":"n4","host":"127.0.0.1","port":27104,"genesis":false}
+{"id":6619137,"name":"n1","host":"127.0.0.1","port":27101,"genesis":true}
+{"id":13238273,"name":"n2","host":"127.0.0.1","port":27102,"genesis":true}
+{"id":19857409,"name":"n3","host":"127.0.0.1","port":27103,"genesis":true}
+{"id":26476545,"name":"n4","host":"127.0.0.1","port":27104,"genesis":false}
 EOF
 
 # Send every line on one connection, preserving the server's sequential client

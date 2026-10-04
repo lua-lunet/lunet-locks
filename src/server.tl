@@ -231,8 +231,7 @@ local function parse_options(argv: {string}): Options
 end
 
 local function uuid_bytes(json: string): string
-    local uuid = json:match('"message_id"%s*:%s*"([0-9a-fA-F%-]+)"')
-    assert(uuid ~= nil and #uuid == 36, "server: request has no UUID message_id")
+    local uuid = transport.message_id_text(json)
     local hex = uuid:gsub("-", "")
     assert(#hex == 32 and hex:find("[^0-9a-fA-F]") == nil, "server: invalid message_id")
     local bytes = ""
@@ -254,6 +253,26 @@ local function log_membership(message: string)
     io.stdout:flush()
     io.stderr:write(message .. "\n")
     io.stderr:flush()
+end
+
+-- The observability contract's protocol stream: one JSON object per line,
+-- `era` and `view` read from the adapter's own status and never defaulted
+-- (docs/src/test-scaffold.md). The members arrive pre-formatted
+-- `"name":value` at the one call site that has them in hand, so the shape is
+-- stated where the values are, not rebuilt from a table here. The membership
+-- fingerprint and the lifecycle notices keep their own free-text channel; this
+-- is the named-event stream.
+local function log_event(event: string, members: {string})
+    local line = '{"ts":'
+        .. tostring(os.time() * 1000)
+        .. ',"level":"INFO","event":"'
+        .. event
+        .. '"'
+    for _, member in ipairs(members) do
+        line = line .. "," .. member
+    end
+    io.stdout:write(line .. "}\n")
+    io.stdout:flush()
 end
 
 local function main(options: Options)
@@ -1322,6 +1341,30 @@ local function main(options: Options)
         return false
     end
 
+    -- The one-outstanding refusal, answered on the socket the refused
+    -- command arrived on. The command never entered the replication log, so
+    -- the connection survives it and the command already outstanding is
+    -- untouched: the refusal costs the client nothing but the round trip.
+    local function refuse_outstanding(
+        client: any, message_id_text: string, refusal: string
+    ): boolean
+        local status = node:status()
+        log_event(
+            "client-request-refused",
+            {
+                '"node":' .. tostring(own_id),
+                '"era":' .. tostring(status.era),
+                '"view":' .. tostring(status.view),
+                '"state":"' .. status.state .. '"',
+                '"reason":"' .. refusal .. '"',
+                '"message_id":"' .. message_id_text .. '"',
+            }
+        )
+        return socket.write(
+            client, transport.encode_outstanding_refusal(message_id_text) .. "\n"
+        ) == nil
+    end
+
     local function serve_client(client: any)
         local client_key = tostring(client)
         active_clients[client_key] = client
@@ -1344,13 +1387,42 @@ local function main(options: Options)
                 return
             end
             buffer = tail as string
-            for _, json in ipairs(messages as {string}) do
-                local sent = false
-                local waited = pcall(function() sent = wait_for_reply(client, json) end)
-                if not waited or not sent then
-                    active_clients[client_key] = nil
-                    close_client(client)
-                    return
+            -- The one-outstanding decision is taken at ARRIVAL, which is the
+            -- only moment the law has teeth: this coroutine reads, then
+            -- serves each command to its reply before looking at the next,
+            -- so a batch of commands would otherwise drain silently one
+            -- after another. A read carrying more than one command is a
+            -- client that wrote a second before reading the first reply, and
+            -- every command after the first arrived while the first was
+            -- outstanding. The first command's uuid is the one outstanding,
+            -- so a re-send of that same uuid inside the batch attaches to it
+            -- rather than being a second outstanding request.
+            local batched = messages as {string}
+            local outstanding = #batched > 0
+                and (transport.message_id_text(batched[1]) as string) or ""
+            for index, json in ipairs(batched) do
+                local arrived = index == 1 and "" or outstanding
+                local message_id_text = transport.message_id_text(json)
+                local admitted, refusal = transport.one_outstanding(
+                    arrived, message_id_text
+                )
+                if not admitted then
+                    local refused = refuse_outstanding(client, message_id_text, refusal)
+                    if not refused then
+                        active_clients[client_key] = nil
+                        close_client(client)
+                        return
+                    end
+                else
+                    local sent = false
+                    local waited = pcall(
+                        function() sent = wait_for_reply(client, json) end
+                    )
+                    if not waited or not sent then
+                        active_clients[client_key] = nil
+                        close_client(client)
+                        return
+                    end
                 end
             end
         end
