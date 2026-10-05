@@ -89,3 +89,79 @@ remains short for leader timeout.
 
 See [Failure detection and the timeouts](failure-detection.md) for the
 mechanisms this ruling governs.
+
+## Witnesses hold the durable stream; clean shutdown is a sync ceremony
+
+A voting node never writes protocol state to its local disk. The cluster's
+store of record is quorum memory, and a restarting node recovers its state
+from the streams of its peers. Local disk on a voter carries the lifecycle
+marker, which fences, and observability, which vouches for nothing. The
+question that remains is where the state is durable when every voter is
+down, and the answer is the witnesses.
+
+**The ruling: the witness is the deployment's state holder.** Every
+deployment registers at least one witness per data centre. A witness is
+outside the roster, never votes, and receives the full phase-2 and commit
+stream from every leader in turn. Its append-only series is the durable
+copy of the stream: the witness records what it receives and tracks two
+high-watermarks, the highest frontier it holds in its buffer and the
+highest frontier it has flushed. The series is no longer observability
+only; it is the copy a full-cluster cold start recovers from.
+
+The witness's write cadence is unchanged by the role: deferred, batched,
+force-flushed on a timer rather than on the replication path, so its I/O
+jitter stays off the voters. The one exception is the sync point, below,
+which forces an early flush of a batch already in hand: a small amount of
+bookkeeping and an early flush, never a change to the streaming protocol.
+
+### The shutdown ceremony
+
+A node shutting down cleanly owes the cluster one act before it may call
+itself flushed: proof that its frontier is durable on a state holder.
+
+1. The node stops accepting new protocol traffic. Anything arriving after
+   this point that is not a sync acknowledgement is dropped; the node is
+   shutting down, and the loop now serves only the ceremony.
+2. The node broadcasts a sync point, its own committed frontier, to all
+   nodes, so that every witness syncs. Every witness receiving the point
+   applies the same rule: if its flushed watermark already covers the
+   frontier it acknowledges immediately; if the frontier is in its buffer
+   it forces the flush and acknowledges; if it has not yet seen the
+   frontier it holds the point open, flushes the moment the stream covers
+   it, and acknowledges then.
+3. The marker rounds proceed in parallel with the wait. The superblock
+   writes are theirs to finish; they do not wait on the sync.
+4. The node waits for exactly one witness's acknowledgement. One response
+   suffices: every witness holds the full stream, so a single ack proves
+   the frontier is durable outside the voters.
+5. Only then does the node write the flushed marker round. A halt with no
+   witness acknowledgement is not a clean halt: the marker does not claim
+   flushed, and the restart classifies dirty, which reincarnates. The
+   ceremony is not a precondition of stopping; a node always stops. It is
+   the precondition of the marker that says the stop was clean.
+
+### The startup side
+
+A restart with the cluster live is unchanged: the node reincarnates, the
+leader streams it, the witness lists carry it.
+
+A full-cluster cold start has no leader and no quorum memory. The nodes
+re-form the cluster and recover the state from a witness: a witness answers
+a join gossip with what it durably holds, and a booting node adopts the
+greatest era it hears, witnesses included. The witness's recorded stream is
+the source that makes the cold start recoverable; a cluster with no
+witness ever having flushed still forfeits what its quorum held, exactly
+as the durability paragraph in the architecture document has always said,
+and the operator rule stands: re-bootstrap only after all outstanding
+leases can no longer be valid.
+
+**What this binds.** The shutdown ceremony is enforced by the marker: the
+flushed round vouches for the witnessed sync, never for the process's own
+intent. The witness's two watermarks and the three sync-point rules are
+the AOF event loop's contract, tested red-green around the loop: an ack
+for an already-flushed point, a forced flush for a buffered point, a held
+point that flushes and acks when the stream arrives. The end-to-end
+contract: a clean shutdown followed by a restart preserves every lease the
+witness vouched for; a dirty boot never trusts the witness's series as its
+own state. See [the telemetry AOF](telemetry-aof.md) for the series the
+ceremony rides.

@@ -34,8 +34,12 @@ behind a bounded queue:
   configurable periodic timer (the operator knob), on an explicit checkpoint
   request, and on graceful shutdown.
 - **Loss window**: the last unflushed bytes may be lost on power loss. The
-  AOF is best-effort telemetry; nothing in the cluster depends on it for
-  safety, and no recovery path reads it.
+  AOF is best-effort telemetry on its ordinary cadence; nothing on the
+  replication path waits on it. The one exception is the clean-shutdown
+  sync ceremony (the witness-as-state-holder ruling in
+  [decisions](decisions.md)): a sync point forces an early flush, the
+  acknowledgement is the certificate the flushed marker vouches for, and a
+  full-cluster cold start reads the vouched stream back from the witness.
 
 The record bytes are exactly the lock-event journal format (the same
 `LKE1`/`LKM1` codecs) but written to a different file series: the AOF is

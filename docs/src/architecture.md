@@ -469,11 +469,18 @@ the packing's sixteen-bit counter half refuses the boot rather than wrap
 a superseded identity back into circulation.
 
 Durability is a stated property of the design. Under `Stability::Volatile`
-the core keeps protocol state in quorum memory, not local storage: a rolling
-single-node restart rejoins through reincarnation, while a simultaneous
-full-cluster loss forfeits whatever the quorum held. An operator
-re-bootstrapping a lost cluster must do so only after all outstanding leases
-can no longer be valid.
+the core keeps protocol state in quorum memory, not local storage: a voting
+node never writes protocol state to its own disk. A rolling single-node
+restart rejoins through reincarnation and recovers from its peers' streams.
+A simultaneous full-cluster loss forfeits whatever the quorum held in
+memory; what survives is the witness's durable stream, and the
+clean-shutdown sync ceremony is what guarantees it is current: a node halts
+cleanly only once a witness has acknowledged that its frontier is flushed
+(the witness-as-state-holder ruling in [decisions](decisions.md), whose
+startup half covers the cold start). A cluster that lost its witnesses'
+streams along with its quorum forfeits what memory held, and an operator
+re-bootstrapping such a cluster must do so only after all outstanding
+leases can no longer be valid.
 
 Default timers are 200 ms heartbeat, a 1,200 ms election floor plus a 200 ms
 per-node stagger (the descriptor's genesis ranks; the first line's member has
