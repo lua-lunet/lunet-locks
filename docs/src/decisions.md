@@ -130,16 +130,19 @@ itself flushed: its lock table durable under its own write-behind series.
    node's certificate is its own flush.
 2. The node stops its message loop. No further protocol traffic is
    accepted, and anything arriving after this point is dropped.
-3. The node forces its own local sync: the write-behind's pending records
-   and the current live-lock set are flushed to disk, forced, in parallel
-   with the superblock marker rounds. The two are independent work and
-   proceed concurrently.
+3. The node writes its own frame: the sync-start marker naming the life
+   and the committed frontier, the live-lock records, the end marker,
+   forced and renamed by the artefact's discipline, in parallel with the
+   superblock marker rounds. The two are independent work and proceed
+   concurrently.
 4. When all of it is done, the node halts. The flushed marker round is
-   written last and vouches for the write-behind beneath it. A halt that
-   did not finish the flush is not a clean halt: the marker does not
-   claim flushed, and the restart classifies dirty, which reincarnates.
-   The ceremony is not a precondition of stopping; a node always stops.
-   It is the precondition of the marker that says the stop was clean.
+   written last and vouches for the frame beneath it: the frame's end
+   marker is the completeness proof, and a torn frame is refused, never
+   repaired. A halt that did not finish the frame is not a clean halt:
+   the marker does not claim flushed, and the restart classifies dirty,
+   which reincarnates. The ceremony is not a precondition of stopping; a
+   node always stops. It is the precondition of the marker that says the
+   stop was clean.
 
 ### The startup side
 
@@ -171,8 +174,12 @@ they record has expired: the live set is small and the dead record is
 bulk.
 
 **What this binds.** The shutdown ceremony is enforced by the marker: the
-flushed round vouches for the local write-behind flush, never for the
-process's own intent. The witness's two watermarks and the three
+flushed round vouches for the local frame's end marker, never for the
+process's own intent. The artefact is a frame, not a running series: a
+dirty boot never reads it, so nothing is written to it during operation,
+and the serving path never touches the disk. The sweeper rides the
+leader's heartbeat cadence and removes expired locks from the table; no
+tombstones are written, because the frame holds the live set alone. The witness's two watermarks and the three
 sync-point rules are the AOF event loop's contract, tested red-green
 around the loop: an ack for an already-flushed point, a forced flush for
 a buffered point, a held point that flushes and acks when the stream
