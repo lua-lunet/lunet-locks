@@ -142,18 +142,26 @@ itself flushed: proof that its frontier is durable on a state holder.
 
 ### The startup side
 
-A restart with the cluster live is unchanged: the node reincarnates, the
-leader streams it, the witness lists carry it.
+The witness series is never on the startup path. A starting node does not
+read the tape and does not wait on it. It reincarnates at once, gossips
+its frontiers to every node it knows, and recovers its state from the
+live nodes. Every live node answers with its frontiers, not only the
+leader, and the state transfer carries the live state whole: all the live
+locks and every inflight command, the retransmission retention the base
+protocol family keeps for exactly this purpose. The live cluster's memory
+is the source of truth for a rejoining node; the tape is not.
 
-A full-cluster cold start has no leader and no quorum memory. The nodes
-re-form the cluster and recover the state from a witness: a witness answers
-a join gossip with what it durably holds, and a booting node adopts the
-greatest era it hears, witnesses included. The witness's recorded stream is
-the source that makes the cold start recoverable; a cluster with no
-witness ever having flushed still forfeits what its quorum held, exactly
-as the durability paragraph in the architecture document has always said,
-and the operator rule stands: re-bootstrap only after all outstanding
-leases can no longer be valid.
+A full-cluster cold start re-forms the cluster empty. The witness series
+is the shutdown certificate and the console's record, and it is the
+operator's backup: an ordered shutdown leaves the whole stream durable,
+the record exists for an operator-driven recovery, and no startup path
+replays it automatically.
+
+Witness retention is bounded by the lease horizon, not by the deployment's
+age. A witness retains its series indefinitely while it runs, rotates its
+files at its own reboot, and may drop files old enough that every lease
+they record has expired: the live set is small and the dead record is
+bulk.
 
 **What this binds.** The shutdown ceremony is enforced by the marker: the
 flushed round vouches for the witnessed sync, never for the process's own

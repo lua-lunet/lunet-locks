@@ -470,17 +470,18 @@ a superseded identity back into circulation.
 
 Durability is a stated property of the design. Under `Stability::Volatile`
 the core keeps protocol state in quorum memory, not local storage: a voting
-node never writes protocol state to its own disk. A rolling single-node
-restart rejoins through reincarnation and recovers from its peers' streams.
-A simultaneous full-cluster loss forfeits whatever the quorum held in
-memory; what survives is the witness's durable stream, and the
-clean-shutdown sync ceremony is what guarantees it is current: a node halts
-cleanly only once a witness has acknowledged that its frontier is flushed
-(the witness-as-state-holder ruling in [decisions](decisions.md), whose
-startup half covers the cold start). A cluster that lost its witnesses'
-streams along with its quorum forfeits what memory held, and an operator
-re-bootstrapping such a cluster must do so only after all outstanding
-leases can no longer be valid.
+node never writes protocol state to its own disk. A restarting node
+reincarnates and recovers its state from the live nodes, whose memory
+holds the live locks and the inflight commands whole; the witness series
+is never on the startup path. The witness holds the durable copy of the
+stream as the deployment's state holder, and the clean-shutdown sync
+ceremony guarantees it is current at a clean halt: a node halts cleanly
+only once a witness has acknowledged that its frontier is flushed (the
+witness-as-state-holder ruling in [decisions](decisions.md)). An ordered
+full shutdown therefore leaves the whole stream durable as the certificate
+and the operator's backup, while a re-form after a full-cluster cold start
+begins empty, and an operator re-bootstrapping such a cluster must do so
+only after all outstanding leases can no longer be valid.
 
 Default timers are 200 ms heartbeat, a 1,200 ms election floor plus a 200 ms
 per-node stagger (the descriptor's genesis ranks; the first line's member has
