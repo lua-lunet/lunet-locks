@@ -18,6 +18,7 @@ nav = [
   { "The Compliance ABI and the information console" = "compliance-abi.md" },
   { "The compliance corpus suite" = "compliance-suite.md" },
   { "Decisions" = "decisions.md" },
+  { "VRR-2012 reading group summary" = "vrr-2012-reading-group-summary.md" },
   { "The timeout policy" = "timeout-policy.md" },
   { "Bench harness" = "bench-harness.md" },
   { "Contributing" = "contributing.md" },
