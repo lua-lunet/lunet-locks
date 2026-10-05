@@ -42,6 +42,10 @@ supplied `lunet-run` is the project-local official `v0.10.0` runtime from
   telemetry node's AOF write-behind series: the async writer, the
   rotation at (re)start, 2 MiB erasure-block rolling, the deferred fsync
   policy, and the console follow path.
+- [The write-behind lock table](write-behind.md) documents the voting
+  node's local state durability: the lock-state series that is never
+  forced on the serving path, the sweeper, the clean-shutdown ceremony,
+  and the boot-fence-gated restore.
 - [The Flight Recorder](flight-recorder.md) documents the per-node
   internal trace: the debug-level feature-flagged build that records
   everything the telemetry never sees, the commit gate, and the tape

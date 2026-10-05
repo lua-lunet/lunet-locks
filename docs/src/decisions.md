@@ -116,40 +116,47 @@ bookkeeping and an early flush, never a change to the streaming protocol.
 
 ### The shutdown ceremony
 
-A node shutting down cleanly owes the cluster one act before it may call
-itself flushed: proof that its frontier is durable on a state holder.
+A node shutting down cleanly owes itself one act before it may call
+itself flushed: its lock table durable under its own write-behind series.
 
-1. The node stops accepting new protocol traffic. Anything arriving after
-   this point that is not a sync acknowledgement is dropped; the node is
-   shutting down, and the loop now serves only the ceremony.
-2. The node broadcasts a sync point, its own committed frontier, to all
-   nodes, so that every witness syncs. Every witness receiving the point
-   applies the same rule: if its flushed watermark already covers the
-   frontier it acknowledges immediately; if the frontier is in its buffer
-   it forces the flush and acknowledges; if it has not yet seen the
-   frontier it holds the point open, flushes the moment the stream covers
-   it, and acknowledges then.
-3. The marker rounds proceed in parallel with the wait. The superblock
-   writes are theirs to finish; they do not wait on the sync.
-4. The node waits for exactly one witness's acknowledgement. One response
-   suffices: every witness holds the full stream, so a single ack proves
-   the frontier is durable outside the voters.
-5. Only then does the node write the flushed marker round. A halt with no
-   witness acknowledgement is not a clean halt: the marker does not claim
-   flushed, and the restart classifies dirty, which reincarnates. The
-   ceremony is not a precondition of stopping; a node always stops. It is
-   the precondition of the marker that says the stop was clean.
+1. The node broadcasts a sync point, its own committed frontier, to all
+   nodes, fire and forget, so that every witness syncs. Every witness
+   receiving the point applies the same rule: if its flushed watermark
+   already covers the frontier it acknowledges immediately; if the
+   frontier is in its buffer it forces the flush and acknowledges; if it
+   has not yet seen the frontier it holds the point open, flushes the
+   moment the stream covers it, and acknowledges then. No reply is
+   awaited: the witnesses' series are the backup certificate, and the
+   node's certificate is its own flush.
+2. The node stops its message loop. No further protocol traffic is
+   accepted, and anything arriving after this point is dropped.
+3. The node forces its own local sync: the write-behind's pending records
+   and the current live-lock set are flushed to disk, forced, in parallel
+   with the superblock marker rounds. The two are independent work and
+   proceed concurrently.
+4. When all of it is done, the node halts. The flushed marker round is
+   written last and vouches for the write-behind beneath it. A halt that
+   did not finish the flush is not a clean halt: the marker does not
+   claim flushed, and the restart classifies dirty, which reincarnates.
+   The ceremony is not a precondition of stopping; a node always stops.
+   It is the precondition of the marker that says the stop was clean.
 
 ### The startup side
 
-The witness series is never on the startup path. A starting node does not
-read the tape and does not wait on it. It reincarnates at once, gossips
-its frontiers to every node it knows, and recovers its state from the
-live nodes. Every live node answers with its frontiers, not only the
-leader, and the state transfer carries the live state whole: all the live
-locks and every inflight command, the retransmission retention the base
-protocol family keeps for exactly this purpose. The live cluster's memory
-is the source of truth for a rejoining node; the tape is not.
+The witness series is never on the startup path. A starting node reads
+its boot fence, and the classification chooses the path:
+
+- **Clean** (the marker reads flushed): the node reads its own
+  write-behind series, rebuilds the lock table from it, and carries on.
+  The local series restores the locks; the live peers restore the
+  protocol state, as ever. Neither crosses into the other's lane.
+- **Dirty**: the node reincarnates at once and never reads the series.
+  It gossips its frontiers to every node it knows, every live node
+  answers with its frontiers, not only the leader, and the state
+  transfer carries the live state whole: all the live locks and every
+  inflight command, the retransmission retention the base protocol
+  family keeps for exactly this purpose. The live cluster's memory is
+  the source of truth for a rejoining node; the tape is not.
 
 A full-cluster cold start re-forms the cluster empty. The witness series
 is the shutdown certificate and the console's record, and it is the
@@ -164,12 +171,13 @@ they record has expired: the live set is small and the dead record is
 bulk.
 
 **What this binds.** The shutdown ceremony is enforced by the marker: the
-flushed round vouches for the witnessed sync, never for the process's own
-intent. The witness's two watermarks and the three sync-point rules are
-the AOF event loop's contract, tested red-green around the loop: an ack
-for an already-flushed point, a forced flush for a buffered point, a held
-point that flushes and acks when the stream arrives. The end-to-end
-contract: a clean shutdown followed by a restart preserves every lease the
-witness vouched for; a dirty boot never trusts the witness's series as its
-own state. See [the telemetry AOF](telemetry-aof.md) for the series the
-ceremony rides.
+flushed round vouches for the local write-behind flush, never for the
+process's own intent. The witness's two watermarks and the three
+sync-point rules are the AOF event loop's contract, tested red-green
+around the loop: an ack for an already-flushed point, a forced flush for
+a buffered point, a held point that flushes and acks when the stream
+arrives. The end-to-end contract: a clean shutdown followed by a restart
+preserves every lock the node's own series recorded; a dirty boot never
+trusts the series it finds. See [the write-behind lock table](write-behind.md)
+for the mechanism and its nuances, and [the telemetry AOF](telemetry-aof.md)
+for the write-behind discipline both series share.
