@@ -1,0 +1,105 @@
+# The contract seam
+
+The advisory-locking machinery is separated from everything that persists,
+measures, or kills it by three traits: `Disk`, `StateStore`, and `CommitHook`.
+They are the whole contract. Nothing else crosses the boundary — no ambient
+file system, no globals, no environment reach-arounds. The traits are defined
+in the `disk` and `state` modules of the `lunet-advisory-lock` crate and
+re-exported from its `spi` module, which is the single named surface both
+sides of the seam are written against.
+
+The seam exists because the machinery must live in two environments that are
+never conflated: a minimal experimental harness that proves the protocol and
+measures it, and an industrial deployment that must survive real disks, real
+crashes, and real operators. The machinery is one body of code; the
+environments are interchangeable implementations of the three traits.
+
+## The traits
+
+- **`Disk`** — every byte of disk access. Open, read, write, append, flush,
+  sync, rename, remove, create-dir, read-dir, metadata. Flush-to-userspace and
+  sync-to-device are distinct operations and are never conflated: a journal
+  that fsyncs and a trace that merely flushes are different durability
+  statements, and the trait says which is which.
+- **`StateStore`** — the lock table's persistence: `flush` a snapshot out,
+  `load` a snapshot back. The semantics are the law of the next section.
+- **`CommitHook`** — a callback invoked at each applied commit. The machinery
+  knows nothing about what the callback does. It is the experimental
+  harness's failure-injection point and the industrial side's trigger for
+  amortized maintenance.
+
+## The persistence law
+
+These three rules are the contract, stated once and binding on every
+implementation of `StateStore`:
+
+1. **Flush is eager on the shutdown path.** A clean stop writes the whole
+   lock-table snapshot to disk, in the foreground, after the drain window
+   closes and before the stop completes. A stop that cannot flush is a failed
+   stop: the failure is surfaced through the same channel as any other failed
+   stop, never silently skipped.
+2. **Load is lazy on the regular path.** Boot never loads eagerly. The table
+   starts empty; the first demand that finds the table empty, behind a
+   clean-stop verdict from the boot gate, performs exactly one load. Until
+   that demand arrives the snapshot on disk is unread.
+3. **A crashed boot distrusts the state file.** When the boot gate's verdict
+   is crashed, the snapshot is unread regardless of what it contains, and the
+   node rebuilds from the replica stream. Only a clean-stop file is loadable.
+   A snapshot that fails its own validation loads as nothing, never as an
+   error that blocks boot.
+
+## The commit hook
+
+`CommitHook` is a callback invoked at each applied commit. The machinery
+knows nothing about what the callback does, and the contract deliberately
+says nothing about it: the hook is generic machinery, and whatever rides on
+it is the consumer's business.
+
+Two consumers are named. The experimental harness uses the hook to kill a
+node at a named commit — by whatever means it chooses, which is its own
+affair — so crash-reload is exercised without failure detection in the loop:
+instead of waiting on timeouts and suspicion, the harness names the commit at
+which a node dies and then reloads it. The industrial side uses the same hook
+for amortized maintenance: a flush of the state snapshot spread over new
+commits — every N commits, TigerBeetle-style — so the eager shutdown flush
+rarely carries a large backlog, and for logging.
+
+## The division of labour
+
+**The experimental side** (the advisory-locks demo in `uvrr-core`) ships the
+machinery with the least environment it can get away with:
+
+- trivial `Disk` and `StateStore` implementations — plain files, no AOF, no
+  real superblock;
+- induced timeouts, driven by the harness — no failure-detection machinery in
+  the loop;
+- crash-at-a-named-commit through the commit hook, and crash-reload, in a
+  plain harness, run distributed across a few nodes to take timings;
+- maelstrom-style verification of the machinery itself.
+
+**The industrial side** (this repository) mounts the heavy environment onto
+the same machinery through the same traits:
+
+- the tbio-core storage engine, already behind the marker store's FFI
+  boundary, and the industrial `Disk` and `StateStore` implementations;
+- real timeouts and failure detection;
+- amortized flushing and logging driven by the commit hook;
+- the AOF, the event journal, and the web console, bridge, and launch
+  tooling.
+
+## What the experimental side is not asked to build
+
+No compliance suite. No corpus machinery. No FFI or cdylib surface. No
+industrial durability. The demo proves the machinery and takes its timings;
+experimentation and industrialisation are not conflated, in either direction:
+the experiment carries no industrial weight, and the industry carries no
+experimental scaffolding.
+
+## The consumption shape
+
+This repository consumes `uvrr-core` as a plain git-tag dependency —
+`vrr = { package = "uvrr-core", git = "…", tag = "…" }`. There is no
+submodule and no `[patch]` override: the tag in the manifest is the code that
+builds, and a version bump is a one-line manifest diff that review sees as a
+version bump. When the upstream demo ships, the tag bumps, and the industrial
+implementations mount onto the tested core without the machinery changing.
