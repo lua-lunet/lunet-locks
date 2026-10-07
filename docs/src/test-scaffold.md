@@ -268,6 +268,7 @@ kill) are surfaced to the operator wherever `stop` fails.
 |---|---|
 | `ext/advisory_lock/src/ffi.rs` | the adapter: the `Node`, the boot gate, the emission gate, the drain-point stops |
 | `ext/advisory_lock/src/marker_store.rs` | the marker pair mechanics, `GateStore`, the projection |
+| `ext/advisory_lock/src/state.rs` | the state seam: the file framing, and the lazy load's clean-verdict guard |
 | `ext/advisory_lock/src/aof.rs` | the AOF: append, drain, roll, the erasure-block trap, torn-tail truncation |
 | `ext/uvrr-core/src/timeout.rs` | the flavoured-timeout model: the matcher, the `Sorry{runbook}` verdicts |
 | `ext/uvrr-core/src/bin/timeout-policy/` | the timeout-policy tool: the opinion for a (state, timeout) pair |

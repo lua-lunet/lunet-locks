@@ -15,6 +15,16 @@ pub mod journal;
 pub mod locks;
 mod marker_store;
 pub mod recovery_flush;
+/// The state seam: the lock table's persistence contract, one trait
+/// ([`state::StateStore`]). Flush is EAGER — on the shutdown path the
+/// whole lock-table state is written in the foreground before the stop
+/// completes, and a stop that cannot flush is a failed stop, never a
+/// silent skip. Load is LAZY — the regular path never loads eagerly at
+/// boot; the table starts empty and state materialises only on demand, at
+/// the apply path's first committed entry. A crashed boot (the marker
+/// gate's verdict) distrusts the state file and rebuilds from the replica
+/// stream: only a clean-stop file is loadable.
+pub mod state;
 
 pub use ffi::{
     Node, NodeOutput, NodeStatus, OUTPUT_REPLY, OUTPUT_SEND, POSITION_APPEND, PRIMARY_TIMEOUT_MS,

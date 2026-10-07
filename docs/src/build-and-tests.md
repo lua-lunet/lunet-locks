@@ -245,8 +245,9 @@ snapshot refuses the wipe loudly and leaves the state in place.
 
 | File | Responsibility |
 |---|---|
-| `ext/advisory_lock/src/locks.rs` | JSON lock protocol and lock state machine |
-| `ext/advisory_lock/src/ffi.rs` | uvrr-core adapter, C ABI, tick clock, incarnation marker |
+| `ext/advisory_lock/src/locks.rs` | JSON lock protocol and lock state machine, and the state snapshot |
+| `ext/advisory_lock/src/state.rs` | the state seam: the lock table's eager-flush / lazy-load contract |
+| `ext/advisory_lock/src/ffi.rs` | uvrr-core adapter, C ABI, tick clock, incarnation marker, stop schedule |
 | `src/advisory_lock.tl` | Teal wrapper and owned output draining |
 | `src/cluster_config.tl` | JSONL deployment descriptor: parse, encode, genesis succession |
 | `src/admin.tl` | Admin verb decode, ADMIN peer payload, acknowledgments, dedup cache |

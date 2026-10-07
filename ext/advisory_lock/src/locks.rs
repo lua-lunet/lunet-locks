@@ -324,6 +324,23 @@ pub enum Response {
     },
 }
 
+/// The lock table's whole durable state as one serialisable value: every
+/// lock id's stored record — its holder, its lease id, its expiry, its
+/// window, its display identity and its counters.
+///
+/// This is the payload the state seam flushes and loads (see
+/// [`crate::state`]): the table is the only state the lock service keeps,
+/// so its serialisable view IS its state. It is deliberately plain — the
+/// derive is the schema, and the file carries the format-version byte that
+/// says which derive a reader is looking at.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct StateSnapshot {
+    /// The table itself: lock id -> stored record, ordered so the encoded
+    /// bytes are a function of the state and never of the map's insertion
+    /// history.
+    pub locks: BTreeMap<u64, Lease>,
+}
+
 #[derive(Clone, Default)]
 pub struct Service {
     locks: BTreeMap<u64, Lease>,
@@ -590,5 +607,31 @@ impl Service {
             .get(&lock_id)
             .cloned()
             .filter(|lease| lease.expiry > execution_time)
+    }
+
+    /// Whether the table holds no record at all. The lazy-load seam's
+    /// first clause: a table with anything in it was materialised by the
+    /// regular path (or by an earlier load), so a load now would overwrite
+    /// state the node already holds.
+    pub fn is_empty(&self) -> bool {
+        self.locks.is_empty()
+    }
+
+    /// The table's whole state as one serialisable value — the state
+    /// seam's flush payload, captured at the moment the caller asks.
+    pub fn snapshot(&self) -> StateSnapshot {
+        StateSnapshot {
+            locks: self.locks.clone(),
+        }
+    }
+
+    /// Install a loaded snapshot as the table's whole contents.
+    ///
+    /// Wholesale, not a merge: the loaded value IS the pre-stop table, so
+    /// a merge against whatever the node holds would fabricate records the
+    /// stop never wrote. The seam calls this on the lazy-load path only,
+    /// against a table it has just established is empty.
+    pub fn restore(&mut self, snapshot: StateSnapshot) {
+        self.locks = snapshot.locks;
     }
 }

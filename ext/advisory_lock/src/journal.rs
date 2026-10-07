@@ -519,7 +519,12 @@ const fn generate_crc32_table() -> [u32; 256] {
 }
 
 /// Compute CRC-32 IEEE over `data`.
-fn crc32_ieee(data: &[u8]) -> u32 {
+///
+/// The crate's one checksum, shared with the state seam's file framing
+/// (`crate::state`) so a rotted byte is detected the same way wherever
+/// it rots. `pub(crate)`, not public: the seam is the only other caller
+/// and the table behind it is this module's business.
+pub(crate) fn crc32_ieee(data: &[u8]) -> u32 {
     let mut crc: u32 = 0xFFFF_FFFF;
     for &byte in data {
         let index = ((crc ^ byte as u32) & 0xFF) as usize;

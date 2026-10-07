@@ -211,6 +211,7 @@ use crate::disk::{Disk, StdDisk, std_disk};
 use crate::journal::{self, Journal as LockJournal, JournalEvent};
 use crate::locks::{Service, Transition};
 use crate::recovery_flush::{self, FlushOutcome, RecoveryFlush};
+use crate::state::{self, FileStateStore, StateStore};
 #[cfg(any(test, debug_assertions))]
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -519,6 +520,24 @@ pub struct Node {
     /// view-record write, above all. Dynamic, never generic: the C ABI
     /// surface stays monomorph-free.
     disk: Arc<dyn Disk>,
+    /// The lock table's persistence contract: the eager flush the stop
+    /// path owes, and the lazy load the regular path never takes at boot.
+    /// Dynamic, never generic, for the same reason as the disk above —
+    /// and a `Box` rather than an `Arc`, because nothing here is shared:
+    /// the node owns its store outright, and `flush` takes `&mut self`
+    /// precisely so the eager path needs no interior mutability to
+    /// reach it.
+    state_store: Box<dyn StateStore>,
+    /// Whether the boot gate's verdict was a CLEAN stop. The lazy-load
+    /// guard's second clause: a crashed boot distrusts the state file and
+    /// rebuilds from the replica stream (see
+    /// [`Node::load_state_on_demand`]).
+    clean_boot: bool,
+    /// Whether the lazy load has already been taken this life. The guard's
+    /// third clause: the load happens at most once per node, so a table
+    /// that empties again later never re-reads a file the stream has
+    /// already overtaken.
+    state_loaded: bool,
     /// The boot gate's latched session: the Running typestate whose
     /// schedule the stop path drives. `None` while the crashed
     /// classification's engine session is unlatched (the seated witness
@@ -774,6 +793,76 @@ impl Node {
         OK
     }
 
+    /// THE LAZY LOAD — the one place the lock table is read back, and
+    /// the mirror of the eager flush in [`Node::stop`].
+    ///
+    /// The law, verbatim: load is LAZY. The regular path never loads
+    /// eagerly at boot — there is no `load()` call in any constructor;
+    /// the table starts empty and state materialises only on demand.
+    /// The seat is the apply path's first committed entry
+    /// (`apply_effect`'s `Effect::Apply` arm, immediately before
+    /// `Service::execute`): the first moment the table is genuinely
+    /// demanded by the state machine, and therefore the first moment a
+    /// loaded table can be worth anything.
+    ///
+    /// The guard has three clauses, and all three must hold:
+    ///
+    /// 1. **Once.** `state_loaded` is set on the first demand whatever
+    ///    the outcome, so a table that empties again later never
+    ///    re-reads a file the replica stream has already overtaken.
+    /// 2. **Clean verdict.** A CRASHED boot (the marker gate's verdict)
+    ///    DISTRUSTS the state file: load returns nothing and the node
+    ///    rebuilds from the replica stream. Only a clean-stop file is
+    ///    loadable — the file the eager flush wrote in the drain window
+    ///    of a stop that went on to write its drain-proven `Stopped`
+    ///    round. A first life has no file and takes no load either; the
+    ///    clause reads "clean" precisely, and a first boot's empty table
+    ///    is what the stream fills.
+    /// 3. **Empty.** The table must hold nothing. Anything in it was
+    ///    materialised by the regular path (or by an earlier load), and
+    ///    a load now would overwrite live state.
+    ///
+    /// Clauses 2 and 3 are [`state::lazy_load`]'s, kept beside the trait
+    /// so the guard is stated once and can be driven without a node.
+    ///
+    /// Nothing here fails the node. A store that answers `Err` is a
+    /// store in trouble, so it is named on stderr and the node serves
+    /// from the empty table the stream fills — the fallback is exactly
+    /// what a missing file gives, so a broken fallback is not a worse
+    /// outcome than no fallback.
+    fn load_state_on_demand(&mut self) {
+        if self.state_loaded {
+            return;
+        }
+        // Clause 1: the load is taken at most once per life, and the
+        // decision is final whatever it was.
+        self.state_loaded = true;
+        let clean_boot = self.clean_boot;
+        let table_empty = self.service.is_empty();
+        match state::lazy_load(&*self.state_store, clean_boot, table_empty) {
+            Ok(Some(snapshot)) => {
+                self.service.restore(snapshot);
+                info!(
+                    ts = log_millis(),
+                    event = "state-loaded",
+                    node = self.replica.own().0,
+                    "the lock table materialised from the clean stop's state file"
+                );
+            }
+            // Every refusal — a distrusted verdict, a populated table, an
+            // absent or rotten file — is `Ok(None)`, and the table the
+            // stream fills is exactly what a missing file gives.
+            Ok(None) => {}
+            Err(error) => {
+                trace_line!("state.load-refused");
+                eprintln!(
+                    "lunet-advisory-lock: the state load failed ({error}); \
+                     the lock table stays empty and the stream rebuilds it"
+                );
+            }
+        }
+    }
+
     /// The self-arrest bookkeeping: record the reason of the FIRST fault
     /// observation and say it once, loudly. The core's never-repair
     /// contract makes the fault sticky — every later drive repeats the
@@ -1015,6 +1104,14 @@ impl Node {
                         return Err(SERVICE);
                     }
                     let execution_time = unix_millis()?;
+                    // THE LAZY LOAD. The law: load is LAZY — the regular
+                    // path never loads eagerly at boot, so this is the
+                    // only `load()` in the crate, and it is taken here:
+                    // the point the lock table is first demanded, one
+                    // committed entry before the state machine is asked
+                    // to execute against it. See
+                    // `Node::load_state_on_demand` for the guard.
+                    self.load_state_on_demand();
                     let (bytes, transition) = self
                         .service
                         .execute(id, client_id, request_num, execution_time, &payload)
@@ -1222,6 +1319,18 @@ impl NodeStatus {
     }
 }
 
+/// The default state store for a node state path: this crate's own
+/// [`FileStateStore`] over the very disk the node is being built on,
+/// exactly as every entry point defaults its disk. The plumbing is the
+/// disk's plumbing — the store is a parameter of the shared construction
+/// body, and every public entry point builds the default here — so an
+/// embedder mounting its own store has no public injection point yet,
+/// exactly as it has none for a disk (`FileStateStore::new_on` is the
+/// store's own seam, not `Node`'s).
+fn default_state_store(disk: &Arc<dyn Disk>, state: &str) -> Box<dyn StateStore> {
+    Box::new(FileStateStore::new_on(Arc::clone(disk), Path::new(state)))
+}
+
 impl Node {
     /// Safe constructor over the same grammar the C ABI takes: `members` is
     /// the NUL-separated `<u32-id>:<name>` member buffer in descriptor
@@ -1239,6 +1348,7 @@ impl Node {
         primary_timeout: u64,
     ) -> Result<Node, i32> {
         catch_unwind(AssertUnwindSafe(|| {
+            let disk = std_disk();
             node_from_parts(
                 members.as_bytes(),
                 own.as_bytes(),
@@ -1246,7 +1356,8 @@ impl Node {
                 journal_dir.filter(|dir| !dir.is_empty()),
                 roll_bytes,
                 primary_timeout,
-                std_disk(),
+                Arc::clone(&disk),
+                default_state_store(&disk, state),
             )
         }))
         .unwrap_or(Err(PANIC))
@@ -1269,13 +1380,15 @@ impl Node {
         flush_ms: Option<u64>,
     ) -> Result<Node, i32> {
         catch_unwind(AssertUnwindSafe(|| {
+            let disk = std_disk();
             node_from_aof(
                 members.as_bytes(),
                 own.as_bytes(),
                 state.as_bytes(),
                 aof_dir,
                 flush_ms.map(Duration::from_millis),
-                std_disk(),
+                Arc::clone(&disk),
+                default_state_store(&disk, state),
             )
         }))
         .unwrap_or(Err(PANIC))
@@ -1314,7 +1427,8 @@ impl Node {
                 Construction {
                     primary_timeout: PRIMARY_TIMEOUT_MS,
                 },
-                disk,
+                Arc::clone(&disk),
+                default_state_store(&disk, state),
             )
         }))
         .unwrap_or(Err(PANIC))
@@ -1350,7 +1464,12 @@ impl Node {
                 Construction {
                     primary_timeout: PRIMARY_TIMEOUT_MS,
                 },
-                disk,
+                Arc::clone(&disk),
+                // The bench node's state path is the grammar's non-empty
+                // placeholder, so its state store is the default over that
+                // same placeholder — a bench stop writes and loads no
+                // state any more than it writes no marker there.
+                default_state_store(&disk, "bench"),
             )
         }))
         .unwrap_or(Err(PANIC))
@@ -1716,7 +1835,13 @@ impl Node {
     ///    committed-transition sink drains to quiescence (the AOF
     ///    writer's queue appended and fsynced; the blocking journal
     ///    fsynced), strictly between the two rounds.
-    /// 4. **`finish_stop`** — the engine writes the drain-proven second
+    /// 4. **The state flush** — the lock table's whole state, in the
+    ///    foreground, in the drain window: after the drain closes and
+    ///    before the `Stopped` round is written. The eager half of the
+    ///    state seam's law (see [`crate::state`]); a flush failure fails
+    ///    the stop the same way a drain failure does, named
+    ///    `stop.refuse.state-flush`.
+    /// 5. **`finish_stop`** — the engine writes the drain-proven second
     ///    round (`Stopped`, 4x): the next boot's stopped quorum proves
     ///    the clean stop.
     ///
@@ -1736,8 +1861,8 @@ impl Node {
     ///
     /// Every path below names itself on the lifecycle census tape
     /// ([`trace_line!`]): the idempotent re-entry, the drain point, both
-    /// marker rounds, the drain window opening and closing, the unseated
-    /// window's drain, and every refusal arm.
+    /// marker rounds, the drain window opening and closing, the state
+    /// flush, the unseated window's drain, and every refusal arm.
     pub fn stop(&mut self) -> i32 {
         if self.stopped {
             trace_line!("stop.idempotent");
@@ -1767,6 +1892,15 @@ impl Node {
             // The deferred window: no latched identity, no marker round.
             // The host still owes the durable sink drain.
             trace_line!("stop.unseated");
+            // No state flush on this arm, and the absence is the law's
+            // own shape rather than an omission: the unseated window
+            // writes no marker round at all, so it is not a clean stop —
+            // the markers hold the emission gate's round and the next
+            // boot re-classifies crashed, which distrusts the state file
+            // (see `load_state_on_demand`). A file written here could
+            // never be loaded by anybody; the honest thing is to write
+            // none, and the eager flush's seat stays the one place a
+            // loadable file is produced.
             #[cfg(feature = "flight-recorder")]
             self.flight_log(
                 "stop",
@@ -1859,6 +1993,26 @@ impl Node {
             }
         };
         trace_line!("stop.drain-window.close");
+        // THE EAGER FLUSH. The law: flush is EAGER — on the shutdown path
+        // the whole lock-table state is written in the foreground before
+        // the stop completes. The seat in the schedule is the only one
+        // that can hold it: the drain window has just closed (so the sink
+        // is quiescent and the table will not move again — the wire
+        // closed at `stop.wire-closed`, before any marker write), and
+        // the drain-proven `Stopped` round has not yet been written, so a
+        // flush failure leaves the markers at `Stopping` and the next
+        // boot reads crashed — which distrusts the file this stop was
+        // writing. A clean stop therefore means state on disk; a stop
+        // that cannot flush is a FAILED stop, never a silent skip.
+        if let Err(error) = self.state_store.flush(&self.service.snapshot()) {
+            trace_line!("stop.refuse.state-flush");
+            eprintln!(
+                "lunet-advisory-lock: the stop's state flush failed ({error}); \
+                     the marker stays at the first round; {UNFLUSHED_RUNBOOK}"
+            );
+            return SERVICE;
+        }
+        trace_line!("state.flush");
         trace_line!("stop.round.finish");
         #[cfg(feature = "flight-recorder")]
         self.flight_log(
@@ -2597,7 +2751,7 @@ fn boot_gate(
     }
 }
 
-fn sync_parent(disk: &dyn Disk, path: &Path) -> std::io::Result<()> {
+pub(crate) fn sync_parent(disk: &dyn Disk, path: &Path) -> std::io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     sync_dir(disk, parent)
 }
@@ -2658,6 +2812,11 @@ fn open_journal(
 /// the embedded host's `Node::open`: parse the member buffer, classify the
 /// boot from the durable incarnation marker, and build the replica. Each
 /// failure returns its ABI code.
+///
+/// The parameter list is the construction grammar's, one caller-supplied
+/// fact per parameter — the same shape and the same pay as
+/// [`node_from_sink`]'s, which this forwards to.
+#[allow(clippy::too_many_arguments)]
 fn node_from_parts(
     members_data: &[u8],
     own_data: &[u8],
@@ -2666,6 +2825,7 @@ fn node_from_parts(
     roll_bytes: u32,
     primary_timeout: u64,
     disk: Arc<dyn Disk>,
+    state_store: Box<dyn StateStore>,
 ) -> Result<Node, i32> {
     let journal = open_journal(Arc::clone(&disk), journal_dir, roll_bytes);
     node_from_sink(
@@ -2679,6 +2839,7 @@ fn node_from_parts(
             primary_timeout,
         },
         disk,
+        state_store,
     )
 }
 
@@ -2692,6 +2853,7 @@ fn node_from_aof(
     aof_dir: &str,
     flush_interval: Option<Duration>,
     disk: Arc<dyn Disk>,
+    state_store: Box<dyn StateStore>,
 ) -> Result<Node, i32> {
     let config = AofConfig {
         flush_interval,
@@ -2718,16 +2880,18 @@ fn node_from_aof(
             primary_timeout: PRIMARY_TIMEOUT_MS,
         },
         disk,
+        state_store,
     )
 }
 
 // The parameter list IS the node construction grammar, one caller-supplied
 // fact per parameter: the three descriptor buffers, the event sink, the
-// recovery boundary, the bench control socket, the runtime policy, and the
-// disk the whole construction crosses. It pays here because folding them
+// recovery boundary, the bench control socket, the runtime policy, the
+// disk the whole construction crosses, and the state store the lock table
+// is flushed to and loaded from. It pays here because folding them
 // into a carrier struct would rewrite five call sites' signatures — a
 // change to the construction grammar's shape that has nothing to do with
-// the disk seam, and the seam is the only thing this row may move.
+// the seams, and the seams are the only things this row may move.
 #[allow(clippy::too_many_arguments)]
 fn node_from_sink(
     members_data: &[u8],
@@ -2738,6 +2902,7 @@ fn node_from_sink(
     store_ctl: Option<&str>,
     construction: Construction,
     disk: Arc<dyn Disk>,
+    state_store: Box<dyn StateStore>,
 ) -> Result<Node, i32> {
     // The descriptor's grammar refusals: one named path, every branch of
     // it — the grammar is a single shape, so a violation is a single
@@ -3055,6 +3220,14 @@ fn node_from_sink(
         sink,
         state_path: state_path.clone(),
         disk: Arc::clone(&disk),
+        state_store,
+        // Only a clean stop's boot may load the state file (see
+        // `Node::load_state_on_demand`): the boot gate decided `vouched`
+        // — the drain-proven clean classification, and the only one whose
+        // stop went on to write the `Stopped` round the eager flush
+        // precedes.
+        clean_boot: decision.vouched.is_some(),
+        state_loaded: false,
         session: decision.session,
         deferred: decision.deferred,
         stopped: false,
@@ -3148,6 +3321,7 @@ pub unsafe extern "C" fn lunet_lock_node_new(
                 .filter(|s| !s.is_empty())
         };
         match catch_unwind(AssertUnwindSafe(|| {
+            let disk = std_disk();
             node_from_parts(
                 members_data,
                 own_data,
@@ -3155,7 +3329,8 @@ pub unsafe extern "C" fn lunet_lock_node_new(
                 journal_dir,
                 roll_bytes,
                 PRIMARY_TIMEOUT_MS,
-                std_disk(),
+                Arc::clone(&disk),
+                default_state_store(&disk, std::str::from_utf8(state_data).unwrap_or_default()),
             )
         })) {
             Ok(Ok(node)) => {
