@@ -211,6 +211,7 @@ use crate::disk::{Disk, StdDisk, std_disk};
 use crate::journal::{self, Journal as LockJournal, JournalEvent};
 use crate::locks::{Service, Transition};
 use crate::recovery_flush::{self, FlushOutcome, RecoveryFlush};
+use crate::spi::{CommitHook, NoOpHook};
 use crate::state::{self, FileStateStore, StateStore};
 #[cfg(any(test, debug_assertions))]
 use std::cell::RefCell;
@@ -219,7 +220,7 @@ use std::ffi::{OsString, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::ptr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, trace, warn};
 use vrr::configuration::{EraTable, INIT_SLOT, MAX_MEMBERS, SystemOperation, VOID_SLOT};
@@ -538,6 +539,18 @@ pub struct Node {
     /// that empties again later never re-reads a file the stream has
     /// already overtaken.
     state_loaded: bool,
+    /// The commit seam: a trigger fired at each applied commit, and nothing
+    /// more (see [`CommitHook`]). Dynamic, never generic, for the same reason
+    /// as the disk and the store above; `Arc<Mutex<_>>` rather than the
+    /// store's `Box`, because a hook is the one seam a consumer may want to
+    /// reach from beside the node as well as through it, and because
+    /// `on_commit` takes `&mut self` while the apply path holds `&mut self`
+    /// on everything else.
+    ///
+    /// The default is this crate's own no-op: the hook is a seam with no
+    /// in-tree consumer yet, so the production path pays one dispatch per
+    /// commit and nothing more.
+    commit_hook: Arc<Mutex<dyn CommitHook>>,
     /// The boot gate's latched session: the Running typestate whose
     /// schedule the stop path drives. `None` while the crashed
     /// classification's engine session is unlatched (the seated witness
@@ -1077,6 +1090,27 @@ impl Node {
                 operation_id,
                 payload,
             } => {
+                // THE COMMIT HOOK — a trigger, fired once per applied
+                // commit, at the seat where the entry lands on the lock
+                // table: before the state machine is asked to execute, and
+                // before the lazy load materialises the table it will
+                // execute against. Every applied commit fires it, the
+                // cached-duplicate replay included, because a duplicate is
+                // still a commit the replica made.
+                //
+                // The machinery knows nothing about what a hook does. It
+                // carries no verdict back, so nothing here inspects an
+                // answer, branches on one, or can fail a commit because of
+                // one. The named consumers: the experimental harness, which
+                // kills a node at a named commit by whatever means it
+                // chooses (its own affair) so a crash-reload is exercised
+                // at a chosen point rather than after a timeout; and the
+                // industrial side, which rides the same trigger for
+                // amortized maintenance — a state-snapshot flush spread
+                // over new commits, TigerBeetle-style — and for logging.
+                // Production wiring is the no-op hook: see
+                // `default_commit_hook`.
+                commit_hook_guard(&self.commit_hook).on_commit(slot);
                 let message_id = operation_id_bytes(operation_id);
                 let (response, transition) = if let Some(cached) = self.replies.get(&message_id) {
                     // Duplicate committed operation: replay the cached reply,
@@ -1331,6 +1365,28 @@ fn default_state_store(disk: &Arc<dyn Disk>, state: &str) -> Box<dyn StateStore>
     Box::new(FileStateStore::new_on(Arc::clone(disk), Path::new(state)))
 }
 
+/// The default commit hook: this crate's own no-op, behind the seam's own
+/// indirection. The plumbing is a parameter of the shared construction body,
+/// beside the disk's and the store's, so an embedder mounting its own hook
+/// has no public injection point yet — exactly as it has none for a disk or
+/// a store (`Node`'s constructors take the seam; `Node::open*` keep
+/// defaulting).
+fn default_commit_hook() -> Arc<Mutex<dyn CommitHook>> {
+    Arc::new(Mutex::new(NoOpHook))
+}
+
+/// The commit hook's guard, with this crate's poison discipline — the same
+/// one the committed-transition sink takes in `sink_guard`. A hook that
+/// panicked did not un-apply the commit the machinery had already made, so
+/// the lock is recovered and the next commit's hook still runs: the
+/// machinery does not disarm a consumer's callback for the consumer's own
+/// bug.
+fn commit_hook_guard<'a, 'b>(
+    hook: &'a Mutex<dyn CommitHook + 'b>,
+) -> MutexGuard<'a, dyn CommitHook + 'b> {
+    hook.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 impl Node {
     /// Safe constructor over the same grammar the C ABI takes: `members` is
     /// the NUL-separated `<u32-id>:<name>` member buffer in descriptor
@@ -1358,6 +1414,7 @@ impl Node {
                 primary_timeout,
                 Arc::clone(&disk),
                 default_state_store(&disk, state),
+                default_commit_hook(),
             )
         }))
         .unwrap_or(Err(PANIC))
@@ -1389,6 +1446,7 @@ impl Node {
                 flush_ms.map(Duration::from_millis),
                 Arc::clone(&disk),
                 default_state_store(&disk, state),
+                default_commit_hook(),
             )
         }))
         .unwrap_or(Err(PANIC))
@@ -1429,6 +1487,7 @@ impl Node {
                 },
                 Arc::clone(&disk),
                 default_state_store(&disk, state),
+                default_commit_hook(),
             )
         }))
         .unwrap_or(Err(PANIC))
@@ -1470,6 +1529,7 @@ impl Node {
                 // same placeholder — a bench stop writes and loads no
                 // state any more than it writes no marker there.
                 default_state_store(&disk, "bench"),
+                default_commit_hook(),
             )
         }))
         .unwrap_or(Err(PANIC))
@@ -2826,6 +2886,7 @@ fn node_from_parts(
     primary_timeout: u64,
     disk: Arc<dyn Disk>,
     state_store: Box<dyn StateStore>,
+    commit_hook: Arc<Mutex<dyn CommitHook>>,
 ) -> Result<Node, i32> {
     let journal = open_journal(Arc::clone(&disk), journal_dir, roll_bytes);
     node_from_sink(
@@ -2840,12 +2901,20 @@ fn node_from_parts(
         },
         disk,
         state_store,
+        commit_hook,
     )
 }
 
 /// The AOF-backed variant: the committed-transition hook enqueues to the
 /// async write-behind writer instead of the blocking journal. Same node
 /// construction; the C ABI never takes this path.
+// The parameter list IS the node construction grammar, one caller-supplied
+// fact per parameter: the descriptor buffers, the AOF series and its flush
+// interval, the disk, the state store and the commit hook. It pays here for
+// the same reason [`node_from_sink`]'s pays — folding them into a carrier
+// struct would rewrite the construction grammar's shape at every call site,
+// and the seams are the only things this file may move.
+#[allow(clippy::too_many_arguments)]
 fn node_from_aof(
     members_data: &[u8],
     own_data: &[u8],
@@ -2854,6 +2923,7 @@ fn node_from_aof(
     flush_interval: Option<Duration>,
     disk: Arc<dyn Disk>,
     state_store: Box<dyn StateStore>,
+    commit_hook: Arc<Mutex<dyn CommitHook>>,
 ) -> Result<Node, i32> {
     let config = AofConfig {
         flush_interval,
@@ -2881,14 +2951,16 @@ fn node_from_aof(
         },
         disk,
         state_store,
+        commit_hook,
     )
 }
 
 // The parameter list IS the node construction grammar, one caller-supplied
 // fact per parameter: the three descriptor buffers, the event sink, the
 // recovery boundary, the bench control socket, the runtime policy, the
-// disk the whole construction crosses, and the state store the lock table
-// is flushed to and loaded from. It pays here because folding them
+// disk the whole construction crosses, the state store the lock table
+// is flushed to and loaded from, and the commit hook fired at each applied
+// commit. It pays here because folding them
 // into a carrier struct would rewrite five call sites' signatures — a
 // change to the construction grammar's shape that has nothing to do with
 // the seams, and the seams are the only things this row may move.
@@ -2903,6 +2975,7 @@ fn node_from_sink(
     construction: Construction,
     disk: Arc<dyn Disk>,
     state_store: Box<dyn StateStore>,
+    commit_hook: Arc<Mutex<dyn CommitHook>>,
 ) -> Result<Node, i32> {
     // The descriptor's grammar refusals: one named path, every branch of
     // it — the grammar is a single shape, so a violation is a single
@@ -3228,6 +3301,7 @@ fn node_from_sink(
         // precedes.
         clean_boot: decision.vouched.is_some(),
         state_loaded: false,
+        commit_hook,
         session: decision.session,
         deferred: decision.deferred,
         stopped: false,
@@ -3331,6 +3405,7 @@ pub unsafe extern "C" fn lunet_lock_node_new(
                 PRIMARY_TIMEOUT_MS,
                 Arc::clone(&disk),
                 default_state_store(&disk, std::str::from_utf8(state_data).unwrap_or_default()),
+                default_commit_hook(),
             )
         })) {
             Ok(Ok(node)) => {

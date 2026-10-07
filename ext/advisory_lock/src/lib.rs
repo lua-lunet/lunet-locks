@@ -1,4 +1,10 @@
 //! Advisory locks over the external Viewstamped Replication core.
+//!
+//! The machinery is written against three contracts — [`spi::Disk`],
+//! [`spi::StateStore`] and [`spi::CommitHook`] — and nothing else crosses
+//! the boundary between the protocol and whatever environment it runs in.
+//! [`spi`] is the one named surface both sides are written against, and its
+//! module doc is the normative division of labour.
 
 pub mod aof;
 /// The disk seam: the one contract every byte this crate reads or writes
@@ -15,6 +21,13 @@ pub mod journal;
 pub mod locks;
 mod marker_store;
 pub mod recovery_flush;
+/// The contract seam: the three traits the machinery is written against —
+/// [`spi::Disk`], [`spi::StateStore`] and [`spi::CommitHook`] — re-exported
+/// under one name. This module IS the boundary between the experimental
+/// harness upstream runs the machinery in and the industrial deployment
+/// this repository runs it in, and its doc comment states that division
+/// normatively.
+pub mod spi;
 /// The state seam: the lock table's persistence contract, one trait
 /// ([`state::StateStore`]). Flush is EAGER — on the shutdown path the
 /// whole lock-table state is written in the foreground before the stop

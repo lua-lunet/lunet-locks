@@ -3,9 +3,10 @@
 The advisory-locking machinery is separated from everything that persists,
 measures, or kills it by three traits: `Disk`, `StateStore`, and `CommitHook`.
 They are the whole contract. Nothing else crosses the boundary — no ambient
-file system, no globals, no environment reach-arounds. The traits are defined
-in the `disk` and `state` modules of the `lunet-advisory-lock` crate and
-re-exported from its `spi` module, which is the single named surface both
+file system, no globals, no environment reach-arounds. In the
+`lunet-advisory-lock` crate, `Disk` and `StateStore` are defined in its
+`disk` and `state` modules, and `CommitHook` is defined in its `spi` module;
+the `spi` module re-exports all three and is the single named surface both
 sides of the seam are written against.
 
 The seam exists because the machinery must live in two environments that are
