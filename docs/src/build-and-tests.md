@@ -7,13 +7,6 @@ make init       # mise tools, then Cyan, Cerulean, tested, and tl in .rocks/
 make hooks      # enable the formatting pre-commit hook once after clone
 ```
 
-The native adapter requires Rust 1.96 or newer. Its ordering core is the
-vendored `ext/uvrr-core` git submodule, checked out on upstream main at
-tag `v0.13.1` (commit `37549d1`, released 2026-10-03). The adapter manifest
-pins the upstream tag and its `[patch]` section builds the dependency from
-the submodule, so `cargo` fetches no git dependencies: local builds, the
-vendored Docker context, and CI all compile the submodule source directly.
-
 ## Teal tooling
 
 Run orchestration and generic tooling are typed Teal (typed Lua on LuaJIT)

@@ -1,7 +1,3 @@
-//! The wire codec's roundtrip at the host boundary: every live tag the
-//! host can receive or emit (the tag table in `vrr::wire::Tag` at
-//! uvrr-core v0.13.1) packs to its exact normative byte length, unpacks
-//! back with every field surviving, and carries a header slot its
 //! `header_slot_role` admits. The widths the sums below state: header 20
 //! (tag 4 + era 4 + view 4 + slot 8, W1), body discriminant 1, NodeId 4,
 //! Era 4, View 4, Slot 8, OperationId 16, opaque length prefix 4.

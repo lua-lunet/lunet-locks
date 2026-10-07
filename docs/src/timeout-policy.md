@@ -25,14 +25,7 @@ re-asking).
 
 ## The matcher's table, tool-produced
 
-The upstream `timeout-policy` tool (a `[[bin]]` of `uvrr-core`, pinned
-`v0.13.1`) prints the opinion for one pair, and its usage enumerates the
-domain: eight states, eight timeout flavours. The table below is the
-tool's output over the whole domain, each cell being the tool's own
-verdict:
-
 ```console
-$ (cd ext/uvrr-core && cargo build --release --bin timeout-policy)
 $ target/release/timeout-policy <state> <timeout>
 ```
 

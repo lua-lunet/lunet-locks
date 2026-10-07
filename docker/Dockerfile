@@ -1,8 +1,6 @@
 # Plain multi-stage Docker build, intentionally compatible with Colima's legacy
 # builder: it uses no BuildKit-only mounts, secrets, or cache directives.
 # `tools/docker_prepare_context.sh` vendors the transitive dependency sources
-# and the uvrr-core submodule source (the upstream tag v0.13.1 the manifest's
-# dependency names), so no git fetch happens inside Docker. The runtime stage
 # carries the diagnosis kit: the NTP/capture/RTT
 # tooling packages and the demo crate's binaries from the kit stage.
 ARG LUNET_LOCKS_HEAD=unknown
@@ -65,19 +63,13 @@ ENV LUNET_LOCKS_AOF_LIB_DIR=/opt/aof/lib
 WORKDIR /app
 COPY .cargo/config.toml /usr/local/cargo/config.toml
 COPY vendor /app/vendor
-COPY ext/uvrr-core/Cargo.toml /app/ext/uvrr-core/Cargo.toml
 COPY ext/lunet-locks-aof/Cargo.toml ext/lunet-locks-aof/build.rs /app/ext/lunet-locks-aof/
 COPY ext/lunet-locks-aof/src /app/ext/lunet-locks-aof/src
 COPY ext/advisory_lock/Cargo.toml ext/advisory_lock/Cargo.lock /app/ext/advisory_lock/
-RUN mkdir -p /app/ext/uvrr-core/src /app/ext/advisory_lock/src \
-    && printf '' > /app/ext/uvrr-core/src/lib.rs \
-    && printf '' > /app/ext/advisory_lock/src/lib.rs \
-    && cargo build --release --locked --manifest-path /app/ext/advisory_lock/Cargo.toml
 
 FROM native-deps AS native
 
 WORKDIR /app
-COPY ext/uvrr-core /app/ext/uvrr-core
 COPY ext/lunet-locks-aof /app/ext/lunet-locks-aof
 COPY ext/advisory_lock /app/ext/advisory_lock
 RUN cargo clean --release --manifest-path /app/ext/advisory_lock/Cargo.toml \
@@ -101,7 +93,6 @@ ENV LUNET_LOCKS_HEAD=${LUNET_LOCKS_HEAD}
 WORKDIR /app
 COPY .cargo/config-demo.toml /usr/local/cargo/config.toml
 COPY vendor-demo /app/vendor-demo
-COPY ext/uvrr-core /app/ext/uvrr-core
 COPY ext/lunet-locks-aof /app/ext/lunet-locks-aof
 COPY ext/advisory_lock /app/ext/advisory_lock
 COPY examples/lease-sequencer /app/examples/lease-sequencer

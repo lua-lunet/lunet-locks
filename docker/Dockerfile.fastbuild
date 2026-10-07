@@ -108,8 +108,6 @@ ENV LUNET_LOCKS_HEAD=${LUNET_LOCKS_HEAD}
 FROM toolchain AS deps
 
 # The dependencies layer: every member manifest (the layer's cache key)
-# plus the dependency sources — uvrr-core resolves through the [patch]
-# section to the submodule copy; the AOF crate with its zig/ tree is a
 # dependency of the adapter. The internal crates' Cargo.lock files are
 # deliberately untracked (.gitignore, `ext/*/Cargo.lock` — internal FFI
 # components resolve like CI does, unpinned lockless); the example
@@ -118,7 +116,6 @@ FROM toolchain AS deps
 # the layer, not repo truth). Both triples compile on top of empty stub
 # sources, so a source change recompiles only the three own crates.
 WORKDIR /srv
-COPY ext/uvrr-core ext/uvrr-core
 COPY ext/lunet-locks-aof/Cargo.toml ext/lunet-locks-aof/build.rs \
      ext/lunet-locks-aof/
 COPY ext/lunet-locks-aof/src ext/lunet-locks-aof/src

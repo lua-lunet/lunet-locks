@@ -13,20 +13,6 @@ this audit" instead of asserted.
 
 | Path | Upstream | Version | Licence |
 |---|---|---|---|
-| `ext/uvrr-core/` (git submodule) | [lua-lunet/uvrr-core](https://github.com/lua-lunet/uvrr-core) | content of upstream tag `v0.13.1` (submodule commit `37549d1`) | MIT (see `ext/uvrr-core/LICENSE` and `ext/uvrr-core/Cargo.toml`, `license = "MIT"`) |
-
-The submodule checkout is upstream main at tag `v0.13.1` (released
-2026-10-01), carrying the lifecycle boot gate, the learner-acquisition
-rule, and the fence-under-load completion. Upstream copyright (Copyright
-(c) 2026 Simon Massey) and licence text are preserved in the submodule.
-
-The adapter manifest's `[patch]` section resolves the `vrr-core` git
-dependency to this submodule, so every build lane — local, CI, and the
-vendored Docker context — compiles the submodule source directly and
-fetches no git dependencies.
-
-| Path | Upstream | Version | Licence |
-|---|---|---|---|
 | `ext/lunet-locks-aof/zig/src/` | [tigerbeetle/tigerbeetle](https://github.com/tigerbeetle/tigerbeetle) | release tag `0.17.9` (the AOF strip; file map in `ext/lunet-locks-aof/VENDORED.md`) | Apache-2.0 (see `ext/lunet-locks-aof/LICENSE-TigerBeetle`) |
 
 The vendored tree carries only the AOF code path and its minimal
@@ -61,7 +47,6 @@ were verified against the crates.io licence field for each pinned version.
 | `tracing-attributes` | 0.1.31 | MIT | proc-macro of `tracing` |
 | `tracing-core` | 0.1.36 | MIT | dependency of `tracing` |
 | `io-uring` | 0.7.15 | MIT OR Apache-2.0 | Linux-only direct dependency, compiled into the cdylib |
-| `vrr-core` | upstream tag `v0.13.1` content | MIT | resolved by `[patch]` to the `ext/uvrr-core` submodule, linked into the cdylib |
 | `proptest` | 1.11.0 | MIT OR Apache-2.0 | dev-dependency; tests only, not shipped |
 
 ### `ext/lock_feed` — `lock-feed` (smoke/tooling, not in the release archive)

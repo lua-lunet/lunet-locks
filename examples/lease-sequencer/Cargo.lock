@@ -846,6 +846,7 @@ dependencies = [
 [[package]]
 name = "uvrr-core"
 version = "0.14.0"
+source = "git+https://github.com/lua-lunet/uvrr-core.git?tag=v0.14.0#64ec4bb50276e1e8b98c69acf483ac9ab7339d50"
 
 [[package]]
 name = "valuable"

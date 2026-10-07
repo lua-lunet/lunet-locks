@@ -109,14 +109,9 @@ local record M
     check: function(string, Profile): integer
 end
 
--- The CDylib's own source roots: its crate, the two path dependencies it
--- links (the vendored AOF store and the patched uvrr-core submodule), the
--- vendored cargo config, and the toolchain pin. A change to any of them can
--- move the bytes, so all of them are sources.
 local CDYLIB_SOURCES = {
     "ext/advisory_lock",
     "ext/lunet-locks-aof",
-    "ext/uvrr-core",
     ".cargo",
     "rust-toolchain.toml",
 }
@@ -126,7 +121,6 @@ local LEASE_SOURCES = {
     "examples/lease-sequencer",
     "ext/advisory_lock",
     "ext/lunet-locks-aof",
-    "ext/uvrr-core",
     ".cargo",
     "rust-toolchain.toml",
 }
@@ -528,7 +522,6 @@ function M.standby_stack(root: string): Profile
         "examples/lease-sequencer",
         "ext/advisory_lock",
         "ext/lunet-locks-aof",
-        "ext/uvrr-core",
         ".cargo",
         "rust-toolchain.toml",
     }

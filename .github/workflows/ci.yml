@@ -53,9 +53,6 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
     steps:
-      # Recursive: the manifest's [patch] section resolves vrr-core to the
-      # ext/uvrr-core submodule (the lunet-locks/learner-era-fold branch),
-      # so every build lane needs its source checked out.
       - uses: actions/checkout@v4
         with:
           submodules: recursive

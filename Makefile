@@ -149,12 +149,6 @@ bench:
 		--node-bin $(abspath $(BENCH_DIR)/target/debug/lease-sequencer) \
 		--run-dir $(CURDIR)/.tmp/bench-run
 
-# Plain multi-stage `docker build`. The prepared context carries the vendored
-# dependency sources and the ext/uvrr-core submodule source (the manifest's
-# [patch] section resolves vrr-core to it), so no dependency source is
-# fetched over the network inside Docker and no BuildKit mounts are needed;
-# the image's aof stage compiles the vendored AOF's zig/ tree with the
-# pinned Zig toolchain inside the image.
 DOCKER_IMAGE ?= lunet-advisory-lock
 DOCKER_PLATFORM ?= native
 docker-build: build lunet-runtime

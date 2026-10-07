@@ -10,7 +10,6 @@ pub mod client_gate;
 pub mod embedded_client;
 pub mod flight_tape;
 pub mod gateway;
-pub mod gateway_harness;
 pub mod rejoin;
 pub mod relay;
 pub mod shutdown_check;

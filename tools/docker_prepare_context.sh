@@ -28,16 +28,6 @@ sed "s|directory = \".*\"|directory = \"/app/vendor\"|" "$context/.cargo/config.
 cp "$root/ext/advisory_lock/Cargo.toml" "$root/ext/advisory_lock/Cargo.lock" \
     "$root/ext/advisory_lock/build.rs" "$context/ext/advisory_lock/"
 cp -R "$root/ext/advisory_lock/src" "$context/ext/advisory_lock/src"
-# The vendored uvrr-core submodule: the [patch] section of the manifest
-# resolves vrr-core to it, so the vendored context
-# carries its source at the same relative position the manifest names.
-test -d "$root/ext/uvrr-core/src" || {
-    echo "missing the uvrr-core submodule source; run git submodule update --init" >&2
-    exit 2
-}
-mkdir -p "$context/ext/uvrr-core"
-cp "$root/ext/uvrr-core/Cargo.toml" "$context/ext/uvrr-core/Cargo.toml"
-cp -R "$root/ext/uvrr-core/src" "$context/ext/uvrr-core/src"
 # The vendored AOF subcrate: the adapter's lifecycle marker rides its
 # quorum-of-copies superblock, which is Zig source. The Dockerfile's aof
 # stage compiles that zig/ tree inside the image with the pinned 0.14.1
