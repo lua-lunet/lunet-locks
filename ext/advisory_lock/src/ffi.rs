@@ -207,6 +207,7 @@
 //! `own_data` is the local member's name.
 
 use crate::aof::{AofConfig, AofWriter};
+use crate::disk::{Disk, StdDisk, std_disk};
 use crate::journal::{self, Journal as LockJournal, JournalEvent};
 use crate::locks::{Service, Transition};
 use crate::recovery_flush::{self, FlushOutcome, RecoveryFlush};
@@ -214,8 +215,6 @@ use crate::recovery_flush::{self, FlushOutcome, RecoveryFlush};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{OsString, c_void};
-use std::fs::{self, File, OpenOptions};
-use std::io::Write;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::ptr;
@@ -516,6 +515,10 @@ pub struct Node {
     /// The durable incarnation-marker path: the boot gate's store rides
     /// it; the single-file projection the operators read mirrors it.
     state_path: PathBuf,
+    /// The seam the node's own disk work crosses — the drain window's
+    /// view-record write, above all. Dynamic, never generic: the C ABI
+    /// surface stays monomorph-free.
+    disk: Arc<dyn Disk>,
     /// The boot gate's latched session: the Running typestate whose
     /// schedule the stop path drives. `None` while the crashed
     /// classification's engine session is unlatched (the seated witness
@@ -1243,6 +1246,7 @@ impl Node {
                 journal_dir.filter(|dir| !dir.is_empty()),
                 roll_bytes,
                 primary_timeout,
+                std_disk(),
             )
         }))
         .unwrap_or(Err(PANIC))
@@ -1271,6 +1275,7 @@ impl Node {
                 state.as_bytes(),
                 aof_dir,
                 flush_ms.map(Duration::from_millis),
+                std_disk(),
             )
         }))
         .unwrap_or(Err(PANIC))
@@ -1293,7 +1298,12 @@ impl Node {
         scratch_dir: &str,
     ) -> Result<Node, i32> {
         catch_unwind(AssertUnwindSafe(|| {
-            let journal = open_journal(journal_dir.filter(|dir| !dir.is_empty()), roll_bytes);
+            let disk = std_disk();
+            let journal = open_journal(
+                Arc::clone(&disk),
+                journal_dir.filter(|dir| !dir.is_empty()),
+                roll_bytes,
+            );
             node_from_sink(
                 members.as_bytes(),
                 own.as_bytes(),
@@ -1304,6 +1314,7 @@ impl Node {
                 Construction {
                     primary_timeout: PRIMARY_TIMEOUT_MS,
                 },
+                disk,
             )
         }))
         .unwrap_or(Err(PANIC))
@@ -1324,7 +1335,8 @@ impl Node {
         store_ctl: &str,
     ) -> Result<Node, i32> {
         catch_unwind(AssertUnwindSafe(|| {
-            let journal = open_journal(journal_dir, roll_bytes);
+            let disk = std_disk();
+            let journal = open_journal(Arc::clone(&disk), journal_dir, roll_bytes);
             node_from_sink(
                 members.as_bytes(),
                 own.as_bytes(),
@@ -1338,6 +1350,7 @@ impl Node {
                 Construction {
                     primary_timeout: PRIMARY_TIMEOUT_MS,
                 },
+                disk,
             )
         }))
         .unwrap_or(Err(PANIC))
@@ -1820,7 +1833,7 @@ impl Node {
             era: snapshot.era,
             view: snapshot.view,
         };
-        if let Err(error) = write_view_record(&self.state_path, &record) {
+        if let Err(error) = write_view_record(&*self.disk, &self.state_path, &record) {
             trace_line!("stop.refuse.drain-window");
             eprintln!(
                 "lunet-advisory-lock: the stop's view-record write failed ({error}); \
@@ -2255,7 +2268,11 @@ fn view_record_path(state: &Path) -> PathBuf {
 
 /// Writes the view record durably (fsync+rename+dir-sync, the marker
 /// projection's crash-consistency idiom).
-pub(crate) fn write_view_record(path: &Path, record: &ViewRecord) -> std::io::Result<()> {
+pub(crate) fn write_view_record(
+    disk: &dyn Disk,
+    path: &Path,
+    record: &ViewRecord,
+) -> std::io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let base = path.file_name().unwrap_or_default();
     let unique = SystemTime::now()
@@ -2266,29 +2283,30 @@ pub(crate) fn write_view_record(path: &Path, record: &ViewRecord) -> std::io::Re
     temporary.push(format!(".view-tmp-{}-{unique}", std::process::id()));
     let temporary = parent.join(temporary);
     let result = (|| {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)?;
+        let mut file = disk.create_new_write(&temporary)?;
         file.write_all(record.line().as_bytes())?;
         file.sync_all()?;
-        fs::rename(&temporary, view_record_path(path))?;
-        sync_parent(path)
+        disk.rename(&temporary, &view_record_path(path))?;
+        sync_parent(disk, path)
     })();
     if result.is_err() {
-        let _ = fs::remove_file(&temporary);
+        let _ = disk.remove_file(&temporary);
     }
     result
 }
 
 /// Reads the view record. `None` when the file does not exist (no stop
 /// ever wrote one); any existing-but-unreadable record is an error.
+///
+/// The single-file projection's reader, over the default disk: its only
+/// caller is the marker store, whose own disk path rides the vendored
+/// store's own boundary, so no disk is threaded in here.
 pub(crate) fn read_view_record(path: &Path) -> std::io::Result<Option<ViewRecord>> {
     let path = view_record_path(path);
-    if !path.exists() {
+    if !StdDisk.exists(&path) {
         return Ok(None);
     }
-    let text = fs::read_to_string(&path)?;
+    let text = StdDisk.read_to_string(&path)?;
     ViewRecord::parse(&text).map(Some).ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -2322,8 +2340,11 @@ pub(crate) fn parse_marker(text: &str) -> Option<(u16, u16, Marker)> {
     Some((system, crash, marker))
 }
 
+/// The marker's single-file projection, read over the default disk: the
+/// marker store is this reader's only caller, and it rides the vendored
+/// store's own boundary for its durable path.
 pub(crate) fn read_marker(path: &Path) -> std::io::Result<(u16, u16, Marker)> {
-    parse_marker(&fs::read_to_string(path)?)
+    parse_marker(&StdDisk.read_to_string(path)?)
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid marker"))
 }
 
@@ -2334,6 +2355,9 @@ pub(crate) fn read_marker(path: &Path) -> std::io::Result<(u16, u16, Marker)> {
 /// The single-file write is the COMPATIBILITY PROJECTION — written only
 /// after the authoritative quorum write succeeded (see `marker_store`),
 /// never a classification input once the copies exist.
+/// The marker's single-file projection write, over the default disk: the
+/// marker store is this writer's only caller, and it rides the vendored
+/// store's own boundary for its durable path.
 pub(crate) fn write_marker(
     path: &Path,
     system: u16,
@@ -2349,18 +2373,15 @@ pub(crate) fn write_marker(
     temporary.push(base);
     temporary.push(format!(".tmp-{}-{unique}", std::process::id()));
     let temporary = parent.join(temporary);
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary)?;
+    let mut file = StdDisk.create_new_write(&temporary)?;
     let result = (|| {
         file.write_all(marker_line(system, crash, marker).as_bytes())?;
         file.sync_all()?;
-        fs::rename(&temporary, path)?;
-        sync_parent(path)
+        StdDisk.rename(&temporary, path)?;
+        sync_parent(&StdDisk, path)
     })();
     if result.is_err() {
-        let _ = fs::remove_file(&temporary);
+        let _ = StdDisk.remove_file(&temporary);
     }
     result
 }
@@ -2445,6 +2466,7 @@ struct BootDecision {
 /// ([`trace_line!`]), classification and refusal alike, and the proving
 /// test asserts each name against a fixture that reaches it.
 fn boot_gate(
+    disk: &dyn Disk,
     store: GateStore,
     system: SystemId,
     recovery: Option<(&RecoveryFlush, &Path)>,
@@ -2552,12 +2574,11 @@ fn boot_gate(
             let flush = match recovery {
                 None | Some((RecoveryFlush::Diskless, _)) => None,
                 Some((variant, scratch)) => Some(
-                    recovery_flush::execute(scratch, *variant, u64::from(pair.new.0)).map_err(
-                        |error| {
+                    recovery_flush::execute_on(disk, scratch, *variant, u64::from(pair.new.0))
+                        .map_err(|error| {
                             trace_line!("boot.refuse.recovery-flush");
                             refuse(format!("the recovery-boundary flush failed: {error}"))
-                        },
-                    )?,
+                        })?,
                 ),
             };
             if flush.is_some() {
@@ -2576,26 +2597,26 @@ fn boot_gate(
     }
 }
 
-fn sync_parent(path: &Path) -> std::io::Result<()> {
+fn sync_parent(disk: &dyn Disk, path: &Path) -> std::io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    sync_dir(parent)
+    sync_dir(disk, parent)
 }
 
 // Fsyncing the containing directory after create/rename is a POSIX crash-
 // consistency idiom (persist the new directory entry, not just the file's
-// data). Windows has no equivalent: `File::open` on a directory fails with
+// data). Windows has no equivalent: opening a directory fails with
 // ERROR_ACCESS_DENIED (std does not set FILE_FLAG_BACKUP_SEMANTICS), and NTFS
 // does not require or support an explicit directory fsync for this guarantee
 // the way POSIX filesystems do. Other Rust crates with the same durability
 // pattern (e.g. `atomicwrites`) no-op this step on Windows for the same
 // reason; do the same here rather than fail every nonce write on Windows.
 #[cfg(unix)]
-fn sync_dir(dir: &Path) -> std::io::Result<()> {
-    File::open(dir)?.sync_all()
+fn sync_dir(disk: &dyn Disk, dir: &Path) -> std::io::Result<()> {
+    disk.sync_path(dir)
 }
 
 #[cfg(windows)]
-fn sync_dir(_dir: &Path) -> std::io::Result<()> {
+fn sync_dir(_disk: &dyn Disk, _dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
@@ -2614,9 +2635,13 @@ const PREPARE_OVERHEAD: usize = 20 + 1 + 8 + 4 + 1 + 16 + 4 + 8;
 /// The blocking journal's open, shared by every node-construction path
 /// that takes one: a failure logs and disables journaling for the
 /// process; the replication path is never poisoned by observability.
-fn open_journal(journal_dir: Option<&str>, roll_bytes: u32) -> Option<JournalSink> {
-    journal_dir.and_then(
-        |dir| match LockJournal::open(Path::new(dir), roll_bytes as u64) {
+fn open_journal(
+    disk: Arc<dyn Disk>,
+    journal_dir: Option<&str>,
+    roll_bytes: u32,
+) -> Option<JournalSink> {
+    journal_dir.and_then(|dir| {
+        match LockJournal::open_on(Arc::clone(&disk), Path::new(dir), roll_bytes as u64) {
             Ok(j) => Some(JournalSink::Blocking(j)),
             Err(e) => {
                 eprintln!(
@@ -2625,8 +2650,8 @@ fn open_journal(journal_dir: Option<&str>, roll_bytes: u32) -> Option<JournalSin
                 );
                 None
             }
-        },
-    )
+        }
+    })
 }
 
 /// The construction body shared by the C ABI's `lunet_lock_node_new` and
@@ -2640,8 +2665,9 @@ fn node_from_parts(
     journal_dir: Option<&str>,
     roll_bytes: u32,
     primary_timeout: u64,
+    disk: Arc<dyn Disk>,
 ) -> Result<Node, i32> {
-    let journal = open_journal(journal_dir, roll_bytes);
+    let journal = open_journal(Arc::clone(&disk), journal_dir, roll_bytes);
     node_from_sink(
         members_data,
         own_data,
@@ -2652,6 +2678,7 @@ fn node_from_parts(
         Construction {
             primary_timeout,
         },
+        disk,
     )
 }
 
@@ -2664,12 +2691,13 @@ fn node_from_aof(
     state_data: &[u8],
     aof_dir: &str,
     flush_interval: Option<Duration>,
+    disk: Arc<dyn Disk>,
 ) -> Result<Node, i32> {
     let config = AofConfig {
         flush_interval,
         ..AofConfig::default()
     };
-    let sink = match AofWriter::open(Path::new(aof_dir), config) {
+    let sink = match AofWriter::open_on(Arc::clone(&disk), Path::new(aof_dir), config) {
         Ok(writer) => Some(JournalSink::Aof(writer)),
         Err(e) => {
             eprintln!(
@@ -2689,9 +2717,18 @@ fn node_from_aof(
         Construction {
             primary_timeout: PRIMARY_TIMEOUT_MS,
         },
+        disk,
     )
 }
 
+// The parameter list IS the node construction grammar, one caller-supplied
+// fact per parameter: the three descriptor buffers, the event sink, the
+// recovery boundary, the bench control socket, the runtime policy, and the
+// disk the whole construction crosses. It pays here because folding them
+// into a carrier struct would rewrite five call sites' signatures — a
+// change to the construction grammar's shape that has nothing to do with
+// the disk seam, and the seam is the only thing this row may move.
+#[allow(clippy::too_many_arguments)]
 fn node_from_sink(
     members_data: &[u8],
     own_data: &[u8],
@@ -2700,6 +2737,7 @@ fn node_from_sink(
     recovery: Option<(RecoveryFlush, PathBuf)>,
     store_ctl: Option<&str>,
     construction: Construction,
+    disk: Arc<dyn Disk>,
 ) -> Result<Node, i32> {
     // The descriptor's grammar refusals: one named path, every branch of
     // it — the grammar is a single shape, so a violation is a single
@@ -2816,6 +2854,7 @@ fn node_from_sink(
         )
     };
     let decision = boot_gate(
+        &*disk,
         store,
         system,
         recovery
@@ -3015,11 +3054,12 @@ fn node_from_sink(
         last_config_era: None,
         sink,
         state_path: state_path.clone(),
+        disk: Arc::clone(&disk),
         session: decision.session,
         deferred: decision.deferred,
         stopped: false,
         #[cfg(feature = "flight-recorder")]
-        flight: crate::flight::FlightRecorder::open_from_env(own_id.0),
+        flight: crate::flight::FlightRecorder::open_from_env_on(&disk, own_id.0),
     };
     // The bumped node's entry ticket (§4) rides the fenced-boot drive
     // (`recover`): the announcement is emitted on the host's first
@@ -3115,6 +3155,7 @@ pub unsafe extern "C" fn lunet_lock_node_new(
                 journal_dir,
                 roll_bytes,
                 PRIMARY_TIMEOUT_MS,
+                std_disk(),
             )
         })) {
             Ok(Ok(node)) => {

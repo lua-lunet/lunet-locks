@@ -27,8 +27,8 @@
 //! The flush outcome reports the measured latency (flush start to write
 //! completion, `fsync` included) and the bytes written.
 
-use std::fs::OpenOptions;
-use std::io::{self, Seek, SeekFrom, Write};
+use crate::disk::{Disk, std_disk};
+use std::io;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -124,11 +124,23 @@ fn fake_line(seed: u64) -> [u8; DATA_LINE_BYTES] {
     line
 }
 
-/// Executes the selected variant's flush against `dir` (created on demand)
-/// and reports the measured latency. Variant 0 writes nothing and reports a
-/// zero latency. A flush failure here is a boot failure at the recovery
-/// boundary: the caller refuses the boot rather than rejoin unmeasured.
+/// Executes the selected variant's flush against `dir` over the default
+/// disk (created on demand) and reports the measured latency. Variant 0
+/// writes nothing and reports a zero latency. A flush failure here is a
+/// boot failure at the recovery boundary: the caller refuses the boot
+/// rather than rejoin unmeasured.
 pub fn execute(dir: &Path, variant: RecoveryFlush, sequence: u64) -> io::Result<FlushOutcome> {
+    execute_on(&*std_disk(), dir, variant, sequence)
+}
+
+/// [`execute`] against a named disk — the same two block writes and the
+/// same fsync, over whatever [`Disk`] the caller holds.
+pub fn execute_on(
+    disk: &dyn Disk,
+    dir: &Path,
+    variant: RecoveryFlush,
+    sequence: u64,
+) -> io::Result<FlushOutcome> {
     match variant {
         RecoveryFlush::Diskless => Ok(FlushOutcome {
             variant: variant.label(),
@@ -136,17 +148,13 @@ pub fn execute(dir: &Path, variant: RecoveryFlush, sequence: u64) -> io::Result<
             latency: Duration::ZERO,
         }),
         RecoveryFlush::SingleBlock => {
-            std::fs::create_dir_all(dir)?;
+            disk.create_dir_all(dir)?;
             let path = dir.join("recovery-flush-single.bin");
             let start = Instant::now();
-            let mut file = OpenOptions::new()
-                .create(true)
-                // Overwrite in place: the baseline stays exactly one block
-                // across boots.
-                .truncate(false)
-                .write(true)
-                .open(&path)?;
-            file.seek(SeekFrom::Start(0))?;
+            // Overwrite in place: the baseline stays exactly one block
+            // across boots.
+            let mut file = disk.open_or_create_write(&path)?;
+            file.seek(std::io::SeekFrom::Start(0))?;
             let block = fake_block(sequence);
             file.write_all(&block)?;
             file.sync_all()?;
@@ -158,27 +166,23 @@ pub fn execute(dir: &Path, variant: RecoveryFlush, sequence: u64) -> io::Result<
             })
         }
         RecoveryFlush::DoubleRing => {
-            std::fs::create_dir_all(dir)?;
+            disk.create_dir_all(dir)?;
             let path = dir.join("recovery-flush-double.bin");
             let start = Instant::now();
-            let mut file = OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .write(true)
-                .open(&path)?;
+            let mut file = disk.open_or_create_write(&path)?;
             let line = fake_line(sequence);
             let checksum = fnv1a(&line);
             let header = ring_header(checksum, sequence, DATA_LINE_BYTES as u64);
             // Ring one: checksum header + the 64-byte data line, in one
             // 4 KiB-aligned block at the file's start.
-            file.seek(SeekFrom::Start(0))?;
+            file.seek(std::io::SeekFrom::Start(0))?;
             let mut ring_one = [0u8; BLOCK_BYTES];
             ring_one[..HEADER_BYTES].copy_from_slice(&header);
             ring_one[HEADER_BYTES..HEADER_BYTES + DATA_LINE_BYTES].copy_from_slice(&line);
             file.write_all(&ring_one)?;
             // Ring two: the header+checksum copy with NO payload, in its own
             // 4 KiB-aligned zone spaced RING_SPACING_BYTES from ring one.
-            file.seek(SeekFrom::Start(RING_SPACING_BYTES))?;
+            file.seek(std::io::SeekFrom::Start(RING_SPACING_BYTES))?;
             let mut ring_two = [0u8; BLOCK_BYTES];
             ring_two[..HEADER_BYTES].copy_from_slice(&header);
             file.write_all(&ring_two)?;

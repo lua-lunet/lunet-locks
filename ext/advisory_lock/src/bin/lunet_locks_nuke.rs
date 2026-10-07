@@ -30,12 +30,12 @@
 //!   1 any real failure. Corrupt-copy garbage never prints as fake
 //!   decimal facts — hex only.
 
-use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
 
+use lunet_advisory_lock::disk::{Disk, std_disk};
 use lunet_locks_aof::marker::{self, CopyInfo};
 
 const PREFIX: &str = "lunet_locks_nuke";
@@ -96,6 +96,11 @@ fn main() -> std::process::ExitCode {
 }
 
 fn run(args: &Args) -> i32 {
+    // One seam for the whole tool: the projection and the superblock's
+    // raw-zone dump are the only files it touches directly — the marker
+    // copies themselves are the vendored store's own boundary, not this
+    // row's.
+    let disk = std_disk();
     let writing = args.set_state.is_some() || args.set_system.is_some() || args.set_crash.is_some();
     let superblock = superblock_path(&args.state);
 
@@ -103,7 +108,7 @@ fn run(args: &Args) -> i32 {
     // exists — a one-line stderr error, EX_NOINPUT, no stdout data.
     // (A write over a fresh path is the store's seeding path: the fresh
     // format creates the copies.)
-    if !writing && !args.state.exists() && !superblock.exists() {
+    if !writing && !disk.exists(&args.state) && !disk.exists(&superblock) {
         eprintln!(
             "{PREFIX}: {}: no such file or directory",
             args.state.display()
@@ -120,7 +125,7 @@ fn run(args: &Args) -> i32 {
     };
 
     if !args.quiet {
-        print_dump(args, &superblock, geometry);
+        print_dump(&*disk, args, &superblock, geometry);
     }
 
     if !writing {
@@ -229,7 +234,7 @@ fn run(args: &Args) -> i32 {
         );
         return EXIT_FAILURE;
     }
-    if let Err(message) = write_projection(&args.state, system, crash, word) {
+    if let Err(message) = write_projection(&*disk, &args.state, system, crash, word) {
         eprintln!("{PREFIX}: the projection write failed: {message}");
         return EXIT_FAILURE;
     }
@@ -248,11 +253,11 @@ fn resolve_state_name(name: &str) -> Option<marker::MarkerState> {
     marker::MarkerState::from_code(index as u32)
 }
 
-fn print_dump(args: &Args, superblock: &Path, geometry: marker::Geometry) {
+fn print_dump(disk: &dyn Disk, args: &Args, superblock: &Path, geometry: marker::Geometry) {
     println!("marker state: {}", args.state.display());
     println!("superblock copies: {}", superblock.display());
     println!();
-    match read_projection(&args.state) {
+    match read_projection(disk, &args.state) {
         Some(line) => println!("projection ({}): {line}", args.state.display()),
         None => println!("projection ({}): absent", args.state.display()),
     }
@@ -263,7 +268,7 @@ fn print_dump(args: &Args, superblock: &Path, geometry: marker::Geometry) {
                 "superblock copies ({} copies, {}-byte zones):",
                 geometry.copies, geometry.copy_size
             );
-            print_copies(superblock, &copies, geometry);
+            print_copies(disk, superblock, &copies, geometry);
             println!();
             println!("{}", verdict(&copies));
         }
@@ -275,8 +280,13 @@ fn print_dump(args: &Args, superblock: &Path, geometry: marker::Geometry) {
     println!();
 }
 
-fn print_copies(superblock: &Path, copies: &[CopyInfo], geometry: marker::Geometry) {
-    let raw = fs::read(superblock).ok();
+fn print_copies(
+    disk: &dyn Disk,
+    superblock: &Path,
+    copies: &[CopyInfo],
+    geometry: marker::Geometry,
+) {
+    let raw = disk.read(superblock).ok();
     for (slot, copy) in copies.iter().enumerate() {
         if copy.readable == 0 {
             println!("copy {slot}: ABSENT (torn zone; no header bytes)");
@@ -390,8 +400,8 @@ fn superblock_path(state: &Path) -> PathBuf {
     PathBuf::from(os)
 }
 
-fn read_projection(state: &Path) -> Option<String> {
-    fs::read_to_string(state)
+fn read_projection(disk: &dyn Disk, state: &Path) -> Option<String> {
+    disk.read_to_string(state)
         .ok()
         .map(|text| text.trim_end().to_string())
 }
@@ -399,7 +409,13 @@ fn read_projection(state: &Path) -> Option<String> {
 /// The projection write with the adapter's durability discipline:
 /// fsync, rename, dir-sync (the single-file pattern). Every failure
 /// surfaces as an error — no panic, no expect.
-fn write_projection(state: &Path, system: u16, crash: u16, word: &str) -> Result<(), String> {
+fn write_projection(
+    disk: &dyn Disk,
+    state: &Path,
+    system: u16,
+    crash: u16,
+    word: &str,
+) -> Result<(), String> {
     let parent = state.parent().unwrap_or_else(|| Path::new("."));
     let base = state.file_name().unwrap_or_default();
     let unique = std::time::SystemTime::now()
@@ -412,19 +428,16 @@ fn write_projection(state: &Path, system: u16, crash: u16, word: &str) -> Result
     ));
     let line = format!("{system} {crash} {word}\n");
     if let Err(err) = (|| -> std::io::Result<()> {
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)?;
+        let mut file = disk.create_new_write(&temporary)?;
         file.write_all(line.as_bytes())?;
         file.sync_all()?;
         Ok(())
     })() {
-        let _ = fs::remove_file(&temporary);
+        let _ = disk.remove_file(&temporary);
         return Err(format!("{}: {err}", temporary.display()));
     }
-    if let Err(err) = fs::rename(&temporary, state) {
-        let _ = fs::remove_file(&temporary);
+    if let Err(err) = disk.rename(&temporary, state) {
+        let _ = disk.remove_file(&temporary);
         return Err(format!(
             "{} -> {}: {err}",
             temporary.display(),
@@ -432,7 +445,7 @@ fn write_projection(state: &Path, system: u16, crash: u16, word: &str) -> Result
         ));
     }
     if let Some(dir) = parent.to_str() {
-        let _ = fs::File::open(dir).and_then(|file| file.sync_all());
+        let _ = disk.sync_path(Path::new(dir));
     }
     Ok(())
 }

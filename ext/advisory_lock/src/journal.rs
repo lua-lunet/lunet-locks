@@ -34,9 +34,16 @@
 //! - Open (still-appending): `ev-open-<ts_started_ms>.bin` — no metafile.
 //! - Rolled: `ev-<op_min>-<op_max>-<expiry_min>-<expiry_max>.bin` + `.meta`.
 
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use crate::disk::{Disk, DiskDirEntry, DiskFile, std_disk};
+use std::io::{self, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+// The unit tests below read and stat the series they just wrote with
+// `std::fs` directly: they are the tests' own observations of the files
+// on disk, not the journal's live path, and this row does not edit tests.
+#[cfg(test)]
+use std::fs;
 
 /// Magic bytes for event records.
 const RECORD_MAGIC: &[u8; 4] = b"LKE1";
@@ -250,7 +257,9 @@ impl Window {
 pub struct Journal {
     dir: PathBuf,
     roll_bytes: u64,
-    file: File,
+    file: DiskFile,
+    /// The seam every filesystem operation in this journal crosses.
+    disk: Arc<dyn Disk>,
     open_path: PathBuf,
     started_ms: u64,
     written: u64,
@@ -258,16 +267,25 @@ pub struct Journal {
 }
 
 impl Journal {
-    /// Open (or create) a journal rooted at `dir`. If an `ev-open-*.bin`
-    /// file already exists, resume appending to it by scanning its records
-    /// (bounded by `roll_bytes`) to recompute the window and seeking to end.
+    /// Open (or create) a journal rooted at `dir`, over the default disk.
+    /// If an `ev-open-*.bin` file already exists, resume appending to it by
+    /// scanning its records (bounded by `roll_bytes`) to recompute the
+    /// window and seeking to end.
     pub fn open(dir: &Path, roll_bytes: u64) -> io::Result<Self> {
-        fs::create_dir_all(dir)?;
+        Self::open_on(std_disk(), dir, roll_bytes)
+    }
+
+    /// [`Journal::open`] against a named disk — the same journal, over
+    /// whatever [`Disk`] the caller holds. The journal keeps the disk for
+    /// its own life: every roll, every metafile, every directory sync
+    /// crosses the same seam.
+    pub fn open_on(disk: Arc<dyn Disk>, dir: &Path, roll_bytes: u64) -> io::Result<Self> {
+        disk.create_dir_all(dir)?;
         // Look for an existing open file to resume.
-        if let Some(entry) = find_open_file(dir)? {
+        if let Some(entry) = find_open_file_on(&*disk, dir)? {
             let path = entry.path();
             let started_ms = parse_open_timestamp(&path).unwrap_or(0);
-            let mut file = OpenOptions::new().read(true).append(true).open(&path)?;
+            let mut file = disk.open_read_append(&path)?;
             // Scan existing records to recompute the window.
             let mut window: Option<Window> = None;
             let mut scanned: u64 = 0;
@@ -299,6 +317,7 @@ impl Journal {
                 dir: dir.to_path_buf(),
                 roll_bytes,
                 file,
+                disk,
                 open_path: path,
                 started_ms,
                 written,
@@ -309,11 +328,12 @@ impl Journal {
             // the spec says open creates the dir. We create the file eagerly
             // so the caller can verify the journal is writable.
             let started_ms = current_millis_fallback();
-            let (file, open_path) = create_open_file(dir, started_ms)?;
+            let (file, open_path) = create_open_file(&*disk, dir, started_ms)?;
             Ok(Self {
                 dir: dir.to_path_buf(),
                 roll_bytes,
                 file,
+                disk,
                 open_path,
                 started_ms,
                 written: 0,
@@ -357,27 +377,30 @@ impl Journal {
         let meta = window.meta();
         // Close the current file by dropping and reopening is implicit in
         // the rename flow; we just need to flush (already done in append).
-        drop(std::mem::replace(
-            &mut self.file,
-            File::open("/dev/null").unwrap_or_else(|_| {
+        let placeholder = self
+            .disk
+            .open_read(Path::new("/dev/null"))
+            .unwrap_or_else(|_| {
                 // Fallback for platforms without /dev/null: open the file
                 // itself read-only as a placeholder.
-                File::open(&self.open_path).expect("placeholder file")
-            }),
-        ));
+                self.disk
+                    .open_read(&self.open_path)
+                    .expect("placeholder file")
+            });
+        drop(std::mem::replace(&mut self.file, placeholder));
         // Rename to final name.
         let final_name = format!(
             "ev-{}-{}-{}-{}.bin",
             meta.op_min, meta.op_max, meta.expiry_min, meta.expiry_max
         );
         let final_path = self.dir.join(&final_name);
-        fs::rename(&self.open_path, &final_path)?;
+        self.disk.rename(&self.open_path, &final_path)?;
         // Write meta atomically.
         let meta_path = final_path.with_extension("meta");
-        write_meta_atomic(&meta_path, &meta)?;
+        write_meta_atomic(&*self.disk, &meta_path, &meta)?;
         // Open a fresh open file.
         self.started_ms = current_millis_fallback();
-        let (file, open_path) = create_open_file(&self.dir, self.started_ms)?;
+        let (file, open_path) = create_open_file(&*self.disk, &self.dir, self.started_ms)?;
         self.file = file;
         self.open_path = open_path;
         self.written = 0;
@@ -386,13 +409,18 @@ impl Journal {
     }
 }
 
+/// The unit tests' view of the open-file scan, over the default disk.
+#[cfg(test)]
+pub(crate) fn find_open_file(dir: &Path) -> io::Result<Option<DiskDirEntry>> {
+    find_open_file_on(&*std_disk(), dir)
+}
+
 /// Find an existing `ev-open-*.bin` file in the directory. Shared with the
 /// AOF writer, which resumes its series with the same conventions.
-pub(crate) fn find_open_file(dir: &Path) -> io::Result<Option<fs::DirEntry>> {
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
+pub(crate) fn find_open_file_on(disk: &dyn Disk, dir: &Path) -> io::Result<Option<DiskDirEntry>> {
+    for entry in disk.read_dir(dir)? {
+        let path = entry.path();
+        let name_str = path.file_name().unwrap_or_default().to_string_lossy();
         if name_str.starts_with("ev-open-") && name_str.ends_with(".bin") {
             return Ok(Some(entry));
         }
@@ -408,19 +436,20 @@ fn parse_open_timestamp(path: &Path) -> Option<u64> {
 }
 
 /// Create a new `ev-open-<ts>.bin` file in the directory.
-fn create_open_file(dir: &Path, started_ms: u64) -> io::Result<(File, PathBuf)> {
+fn create_open_file(
+    disk: &dyn Disk,
+    dir: &Path,
+    started_ms: u64,
+) -> io::Result<(DiskFile, PathBuf)> {
     let name = format!("ev-open-{started_ms}.bin");
     let path = dir.join(&name);
-    let file = OpenOptions::new()
-        .create_new(true)
-        .append(true)
-        .open(&path)?;
+    let file = disk.create_new_append(&path)?;
     Ok((file, path))
 }
 
 /// Write a metafile atomically: tmp + fsync + rename + dir sync. Shared
 /// with the AOF writer, which finalizes files with the same conventions.
-pub(crate) fn write_meta_atomic(path: &Path, meta: &Meta) -> io::Result<()> {
+pub(crate) fn write_meta_atomic(disk: &dyn Disk, path: &Path, meta: &Meta) -> io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let base = path.file_name().unwrap_or_default();
     let unique = current_millis_fallback();
@@ -429,18 +458,15 @@ pub(crate) fn write_meta_atomic(path: &Path, meta: &Meta) -> io::Result<()> {
     let tmp_name = format!(".{}.tmp-{unique}", base.to_string_lossy());
     let tmp_path = parent.join(tmp_name);
     let encoded = meta.encode();
-    let mut file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&tmp_path)?;
+    let mut file = disk.create_new_write(&tmp_path)?;
     let result = (|| {
         file.write_all(&encoded)?;
         file.sync_all()?;
-        fs::rename(&tmp_path, path)?;
-        sync_parent(path)
+        disk.rename(&tmp_path, path)?;
+        sync_parent(disk, path)
     })();
     if result.is_err() {
-        let _ = fs::remove_file(&tmp_path);
+        let _ = disk.remove_file(&tmp_path);
     }
     result
 }
@@ -448,13 +474,13 @@ pub(crate) fn write_meta_atomic(path: &Path, meta: &Meta) -> io::Result<()> {
 /// Fsync the parent directory (POSIX crash-consistency idiom). No-op on
 /// Windows (see ffi.rs for rationale).
 #[cfg(unix)]
-fn sync_parent(path: &Path) -> io::Result<()> {
+fn sync_parent(disk: &dyn Disk, path: &Path) -> io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    File::open(parent)?.sync_all()
+    disk.sync_path(parent)
 }
 
 #[cfg(windows)]
-fn sync_parent(_path: &Path) -> io::Result<()> {
+fn sync_parent(_disk: &dyn Disk, _path: &Path) -> io::Result<()> {
     Ok(())
 }
 

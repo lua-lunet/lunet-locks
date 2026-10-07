@@ -67,9 +67,11 @@
 //! flushed: a crash must not lose the events that explain it.
 
 use serde_json::{Value, json};
-use std::fs::{File, OpenOptions};
+
+use crate::disk::{Disk, DiskFile, std_disk};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// The commit hash this build was compiled from (the build script's
 /// stamp). A flight recording's header names this; the reader path
@@ -149,14 +151,30 @@ pub fn parse_flight_history_name(name: &str, node_id: u32) -> Option<(u64, u64)>
 }
 
 /// The (epoch, sequence)-sorted listing of one node's rotated history
-/// files in `dir`, oldest first.
+/// files in `dir`, oldest first, over the default disk.
 pub fn list_flight_history(dir: &Path, node_id: u32) -> std::io::Result<Vec<FlightHistoryFile>> {
+    list_flight_history_on(&*std_disk(), dir, node_id)
+}
+
+/// [`list_flight_history`] against a named disk.
+pub fn list_flight_history_on(
+    disk: &dyn Disk,
+    dir: &Path,
+    node_id: u32,
+) -> std::io::Result<Vec<FlightHistoryFile>> {
     let mut result = Vec::new();
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let name = entry.file_name().to_string_lossy().to_string();
+    for entry in disk.read_dir(dir)? {
+        let path = entry.path();
+        let name = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
         if let Some((epoch, seq)) = parse_flight_history_name(&name, node_id) {
-            let size = entry.metadata()?.len();
+            // Only a matched entry is stat'ed: a neighbour that vanishes
+            // between the listing and the stat must fail THIS recorder's
+            // sweep, never a listing that never cared about it.
+            let size = disk.file_len(&path)?;
             result.push(FlightHistoryFile {
                 epoch,
                 seq,
@@ -207,10 +225,14 @@ pub fn flight_sweep_plan(
 
 /// One node's flight recorder: the append-only JSONL tape.
 pub struct FlightRecorder {
-    writer: Option<BufWriter<File>>,
+    writer: Option<BufWriter<DiskFile>>,
     dir: PathBuf,
     node_id: u32,
     path: PathBuf,
+    /// The seam every filesystem operation in this recorder crosses:
+    /// the open, the rotate, the sweep and the rename all cross this one
+    /// disk, never a `std::fs` call of their own.
+    disk: Arc<dyn Disk>,
     retention: u64,
     bytes_written: u64,
     seq: u64,
@@ -223,8 +245,14 @@ impl FlightRecorder {
     /// directory) or when the open fails (said loudly, the node keeps
     /// serving: the recorder never touches the replication path).
     pub fn open_from_env(node_id: u32) -> Option<Self> {
+        let disk = std_disk();
+        Self::open_from_env_on(&disk, node_id)
+    }
+
+    /// [`FlightRecorder::open_from_env`] against a named disk.
+    pub fn open_from_env_on(disk: &Arc<dyn Disk>, node_id: u32) -> Option<Self> {
         let dir = std::env::var_os(FLIGHT_DIR_ENV)?;
-        match Self::open(Path::new(&dir), node_id) {
+        match Self::open_on(disk, Path::new(&dir), node_id) {
             Ok(recorder) => Some(recorder),
             Err(error) => {
                 eprintln!(
@@ -244,27 +272,43 @@ impl FlightRecorder {
         Self::open_capped(dir, node_id, FLIGHT_RETENTION_BYTES)
     }
 
+    /// [`FlightRecorder::open`] against a named disk.
+    pub fn open_on(disk: &Arc<dyn Disk>, dir: &Path, node_id: u32) -> std::io::Result<Self> {
+        Self::open_capped_on(disk, dir, node_id, FLIGHT_RETENTION_BYTES)
+    }
+
     /// [`FlightRecorder::open`] with an explicit cap (the tests' small
     /// tapes); production rides the [`FLIGHT_RETENTION_BYTES`] default.
     pub fn open_capped(dir: &Path, node_id: u32, retention: u64) -> std::io::Result<Self> {
-        std::fs::create_dir_all(dir)?;
+        Self::open_capped_on(&std_disk(), dir, node_id, retention)
+    }
+
+    /// [`FlightRecorder::open_capped`] against a named disk.
+    pub fn open_capped_on(
+        disk: &Arc<dyn Disk>,
+        dir: &Path,
+        node_id: u32,
+        retention: u64,
+    ) -> std::io::Result<Self> {
+        disk.create_dir_all(dir)?;
         let path = dir.join(active_name(node_id));
         // Rotate-on-open (the telemetry capture's restart rotation): a
         // tape already over the rotation threshold becomes an
         // epoch-named history file; the fresh boot records into a fresh
         // tape. Best effort — a failed rename just keeps appending.
-        if std::fs::metadata(&path).is_ok_and(|meta| {
-            meta.len() >= rotation_bytes(retention)
-                && rename_to_history(dir, node_id, &path).is_some()
+        if disk.file_len(&path).is_ok_and(|len| {
+            len >= rotation_bytes(retention)
+                && rename_to_history(&**disk, dir, node_id, &path).is_some()
         }) {
             // The old tape moved; the fresh open below starts empty.
         }
-        let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let file = disk.open_or_create_append(&path)?;
         let mut recorder = Self {
             writer: Some(BufWriter::new(file)),
             dir: dir.to_path_buf(),
             node_id,
             path,
+            disk: Arc::clone(disk),
             retention,
             bytes_written: 0,
             seq: 0,
@@ -272,8 +316,8 @@ impl FlightRecorder {
         recorder.bytes_written = recorder
             .writer
             .as_ref()
-            .and_then(|writer| writer.get_ref().metadata().ok())
-            .map_or(0, |meta| meta.len());
+            .and_then(|writer| writer.get_ref().file_len().ok())
+            .unwrap_or(0);
         recorder.write_line(&Self::header(node_id));
         recorder.sweep();
         Ok(recorder)
@@ -323,14 +367,10 @@ impl FlightRecorder {
     /// the cap. Any failure poisons THIS recorder only.
     fn rotate(&mut self) {
         self.writer = None; // per-line flush means the tape is complete on disk
-        if rename_to_history(&self.dir, self.node_id, &self.path).is_none() {
+        if rename_to_history(&*self.disk, &self.dir, self.node_id, &self.path).is_none() {
             return;
         }
-        match OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-        {
+        match self.disk.open_or_create_append(&self.path) {
             Ok(file) => {
                 self.bytes_written = 0;
                 self.writer = Some(BufWriter::new(file));
@@ -348,14 +388,14 @@ impl FlightRecorder {
     /// history sum exceeds the history budget. A failure here is silent:
     /// the next rotation tries again.
     fn sweep(&mut self) {
-        let Ok(history) = list_flight_history(&self.dir, self.node_id) else {
+        let Ok(history) = list_flight_history_on(&*self.disk, &self.dir, self.node_id) else {
             return;
         };
         let budget = self
             .retention
             .saturating_sub(rotation_bytes(self.retention));
         for name in flight_sweep_plan(&history, self.bytes_written, budget) {
-            let _ = std::fs::remove_file(self.dir.join(name));
+            let _ = self.disk.remove_file(&self.dir.join(name));
         }
     }
 
@@ -390,9 +430,9 @@ impl FlightRecorder {
 /// land inside one millisecond — the sweep's "newest survives" floor
 /// never protects stale content. `None` on failure: the caller keeps
 /// the recorder poisoned, the node runs on.
-fn rename_to_history(dir: &Path, node_id: u32, active: &Path) -> Option<PathBuf> {
+fn rename_to_history(disk: &dyn Disk, dir: &Path, node_id: u32, active: &Path) -> Option<PathBuf> {
     let epoch = unix_millis();
-    let existing = list_flight_history(dir, node_id).ok()?;
+    let existing = list_flight_history_on(disk, dir, node_id).ok()?;
     let suffix = existing
         .iter()
         .filter(|file| file.epoch == epoch)
@@ -400,7 +440,7 @@ fn rename_to_history(dir: &Path, node_id: u32, active: &Path) -> Option<PathBuf>
         .max()
         .map_or(0, |highest| highest + 1);
     let target = dir.join(flight_history_name(node_id, epoch, suffix));
-    std::fs::rename(active, &target).ok()?;
+    disk.rename(active, &target).ok()?;
     Some(target)
 }
 
@@ -468,8 +508,14 @@ impl std::error::Error for FlightReadError {}
 /// Reads the recording's header: its FIRST line. `MissingHeader` when the
 /// first line is not a `flight-header` (an empty or mangled file).
 pub fn read_header(path: &Path) -> Result<FlightHeader, FlightReadError> {
-    let text =
-        std::fs::read_to_string(path).map_err(|error| FlightReadError::Io(error.to_string()))?;
+    read_header_on(&*std_disk(), path)
+}
+
+/// [`read_header`] against a named disk.
+pub fn read_header_on(disk: &dyn Disk, path: &Path) -> Result<FlightHeader, FlightReadError> {
+    let text = disk
+        .read_to_string(path)
+        .map_err(|error| FlightReadError::Io(error.to_string()))?;
     let first = text.lines().next().ok_or(FlightReadError::MissingHeader)?;
     let value: Value = serde_json::from_str(first).map_err(|_| FlightReadError::MissingHeader)?;
     if value.get("kind").and_then(|kind| kind.as_str()) != Some("flight-header") {

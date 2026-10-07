@@ -1,6 +1,12 @@
 //! Advisory locks over the external Viewstamped Replication core.
 
 pub mod aof;
+/// The disk seam: the one contract every byte this crate reads or writes
+/// is named against, so the crate compiles identically over the local
+/// filesystem ([`disk::StdDisk`]) and over whatever industrial engine an
+/// embedder mounts behind [`disk::Disk`] instead. Nothing above the seam
+/// knows which one it holds.
+pub mod disk;
 mod ffi;
 #[cfg(feature = "flight-recorder")]
 pub mod flight;

@@ -48,44 +48,26 @@
 //! - **macOS and other non-Linux targets**: a plain dedicated writer thread
 //!   with buffered `write_all`.
 
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read};
-#[cfg(not(any(unix, windows)))]
-use std::io::{Seek, SeekFrom, Write};
-#[cfg(unix)]
-use std::os::unix::fs::FileExt;
-#[cfg(windows)]
-use std::os::windows::fs::FileExt;
+use crate::disk::{Disk, DiskFile, std_disk};
+use crate::journal::{self, JournalEvent, RECORD_SIZE};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-/// Positional write, portable across the platforms the crate builds on:
-/// `write_all_at` on unix and windows (both use the file's own position
-/// table, not the shared handle cursor), and an explicit seek-plus-write
-/// everywhere else. Callers never rely on the handle cursor.
-#[cfg(unix)]
-fn write_all_at(file: &mut File, offset: u64, bytes: &[u8]) -> io::Result<()> {
-    FileExt::write_all_at(file, bytes, offset)
-}
-
-#[cfg(windows)]
-fn write_all_at(file: &mut File, offset: u64, bytes: &[u8]) -> io::Result<()> {
-    FileExt::seek_write(file, bytes, offset).map(|_| ())
-}
-
-#[cfg(not(any(unix, windows)))]
-fn write_all_at(file: &mut File, offset: u64, bytes: &[u8]) -> io::Result<()> {
-    file.seek(SeekFrom::Start(offset))?;
-    file.write_all(bytes)
-}
-
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
 use tracing::warn;
 
-use crate::journal::{self, JournalEvent, RECORD_SIZE};
+// The unit tests below append a torn tail, and read and stat the series
+// they just wrote, with `std::fs` directly: those are the tests' own
+// observations of the files on disk, not the writer's live path, and this
+// row does not edit tests.
+#[cfg(test)]
+use std::fs;
+#[cfg(test)]
+use std::fs::OpenOptions;
 
 /// The roll threshold: one erasure block, 2 MiB.
 pub const ROLL_BYTES: u64 = 2 * 1024 * 1024;
@@ -134,7 +116,7 @@ impl Default for AofConfig {
 /// 2 MiB roll cadence); a ring-creation failure falls back to plain
 /// buffered `write_all` and logs once per file.
 struct FileSink {
-    file: File,
+    file: DiskFile,
     path: PathBuf,
     /// Logical write position (bytes written to the active file).
     offset: u64,
@@ -143,29 +125,25 @@ struct FileSink {
 }
 
 impl FileSink {
-    fn open_file(dir: &Path, started_ms: u64) -> io::Result<(PathBuf, File)> {
+    fn open_file(disk: &dyn Disk, dir: &Path, started_ms: u64) -> io::Result<(PathBuf, DiskFile)> {
         let name = format!("ev-open-{started_ms}.bin");
         let path = dir.join(&name);
-        let file = OpenOptions::new()
-            .create_new(true)
-            .read(true)
-            .write(true)
-            .open(&path)?;
+        let file = disk.create_new_read_write(&path)?;
         Ok((path, file))
     }
 
-    fn new(dir: &Path, started_ms: u64) -> io::Result<Self> {
-        let (path, file) = Self::open_file(dir, started_ms)?;
+    fn new(disk: &dyn Disk, dir: &Path, started_ms: u64) -> io::Result<Self> {
+        let (path, file) = Self::open_file(disk, dir, started_ms)?;
         Self::from_parts(path, file, 0)
     }
 
     /// Adopt an existing open file after a resume scan.
-    fn adopt(path: PathBuf, file: File, offset: u64) -> io::Result<Self> {
+    fn adopt(path: PathBuf, file: DiskFile, offset: u64) -> io::Result<Self> {
         Self::from_parts(path, file, offset)
     }
 
     #[cfg(all(target_os = "linux", feature = "io-uring"))]
-    fn from_parts(path: PathBuf, file: File, offset: u64) -> io::Result<Self> {
+    fn from_parts(path: PathBuf, file: DiskFile, offset: u64) -> io::Result<Self> {
         let ring = match io_uring::IoUring::new(64) {
             Ok(ring) => Some(ring),
             Err(e) => {
@@ -186,7 +164,7 @@ impl FileSink {
     }
 
     #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
-    fn from_parts(path: PathBuf, file: File, offset: u64) -> io::Result<Self> {
+    fn from_parts(path: PathBuf, file: DiskFile, offset: u64) -> io::Result<Self> {
         Ok(Self { file, path, offset })
     }
 
@@ -206,7 +184,6 @@ impl FileSink {
     #[cfg(all(target_os = "linux", feature = "io-uring"))]
     fn write_all_ring(&mut self, ring: &mut io_uring::IoUring, bytes: &[u8]) -> io::Result<()> {
         use io_uring::{opcode, types};
-        use std::os::fd::AsRawFd;
 
         let fd = types::Fd(self.file.as_raw_fd());
         let mut remaining = bytes;
@@ -240,7 +217,7 @@ impl FileSink {
     }
 
     fn write_all_blocking(&mut self, bytes: &[u8]) -> io::Result<()> {
-        write_all_at(&mut self.file, self.offset, bytes)?;
+        self.file.write_all_at(self.offset, bytes)?;
         self.offset += bytes.len() as u64;
         Ok(())
     }
@@ -260,6 +237,8 @@ impl FileSink {
 struct AofCore {
     dir: PathBuf,
     flush_bytes: usize,
+    /// The seam every filesystem operation in this writer crosses.
+    disk: Arc<dyn Disk>,
     sink: FileSink,
     /// Bytes of complete records written to the active file.
     written: u64,
@@ -273,12 +252,20 @@ struct AofCore {
 }
 
 impl AofCore {
+    /// The core over the default disk. The unit tests' entry point — the
+    /// live writer is always constructed over a named disk.
+    #[cfg(test)]
     fn open(dir: &Path, flush_bytes: usize) -> io::Result<Self> {
-        fs::create_dir_all(dir)?;
-        let (sink, written, window) = match journal::find_open_file(dir)? {
+        Self::open_on(std_disk(), dir, flush_bytes)
+    }
+
+    /// The core over a named disk.
+    fn open_on(disk: Arc<dyn Disk>, dir: &Path, flush_bytes: usize) -> io::Result<Self> {
+        disk.create_dir_all(dir)?;
+        let (sink, written, window) = match journal::find_open_file_on(&*disk, dir)? {
             Some(entry) => {
                 let path = entry.path();
-                let mut file = OpenOptions::new().read(true).write(true).open(&path)?;
+                let mut file = disk.open_read_write(&path)?;
                 // Scan the valid records to rebuild the position and the
                 // metadata window. An open file's tail is either mid-record
                 // (torn append) or zero pad (crash between pad and rename);
@@ -303,7 +290,7 @@ impl AofCore {
                         None => break,
                     }
                 }
-                let len = file.metadata()?.len();
+                let len = file.file_len()?;
                 if len > scanned {
                     file.set_len(scanned)?;
                 }
@@ -311,12 +298,13 @@ impl AofCore {
             }
             None => {
                 let started_ms = unix_millis();
-                (FileSink::new(dir, started_ms)?, 0, None)
+                (FileSink::new(&*disk, dir, started_ms)?, 0, None)
             }
         };
         Ok(Self {
             dir: dir.to_path_buf(),
             flush_bytes,
+            disk,
             sink,
             written,
             window,
@@ -391,9 +379,13 @@ impl AofCore {
             window.op_min, window.op_max, window.expiry_min, window.expiry_max
         );
         let final_path = self.dir.join(&final_name);
-        fs::rename(&self.sink.path, &final_path)?;
-        journal::write_meta_atomic(&final_path.with_extension("meta"), &window.meta())?;
-        self.sink = FileSink::new(&self.dir, unix_millis())?;
+        self.disk.rename(&self.sink.path, &final_path)?;
+        journal::write_meta_atomic(
+            &*self.disk,
+            &final_path.with_extension("meta"),
+            &window.meta(),
+        )?;
+        self.sink = FileSink::new(&*self.disk, &self.dir, unix_millis())?;
         self.written = 0;
         self.window = None;
         Ok(())
@@ -453,7 +445,15 @@ impl AofWriter {
     /// thread. An open error here disables telemetry for the process (the
     /// caller logs and proceeds without a sink).
     pub fn open(dir: &Path, config: AofConfig) -> io::Result<Self> {
-        let core = AofCore::open(dir, config.flush_bytes)?;
+        Self::open_on(std_disk(), dir, config)
+    }
+
+    /// [`AofWriter::open`] against a named disk — the same writer, over
+    /// whatever [`Disk`] the caller holds. The disk rides into the writer
+    /// thread with the core: every buffered write, every fsync, every roll
+    /// and every metafile crosses that one seam.
+    pub fn open_on(disk: Arc<dyn Disk>, dir: &Path, config: AofConfig) -> io::Result<Self> {
+        let core = AofCore::open_on(disk, dir, config.flush_bytes)?;
         let (tx, rx) = sync_channel::<Msg>(config.queue_cap);
         let drops = Arc::new(AtomicU64::new(0));
         let thread_drops = Arc::clone(&drops);
