@@ -1,5 +1,5 @@
-//! The build script stamps the build's identity facts and holds the two
-//! clean-commit guards.
+//! The build script stamps the build's identity facts and holds the
+//! clean-commit guard.
 //!
 //! Every build carries `FLIGHT_COMMIT` (the HEAD hash) and `FLIGHT_DIRTY`
 //! so a flight recording can name the exact code state it was recorded
@@ -12,13 +12,12 @@
 //! same git probe, and a fact the probe cannot reach is stamped
 //! `unknown` rather than guessed (`src/info.rs`).
 //!
-//! Two features hold a clean-commit guard, each for its own reason:
-//! `flight-recorder` because a recording is readable only by the code
-//! as-at its commit, and `compatibility_suite` because a compliance
-//! verdict is evidence about a commit — a verdict produced from an
-//! uncommitted tree names no code state at all. A guard that fires is
-//! overridden by the feature's own `*_ALLOW_DIRTY=1`, which still
-//! stamps the build `dirty: true` so every reader annotates it loudly.
+//! The `flight-recorder` feature holds a clean-commit guard: a
+//! recording is readable only by the code as-at its commit — a
+//! recording produced from an uncommitted tree names no code state at
+//! all. A guard that fires is overridden by the feature's own
+//! `FLIGHT_RECORDER_ALLOW_DIRTY=1`, which still stamps the build
+//! `dirty: true` so every reader annotates it loudly.
 //! An ordinary prod build (both features OFF) is never gated: dev trees
 //! stay buildable.
 
@@ -26,14 +25,10 @@ use std::process::Command;
 
 fn main() {
     let flight_feature = feature_on("FLIGHT_RECORDER");
-    let suite_feature = feature_on("COMPATIBILITY_SUITE");
     let (commit, dirty) = match head_state() {
         Some((commit, dirty)) => (commit, dirty),
         None => {
-            for (on, feature) in [
-                (flight_feature, "flight-recorder"),
-                (suite_feature, "compatibility_suite"),
-            ] {
+            for (on, feature) in [(flight_feature, "flight-recorder")] {
                 if on {
                     panic!(
                         "{feature} build refuses to proceed: the git commit hash \
@@ -54,20 +49,13 @@ fn main() {
     println!("cargo:rustc-env=LUNET_INFO_DIRTY={dirty}");
     println!(
         "cargo:rustc-env=LUNET_INFO_FEATURES={}",
-        feature_shape(suite_feature, flight_feature)
+        feature_shape(flight_feature)
     );
 
     guard_clean_commit(
         "FLIGHT_RECORDER_ALLOW_DIRTY",
         "flight-recorder",
         flight_feature,
-        &commit,
-        dirty,
-    );
-    guard_clean_commit(
-        "COMPATIBILITY_SUITE_ALLOW_DIRTY",
-        "compatibility_suite",
-        suite_feature,
         &commit,
         dirty,
     );
@@ -82,9 +70,9 @@ fn feature_on(name: &str) -> bool {
 
 /// The build's feature shape: `production`, then `+<feature>` for each
 /// development feature it carries.
-fn feature_shape(suite: bool, flight: bool) -> String {
+fn feature_shape(flight: bool) -> String {
     let mut shape = String::from("production");
-    for (on, name) in [(suite, "compatibility_suite"), (flight, "flight-recorder")] {
+    for (on, name) in [(flight, "flight-recorder")] {
         if on {
             shape.push('+');
             shape.push_str(name);

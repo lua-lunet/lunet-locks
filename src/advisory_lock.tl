@@ -489,7 +489,7 @@ end
 --
 -- The native call takes NO node handle, so nothing reachable from here
 -- writes protocol state; this map is the whole of the surface a
--- production build adds (docs/src/compliance-abi.md). The native side
+-- production build adds. The native side
 -- answers the pull-style sizing call first, so the buffer is the size
 -- the library itself reports.
 function M.version_properties(): {string: string}

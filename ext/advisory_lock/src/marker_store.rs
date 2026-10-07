@@ -287,7 +287,7 @@ fn machine_word(marker: Marker) -> &'static str {
 /// checked against it. The `ops` log records every marker round the
 /// boot-gate machine wrote (`commit:<Marker>@<packed identity>`) and the
 /// drain the halt schedule forces between its rounds (`drain`), in write
-/// order — the schedule the compliance corpus asserts. The boot's
+/// order. The boot's
 /// classification branches and the store's read verdicts are NOT on this
 /// tape: they name themselves on the lifecycle census tape instead
 /// (`crate::trace_line!`), which is where a REFUSED boot can be seen at
@@ -341,10 +341,8 @@ impl GateStore {
     /// before the driver releases the first announcement. Unconditional:
     /// the round lands seated or not. The argument is the bumped pair
     /// itself; an identity with a zero half is no identity and refuses
-    /// here. The round is the adapter's own write, not the engine's, so
-    /// it stays off the marker-round schedule the compliance corpus
-    /// pins; the `boot.emission-gate` census line is where it shows
-    /// itself.
+    /// here. The round is the adapter's own write, not the engine's;
+    /// the `boot.emission-gate` census line is where it shows itself.
     pub(crate) fn emission_gate(&self, identity: NodeId) -> io::Result<()> {
         match &self.backend {
             Backend::Disk { state } => {

@@ -62,24 +62,6 @@ cargo build --release --features flight-recorder -p lease-sequencer   # the rig 
 A node opts in per node via `LUNET_FLIGHT_RECORDER_DIR`; the reader is
 `skaffold_flight_tape`. See [the Flight Recorder](flight-recorder.md).
 
-## The Compliance ABI build
-
-The Compliance ABI — the nine `unsafe_*` exports the upstream compliance
-corpus drives — is a cargo feature, OFF by default, so the production
-library does not compile them at all. The development shape MUST come
-from a clean commit (the build fails on a dirty tree;
-`COMPATIBILITY_SUITE_ALLOW_DIRTY=1` overrides, stamping the build dirty
-and warning), and a boot of it announces the exposure at error severity.
-It is never booted in production.
-
-```console
-cargo build --release --features compatibility_suite   # the compliance cdylib shape
-```
-
-`make ext-check` and `make ext-test` run the crate in BOTH shapes, and
-the symbol-table gate reads both built libraries on every run. See [the
-Compliance ABI and the information console](compliance-abi.md).
-
 ## The build-confirmation gate
 
 `make sanity` is MANDATORY before every cloud test run. We test
@@ -266,60 +248,13 @@ snapshot. Every wipe step (`tools/smoke.lua`, the
 directory it is about to remove and wipes only on its success; a failed
 snapshot refuses the wipe loudly and leaves the state in place.
 
-## The uVRR compliance suite
-
-`cargo test --quiet` in `ext/advisory_lock` runs the uVRR compliance
-suite: uvrr-core's corpus of 73 cases in ten families
-(`ext/uvrr-core/tests/compliance/corpus/*.json`, the pinned submodule
-tag — the corpus is read from the submodule, never copied), replayed by
-`ext/advisory_lock/tests/compliance.rs` through the abstract host
-interface of
-[uvrr-host-compliance.md](../../ext/uvrr-core/docs/uvrr-host-compliance.md)
-against OUR host: the adapter's `Node` over the real marker store. The
-executor (`ext/advisory_lock/tests/compliance/`) drives the corpus's ops
-over the adapter's entry points — provision over
-`Node::open_compliance` (the case's primary-timeout knob, the corpus's
-unbounded suffix budget, the executor's logical clock instead of the
-wall clock), settle/tick/tick_all over `idle`, propose over the opaque
-application boundary (the corpus's raw payloads journal without a
-Service decode), deliver/gossip over `receive` with the hex-decoded
-bytes, reconfigure at the reference host's pivot policy, crash as a
-drop without the stop contract, restart as a reopen over the same
-markers (the clean classification restores the view record the stop's
-drain window wrote), halt as the stop contract, boot as the joiner
-open, announce as the fenced-boot drive — and asserts every case's
-byte-exact named deliveries plus the full post-state record
-(status/era/view, frontiers, journal, members/weights, the boot gate's
-marker schedule, witnesses). Emissions beyond the named multiset fail
-the case; no host-loop autonomous drive ever runs inside the executor.
-
-### The same corpus over the transport
-
-`make compliance-suite`, part of `make check`, replays the same corpus a
-second time: through this tree's own Teal compliance host, over the HTTP
-transport of the same document's §8, driven by the upstream `hurl` suite
-beside the corpus. The host's executor is held to the reference executor
-operation for operation, and its verdict is its own capture compared
-against the expectation the request carries. The suite is two shapes —
-the production library's symbol table must still carry zero `unsafe_`
-symbols, and the gated library must carry all nine and pass all 73. See
-[the compliance corpus suite](compliance-suite.md).
-
 ## Relevant files
 
 | File | Responsibility |
 |---|---|
 | `ext/advisory_lock/src/locks.rs` | JSON lock protocol and lock state machine |
 | `ext/advisory_lock/src/ffi.rs` | uvrr-core adapter, C ABI, tick clock, incarnation marker |
-| `ext/advisory_lock/tests/compliance.rs` | the uVRR compliance suite's runner: the corpus target |
-| `ext/advisory_lock/tests/compliance/` | the compliance executor: the abstract host interface over the adapter |
 | `src/advisory_lock.tl` | Teal wrapper and owned output draining |
-| `src/compliance_abi.tl` | the Compliance ABI bindings: the nine `unsafe_*` exports |
-| `src/compliance_executor.tl` | the abstract host interface over the Compliance ABI |
-| `src/compliance_host.tl` | the §8 case and session endpoints, and the verdict |
-| `src/compliance_server.tl` | the corpus host on a socket, separate from the lock's client port |
-| `src/compliance_json.tl` | the corpus's JSON codec: ordered objects, exact integers |
-| `tools/lib/compliance_gate.tl` | the gate: both feature shapes and the corpus run |
 | `src/cluster_config.tl` | JSONL deployment descriptor: parse, encode, genesis succession |
 | `src/admin.tl` | Admin verb decode, ADMIN peer payload, acknowledgments, dedup cache |
 | `src/server.tl` | TCP NDJSON server, UDP peers, leader forwarding, reconfiguration drives |

@@ -228,7 +228,7 @@ use vrr::effects::{Effect, Stability};
 use vrr::ids::{
     Ballot, CrashCounter, Era, NodeId, Operation, OperationId, Slot, SystemId, Tick, View,
 };
-use vrr::journal::{Journal, JournalView, LogEntry, Payload, SegmentedLog};
+use vrr::journal::{Journal, LogEntry, Payload, SegmentedLog};
 use vrr::lifecycle::{self, BootError, BootOutcome, Bumped, Crashed, Marker, Running, Vouched};
 use vrr::message::{Body, Message};
 use vrr::observe::Diagnostic;
@@ -422,8 +422,7 @@ const MAX_DATAGRAM: usize = 65507;
 /// Ticks (milliseconds) of primary silence before a backup fences into the
 /// next view. Host policy; correctness never depends on it. The default
 /// every [`Node::open`] caller passes; a caller that pins its own policy
-/// passes its own value (the compliance suite's corpus clusters pass the
-/// case's provision timeout).
+/// passes its own value.
 pub const PRIMARY_TIMEOUT_MS: u64 = 5000;
 
 /// The host's evidence-and-transfer datagram budget (W5): the largest
@@ -463,30 +462,10 @@ struct Queued {
 
 type Core = Replica<SegmentedLog, WeightedMajority>;
 
-/// The compliance suite's harness rules (`docs/uvrr-host-compliance.md`),
-/// armed by [`Node::open_compliance`]. The executor drives the clock —
-/// every drive carries the executor's logical tick, never the wall
-/// clock — so the corpus replays byte-identically on every run. The
-/// boundary rules that ride the flag: the application boundary is the
-/// opaque acknowledge (the corpus's raw payloads journal without a
-/// Service decode and are never executed, the §11.1 acknowledgement the
-/// reference host never sends), and the peer gate accepts the corpus's
-/// outside identities (the gossip sender, the fabricated votes) — the
-/// core drops what it drops, by name.
-#[derive(Default)]
-struct Compliance {
-    /// The executor's logical tick, carried by every drive between the
-    /// executor's settings. `0` until the executor first advances it.
-    clock: u64,
-}
-
 /// The node construction's runtime policy: the view-change timeout the
-/// cluster plays by, and the compliance rules when the constructor is
-/// the compliance suite's (`None` is the prod shape — the wall clock,
-/// the Service boundary, the descriptor's address space).
+/// cluster plays by.
 struct Construction {
     primary_timeout: u64,
-    compliance: Option<Compliance>,
 }
 
 pub struct Node {
@@ -552,16 +531,6 @@ pub struct Node {
     /// stop, and refusing every further inbound entry while set — the
     /// mandatory obligation that makes the in-memory state final.
     stopped: bool,
-    /// The compliance suite's harness rules. `None` on every other
-    /// constructor (the prod shape: the wall clock, the Service
-    /// boundary, the descriptor's address space).
-    compliance: Option<Compliance>,
-    /// The boot gate's marker-round schedule (the machine's commits and
-    /// the drain between its rounds), shared with this boot's
-    /// `GateStore`. The handle outlives the node: the compliance
-    /// executor retains it across crash and halt, exactly like the
-    /// marker files themselves.
-    marker_log: Arc<Mutex<Vec<String>>>,
     /// The Flight Recorder's tape (the `flight-recorder` feature): the
     /// per-node internal trace. `None` without the feature (the field
     /// itself is compiled out) and whenever the env did not name a
@@ -580,14 +549,9 @@ impl Node {
     /// The next monotonic tick from the adapter-owned ms clock (never
     /// decreasing per node, even across a wall-clock regression). Ticks
     /// come from the clock only — the durable state file is the incarnation
-    /// marker, not a tick source. Under the compliance rules the tick is
-    /// the executor's logical clock instead: the executor sets it before
-    /// every drive, the corpus's determinism (no wall clock anywhere).
+    /// marker, not a tick source.
     fn tick(&mut self) -> Result<u64, i32> {
-        let now = match &self.compliance {
-            Some(compliance) => compliance.clock,
-            None => unix_millis()?,
-        };
+        let now = unix_millis()?;
         let next = self.last_tick.max(now);
         // Invariant (asserted, always): ticks are nondecreasing — the clamp
         // holds even across a wall-clock regression.
@@ -633,8 +597,7 @@ impl Node {
     /// mints the witness, and the engine latches the crashed
     /// classification — `(new, Joining)` written 4x through the machine,
     /// the same round the emission gate made durable at boot. Checked
-    /// after every drive (the harness pattern: the latch fires on the
-    /// first step after which the witness mints). A failed latch write
+    /// after every drive. A failed latch write
     /// keeps the session — the markers already hold the emission gate's
     /// round, and the next drive retries.
     fn settle_deferred_latch(&mut self) {
@@ -1023,15 +986,6 @@ impl Node {
                 operation_id,
                 payload,
             } => {
-                // The compliance rules' opaque acknowledge: the corpus's
-                // payloads are raw bytes, never Service JSON, and the
-                // reference host never executes an apply — the effect is
-                // absorbed with no reply, no journal, and no §11.1
-                // acknowledgement (the applied frontier stays where the
-                // core's own system-op walk left it).
-                if self.compliance.is_some() {
-                    return Ok(());
-                }
                 let message_id = operation_id_bytes(operation_id);
                 let (response, transition) = if let Some(cached) = self.replies.get(&message_id) {
                     // Duplicate committed operation: replay the cached reply,
@@ -1295,37 +1249,6 @@ impl Node {
         .unwrap_or(Err(PANIC))
     }
 
-    /// The compliance suite's constructor (`docs/uvrr-host-compliance.md`):
-    /// [`Node::open`] over the same marker store with the lock-event
-    /// journal disabled and the corpus's deterministic harness rules
-    /// armed — the opaque-payload application boundary (the raw corpus
-    /// payloads commit without a Service decode), the unbounded
-    /// view-change suffix budget the corpus clusters run, and the
-    /// executor-driven clock (every drive carries the executor's logical
-    /// tick, never the wall clock).
-    pub fn open_compliance(
-        members: &str,
-        own: &str,
-        state: &str,
-        primary_timeout: u64,
-    ) -> Result<Node, i32> {
-        catch_unwind(AssertUnwindSafe(|| {
-            node_from_sink(
-                members.as_bytes(),
-                own.as_bytes(),
-                state.as_bytes(),
-                None,
-                None,
-                None,
-                Construction {
-                    primary_timeout,
-                    compliance: Some(Compliance::default()),
-                },
-            )
-        }))
-        .unwrap_or(Err(PANIC))
-    }
-
     /// The standby telemetry variant: the committed-transition hook enqueues
     /// to the AOF write-behind writer instead of the blocking journal. Same
     /// member/own/state grammar as [`Node::open`]; `aof_dir` is the AOF
@@ -1381,7 +1304,6 @@ impl Node {
                 None,
                 Construction {
                     primary_timeout: PRIMARY_TIMEOUT_MS,
-                    compliance: None,
                 },
             )
         }))
@@ -1416,7 +1338,6 @@ impl Node {
                 Some(store_ctl),
                 Construction {
                     primary_timeout: PRIMARY_TIMEOUT_MS,
-                    compliance: None,
                 },
             )
         }))
@@ -1491,12 +1412,8 @@ impl Node {
         // a maybe (an unknown peer id). A later life of a member
         // (the crash counter advanced under the same system half — the
         // identity law's packing) is the reincarnation story's
-        // legitimate caller and exempt. The compliance rules lift the
-        // gate: the corpus drives outside identities (the gossip
-        // sender, the fabricated votes) whose verdict is the core's,
-        // dropped by name.
-        if self.compliance.is_none()
-            && !self.known_ids.contains(&from)
+        // legitimate caller and exempt.
+        if !self.known_ids.contains(&from)
             && !self
                 .known_ids
                 .iter()
@@ -1564,10 +1481,8 @@ impl Node {
         );
         // The peer payload gate: the host re-checks every peer-carried
         // operation entry with `Service` before the message reaches the
-        // core. The compliance rules lift it — the corpus's payloads are
-        // opaque bytes (B2), never Service JSON, and the reference host
-        // validates none of them.
-        if self.compliance.is_none() && !valid_message_payloads(&message) {
+        // core.
+        if !valid_message_payloads(&message) {
             warn!(
                 ts = log_millis(),
                 event = "payload-gate-refused",
@@ -2042,31 +1957,14 @@ impl Node {
 }
 
 impl Node {
-    /// The compliance executor's logical clock: every drive between the
-    /// executor's settings carries `at` as its tick. The corpus's
-    /// determinism — the wall clock is never read under the compliance
-    /// rules. Outside compliance this is a no-op (the wall clock is the
-    /// prod tick source).
-    pub fn set_compliance_clock(&mut self, at: u64) {
-        if let Some(compliance) = &mut self.compliance {
-            compliance.clock = at;
-        }
-    }
-
-    /// One opaque proposal (the compliance suite's `propose` op): the
-    /// payload is raw bytes the core carries opaque (B2) — no Service
-    /// decode, no reply correlation, the corpus's own `OperationId` the
-    /// executor assigns. Outside compliance this reports INVALID: the
-    /// prod boundary is the Service request.
+    /// One opaque proposal: the payload is raw bytes the core carries
+    /// opaque (B2) — no Service decode, no reply correlation.
     ///
     /// # Panics
     ///
     /// Never deliberately; a drive's boundary panic poisons the node and
     /// reports `PANIC` through the usual path.
     pub fn propose_opaque(&mut self, id: OperationId, payload: &[u8]) -> i32 {
-        if self.compliance.is_none() {
-            return INVALID;
-        }
         self.drive(Input::Propose {
             operation: Operation {
                 id,
@@ -2075,15 +1973,10 @@ impl Node {
         })
     }
 
-    /// One typed cluster operation over the ordinary consensus pipeline
-    /// (the compliance suite's `reconfigure` op), at the reference
-    /// host's pivot policy: `pivot: None`, the stop-the-world fallback
-    /// — a latency outcome, never an error. Outside compliance this
-    /// reports INVALID (the prod boundary derives the pivot itself).
+    /// One typed cluster operation over the ordinary consensus pipeline,
+    /// at the reference host's pivot policy: `pivot: None`, the
+    /// stop-the-world fallback — a latency outcome, never an error.
     pub fn reconfigure_opaque(&mut self, op: SystemOperation) -> i32 {
-        if self.compliance.is_none() {
-            return INVALID;
-        }
         self.drive(Input::Reconfigure { op, pivot: None })
     }
 
@@ -2093,27 +1986,6 @@ impl Node {
     pub fn frontiers(&self) -> (u64, u64, u64) {
         let snapshot = self.replica.observer().read();
         (snapshot.accepted, snapshot.committed, snapshot.applied)
-    }
-
-    /// The whole journal, from the void slot through the accepted
-    /// frontier: the entries the corpus's journal grammar renders.
-    ///
-    /// # Panics
-    ///
-    /// A journal whose retained window no longer covers the history
-    /// (a published checkpoint reclaimed the prefix) — the compliance
-    /// corpus never publishes one.
-    #[must_use]
-    pub fn journal_entries(&self) -> Vec<LogEntry> {
-        let view = self.replica.journal().view();
-        let Some(frontier) = view.accepted() else {
-            return Vec::new();
-        };
-        let mut entries = Vec::new();
-        match view.copy_out(VOID_SLOT, frontier, &mut entries) {
-            vrr::journal::RangeOutcome::Complete => entries,
-            other => panic!("the compliance journal is unreclaimed: {other:?}"),
-        }
     }
 
     /// The folded configuration's current record: the succession order
@@ -2136,17 +2008,6 @@ impl Node {
     #[must_use]
     pub fn witnesses(&self) -> Vec<NodeId> {
         self.replica.witnesses().to_vec()
-    }
-
-    /// The boot gate's marker-round schedule handle: every machine
-    /// commit (`commit:<Marker>@<packed identity>`) and the halt's drain
-    /// (`drain`), in write order. The handle is this boot's own record —
-    /// it is shared with the store and outlives the node, so the
-    /// compliance executor retains a crashed or halted node's schedule
-    /// exactly as the marker files persist.
-    #[must_use]
-    pub fn marker_log(&self) -> Arc<Mutex<Vec<String>>> {
-        Arc::clone(&self.marker_log)
     }
 }
 
@@ -2356,8 +2217,7 @@ fn marker_line(system: u16, crash: u16, marker: Marker) -> String {
 /// writes into its drain window, strictly between the halt's two marker
 /// rounds. The clean classification reads it back; the node resumes at
 /// the view it stopped at instead of re-fencing at the genesis view —
-/// a stale Prepare from below its own view then drops by name, exactly
-/// as the compliance corpus pins. The journal is not carried (the
+/// a stale Prepare from below its own view then drops by name. The journal is not carried (the
 /// adapter's durable shape: a reopened node holds the deployment's
 /// genesis and catches up through the stream — its frontiers stay the
 /// genesis ones the journal covers), so only the ballot is restored:
@@ -2792,7 +2652,6 @@ fn node_from_parts(
         None,
         Construction {
             primary_timeout,
-            compliance: None,
         },
     )
 }
@@ -2830,7 +2689,6 @@ fn node_from_aof(
         None,
         Construction {
             primary_timeout: PRIMARY_TIMEOUT_MS,
-            compliance: None,
         },
     )
 }
@@ -2844,14 +2702,6 @@ fn node_from_sink(
     store_ctl: Option<&str>,
     construction: Construction,
 ) -> Result<Node, i32> {
-    // Every construction in this shape announces that the nine
-    // `lunet_lock_node_unsafe_*` exports are present, before anything is
-    // built: a boot of a `compatibility_suite` build is a misconfiguration
-    // and must be unmissable in the log the runbook reads
-    // (docs/src/compliance-abi.md). The default shape compiles no such
-    // exports and no such line.
-    #[cfg(feature = "compatibility_suite")]
-    crate::info::announce_compatibility_exposure();
     // The descriptor's grammar refusals: one named path, every branch of
     // it — the grammar is a single shape, so a violation is a single
     // observation on the census tape.
@@ -2917,14 +2767,7 @@ fn node_from_sink(
     };
     let knobs = ViewChangeKnobs {
         primary_timeout: construction.primary_timeout,
-        // The compliance suite's clusters run the corpus's unbounded
-        // suffix budget; the host's own budget is the datagram-sized
-        // EVIDENCE_BUDGET (see the constant's note).
-        view_change_budget: if construction.compliance.is_some() {
-            usize::MAX
-        } else {
-            EVIDENCE_BUDGET
-        },
+        view_change_budget: EVIDENCE_BUDGET,
     };
     // The boot gate: the engine reads the durable markers, classifies
     // the start, and hands back the session whose type fixes the write
@@ -2938,9 +2781,8 @@ fn node_from_sink(
     let state_path = PathBuf::from(state);
     let sink: SinkDoor = Arc::new(Mutex::new(journal));
     // The boot gate's marker-round schedule: every machine commit and the
-    // drain between the halt's rounds, in write order. The executor of
-    // the compliance suite asserts the schedule through it; the store
-    // owns the record.
+    // drain between the halt's rounds, in write order. The store owns the
+    // record.
     let marker_log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     #[cfg(unix)]
     let store = match store_ctl {
@@ -3177,8 +3019,6 @@ fn node_from_sink(
         session: decision.session,
         deferred: decision.deferred,
         stopped: false,
-        compliance: construction.compliance,
-        marker_log,
         #[cfg(feature = "flight-recorder")]
         flight: crate::flight::FlightRecorder::open_from_env(own_id.0),
     };
@@ -3204,8 +3044,7 @@ fn node_from_sink(
 /// The call takes NO node handle — that is the whole of its safety
 /// argument. Nothing reachable from here reaches a [`Node`], so the
 /// console is read-only by construction: there is no path through it
-/// that writes protocol state, mutates the store, or arms the
-/// compliance rules (`src/info.rs`, docs/src/compliance-abi.md). Every
+/// that writes protocol state or mutates the store. Every
 /// value is stamped at build time, so the answer is the same on every
 /// call and on every host that loaded this cdylib.
 #[unsafe(no_mangle)]
@@ -3585,333 +3424,6 @@ pub unsafe extern "C" fn lunet_lock_node_next(
     })
 }
 
-/// The Compliance ABI — the locked door.
-///
-/// Nine exports over the [`Node`] methods the upstream compliance corpus
-/// drives (`docs/uvrr-host-compliance.md`). The whole module is behind
-/// the `compatibility_suite` cargo feature, which is OFF in `default`:
-/// with the feature off these functions DO NOT COMPILE, so a production
-/// cdylib carries no such symbol at all — an absence, not a runtime
-/// refusal. `tests/abi_door_test.rs` reads the built library's symbol
-/// table and fails if any `unsafe_` symbol is present in the default
-/// build, or if these nine are absent from the feature build; that gate
-/// runs on every `make ext-test`.
-///
-/// Most of these write protocol state, directly or by arming the
-/// compliance rules; the rest read the state the corpus's expectations
-/// are written against. All of them exist for the corpus and for nothing
-/// else, and a build carrying them must never be booted in production:
-/// the build script holds the clean-commit guard and every node boot
-/// announces the exposure at error severity (`src/info.rs`).
-///
-/// The vector returns mirror the pull-style buffer contract of
-/// `lunet_lock_node_fault`: the payload is written NUL-terminated with
-/// its length (excluding the NUL) in `out_len`, and a caller whose
-/// buffer is too small gets `TOO_LARGE` and the size it needs. Nothing
-/// here allocates across the boundary.
-#[cfg(feature = "compatibility_suite")]
-mod unsafe_abi {
-    use super::*;
-    use std::sync::PoisonError;
-
-    /// Copies a NUL-terminated payload out, on the `lunet_lock_node_fault`
-    /// contract: `out_len` carries the length excluding the NUL, a
-    /// buffer that cannot hold it plus the NUL is `TOO_LARGE` with the
-    /// needed size written, and a null `out_data` is a sizing probe.
-    unsafe fn copy_out(text: &str, out_data: *mut u8, capacity: usize, out_len: *mut usize) -> i32 {
-        unsafe { *out_len = text.len() };
-        if text.len() + 1 > capacity {
-            return TOO_LARGE;
-        }
-        if !out_data.is_null() {
-            unsafe {
-                ptr::copy_nonoverlapping(text.as_ptr(), out_data, text.len());
-                *out_data.add(text.len()) = 0;
-            }
-        }
-        OK
-    }
-
-    /// [`Node::open_compliance`] — the compliance constructor: the same
-    /// marker store and lock-event journal disabled, with the corpus's
-    /// harness rules armed. This is the ONLY entry that arms them, and
-    /// the constructor a production host never reaches
-    /// (`lunet_lock_node_new` does not arm them).
-    ///
-    /// Writes: a node, its marker store, and its incarnation markers.
-    #[unsafe(no_mangle)]
-    pub unsafe extern "C" fn lunet_lock_node_unsafe_open_compliance(
-        members_len: usize,
-        members_data: *const u8,
-        own_len: usize,
-        own_data: *const u8,
-        state_len: usize,
-        state_data: *const u8,
-        primary_timeout: u64,
-        out: *mut *mut c_void,
-    ) -> i32 {
-        guarded(|| {
-            if out.is_null() {
-                return INVALID;
-            }
-            let Ok(members_data) = (unsafe { bytes(members_len, members_data) }) else {
-                return INVALID;
-            };
-            let Ok(own_data) = (unsafe { bytes(own_len, own_data) }) else {
-                return INVALID;
-            };
-            let Ok(state_data) = (unsafe { bytes(state_len, state_data) }) else {
-                return INVALID;
-            };
-            let (Ok(members), Ok(own), Ok(state)) = (
-                std::str::from_utf8(members_data),
-                std::str::from_utf8(own_data),
-                std::str::from_utf8(state_data),
-            ) else {
-                return INVALID;
-            };
-            match Node::open_compliance(members, own, state, primary_timeout) {
-                Ok(node) => {
-                    unsafe { *out = Box::into_raw(Box::new(node)).cast() };
-                    OK
-                }
-                Err(code) => code,
-            }
-        })
-    }
-
-    /// [`Node::set_compliance_clock`] — the executor's logical tick,
-    /// carried by every drive until the executor advances it again.
-    ///
-    /// Writes: the node's clock source, and through it every subsequent
-    /// drive's timeout arithmetic.
-    #[unsafe(no_mangle)]
-    pub unsafe extern "C" fn lunet_lock_node_unsafe_set_compliance_clock(
-        node: *mut c_void,
-        at: u64,
-    ) -> i32 {
-        guarded(|| {
-            let Some(node) = (unsafe { node.cast::<Node>().as_mut() }) else {
-                return INVALID;
-            };
-            node.set_compliance_clock(at);
-            OK
-        })
-    }
-
-    /// [`Node::propose_opaque`] — one opaque proposal: the payload is raw
-    /// bytes the core carries opaque, and `id_msb`/`id_lsb` are the
-    /// executor's own `OperationId` (first eight bytes big-endian, last
-    /// eight big-endian — the core's wire order). Outside a compliance
-    /// node the method reports `INVALID`; the rules are the ABI's own
-    /// refusal, not this wrapper's.
-    ///
-    /// Writes: protocol state — this is a proposal into the replicated
-    /// log.
-    #[unsafe(no_mangle)]
-    pub unsafe extern "C" fn lunet_lock_node_unsafe_propose_opaque(
-        node: *mut c_void,
-        id_msb: u64,
-        id_lsb: u64,
-        payload_len: usize,
-        payload: *const u8,
-    ) -> i32 {
-        guarded(|| {
-            let Some(node) = (unsafe { node.cast::<Node>().as_mut() }) else {
-                return INVALID;
-            };
-            let Ok(payload) = (unsafe { bytes(payload_len, payload) }) else {
-                return INVALID;
-            };
-            node.propose_opaque(
-                OperationId {
-                    msb: id_msb,
-                    lsb: id_lsb,
-                },
-                payload,
-            )
-        })
-    }
-
-    /// [`Node::reconfigure_opaque`] — one typed cluster operation over
-    /// the ordinary consensus pipeline, at the reference host's pivot
-    /// policy (the stop-the-world fallback, a latency outcome). The
-    /// operation crosses as the core's own JSON encoding of
-    /// `SystemOperation` (the `vrr/serde` derives, which the feature
-    /// enables); an unparseable body is `CLIENT_JSON`.
-    ///
-    /// Writes: protocol state — this is a reconfiguration into the
-    /// replicated log, and on commit the folded configuration itself.
-    #[unsafe(no_mangle)]
-    pub unsafe extern "C" fn lunet_lock_node_unsafe_reconfigure_opaque(
-        node: *mut c_void,
-        op_json_len: usize,
-        op_json: *const u8,
-    ) -> i32 {
-        guarded(|| {
-            let Some(node) = (unsafe { node.cast::<Node>().as_mut() }) else {
-                return INVALID;
-            };
-            let Ok(op_json) = (unsafe { bytes(op_json_len, op_json) }) else {
-                return INVALID;
-            };
-            let Ok(op) = serde_json::from_slice::<SystemOperation>(op_json) else {
-                return CLIENT_JSON;
-            };
-            node.reconfigure_opaque(op)
-        })
-    }
-
-    /// [`Node::frontiers`] — `(accepted, committed, applied)` as the
-    /// observation carries them.
-    ///
-    /// Reads: protocol state. Drives nothing.
-    #[unsafe(no_mangle)]
-    pub unsafe extern "C" fn lunet_lock_node_unsafe_frontiers(
-        node: *mut c_void,
-        out_accepted: *mut u64,
-        out_committed: *mut u64,
-        out_applied: *mut u64,
-    ) -> i32 {
-        guarded(|| {
-            if node.is_null()
-                || out_accepted.is_null()
-                || out_committed.is_null()
-                || out_applied.is_null()
-            {
-                return INVALID;
-            }
-            let node = unsafe { &*node.cast::<Node>() };
-            let (accepted, committed, applied) = node.frontiers();
-            unsafe {
-                *out_accepted = accepted;
-                *out_committed = committed;
-                *out_applied = applied;
-            }
-            OK
-        })
-    }
-
-    /// [`Node::journal_entries`] — the whole journal, void slot through
-    /// the accepted frontier, as the core's own JSON encoding of the
-    /// entries (slot, era, payload; an operation payload is its opaque
-    /// bytes as a JSON byte array, a system payload its `SystemOperation`).
-    ///
-    /// Reads: protocol state. Drives nothing.
-    #[unsafe(no_mangle)]
-    pub unsafe extern "C" fn lunet_lock_node_unsafe_journal_entries(
-        node: *mut c_void,
-        out_data: *mut u8,
-        capacity: usize,
-        out_len: *mut usize,
-    ) -> i32 {
-        guarded(|| {
-            if node.is_null() || out_len.is_null() {
-                return INVALID;
-            }
-            let node = unsafe { &*node.cast::<Node>() };
-            let Ok(text) = serde_json::to_string(&node.journal_entries()) else {
-                return SERVICE;
-            };
-            unsafe { copy_out(&text, out_data, capacity, out_len) }
-        })
-    }
-
-    /// [`Node::membership`] — the folded configuration's current record:
-    /// the succession order and each member's weight, in the same order,
-    /// as `out_count` `u32` ids and `u64` weights. A node holding no era
-    /// record reports zero members. A caller whose arrays cannot hold the
-    /// record gets `TOO_LARGE` and the count it needs.
-    ///
-    /// Reads: protocol state. Drives nothing.
-    #[unsafe(no_mangle)]
-    pub unsafe extern "C" fn lunet_lock_node_unsafe_membership(
-        node: *mut c_void,
-        out_count: *mut usize,
-        out_ids: *mut u32,
-        out_weights: *mut u64,
-        capacity: usize,
-    ) -> i32 {
-        guarded(|| {
-            if node.is_null() || out_count.is_null() {
-                return INVALID;
-            }
-            let node = unsafe { &*node.cast::<Node>() };
-            let Some((order, weights)) = node.membership() else {
-                unsafe { *out_count = 0 };
-                return OK;
-            };
-            unsafe { *out_count = order.len() };
-            if order.len() > capacity || out_ids.is_null() || out_weights.is_null() {
-                return TOO_LARGE;
-            }
-            for (index, (&id, &weight)) in order.iter().zip(&weights).enumerate() {
-                unsafe {
-                    *out_ids.add(index) = id.0;
-                    *out_weights.add(index) = weight;
-                }
-            }
-            OK
-        })
-    }
-
-    /// [`Node::witnesses`] — the gossip-witness list, in list order, as
-    /// `out_count` `u32` ids. A caller's array that cannot hold the list
-    /// gets `TOO_LARGE` and the count it needs.
-    ///
-    /// Reads: protocol state. Drives nothing.
-    #[unsafe(no_mangle)]
-    pub unsafe extern "C" fn lunet_lock_node_unsafe_witnesses(
-        node: *mut c_void,
-        out_count: *mut usize,
-        out_ids: *mut u32,
-        capacity: usize,
-    ) -> i32 {
-        guarded(|| {
-            if node.is_null() || out_count.is_null() {
-                return INVALID;
-            }
-            let node = unsafe { &*node.cast::<Node>() };
-            let witnesses = node.witnesses();
-            unsafe { *out_count = witnesses.len() };
-            if witnesses.len() > capacity || out_ids.is_null() {
-                return TOO_LARGE;
-            }
-            for (index, &id) in witnesses.iter().enumerate() {
-                unsafe { *out_ids.add(index) = id.0 };
-            }
-            OK
-        })
-    }
-
-    /// [`Node::marker_log`] — this boot's own marker-round schedule, in
-    /// write order, one raw line per record and LF-separated: every
-    /// machine commit (`commit:<Marker>@<packed identity>`) and the
-    /// halt's drain (`drain`). The lines are the store's own, so the
-    /// reader renders them; this call does not interpret them.
-    ///
-    /// Reads: the marker store's schedule. Drives nothing.
-    #[unsafe(no_mangle)]
-    pub unsafe extern "C" fn lunet_lock_node_unsafe_marker_log(
-        node: *mut c_void,
-        out_data: *mut u8,
-        capacity: usize,
-        out_len: *mut usize,
-    ) -> i32 {
-        guarded(|| {
-            if node.is_null() || out_len.is_null() {
-                return INVALID;
-            }
-            let node = unsafe { &*node.cast::<Node>() };
-            let log = node.marker_log();
-            let text = log
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .join("\n");
-            unsafe { copy_out(&text, out_data, capacity, out_len) }
-        })
-    }
-}
 
 #[cfg(test)]
 mod tests {

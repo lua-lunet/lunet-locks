@@ -60,9 +60,9 @@ reported as **invalid**, not failed: unhandled exceptions, tests with no asserti
 whose declared `expected` result is not actually produced. That behavior is pinned by a learning
 test in [`tests/teal_learning_test.tl`](tests/teal_learning_test.tl).
 
-`make check` is the stable validation gate: the type checks, the Rust lint and test lanes, the
-compliance corpus, and the Teal suite (`teal-suite`) are all prerequisites of it, so a test file
-that rots turns the gate red. `make test` is that same gate under its validation name. Cargo
+`make check` is the stable validation gate: the type checks, the Rust lint and test lanes, and
+the Teal suite (`teal-suite`) are all prerequisites of it, so a test file that rots turns the
+gate red. `make test` is that same gate under its validation name. Cargo
 discovers the extension's integration tests, so do not add per-suite Make targets that merely
 repeat `cargo test`.
 

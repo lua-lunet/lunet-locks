@@ -9,7 +9,7 @@
 //! and no state: the values are compile-time constants and the functions
 //! here are pure functions over them. There is deliberately no entry on
 //! this module that reaches a [`crate::Node`], so no call through it can
-//! write protocol state or anything else (`docs/src/compliance-abi.md`).
+//! write protocol state or anything else.
 //!
 //! The payload is the Maven `version.properties` shape: `key=value` lines,
 //! LF-terminated. `GET /info` ([`info_response`]) is exactly that text in
@@ -30,9 +30,8 @@ pub const VERSION: &str = env!("LUNET_INFO_VERSION");
 pub const SHA: &str = env!("LUNET_INFO_SHA");
 
 /// The build's feature shape: `production`, or `production` plus the
-/// development features this build carries (`+compatibility_suite`,
-/// `+flight-recorder`, both). A production build is exactly
-/// `production`.
+/// development features this build carries (`+flight-recorder`). A
+/// production build is exactly `production`.
 pub const FEATURE_SHAPE: &str = env!("LUNET_INFO_FEATURES");
 
 /// Whether this build's working tree carried uncommitted changes. A
@@ -89,31 +88,6 @@ pub fn info_response() -> String {
          {body}",
         body.len()
     )
-}
-
-/// The `compatibility_suite` boot announcement, once per process: the
-/// nine `unsafe_*` exports this build carries are a compliance surface
-/// that WRITES protocol state, and a boot of such a shape is a
-/// misconfiguration an operator must not be able to miss. Said at error
-/// severity, on every construction path, before any node exists
-/// (`docs/src/compliance-abi.md`).
-#[cfg(feature = "compatibility_suite")]
-pub fn announce_compatibility_exposure() {
-    static ANNOUNCED: std::sync::Once = std::sync::Once::new();
-    ANNOUNCED.call_once(|| {
-        tracing::error!(
-            ts = crate::log_millis(),
-            event = "compliance-abi-exposed",
-            feature_shape = FEATURE_SHAPE,
-            version = VERSION,
-            sha = SHA,
-            "this build carries the compliance_suite ABI: the nine \
-             lunet_lock_node_unsafe_* exports write protocol state and exist \
-             for the upstream compliance corpus. A production boot of this \
-             shape is a misconfiguration — the released build is the \
-             default shape, in which those exports do not exist"
-        );
-    });
 }
 
 #[cfg(test)]

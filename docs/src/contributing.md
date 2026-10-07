@@ -21,7 +21,7 @@ A patch is reviewed only when the repository gates pass:
 
 ```console
 make check    # Cyan type checks, Cerulean formatting verification, Rust lint/test lanes,
-              # the compliance corpus, and the Teal suite
+              # and the Teal suite
 make test     # the same gate under its validation name
 ```
 

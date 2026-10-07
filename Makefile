@@ -40,23 +40,7 @@ SIGNAL_BIN := examples/lease-sequencer/bin
 # lane). The lint gate runs the example crate in BOTH shapes.
 BENCH_DIR := examples/lease-sequencer
 BENCH_FEATURES := flight-recorder
-# The advisory-lock crate's Compliance ABI shape (docs/src/compliance-abi.md).
-# The lint and test gates run the crate in BOTH shapes: the default one
-# proves the nine unsafe_* exports are absent from the production build,
-# this one proves they are all there.
-COMPAT_FEATURES := compatibility_suite
-# The corpus suite runs the same two shapes, from the outside: the
-# production library must still expose no `unsafe_` symbol, and the
-# gated library must expose all nine and replay the upstream corpus over
-# the transport. The gated library builds into a target directory of its
-# own so the production cdylib under `target/release` is never replaced
-# by it — the door stays shut for anything that loads that path.
-COMPAT_TARGET := $(CURDIR)/ext/advisory_lock/target/compliance
-COMPAT_SOEXT := $(if $(filter Darwin,$(LUNET_OS)),dylib,so)
-COMPAT_LIB := $(COMPAT_TARGET)/debug/liblunet_advisory_lock.$(COMPAT_SOEXT)
-COMPAT_RUN_DIR := $(CURDIR)/.tmp/compliance/gate
-
-.PHONY: init deps build check test teal-suite smoke simulation simulation-test lunet-runtime docs clean ext ext-check ext-test example-check fmt lint hooks sh-check sh-smoke docker-build docker-simulation sanity release-images build-proof package package-verify bench compliance-lib compliance-production-shape compliance-suite-shape compliance-suite
+.PHONY: init deps build check test teal-suite smoke simulation simulation-test lunet-runtime docs clean ext ext-check ext-test example-check fmt lint hooks sh-check sh-smoke docker-build docker-simulation sanity release-images build-proof package package-verify bench
 
 init:
 	@command -v mise >/dev/null 2>&1 || { echo "ERROR: mise is not on PATH. Install it from https://mise.jdx.dev and try again."; exit 1; }
@@ -97,29 +81,6 @@ sh-check:
 sh-smoke:
 	$(SIGNAL_BIN)/client-signal-smoke.sh
 
-# The gated library, built apart from the production one so the two
-# shapes can never be confused for one another on disk.
-compliance-lib:
-	COMPATIBILITY_SUITE_ALLOW_DIRTY=1 CARGO_TARGET_DIR=$(COMPAT_TARGET) \
-		cargo build --lib --manifest-path ext/advisory_lock/Cargo.toml \
-		--features "$(COMPAT_FEATURES)"
-
-# Shape one: the production library's symbol table. Zero `unsafe_`
-# symbols, read from the built cdylib rather than asserted in a comment.
-compliance-production-shape: build
-	tools/compliance_gate.lua --shape production
-
-# Shape two: the gated library's symbol table plus the upstream corpus
-# replayed over the transport against the Lua compliance host.
-# `contract.hurl` runs first (it is first in the gate's file list): it
-# covers the endpoints that replay no case, so a transport fault names
-# itself before any case is reached.
-compliance-suite-shape: build lunet-runtime compliance-lib
-	tools/compliance_gate.lua --shape compatibility_suite \
-		--run-dir $(COMPAT_RUN_DIR)
-
-compliance-suite: compliance-production-shape compliance-suite-shape
-
 # The Teal suite, a prerequisite of `check` rather than a lane beside it, so
 # a test file that rots turns the gate red. `LUA_PATH` carries the compiled
 # production modules and the repository root, and the repository root is
@@ -131,7 +92,7 @@ compliance-suite: compliance-production-shape compliance-suite-shape
 teal-suite: build
 	LUA_PATH="$(abspath build)/?.lua;$(CURDIR)/?.tl;;" $(TESTED) tests
 
-check: build lint teal-suite example-check sh-check sh-smoke compliance-suite
+check: build lint teal-suite example-check sh-check sh-smoke
 	$(CYAN) check $(TEAL_SOURCES)
 
 # The gate under its validation name. The suite runs once, as `check`'s
@@ -274,7 +235,6 @@ ext: ext-test
 ext-check:
 	cargo fmt --manifest-path ext/advisory_lock/Cargo.toml -- --check
 	cargo clippy --manifest-path ext/advisory_lock/Cargo.toml --all-targets -- -D warnings
-	COMPATIBILITY_SUITE_ALLOW_DIRTY=1 cargo clippy --manifest-path ext/advisory_lock/Cargo.toml --all-targets --features "$(COMPAT_FEATURES)" -- -D warnings
 	cargo fmt --manifest-path ext/lunet-locks-aof/Cargo.toml -- --check
 	cargo clippy --manifest-path ext/lunet-locks-aof/Cargo.toml --all-targets -- -D warnings
 	mise exec -- zig fmt --check ext/lunet-locks-aof/zig/src
@@ -293,7 +253,6 @@ example-check:
 
 ext-test: ext-check
 	cargo test --manifest-path ext/advisory_lock/Cargo.toml
-	COMPATIBILITY_SUITE_ALLOW_DIRTY=1 cargo test --manifest-path ext/advisory_lock/Cargo.toml --features "$(COMPAT_FEATURES)"
 	cargo test --manifest-path ext/lunet-locks-aof/Cargo.toml
 	cd ext/lunet-locks-aof/zig && mise exec -- zig build test $(ZIG_TEST_FLAGS)
 	cargo test --manifest-path ext/paxe-core/Cargo.toml
