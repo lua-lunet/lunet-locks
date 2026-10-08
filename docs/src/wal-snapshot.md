@@ -185,7 +185,20 @@ capacity × 72 B data ring, capacity × 40 B header ring per pair.
   synchronous-completion backend. Exposed over a C ABI in the
   `aof_c.zig` pattern: `wal_open`, `wal_submit`, `wal_pump`,
   `wal_event_fd` (Linux), `wal_flush_sync` (the shutdown generation),
-  `wal_load`, `wal_status`, `wal_close`.
+  `wal_load`, `wal_status`, `wal_close`. The submit carries the caller's
+  serialized batch — one generation of 72-byte records — and one
+  generation is outstanding at a time: a second submit before the pump is
+  refused (`-EAGAIN`), the host pumps first. The counters move at
+  completion time, inline on darwin and at the pump (or the flush) on
+  Linux. `wal_flush_sync` takes the serialized live set, validates it
+  against the engine's own mirror (a divergence is the loud failed stop),
+  drains any outstanding batch first, writes forward, and fsyncs exactly
+  once. `wal_load` answers every content refusal as "none" — checksums,
+  twins and expiry all refuse at open or in the scan, never as an error.
+  A backend IO failure poisons the handle: every call returns `-EIO`
+  until it is dropped, and nothing partial is ever silent. The Linux
+  io_uring backend is compile-checked on every host by a cross-compile
+  gate and exercised at runtime on Linux.
 - **Rust wrapper** (this repo): a `WalSnapshotStore` implementing
   `StateStore` over that ABI, mounted where the node mounts its store
   today — nothing above the trait knows which store it holds.
