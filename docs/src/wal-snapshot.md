@@ -77,36 +77,44 @@ One file beside the node's state path: the state path's name with a `.wal`
 suffix. The file is fixed-size and pre-laid-out; everything in it is at a
 fixed offset.
 
-**Record** — 64 bytes, fixed — exactly one cache line:
+**Record** — 64 bytes, fixed — exactly one cache line. The struct is
+**layout-exact and memcpy-round-trippable**: the on-disk bytes ARE the
+struct's bytes — zero padding, every field naturally aligned, struct
+alignment 8 — and the round trip is a memcpy in both directions; the only
+"special" step is the checksum, computed into the struct's own field on
+encode and verified on decode. Little-endian is baked by that memcpy on
+both release targets (x86_64, aarch64 — both LE); a big-endian host would
+fail the round trip loudly. The layout is pinned by assertions that run
+on every build — Zig `comptime` size/offset asserts in the engine and the
+C ABI, `const` `size_of`/`offset_of!` asserts in the Rust wrapper — so a
+layout drift is a compile error, never a silent corruption.
 
-```text
-header, 36 bytes:
-  ns write stamp   u64  — the epoch selector, wall clock of the write
-  expiry           u64  — absolute, in the leader's clock, milliseconds;
-                          the engine's clock is nanoseconds and the
-                          wrapper converts (ms→ns on write, ns→ms on read)
-  lock id          u64
-  lease id         u64
-  tag              u32  — record kind: live | tombstone; format version bits
-lease payload, 24 bytes:
-  holder uuid      16 bytes
-  lease window     u64  — lease_ms
-checksum, 4 bytes:        — the low 32 bits of the vendored Aegis-128
-                          checksum (vsr/checksum.zig) over the 60 bytes
-                          before it; all integers little-endian
-```
+| offset | field | type |
+| --- | --- | --- |
+| 0 | ns write stamp | u64 — the epoch selector, wall clock of the write |
+| 8 | expiry | u64 — absolute, in the leader's clock; the wrapper converts (the table's milliseconds → the engine's nanoseconds on write, back on read) |
+| 16 | lock id | u64 |
+| 24 | lease id | u64 |
+| 32 | holder uuid | 16 bytes |
+| 48 | lease window | u64 — lease_ms |
+| 56 | tag | u32 — record kind: live \| tombstone; format version bits |
+| 60 | checksum | u32 — the low 32 bits of the vendored Aegis-128 checksum (vsr/checksum.zig) over the 60 bytes before it; all integers little-endian |
 
 The record carries the lease's identity and nothing else — a lock's
 display name, its labels, and the counters are not durable here; they
 ride the identity sidecar (below). Every data ring starts on a 1 MiB
-boundary, so each 64-byte record occupies exactly one cache line — the
+boundary and 64 divides 1 MiB, so each 64-byte record occupies exactly
+one cache line and every record boundary sits on a 64-byte line — the
 "around a cache line" sizing is exact, and the ring arithmetic is
 `capacity × 64`.
 
-**Header record** — 40 bytes, fixed: the same 36-byte header plus its own
-4-byte Aegis-low-32 checksum, little-endian throughout. The header ring
-carries no payload; it is the torn-write / misdirected-write detector and
-the fast scan path.
+**Header record** — 40 bytes, fixed: the identity header — stamp u64,
+expiry u64, lock id u64, lease id u64 (offsets 0, 8, 16, 24 — the
+record's identity prefix, byte-equal across the rings), the tag u32 at
+offset 32, and its own 4-byte Aegis-low-32 checksum at offset 36,
+little-endian throughout, the same memcpy-exact mechanics as the data
+record. The header ring carries no payload; it is the torn-write /
+misdirected-write detector and the fast scan path.
 
 **The double ring (one WAL, two parts)**: the *data ring* holds full
 records (header + payload + checksum); the *header ring* holds header
@@ -197,7 +205,9 @@ Chubby's sequencer, ZooKeeper's zxid and etcd's revision).
   2. apply tombstones (drop the lock; last record per lock id wins);
   3. hydrate survivors' payloads from the data ring, each demanding its
      header checksum, its data checksum, and twin agreement between the
-     rings.
+     rings — the 32-byte identity prefix (stamp, expiry, lock id, lease
+     id) byte-equal across both rings, and the tag checked as a field
+     (its offsets differ between the records).
 - **Load is lazy, clean-boot-only**: the boot fence (marker `stopped` →
   `flushed`) gates it as everywhere else; a dirty boot reads nothing and
   rebuilds from the replica stream — the "resync-from-commit" of issue
@@ -225,7 +235,8 @@ capacity × 64 B data ring, capacity × 40 B header ring per pair.
   `wal_load`, `wal_status`, `wal_close`, and the record exchange
   `wal_record_encode` / `wal_record_decode` — the engine's own codec,
   where the one checksum there is (the vendored Aegis-128 primitive,
-  low 32 bits) is stamped and verified. The submit carries the caller's
+  low 32 bits) is stamped and verified — plus the copy canary's
+  `wal_canary_bump_copy`. The submit carries the caller's
   serialized batch — one generation of 64-byte records — and one
   generation is outstanding at a time: a second submit before the pump is
   refused (`-EAGAIN`), the host pumps first. The counters move at
@@ -248,6 +259,34 @@ capacity × 64 B data ring, capacity × 40 B header ring per pair.
   the engine behind the ABI (there is exactly one of each, ever — a
   second implementation on the host would be a permanent agreement
   burden).
+
+  **The copy canary.** The interop across the C ABI carries a standing
+  proof: `wal_canary_bump_copy` (the engine, in `wal_canary.zig`) copies
+  one 64-byte record between two caller-owned slots and bumps the two
+  bump fields (stamp, lease id) by exactly 1 — the fields read as the
+  struct, never as offset math on raw bytes, increments checked. The
+  Rust driver test packs wide-bit unique unsigned sentinels into the
+  real `WalRecord`, copies through three caller-owned slots, and
+  verifies the last slot byte-exact and field-true: bumped fields are
+  sentinel + 2 exactly, everything else byte-equal, no two fields
+  colliding after the bumps. A plain copy proves nothing; the bump
+  proves the Zig side interprets the fields for what they are. What it
+  proves on the build: the C layout, the size/shape/C field math, the
+  endianness, and field-true interpretation across the boundary — the
+  insurance that a debugger logging the struct inside the engine sees
+  what the host wrote, and that no value crossing the boundary silently
+  loses bits. The ownership contract is the WAL ABI's own: caller-owned,
+  always — all three slots are one caller-owned array, the engine
+  allocates nothing, frees nothing, and touches only the slots handed
+  to it, only for the duration of the call. Null pointers, overlapping
+  slots and misaligned (not 8-aligned) buffers are refused with a
+  negative code; the canary is deliberately memory-only (no disk, no
+  flush — the disk round trip is a later integration concern). It rides
+  every build on every architecture: the Zig export and its in-engine
+  tests compile into every cdylib (the sentinels' comptime headroom
+  assert — `sentinel + 2 < maxInt` — is a compile error to violate),
+  and the Rust driver test runs in the standard cargo test invocation
+  wherever cargo runs; a big-endian host would fail the canary loudly.
 - **Loop integration** (this repo): the ~1000 ms libuv timer submits and
   pumps through the node's FFI; on Linux a `uv_poll` on the eventfd fd
   wakes the loop for completions; the counters ride the status surface.
