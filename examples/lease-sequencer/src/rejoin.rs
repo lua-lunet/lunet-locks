@@ -7,7 +7,7 @@
 //!
 //! Why the send is the host's: the core emits no `GossipRequest` — a
 //! `Joining` node's tick drives only an already-open fetch
-//! (`ext/uvrr-core/src/replica/mod.rs` `plan_tick`), and the fetch opens
+//! (upstream `uvrr-core/src/replica/mod.rs` `plan_tick`), and the fetch opens
 //! only through paths a fenced fresh boot never reaches. The core HANDLES
 //! the message on receive (`plan_gossip_request`: every node that hears
 //! it records the sender as a gossip-witness; the leader answers with the

@@ -1,6 +1,7 @@
 # The timeout policy
 
-The flavoured-timeout model (`ext/uvrr-core/src/timeout.rs`) is a total
+The flavoured-timeout model (upstream `uvrr-core/src/timeout.rs`, consumed
+at tag `v0.14.0`) is a total
 function over the node's protocol conditions: given a state, a timeout
 flavour, and the host's clock event that a waiting time is exceeded, the
 matcher returns one opinion — `retransmit`, `do-nothing`, `heartbeat`,
@@ -13,7 +14,7 @@ performs no clock reads; the durations are host policy
 may do when the waiting time is exceeded is protocol.
 
 The opinions' normative sources are the upstream architecture's liveness
-section (`ext/uvrr-core/docs/architecture.md`, "Liveness: the resend, the
+section (upstream `docs/architecture.md`, "Liveness: the resend, the
 heartbeat, and the retransmit"): the leader's resend policy (resend what
 has not received a response on, a relay of what the core already
 released), the heartbeat (a leader with no outstanding matters and
@@ -52,8 +53,7 @@ foreign non-agent flavour on an agent is not protocol for it either.
 ## The Sorry verdict
 
 Every `(stopping-not-flushed, *)` pair answers `sorry`, and the runbook
-statement is the whole of the opinion (`UNFLUSHED_RUNBOOK`,
-`ext/uvrr-core/src/timeout.rs:190`; the tool prints it under every such
+statement is the whole of the opinion (`UNFLUSHED_RUNBOOK`, upstream `uvrr-core/src/timeout.rs:190`; the tool prints it under every such
 pair):
 
 > a node stopping but not flushed presents a stall the operator may
@@ -141,7 +141,7 @@ its marker rounds land.
 ## The relay: what a repeated send may be
 
 A repeated send is a relay of what the core has already released, never a
-message the host composes (`ext/uvrr-core/docs/architecture.md`, the
+message the host composes (upstream `docs/architecture.md`, the
 authorization rule for replayed messages; retransmission is host transport
 policy). The hosts keep that discipline in one ledger
 (`examples/lease-sequencer/src/relay.rs`): every datagram the node
@@ -153,7 +153,7 @@ later, a `Commit` by a later `PrepareOk` (the proof it was applied), a
 `StartViewChange` fence vote by the recipient's own fence vote, and
 `DoViewChange` evidence by the designated primary installing a view — and
 every relay re-sends the recorded bytes to the recorded peer, so a relay
-is a repeat a receiver absorbs (`ext/uvrr-core/docs/architecture.md`: a
+is a repeat a receiver absorbs (upstream `docs/architecture.md`: a
 repeated `Prepare` re-acknowledges without re-applying, the commit handler
 takes the frontier each time).
 

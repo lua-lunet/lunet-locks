@@ -3,8 +3,8 @@
 `lunet-advisory-lock` is an advisory-lock service for expiring leases with
 live, reconfigurable membership. Lunet and Teal provide the TCP/UDP process;
 a small Rust adapter owns lock execution and delegates replication to
-[uvrr-core](https://github.com/lua-lunet/uvrr-core), vendored as the
-`ext/uvrr-core` submodule.
+[uvrr-core](https://github.com/lua-lunet/uvrr-core), consumed as a git
+dependency at tag `v0.14.0`.
 
 ## Service topology
 

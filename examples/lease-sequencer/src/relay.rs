@@ -3,7 +3,7 @@
 //!
 //! The core releases a message once and never re-releases it: a repeated
 //! send is a relay of what the core already put on the wire, never a
-//! message the host composes (`ext/uvrr-core/docs/architecture.md`,
+//! message the host composes (upstream `uvrr-core/docs/architecture.md`,
 //! "Liveness: the resend, the heartbeat, and the retransmit"). This module
 //! is that host half, and nothing else:
 //!

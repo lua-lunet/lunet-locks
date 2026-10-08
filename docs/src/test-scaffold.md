@@ -229,7 +229,7 @@ tape's slot-frontier records ([the architecture](architecture.md)).
 
 ## The timeout-policy audit
 
-The flavoured-timeout model (`ext/uvrr-core/src/timeout.rs`) maps
+The flavoured-timeout model (upstream `uvrr-core/src/timeout.rs`) maps
 every (state, timeout) pair to an opinion; the upstream
 `timeout-policy` tool prints the map for a pair. The audit pins the
 matcher's table in our tree as living documentation and asserts — as a
@@ -270,8 +270,6 @@ kill) are surfaced to the operator wherever `stop` fails.
 | `ext/advisory_lock/src/marker_store.rs` | the marker pair mechanics, `GateStore`, the projection |
 | `ext/advisory_lock/src/state.rs` | the state seam: the file framing, and the lazy load's clean-verdict guard |
 | `ext/advisory_lock/src/aof.rs` | the AOF: append, drain, roll, the erasure-block trap, torn-tail truncation |
-| `ext/uvrr-core/src/timeout.rs` | the flavoured-timeout model: the matcher, the `Sorry{runbook}` verdicts |
-| `ext/uvrr-core/src/bin/timeout-policy/` | the timeout-policy tool: the opinion for a (state, timeout) pair |
 | `examples/lease-sequencer/src/main.rs` | the host loop: the drives, the signals, the stop contract |
 | `examples/lease-sequencer/src/shutdown_check.rs` | the shutdown-restart consistency check |
 | `ext/advisory_lock/src/info.rs` | the read-only information console: the facts the build stamped, handed back on request |

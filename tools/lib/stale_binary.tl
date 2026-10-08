@@ -244,9 +244,9 @@ end
 
 -- The newest file under each source root, as tracked plus
 -- untracked-not-ignored: the files a build can read. A source root that is
--- itself a checkout (the uvrr-core submodule) is asked where it lives,
--- because the parent index names a submodule as one gitlink and would hide
--- every file inside it.
+-- itself a checkout (the `ext/lunet-locks-aof` submodule) is asked where it
+-- lives, because the parent index names a submodule as one gitlink and
+-- would hide every file inside it.
 local function newest_source(root: string, sources: {string}): string, integer, integer
     local best_path = ""
     local best_s = -1

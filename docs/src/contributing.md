@@ -28,8 +28,8 @@ make test     # the same gate under its validation name
 Teal sources are formatted with Cerulean (`make fmt` formats in place,
 `make check` rejects unformatted code); `make hooks` enables the
 pre-commit formatting guard once after clone. Changes to the native
-adapter or its vendored submodule must additionally pass the Rust gates
-(`make ext-test`: `cargo fmt`, `clippy` with warnings denied, and
+adapter or its `uvrr-core` git dependency must additionally pass the Rust
+gates (`make ext-test`: `cargo fmt`, `clippy` with warnings denied, and
 `cargo test`), which `make build` runs.
 
 ## Documentation
@@ -41,13 +41,14 @@ contemporaneous commentary do not belong in the docs tree.
 
 ## Upstream engagement
 
-The replication core is the vendored `ext/uvrr-core` submodule. A serious
-correctness, safety, or replication bug found in that tree is a
+The replication core is the `uvrr-core` git dependency (tag `v0.14.0`). A
+serious correctness, safety, or replication bug found in that crate is a
 stop-and-report issue: file the issue against
 [lua-lunet/uvrr-core](https://github.com/lua-lunet/uvrr-core) and surface
-it to the coordinator before changing the submodule; bugs in vendored or
-derived code are reported to this project first, then upstreamed to both
-communities (see [`ATTRIBUTIONS.md`](../ATTRIBUTIONS.md)).
+it to the coordinator before changing the adapter or re-pinning the
+dependency; bugs in dependencies or derived code are reported to this
+project first, then upstreamed to both communities (see
+[`ATTRIBUTIONS.md`](../ATTRIBUTIONS.md)).
 
 ## Attribution
 

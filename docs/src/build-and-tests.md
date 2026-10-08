@@ -159,9 +159,9 @@ does not take over within five seconds. Logs and node process state are kept in
 
 `make docker-simulation` first assembles a disposable Cargo-vendored context,
 then invokes a conventional multi-stage `docker build`. The prepared context
-carries the vendored dependency sources, the `ext/uvrr-core` submodule
-source at the relative position the manifest's `[patch]` section names,
-and the `ext/lunet-locks-aof` subcrate source, so the image build fetches
+carries the vendored dependency sources — `cargo vendor` fetches the
+`uvrr-core` source at tag `v0.14.0` into the vendor directory — and the
+`ext/lunet-locks-aof` subcrate source, so the image build fetches
 no dependency sources over the network and uses neither BuildKit
 features nor source/bind mounts; the image installs the pinned Zig
 0.14.1 toolchain and downloads its own SHA-256-verified Linux Lunet

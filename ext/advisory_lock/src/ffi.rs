@@ -2896,9 +2896,7 @@ fn node_from_parts(
         journal,
         None,
         None,
-        Construction {
-            primary_timeout,
-        },
+        Construction { primary_timeout },
         disk,
         state_store,
         commit_hook,

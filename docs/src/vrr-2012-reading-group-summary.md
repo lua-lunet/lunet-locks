@@ -23,7 +23,7 @@ tags:
 sources:
   talk: "https://charap.co/reading-group-viewstamped-replication-revisited"
   paper: "https://dspace.mit.edu/entities/publication/80846d94-fcd3-40e6-87fb-8d91fe99a5d1"
-  paper_local: ext/uvrr-core/research/primary-sources/papers/liskov-cowling-vr-revisited-2012.pdf
+  paper_local: "uvrr-core v0.14.0: research/primary-sources/papers/liskov-cowling-vr-revisited-2012.pdf"
   paper_sha256: 1b16284a0a443d08992bd0fd0f032587e34e3e81f61f1871d39a4e4a6e22cfa6
 attribution:
   presenter: "Joran Dirk Greef (TigerBeetle)"

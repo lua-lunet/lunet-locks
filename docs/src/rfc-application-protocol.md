@@ -9,15 +9,15 @@ written to be built against.
 ## The problem this solves
 
 `uvrr-core` orders opaque operations and nothing else. It does not model
-clients, sockets, retries, deduplication, forwarding, or replies
-(`ext/uvrr-core/docs/uvrr-durability-model.md:686`); its own architecture
+clients, sockets, retries, deduplication, forwarding, or replies (upstream
+`docs/uvrr-durability-model.md:686`); its own architecture
 decision B2 removed the VRR-2012 per-client table and made duplicate policy,
 result caching and reply delivery the host's concern
-(`ext/uvrr-core/docs/architecture.md:610-652`, and
-`ext/uvrr-core/docs/uvrr-durability-model.md:733`). Everything above that
+(upstream `docs/architecture.md:610-652`, and
+`docs/uvrr-durability-model.md:733`). Everything above that
 line is unspecified, and a host that invents it without naming its roles
 invents the same confusion twice. The core names the **host** — the system
-above it that it cannot know (`ext/uvrr-core/docs/architecture.md:3,34,151`)
+above it that it cannot know (upstream `docs/architecture.md:3,34,151`)
 — but has no name for the role within a host that terminates alien
 application traffic. This RFC supplies both.
 

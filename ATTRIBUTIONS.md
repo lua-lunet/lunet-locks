@@ -47,7 +47,15 @@ were verified against the crates.io licence field for each pinned version.
 | `tracing-attributes` | 0.1.31 | MIT | proc-macro of `tracing` |
 | `tracing-core` | 0.1.36 | MIT | dependency of `tracing` |
 | `io-uring` | 0.7.15 | MIT OR Apache-2.0 | Linux-only direct dependency, compiled into the cdylib |
+| `vrr` (package `uvrr-core`) | upstream tag `v0.14.0` | MIT | git dependency at tag `v0.14.0`, linked into the cdylib |
 | `proptest` | 1.11.0 | MIT OR Apache-2.0 | dev-dependency; tests only, not shipped |
+
+The `vrr` dependency is the upstream `uvrr-core` crate, fetched by cargo
+from [lua-lunet/uvrr-core](https://github.com/lua-lunet/uvrr-core) at tag
+`v0.14.0` (lockfile commit `64ec4bb`). Its MIT licence and the upstream
+copyright (Copyright (c) 2026 Simon Massey) are verified against the
+upstream `LICENSE` and `Cargo.toml` (`license = "MIT"`) at that tag; no
+copy of the source is stored in this repository.
 
 ### `ext/lock_feed` — `lock-feed` (smoke/tooling, not in the release archive)
 
@@ -107,10 +115,10 @@ attribution obligations met by this file and the shipped `LICENSE`.
 
 ## Statement on bugs in vendored and derived code
 
-Bugs in the vendored `ext/uvrr-core` submodule or the derived
+Bugs in the `uvrr-core` git dependency (tag `v0.14.0`) or the derived
 `console/assets/styles.css` are routed to this project in the first
-instance only. We reproduce the bug against the vendored tree and, when the
-defect exists upstream, report it to the upstream project so both
+instance only. We reproduce the bug against the consumed version and, when
+the defect exists upstream, report it to the upstream project so both
 communities receive the fix.
 
 ## Not covered by this audit

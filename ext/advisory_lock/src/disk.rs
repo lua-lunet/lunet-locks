@@ -164,6 +164,14 @@ pub struct DiskDirEntry {
 }
 
 impl DiskDirEntry {
+    /// Construct an entry from its own path — the constructor an
+    /// out-of-crate [`Disk`] implementation needs: `read_dir` hands these
+    /// back, and an implementation serving its listing from an engine
+    /// rather than a filesystem builds them here.
+    pub fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+
     /// The entry's own path, owned — the same shape `fs::DirEntry::path`
     /// hands back, so a listing's entries outlive the listing itself.
     pub fn path(&self) -> PathBuf {
@@ -318,7 +326,7 @@ impl Disk for StdDisk {
 
     fn read_dir(&self, path: &Path) -> io::Result<Vec<DiskDirEntry>> {
         fs::read_dir(path)?
-            .map(|entry| entry.map(|entry| DiskDirEntry { path: entry.path() }))
+            .map(|entry| entry.map(|entry| DiskDirEntry::new(entry.path())))
             .collect()
     }
 

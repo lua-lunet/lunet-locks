@@ -88,7 +88,7 @@
 
 use vrr::ids::Slot;
 
-pub use crate::disk::{Disk, StdDisk};
+pub use crate::disk::{Disk, DiskDirEntry, DiskFile, StdDisk, std_disk};
 pub use crate::locks::StateSnapshot;
 pub use crate::state::{FileStateStore, StateStore};
 

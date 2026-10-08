@@ -53,10 +53,11 @@
   wiped only by `colima delete`. Keeping the work on the VM disk is the
   point: fast fix-and-rebuild between test runs.
 - **No BuildKit.** The classic layer cache is the cache: the fastbuild
-  image's deps stage copies the manifests and dependency sources only
-  (`ext/uvrr-core` source, the AOF crate's zig/ tree, empty stubs for
-  the own crates) and compiles the whole dependency closure for BOTH
-  triples; that layer survives until a member manifest changes, and
+  image's deps stage copies the manifests and the AOF crate's zig/ tree
+  only, writes empty stubs for the own crates, and compiles the whole
+  dependency closure for BOTH triples (the dependency sources — the
+  `uvrr-core` git tag among them — fetch as cargo resolves); that layer
+  survives until a member manifest changes, and
   source changes recompile only our crates above it. The sanity and
   release payloads start `FROM` that layer. `.dockerignore` carries
   `target` (and the nested crate targets), `.git`, `.rocks`, `build`,

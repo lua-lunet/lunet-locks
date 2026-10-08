@@ -1,7 +1,7 @@
 #!/bin/sh
 # Assemble a disposable, self-contained legacy-Docker build context. This
-# vendors the dependency sources and the uvrr-core submodule (the manifest's
-# [patch] section resolves vrr-core to it) before Docker sees them, avoiding
+# vendors the dependency sources — cargo fetches the `uvrr-core` git tag the
+# manifest names into the vendor directory — before Docker sees them, avoiding
 # BuildKit SSH secrets, host mounts, runtime source mounts, and git fetches.
 set -eu
 
