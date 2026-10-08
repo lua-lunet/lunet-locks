@@ -77,23 +77,31 @@ One file beside the node's state path: the state path's name with a `.wal`
 suffix. The file is fixed-size and pre-laid-out; everything in it is at a
 fixed offset.
 
-**Record** — 72 bytes, fixed:
+**Record** — 64 bytes, fixed — exactly one cache line:
 
 ```text
 header, 36 bytes:
   ns write stamp   u64  — the epoch selector, wall clock of the write
-  expiry           u64  — absolute, always in the leader's clock
+  expiry           u64  — absolute, in the leader's clock, milliseconds;
+                          the engine's clock is nanoseconds and the
+                          wrapper converts (ms→ns on write, ns→ms on read)
   lock id          u64
   lease id         u64
   tag              u32  — record kind: live | tombstone; format version bits
-lease payload, 32 bytes:
+lease payload, 24 bytes:
   holder uuid      16 bytes
   lease window     u64  — lease_ms
-  reserved         8 bytes — zero
 checksum, 4 bytes:        — the low 32 bits of the vendored Aegis-128
-                          checksum (vsr/checksum.zig) over the 68 bytes
+                          checksum (vsr/checksum.zig) over the 60 bytes
                           before it; all integers little-endian
 ```
+
+The record carries the lease's identity and nothing else — a lock's
+display name, its labels, and the counters are not durable here; they
+ride the identity sidecar (below). Every data ring starts on a 1 MiB
+boundary, so each 64-byte record occupies exactly one cache line — the
+"around a cache line" sizing is exact, and the ring arithmetic is
+`capacity × 64`.
 
 **Header record** — 40 bytes, fixed: the same 36-byte header plus its own
 4-byte Aegis-low-32 checksum, little-endian throughout. The header ring
@@ -116,9 +124,35 @@ total file size     4 MiB
 ```
 
 Each ring holds a fixed count of records — the capacity, an operator
-sizing knob (default 1024 records; pair A data ring 72 KiB, header ring
+sizing knob (default 1024 records; pair A data ring 64 KiB, header ring
 40 KiB). The record size is fixed, so "how full" is arithmetic, never
 discovery.
+
+## The identity sidecar
+
+The 64-byte record carries lease identity and deliberately nothing more.
+What must outlive a restart beyond that rides a second, small artefact
+beside the WAL file: the state path's name with a `.wal-identity`
+suffix. It carries the durable identity rows only — a lock's display
+name and labels, and the **keeper rows** (a broken lock's bumped
+lease_id, held with the expiry-0 sentinel: a keeper is "no expiry", it
+dies only when tombstoned or replaced, and it is the fencing token a
+stale holder is judged against after a restart — the same animal as
+Chubby's sequencer, ZooKeeper's zxid and etcd's revision).
+
+- **Written behind the existing tick**, page-cached, atomically
+  (temp file, rename) over the `Disk` seam — the `FileStateStore`
+  framing idiom, not ring machinery. A few hundred bytes to ~10 KiB at
+  realistic scale (tens of named rows × ~400 B identity each).
+- **Fsynced once, with the shutdown generation** — the same durability
+  class as the shutdown flush: a crash mid-period is a dirty boot and
+  the dirty boot reads nothing.
+- **Loaded by the same lazy, clean-boot-only load**, before or with the
+  WAL snapshot, into the same empty-table seam; live state is never
+  overwritten.
+- `taken_at_ms` and `renew_count` are **never durable**: leader-timeline
+  observations, the state machine's and replies' own metadata — the
+  journal UI already reconstructs both from the event stream.
 
 ## The write path
 
@@ -142,9 +176,12 @@ discovery.
 - **Shutdown**: the eager flush writes the full live set to the active
   pair in the foreground, blocks, fsyncs once. The capacity condition is
   the remaining room: `position + live ≤ capacity`; a generation that
-  overruns it is a refused flush = failed stop, per the law. A
-  steady-tick refusal is counted in `refusals` and leaves the serving
-  state untouched. Never a silent partial write, never a truncation.
+  overruns it is a refused flush = failed stop, per the law. The stop
+  path submits the table's current changes through the tick path before
+  the eager flush — the flush validates the set against the engine's own
+  mirror, and a divergence is the loud failed stop. A steady-tick
+  refusal is counted in `refusals` and leaves the serving state
+  untouched. Never a silent partial write, never a truncation.
 
 ## The read path
 
@@ -175,7 +212,7 @@ the steady tick a refusal counted in `refusals` with the serving path
 unaffected (the tick simply does not land until capacity is restored by a
 compaction or an operator resize). Never a silent partial write, never a
 truncation. Sizing is an operator decision and the numbers are public:
-capacity × 72 B data ring, capacity × 40 B header ring per pair.
+capacity × 64 B data ring, capacity × 40 B header ring per pair.
 
 ## The seams
 
@@ -185,8 +222,11 @@ capacity × 72 B data ring, capacity × 40 B header ring per pair.
   synchronous-completion backend. Exposed over a C ABI in the
   `aof_c.zig` pattern: `wal_open`, `wal_submit`, `wal_pump`,
   `wal_event_fd` (Linux), `wal_flush_sync` (the shutdown generation),
-  `wal_load`, `wal_status`, `wal_close`. The submit carries the caller's
-  serialized batch — one generation of 72-byte records — and one
+  `wal_load`, `wal_status`, `wal_close`, and the record exchange
+  `wal_record_encode` / `wal_record_decode` — the engine's own codec,
+  where the one checksum there is (the vendored Aegis-128 primitive,
+  low 32 bits) is stamped and verified. The submit carries the caller's
+  serialized batch — one generation of 64-byte records — and one
   generation is outstanding at a time: a second submit before the pump is
   refused (`-EAGAIN`), the host pumps first. The counters move at
   completion time, inline on darwin and at the pump (or the flush) on
@@ -201,7 +241,13 @@ capacity × 72 B data ring, capacity × 40 B header ring per pair.
   gate and exercised at runtime on Linux.
 - **Rust wrapper** (this repo): a `WalSnapshotStore` implementing
   `StateStore` over that ABI, mounted where the node mounts its store
-  today — nothing above the trait knows which store it holds.
+  today — nothing above the trait knows which store it holds. The
+  wrapper carries no codec and no checksum code of its own: the record's
+  fields cross the ABI through the `wal_record_encode` /
+  `wal_record_decode` exports, and the codec and checksum live only in
+  the engine behind the ABI (there is exactly one of each, ever — a
+  second implementation on the host would be a permanent agreement
+  burden).
 - **Loop integration** (this repo): the ~1000 ms libuv timer submits and
   pumps through the node's FFI; on Linux a `uv_poll` on the eventfd fd
   wakes the loop for completions; the counters ride the status surface.
