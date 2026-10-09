@@ -270,8 +270,13 @@ end
 -- Reaps every tracked process through the polite stop: the runners'
 -- unconditional cleanup on exit.
 function M.stop_all()
-    for _, p in ipairs(M.tracked) do
-        M.stop(p, 1000)
+    -- M.stop reaps and untracks (a table.remove on this very table), so
+    -- an ipairs over the live table skips every second process: the
+    -- 2026-10-09 standby lane's exit left three of seven nodes running.
+    -- Walk the indices backwards — removing the current tail never
+    -- disturbs the indices still to visit.
+    for i = #M.tracked, 1, -1 do
+        M.stop(M.tracked[i], 1000)
     end
 end
 

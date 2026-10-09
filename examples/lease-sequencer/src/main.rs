@@ -1530,12 +1530,14 @@ impl Host {
         let message_id = *uuid::Uuid::new_v4().as_bytes();
         let mid = uuid::Uuid::from_bytes(message_id).to_string();
         let expiry = now + LEASE_MS;
-        let json = format!(
-            "{{\"op\":\"set\",\"message_id\":\"{mid}\",\"client_id\":{},\"request_num\":{},\"lock_id\":{LOCK_ID},\"lease\":{{\"lease_id\":{},\"holder\":\"{}\",\"expiry\":{expiry}}}}}",
+        let json = lease_sequencer::chase_set_payload(
+            &mid,
+            LOCK_ID,
             self.driver.client_id,
             self.driver.request_num,
             self.driver.lease_id,
-            self.driver.holder
+            &self.driver.holder.to_string(),
+            LEASE_MS,
         );
         self.lease_attempt(self.own_id, op.label(), expiry);
         let rc = self.node.request(json.as_bytes());
@@ -1548,12 +1550,14 @@ impl Host {
         let message_id = *uuid::Uuid::new_v4().as_bytes();
         let mid = uuid::Uuid::from_bytes(message_id).to_string();
         let expiry = now + LEASE_MS;
-        let json = format!(
-            "{{\"op\":\"set\",\"message_id\":\"{mid}\",\"client_id\":{},\"request_num\":{},\"lock_id\":{LOCK_ID},\"lease\":{{\"lease_id\":{},\"holder\":\"{}\",\"expiry\":{expiry}}}}}",
+        let json = lease_sequencer::chase_set_payload(
+            &mid,
+            LOCK_ID,
             self.driver.client_id,
             self.driver.request_num,
             self.driver.lease_id,
-            self.driver.holder
+            &self.driver.holder.to_string(),
+            LEASE_MS,
         );
         self.lease_attempt(self.own_id, "renew", expiry);
         let rc = self.node.request(json.as_bytes());

@@ -1342,9 +1342,11 @@ function M.standby(root: string): integer
             -- backs the console's admin views.
             local console_dir = fs.join(root, "console")
             local feed_bin = fs.join(root, "ext/lock_feed/target/release/lock-feed")
+            -- Absolute FEED_DIR: the console recipe's cwd is console/, not
+            -- the repo root, and the feed's dir check dies on a relative path.
             local up_cmd = "env PORT=8480 MOCK_PORT=8481 FEED_PORT=8482"
                 .. " FEED_DIR="
-                .. shell.quote(fs.join(rig.run_dir, "aof"))
+                .. shell.quote(fs.resolve(fs.join(rig.run_dir, "aof")))
                 .. " FEED_BIN="
                 .. shell.quote(fs.resolve(feed_bin))
                 .. " make -C "
