@@ -82,16 +82,18 @@ fn feature_shape(flight: bool) -> String {
 }
 
 /// The release tag this build IS, and the short commit. A build whose
-/// HEAD is not exactly at a tag carries no version: the nearest tag is
-/// not this build, and reporting it would be a lie the `/info` console
-/// could not defend. With no git facts at all (the Docker context, a
+/// HEAD is not exactly at a `v*` release tag carries no version: the
+/// nearest tag is not this build, and reporting it would be a lie the
+/// `/info` console could not defend. Local milestone tags (the
+/// `YYYYMMDD_local_${branch}` convention) are not releases and never
+/// stamp a version. With no git facts at all (the Docker context, a
 /// tarball) both are `unknown`.
 fn version_facts(commit: &str) -> (String, String) {
     if commit == "unknown" {
         return (String::from("unknown"), String::from("unknown"));
     }
     let sha: String = commit.chars().take(12).collect();
-    match git(&["describe", "--tags", "--exact-match"]) {
+    match git(&["describe", "--tags", "--exact-match", "--match", "v*"]) {
         Some(tag) if !tag.is_empty() => (tag, sha),
         _ => (String::from("unknown"), sha),
     }
