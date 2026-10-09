@@ -217,6 +217,7 @@ use crate::state::{self, FileStateStore, StateStore};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{OsString, c_void};
+use std::io;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::ptr;
@@ -229,7 +230,9 @@ use vrr::ids::{
     Ballot, CrashCounter, Era, NodeId, Operation, OperationId, Slot, SystemId, Tick, View,
 };
 use vrr::journal::{Journal, LogEntry, Payload, SegmentedLog};
-use vrr::lifecycle::{self, BootError, BootOutcome, Bumped, Crashed, Marker, Running, Vouched};
+use vrr::lifecycle::{
+    self, BootError, BootOutcome, Bumped, Crashed, LifecycleStore, Marker, Running, Vouched,
+};
 use vrr::message::{Body, Message};
 use vrr::observe::Diagnostic;
 use vrr::progress::Status;
@@ -1355,22 +1358,24 @@ impl NodeStatus {
 
 /// The default state store for a node state path: this crate's own
 /// [`FileStateStore`] over the very disk the node is being built on,
-/// exactly as every entry point defaults its disk. The plumbing is the
-/// disk's plumbing — the store is a parameter of the shared construction
-/// body, and every public entry point builds the default here — so an
-/// embedder mounting its own store has no public injection point yet,
-/// exactly as it has none for a disk (`FileStateStore::new_on` is the
-/// store's own seam, not `Node`'s).
+/// exactly as every defaulting entry point defaults its disk. The
+/// plumbing is the disk's plumbing — the store is a parameter of the
+/// shared construction body, and every defaulting entry point builds the
+/// default here — while the full-shape constructor
+/// ([`Node::open_with_seams`]) takes the store itself: that is the
+/// embedder's public injection point, the same door the disk and the
+/// commit hook ride (`FileStateStore::new_on` remains the store's own
+/// standalone seam).
 fn default_state_store(disk: &Arc<dyn Disk>, state: &str) -> Box<dyn StateStore> {
     Box::new(FileStateStore::new_on(Arc::clone(disk), Path::new(state)))
 }
 
 /// The default commit hook: this crate's own no-op, behind the seam's own
-/// indirection. The plumbing is a parameter of the shared construction body,
-/// beside the disk's and the store's, so an embedder mounting its own hook
-/// has no public injection point yet — exactly as it has none for a disk or
-/// a store (`Node`'s constructors take the seam; `Node::open*` keep
-/// defaulting).
+/// indirection. The plumbing is a parameter of the shared construction
+/// body, beside the disk's and the store's; the defaulting entry points
+/// build the default here, and [`Node::open_with_seams`] takes the hook
+/// itself — the embedder's public injection point, the same door the
+/// disk and the state store ride.
 fn default_commit_hook() -> Arc<Mutex<dyn CommitHook>> {
     Arc::new(Mutex::new(NoOpHook))
 }
@@ -1415,12 +1420,76 @@ impl Node {
                 Arc::clone(&disk),
                 default_state_store(&disk, state),
                 default_commit_hook(),
+                None,
             )
         }))
         .unwrap_or(Err(PANIC))
     }
 
-    /// The standby telemetry variant: the committed-transition hook enqueues
+    /// The full-shape constructor: the embedding host's public injection
+    /// point. Same grammar as [`Node::open`] — `members`, `own`, `state`,
+    /// `journal_dir`, `roll_bytes`, `primary_timeout` — plus the four
+    /// things the machinery is written against, the four seams
+    /// (`docs/src/contract-seam.md`, the embedding API):
+    ///
+    /// * `disk` — every byte of disk access: the journals, the view
+    ///   record, the state file, everything the construction and the run
+    ///   touch.
+    /// * `state_store` — the lock table's persistence, under the
+    ///   persistence law (eager flush on the stop path, lazy load at the
+    ///   first demand).
+    /// * `commit_hook` — the trigger at each applied commit.
+    /// * `fence` — the boot fence, the boot gate's marker store
+    ///   ([`LifecycleStore`], re-exported from `spi`). `None` keeps the
+    ///   industrial default, the superblock quorum store over the state
+    ///   path; `Some(store)` mounts the embedder's own: the boot's
+    ///   classification reads it, the marker machine's rounds go through
+    ///   its `commit`, and the halt's drain rides its `drain` beside the
+    ///   event journal's own drain. What an embedder mounts is the
+    ///   `LifecycleStore` itself; the marker-round schedule and the
+    ///   projection mechanics stay the machinery's.
+    ///
+    /// The defaulting entry points stay exactly as they are —
+    /// [`Node::open`], [`Node::open_aof`],
+    /// [`Node::open_with_recovery_flush`], [`Node::open_bench`], and the
+    /// C ABI's `lunet_lock_node_new` hard-default all four seams and the
+    /// C ABI takes no new surface.
+    // The parameter list IS the mounting grammar, one caller-supplied
+    // fact per parameter: the descriptor buffers and the run's policy,
+    // then the four seams. It pays here for the same reason
+    // [`node_from_sink`]'s pays — the four seams and the six grammar
+    // facts are exactly what an embedder mounts, and folding them into
+    // carriers would hide the mounting grammar behind a shape the
+    // defaulting entry points do not take.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_with_seams(
+        members: &str,
+        own: &str,
+        state: &str,
+        journal_dir: Option<&str>,
+        roll_bytes: u32,
+        primary_timeout: u64,
+        disk: Arc<dyn Disk>,
+        state_store: Box<dyn StateStore>,
+        commit_hook: Arc<Mutex<dyn CommitHook>>,
+        fence: Option<Box<dyn LifecycleStore<Error = io::Error> + Send + Sync>>,
+    ) -> Result<Node, i32> {
+        catch_unwind(AssertUnwindSafe(|| {
+            node_from_parts(
+                members.as_bytes(),
+                own.as_bytes(),
+                state.as_bytes(),
+                journal_dir.filter(|dir| !dir.is_empty()),
+                roll_bytes,
+                primary_timeout,
+                disk,
+                state_store,
+                commit_hook,
+                fence,
+            )
+        }))
+        .unwrap_or(Err(PANIC))
+    }
     /// to the AOF write-behind writer instead of the blocking journal. Same
     /// member/own/state grammar as [`Node::open`]; `aof_dir` is the AOF
     /// series directory (created or resumed); `flush_ms` is the periodic
@@ -1488,6 +1557,7 @@ impl Node {
                 Arc::clone(&disk),
                 default_state_store(&disk, state),
                 default_commit_hook(),
+                None,
             )
         }))
         .unwrap_or(Err(PANIC))
@@ -1530,6 +1600,7 @@ impl Node {
                 // state any more than it writes no marker there.
                 default_state_store(&disk, "bench"),
                 default_commit_hook(),
+                None,
             )
         }))
         .unwrap_or(Err(PANIC))
@@ -2875,7 +2946,9 @@ fn open_journal(
 ///
 /// The parameter list is the construction grammar's, one caller-supplied
 /// fact per parameter — the same shape and the same pay as
-/// [`node_from_sink`]'s, which this forwards to.
+/// [`node_from_sink`]'s, which this forwards to. The fence is the last
+/// parameter: `None` is every defaulting caller's answer, and the
+/// full-shape constructor's fence door forwards through here.
 #[allow(clippy::too_many_arguments)]
 fn node_from_parts(
     members_data: &[u8],
@@ -2887,6 +2960,7 @@ fn node_from_parts(
     disk: Arc<dyn Disk>,
     state_store: Box<dyn StateStore>,
     commit_hook: Arc<Mutex<dyn CommitHook>>,
+    fence: Option<Box<dyn LifecycleStore<Error = io::Error> + Send + Sync>>,
 ) -> Result<Node, i32> {
     let journal = open_journal(Arc::clone(&disk), journal_dir, roll_bytes);
     node_from_sink(
@@ -2900,6 +2974,7 @@ fn node_from_parts(
         disk,
         state_store,
         commit_hook,
+        fence,
     )
 }
 
@@ -2950,6 +3025,7 @@ fn node_from_aof(
         disk,
         state_store,
         commit_hook,
+        None,
     )
 }
 
@@ -2957,8 +3033,9 @@ fn node_from_aof(
 // fact per parameter: the three descriptor buffers, the event sink, the
 // recovery boundary, the bench control socket, the runtime policy, the
 // disk the whole construction crosses, the state store the lock table
-// is flushed to and loaded from, and the commit hook fired at each applied
-// commit. It pays here because folding them
+// is flushed to and loaded from, the commit hook fired at each applied
+// commit, and the boot fence the gate's marker rounds ride (`None` is
+// the industrial default). It pays here because folding them
 // into a carrier struct would rewrite five call sites' signatures — a
 // change to the construction grammar's shape that has nothing to do with
 // the seams, and the seams are the only things this row may move.
@@ -2974,6 +3051,7 @@ fn node_from_sink(
     disk: Arc<dyn Disk>,
     state_store: Box<dyn StateStore>,
     commit_hook: Arc<Mutex<dyn CommitHook>>,
+    fence: Option<Box<dyn LifecycleStore<Error = io::Error> + Send + Sync>>,
 ) -> Result<Node, i32> {
     // The descriptor's grammar refusals: one named path, every branch of
     // it — the grammar is a single shape, so a violation is a single
@@ -3047,10 +3125,13 @@ fn node_from_sink(
     // schedule (see the `marker_store` bridge note and `boot_gate`). The
     // crashed classification is the recovery boundary: a configured E2
     // variant's forced flush executes there, against the caller-provided
-    // scratch directory. The bench harness substitutes the store itself:
-    // `store_ctl` names the driver's control socket and every marker
-    // call rides it (`docs/src/bench-harness.md`); the durable path is
-    // unchanged when no control socket is given.
+    // scratch directory. The fence door is the first shape: a mounted
+    // fence — the embedding constructor's `Some(store)` — is the boot's
+    // classification input and the marker machine's write path, whole.
+    // The bench harness substitutes the store itself: `store_ctl` names
+    // the driver's control socket and every marker call rides it
+    // (`docs/src/bench-harness.md`); the durable path is unchanged when
+    // no control socket is given and no fence is mounted.
     let state_path = PathBuf::from(state);
     let sink: SinkDoor = Arc::new(Mutex::new(journal));
     // The boot gate's marker-round schedule: every machine commit and the
@@ -3058,8 +3139,9 @@ fn node_from_sink(
     // record.
     let marker_log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     #[cfg(unix)]
-    let store = match store_ctl {
-        Some(ctl) => {
+    let store = match (fence, store_ctl) {
+        (Some(fence), _) => GateStore::over(fence, Arc::clone(&sink), Arc::clone(&marker_log)),
+        (None, Some(ctl)) => {
             match GateStore::mem(Path::new(ctl), Arc::clone(&sink), Arc::clone(&marker_log)) {
                 Ok(store) => store,
                 Err(error) => {
@@ -3072,7 +3154,7 @@ fn node_from_sink(
                 }
             }
         }
-        None => GateStore::new(
+        (None, None) => GateStore::new(
             &state_path,
             Arc::clone(&sink),
             system.get(),
@@ -3080,14 +3162,17 @@ fn node_from_sink(
         ),
     };
     #[cfg(not(unix))]
-    let store = {
-        let _ = store_ctl;
-        GateStore::new(
-            &state_path,
-            Arc::clone(&sink),
-            system.get(),
-            Arc::clone(&marker_log),
-        )
+    let store = match (fence, store_ctl) {
+        (Some(fence), _) => GateStore::over(fence, Arc::clone(&sink), Arc::clone(&marker_log)),
+        (None, _) => {
+            let _ = store_ctl;
+            GateStore::new(
+                &state_path,
+                Arc::clone(&sink),
+                system.get(),
+                Arc::clone(&marker_log),
+            )
+        }
     };
     let decision = boot_gate(
         &*disk,
@@ -3404,6 +3489,7 @@ pub unsafe extern "C" fn lunet_lock_node_new(
                 Arc::clone(&disk),
                 default_state_store(&disk, std::str::from_utf8(state_data).unwrap_or_default()),
                 default_commit_hook(),
+                None,
             )
         })) {
             Ok(Ok(node)) => {

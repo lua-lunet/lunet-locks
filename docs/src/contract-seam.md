@@ -15,6 +15,13 @@ measures it, and an industrial deployment that must survive real disks, real
 crashes, and real operators. The machinery is one body of code; the
 environments are interchangeable implementations of the three traits.
 
+The boot fence is the fourth mounting point and not a fourth contract of
+this crate's own: the boot gate's marker store is upstream's
+`LifecycleStore` (`vrr::lifecycle`), and the machinery here routes the
+boot's classification and the marker machine's rounds through it. The
+embedding API, at the end of this document, states the full mounting
+grammar — the three traits and the fence — as one public constructor.
+
 ## The traits
 
 - **`Disk`** — every byte of disk access. Open, read, write, append, flush,
@@ -104,3 +111,50 @@ submodule and no `[patch]` override: the tag in the manifest is the code that
 builds, and a version bump is a one-line manifest diff that review sees as a
 version bump. When the upstream demo ships, the tag bumps, and the industrial
 implementations mount onto the tested core without the machinery changing.
+
+## The embedding API
+
+An embedder mounts its environment on a real node through one public door,
+`Node::open_with_seams`, beside the defaulting entry points and never
+instead of them. Its parameters after the C ABI's own grammar — the member
+descriptor, the local member's name, the state path, the journal directory
+and roll threshold, the primary timeout — are the four things the machinery
+is written against, and nothing else:
+
+- **`disk: Arc<dyn Disk>`** — every byte of disk access: the journals, the
+  view record, the state file, everything the construction and the run
+  touch.
+- **`state_store: Box<dyn StateStore>`** — the lock table's persistence,
+  under the persistence law.
+- **`commit_hook: Arc<Mutex<dyn CommitHook>>`** — the trigger at each
+  applied commit.
+- **`fence: Option<Box<dyn LifecycleStore<Error = io::Error>>>`** — the
+  boot fence, the boot gate's marker store and the fourth touch point.
+  `None` keeps the industrial default: the superblock quorum store over
+  the state path, the Zig engine's quorum-of-copies construction with the
+  single-file projection mirror. `Some(store)` mounts the embedder's own
+  `LifecycleStore`: the boot's classification reads it, the marker
+  machine's rounds — the first-life latch, the halt's `Stopping` round
+  and its drain-proven `Stopped` round, the crashed boot's deferred
+  latch — go through its `commit`, and the halt's drain rides its `drain`
+  beside the event journal's own drain. What an embedder mounts is the
+  `LifecycleStore` itself, the trait the boot-gate chapter defines; the
+  marker-round schedule and the projection mechanics stay the machinery's
+  and are never the embedder's to rewrite. A mounted fence reports
+  `io::Error`, the object shape's pinned failure type.
+
+The trait names hang off `spi`, the seam's front door: `LifecycleStore` is
+re-exported there beside the three traits, so the whole mounting grammar is
+nameable from one surface.
+
+What stays defaulted is everything else: the member grammar and its
+refusals, the identity law, the boot-gate classification and its census
+tape, the halt schedule's marker rounds, the drain window, the eager flush
+and the lazy load. The seams are the only things an embedder mounts; the
+machinery above them is one body of code, and an embedder changes nothing
+above them.
+
+The C ABI stays default-only. `lunet_lock_node_new` and every other C entry
+point build the industrial defaults exactly as `Node::open` does; no C
+surface exists for the seams: an embedder that wants its own environment
+binds the Rust API.

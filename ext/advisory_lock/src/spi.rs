@@ -15,6 +15,10 @@
 //!   more: the machinery does not know what the callback does and does not
 //!   care.
 //!
+//! The boot fence — upstream's [`LifecycleStore`], the boot gate's marker
+//! store — rides beside the three as the fourth mounting point, and the
+//! embedding API states the whole grammar as one public constructor.
+//!
 //! Nothing else crosses the boundary. There is no ambient filesystem, no
 //! global, no environment reach-around, and no verdict the machinery reads
 //! back out of a callback. An embedder that wants the third environment —
@@ -91,6 +95,7 @@ use vrr::ids::Slot;
 pub use crate::disk::{Disk, DiskDirEntry, DiskFile, StdDisk, std_disk};
 pub use crate::locks::StateSnapshot;
 pub use crate::state::{FileStateStore, StateStore};
+pub use vrr::lifecycle::LifecycleStore;
 
 /// A trigger fired at each applied commit.
 ///

@@ -1,10 +1,12 @@
 //! Advisory locks over the external Viewstamped Replication core.
 //!
 //! The machinery is written against three contracts — [`spi::Disk`],
-//! [`spi::StateStore`] and [`spi::CommitHook`] — and nothing else crosses
-//! the boundary between the protocol and whatever environment it runs in.
-//! [`spi`] is the one named surface both sides are written against, and its
-//! module doc is the normative division of labour.
+//! [`spi::StateStore`] and [`spi::CommitHook`] — with the boot fence's
+//! [`spi::LifecycleStore`] re-exported beside them as the fourth mounting
+//! point. Nothing else crosses the boundary between the protocol and
+//! whatever environment it runs in. [`spi`] is the one named surface both
+//! sides are written against, and its module doc is the normative
+//! division of labour.
 
 pub mod aof;
 /// The disk seam: the one contract every byte this crate reads or writes

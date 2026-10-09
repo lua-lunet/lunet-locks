@@ -257,12 +257,37 @@ impl MemBackend {
 enum Backend {
     Disk { state: PathBuf },
     Mem(MemBackend),
+    Mounted(MountedFence),
 }
 
-/// The durable-only backend: non-unix builds carry no bench.
+/// The durable-only backend: non-unix builds carry no bench, and the
+/// mounted fence is in both builds.
 #[cfg(not(unix))]
 enum Backend {
     Disk { state: PathBuf },
+    Mounted(MountedFence),
+}
+
+/// The mounted fence, in both builds: the embedder's own
+/// [`LifecycleStore`], handed to [`GateStore::over`] by the embedding
+/// constructor and riding the boot gate's every marker call. The mutex is
+/// the `&mut` the trait's contract names: the boot gate reaches the fence
+/// through a shared reference (`Clean::store`/`Crashed::store` hand back
+/// `&S`), and the machine's write path stays the trait's own `commit`.
+/// `Send + Sync` because the fence is the fourth seam: the node carries
+/// it the way it carries its `Disk`, `StateStore` and `CommitHook` —
+/// including across the thread boundary a host spawns (`Send`), and the
+/// seam family's own sharing bar (`Sync`).
+type MountedFence = Mutex<Box<dyn LifecycleStore<Error = io::Error> + Send + Sync>>;
+
+/// Locks the mounted fence. A poisoned lock (a panic while held) is
+/// unlocked: the same discipline the sink door takes — the fence's
+/// durable state is the embedder's own machine's, not an invariant of
+/// this adapter's.
+fn fence_guard(
+    fence: &MountedFence,
+) -> MutexGuard<'_, Box<dyn LifecycleStore<Error = io::Error> + Send + Sync>> {
+    fence.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// The engine marker's name, spelled as the engine's own vocabulary
@@ -279,7 +304,10 @@ fn machine_word(marker: Marker) -> &'static str {
 
 /// The host's durable mechanics for the boot gate: the superblock quorum
 /// store plus the single-file projection, wired to the committed-
-/// transition sink for the halt's drain. The system identifier is the
+/// transition sink for the halt's drain — or the bench harness's
+/// in-memory driver store, or the embedding constructor's mounted fence
+/// ([`GateStore::over`]), the embedder's own [`LifecycleStore`]. The
+/// system identifier is the
 /// descriptor's own member's system half — the projection read is
 /// checked against it. The `ops` log records every marker round the
 /// boot-gate machine wrote (`commit:<Marker>@<packed identity>`) and the
@@ -309,6 +337,27 @@ impl GateStore {
             },
             sink,
             system,
+            ops,
+        }
+    }
+
+    /// The mounted fence: the embedder's own boot-gate store, handed up
+    /// by the embedding constructor ([`Node::open_with_seams`]'s fence
+    /// parameter — the fence door). The marker machine's rounds ride the
+    /// mounted store's `commit`, the halt's drain rides its `drain`
+    /// beside the node's own sink drain, and the boot's read rides its
+    /// `read_copies`. The system identifier carries nothing here — the
+    /// mounted store owns its own durable mechanics, and the projection
+    /// cross-system check is the disk backend's, not the trait's.
+    pub(crate) fn over(
+        fence: Box<dyn LifecycleStore<Error = io::Error> + Send + Sync>,
+        sink: SinkDoor,
+        ops: Arc<Mutex<Vec<String>>>,
+    ) -> GateStore {
+        GateStore {
+            backend: Backend::Mounted(Mutex::new(fence)),
+            sink,
+            system: 0,
             ops,
         }
     }
@@ -377,25 +426,38 @@ impl GateStore {
                 }))?;
                 MemBackend::ack(&reply)
             }
+            // The mounted fence's round is the trait's own write shape:
+            // the machine's uniform 4x `(identity, Joining)` copies
+            // through the mounted `commit` — the same round the deferred
+            // latch re-writes idempotently once the seated observation
+            // mints its witness.
+            Backend::Mounted(fence) => {
+                fence_guard(fence).commit(&uniform(identity, Marker::Joining))
+            }
         }
     }
 
     /// The clean classification's view record (the stop's drain-window
     /// write): the view the node stopped at. `None` when no stop ever
     /// wrote one. The mem backend carries none (the bench driver holds
-    /// the state in memory and answers its own discipline).
+    /// the state in memory and answers its own discipline), and the
+    /// mounted fence carries none either: the embedder's fence owns its
+    /// own durable mechanics, and a boot over it resumes fenced at the
+    /// genesis view exactly as a boot without a record does.
     #[cfg(unix)]
     pub(crate) fn view_record(&self) -> io::Result<Option<ViewRecord>> {
         match &self.backend {
             Backend::Disk { state } => read_view_record(state),
-            Backend::Mem(_) => Ok(None),
+            Backend::Mem(_) | Backend::Mounted(_) => Ok(None),
         }
     }
 
     #[cfg(not(unix))]
     pub(crate) fn view_record(&self) -> io::Result<Option<ViewRecord>> {
-        let Backend::Disk { state } = &self.backend;
-        read_view_record(state)
+        match &self.backend {
+            Backend::Disk { state } => read_view_record(state),
+            Backend::Mounted(_) => Ok(None),
+        }
     }
 }
 
@@ -568,8 +630,9 @@ impl LifecycleStore for GateStore {
 
     #[cfg(unix)]
     fn read_copies(&mut self) -> Result<Option<SuperblockCopies>, Self::Error> {
-        match &self.backend {
+        match &mut self.backend {
             Backend::Disk { state } => read_copies_disk(state, self.system),
+            Backend::Mounted(fence) => fence_guard(fence).read_copies(),
             Backend::Mem(mem) => {
                 let reply = mem.rpc(&serde_json::json!({"op": "read"}))?;
                 match reply.get("verdict").and_then(|v| v.as_str()) {
@@ -606,8 +669,9 @@ impl LifecycleStore for GateStore {
 
     #[cfg(not(unix))]
     fn read_copies(&mut self) -> Result<Option<SuperblockCopies>, Self::Error> {
-        match &self.backend {
+        match &mut self.backend {
             Backend::Disk { state } => read_copies_disk(state, self.system),
+            Backend::Mounted(fence) => fence_guard(fence).read_copies(),
         }
     }
 
@@ -619,7 +683,7 @@ impl LifecycleStore for GateStore {
             copies.copies.iter().all(|one| *one == copy),
             "the boot gate's rewrites are uniform 4x"
         );
-        let result = match &self.backend {
+        let result = match &mut self.backend {
             Backend::Disk { state } => commit_disk(state, copy),
             #[cfg(unix)]
             Backend::Mem(mem) => {
@@ -630,6 +694,7 @@ impl LifecycleStore for GateStore {
                 }))?;
                 MemBackend::ack(&reply)
             }
+            Backend::Mounted(fence) => fence_guard(fence).commit(copies),
         };
         if result.is_ok() {
             self.ops
@@ -645,23 +710,27 @@ impl LifecycleStore for GateStore {
     }
 
     fn drain(&mut self) -> Result<(), Self::Error> {
-        let result = drain_sink(&mut sink_guard(&self.sink));
-        let mem_result = result.and_then(|()| {
-            #[cfg(unix)]
-            {
-                if let Backend::Mem(mem) = &self.backend {
+        // The sink drain is the node's own obligation — every record the
+        // event journal holds, forced — and the mounted fence's `drain`
+        // rides the same halt seat beside it: the machine's
+        // `Marker::Stopped` round is written only over a proven drain, so
+        // the fence's durable state is forced here with the journal's.
+        let result =
+            drain_sink(&mut sink_guard(&self.sink)).and_then(|()| match &mut self.backend {
+                Backend::Mounted(fence) => fence_guard(fence).drain(),
+                Backend::Disk { .. } => Ok(()),
+                #[cfg(unix)]
+                Backend::Mem(mem) => {
                     let reply = mem.rpc(&serde_json::json!({"op": "drain"}))?;
-                    return MemBackend::ack(&reply);
+                    MemBackend::ack(&reply)
                 }
-            }
-            Ok(())
-        });
-        if mem_result.is_ok() {
+            });
+        if result.is_ok() {
             self.ops
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .push("drain".to_string());
         }
-        mem_result
+        result
     }
 }

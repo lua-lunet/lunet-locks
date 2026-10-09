@@ -12,10 +12,10 @@
 //! compiling at all is the proof the seam's public surface is complete;
 //! the behaviour assertions pin the delegation.
 //!
-//! The node itself has no public injection point: the `Node::open*`
-//! entry points hard-default their disk, and the mounted-engine door is
-//! a deferred decision. This test proves the trait and its types — not
-//! a node mount.
+//! The node's public injection point is the full-shape constructor
+//! (`Node::open_with_seams`), which mounts the disk, the store, the hook
+//! and the boot fence in one call; its sibling `seam_mount_test.rs` proves
+//! that door on a real node. This test pins the trait surface itself.
 
 use std::collections::BTreeMap;
 use std::fs;
