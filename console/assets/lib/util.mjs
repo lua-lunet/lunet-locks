@@ -1,24 +1,24 @@
 // Small pure helpers shared by the components.
 
-export const esc = (s) =>
-  String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+export const esc = (/** @type {unknown} */ s) =>
+  String(s ?? "").replace(/[&<>"']/g, (c) => /** @type {Record<string, string>} */ ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
 
-const pad = (n) => String(n).padStart(2, "0");
+const pad = (/** @type {number} */ n) => String(n).padStart(2, "0");
 
-export function fmtClock(ms) {
+export function fmtClock(/** @type {number} */ ms) {
   const d = new Date(ms);
   return pad(d.getHours()) + ":" + pad(d.getMinutes()) + ":" + pad(d.getSeconds());
 }
 
-export function fmtDur(ms) {
+export function fmtDur(/** @type {number} */ ms) {
   const s = Math.max(0, Math.round(ms / 1000));
   if (s < 60) return s + "s";
   if (s < 3600) return Math.floor(s / 60) + "m " + (s % 60) + "s";
   return Math.floor(s / 3600) + "h " + Math.floor((s % 3600) / 60) + "m";
 }
 
-// "HH:MM[:SS]" → epoch ms today; null when unparsable.
-export function parseClock(text, baseMs) {
+/** "HH:MM[:SS]" → epoch ms today; null when unparsable. */
+export function parseClock(/** @type {string} */ text, /** @type {number} */ baseMs) {
   const m = /^(\d{1,2}):(\d{2})(?::(\d{2}))?$/.exec((text ?? "").trim());
   if (!m) return null;
   const d = new Date(baseMs);
@@ -26,12 +26,32 @@ export function parseClock(text, baseMs) {
   return d.getTime();
 }
 
+/**
+ * @template {unknown[]} A
+ * @param {(...args: A) => void} fn
+ * @param {number} ms
+ * @returns {(...args: A) => void}
+ */
 export function debounce(fn, ms) {
+  /** @type {ReturnType<typeof setTimeout> | undefined} */
   let t;
   return (...args) => {
     clearTimeout(t);
     t = setTimeout(() => fn(...args), ms);
   };
+}
+
+/**
+ * Click-delegation helper: the event target narrowed to its closest matching
+ * element, or null. The components bind `onclick` on their root and resolve
+ * the actual row/button through this.
+ * @param {MouseEvent} e
+ * @param {string} selector
+ * @returns {HTMLElement | null}
+ */
+export function closestFromEvent(e, selector) {
+  const t = e.target;
+  return t instanceof Element ? /** @type {HTMLElement | null} */ (t.closest(selector)) : null;
 }
 
 export const ICONS = {

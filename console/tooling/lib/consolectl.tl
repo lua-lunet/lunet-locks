@@ -139,9 +139,44 @@ local function ensureCredentials(p: Paths): string, string, boolean
     return "admin", pw, true
 end
 
+-- Does anything answer on this loopback port? A connection-level response
+-- (any status, or even a TLS/protocol mismatch error) proves a listener;
+-- curl prints 000 only when nothing accepts the connection.
+local function portHeld(port: string): boolean
+    local code = sh(
+        string.format(
+            'curl -s -o /dev/null --max-time 1 -w "%%{http_code}" "http://127.0.0.1:%s/"',
+            port
+        )
+    )
+    return code ~= "000" and code ~= ""
+end
+
+-- The owning pid of a listening port, for operator disclosure only.
+local function holderPid(port: string): string
+    return sh("lsof -t -nP -iTCP:" .. port .. " -sTCP:LISTEN 2>/dev/null")
+end
+
 local function startMock(p: Paths, mockPort: string)
     if alive(p.mockPid) then
         return
+    end
+    -- The pidfile race: alive() trusts the pidfile, so a lost pidfile with a
+    -- live listener would spawn a second mock and EADDRINUSE-loop forever
+    -- (mock.log, Oct 2026). Probe the port before spawning; a held port with
+    -- a stale pidfile is the operator's call — never a silent kill of an
+    -- unknown process.
+    if portHeld(mockPort) then
+        local holder = holderPid(mockPort)
+        io.stderr:write(
+            string.format(
+                "ERROR: mock port %s is held (pid %s) but the pidfile (%s) is stale or absent; run `make -C console down` or kill the named pid, then retry\n",
+                mockPort,
+                holder ~= "" and holder or "<unknown>",
+                p.mockPid
+            )
+        )
+        os.exit(1)
     end
     local cmd = string.format(
         '(cd "%s/mock" && MOCK_PORT=%s exec bun admin.mjs) >> "%s" 2>&1 & echo $!',

@@ -3,13 +3,13 @@
 // hierarchical display paths, so this is a single-level grouping.
 
 import { store } from "../lib/state.mjs";
-import { esc } from "../lib/util.mjs";
+import { esc, closestFromEvent } from "../lib/util.mjs";
 
 class LaTree extends HTMLElement {
   connectedCallback() {
     this._unsub = store.subscribe(() => this.render());
     this.onclick = (e) => {
-      const row = e.target.closest(".tree-row");
+      const row = closestFromEvent(e, ".tree-row");
       if (!row) return;
       const id = Number(row.dataset.id);
       if (!isNaN(id)) store.set({ selectedId: id });

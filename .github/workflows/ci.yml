@@ -136,6 +136,36 @@ jobs:
           name: release-${{ matrix.target_key }}
           path: lunet-locks-${{ matrix.target_key }}.tar.gz
           retention-days: 5
+  # The console's static gate: shellcheck + the SPA's tsc --noEmit type gate
+  # + the tooling's Teal check. Platform-independent, so one lane on the fast
+  # Linux image gates every PR; no runtime services needed. The ext crates
+  # (lock_feed included) ride the `test` job's `make test` via the Makefile's
+  # ext/ext-check/ext-test targets — no separate job for them.
+  console-check:
+    name: Console static gate
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes luajit libluajit-5.1-dev luarocks perl
+          # LuaJIT shim prefix; see the test job for why this exists.
+          sudo mkdir -p /opt/luajit-shim/bin
+          sudo ln -sf /usr/bin/luajit /opt/luajit-shim/bin/lua
+          sudo ln -sf /usr/bin/luajit /opt/luajit-shim/bin/luajit
+          sudo ln -sfn /usr/include /opt/luajit-shim/include
+          sudo ln -sfn /usr/lib /opt/luajit-shim/lib
+      # shellcheck is preinstalled on the ubuntu-24.04 image; TypeScript is
+      # pinned here so `make -C console mjs-check` runs offline.
+      - name: Install TypeScript (pinned for the SPA's .mjs type gate)
+        run: npm install --global typescript@6.0.3
+      - name: Install project Lua tools
+        run: make deps LUAJIT_DIR=/opt/luajit-shim
+      - name: Console static gate
+        run: make -C console check LUAJIT_DIR=/opt/luajit-shim
   # Tagged builds only: the docker/* simulation against a release build of
   # the native adapter, on both Linux architectures.
   docker-simulation:

@@ -3,15 +3,16 @@
 // journal feed is read-only and does not expose a break channel.
 
 import { store } from "../lib/state.mjs";
-import { esc, fmtClock, fmtDur, ICONS } from "../lib/util.mjs";
+import { esc, fmtClock, fmtDur, closestFromEvent, ICONS } from "../lib/util.mjs";
 
 class LaDetail extends HTMLElement {
   connectedCallback() {
     this._unsub = store.subscribe(() => this.render());
     this.onclick = (e) => {
-      if (e.target.closest("[data-act=close]")) store.set({ selectedId: null });
-      if (e.target.closest("[data-act=watch]")) {
+      if (closestFromEvent(e, "[data-act=close]")) store.set({ selectedId: null });
+      if (closestFromEvent(e, "[data-act=watch]")) {
         const id = store.state.selectedId;
+        if (id === null) return;
         const watched = new Set(store.state.watched);
         if (watched.has(id)) watched.delete(id); else watched.add(id);
         store.set({ watched });
@@ -47,8 +48,7 @@ class LaDetail extends HTMLElement {
       `<div class="ev"><span class="t">${fmtClock(e.ts)}</span><span class="ev-${esc(e.kind)}">${esc(e.kind)}</span><span class="a">${esc(e.holder)}</span></div>`
     ).join("");
 
-    const body = this.querySelector(".detail-body");
-    const scrollTop = body ? body.scrollTop : 0;
+    const scrollTop = this.querySelector(".detail-body")?.scrollTop ?? 0;
     this.innerHTML = `<div class="detail">
       <div class="detail-head">
         <div class="path">lock ${l.lockId}</div>
@@ -65,7 +65,7 @@ class LaDetail extends HTMLElement {
       </div>
       <div style="padding:8px 12px;font-size:11px;color:var(--color-neutral-500);font-family:var(--font-mono)">break unavailable: journal feed is read-only</div>
     </div>`;
-    this.querySelector(".detail-body").scrollTop = scrollTop;
+    /** @type {HTMLElement} */ (this.querySelector(".detail-body")).scrollTop = scrollTop;
   }
 }
 

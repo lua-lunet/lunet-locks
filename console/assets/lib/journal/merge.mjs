@@ -15,6 +15,9 @@
 import { store } from "../state.mjs";
 import { db } from "../db.mjs";
 
+/** @typedef {import("../types.mjs").JournalEvent} JournalEvent */
+/** @typedef {import("../types.mjs").RateBucket} RateBucket */
+
 const SESSION_KEY = "lock-admin-live";
 const MAX_RECENT_EVENTS = 500;
 const RATE_WINDOW_SEC = 300; // keep 5 minutes of rate buckets
@@ -22,18 +25,22 @@ const RATE_WINDOW_SEC = 300; // keep 5 minutes of rate buckets
 // ---- internal state ----
 
 /** Map<lockId, {leaseId, holder, expiry, acquiredTs, renewCount}> */
+/** @type {Map<number, {leaseId: number, holder: string, expiry: number, acquiredTs: number, renewCount: number}>} */
 const activeLocks = new Map();
 
 /**
  * Pending tombstones: releases that arrived before their acquisition.
  * Map<"lockId:leaseId", {ts, expiry}>
  */
+/** @type {Map<string, {ts: number, expiry: number}>} */
 const pendingTombstones = new Map();
 
 /** Rate buckets: Map<tsSec, {acquire, renew, release}> */
+/** @type {Map<number, RateBucket>} */
 const rateBuckets = new Map();
 
 /** Recent events ring buffer (newest first). */
+/** @type {JournalEvent[]} */
 let recentEvents = [];
 
 /** Status counters. */
@@ -48,16 +55,29 @@ let wsConnected = false;
  */
 const seenKeys = new Set();
 
+/**
+ * @param {JournalEvent} ev
+ * @returns {string}
+ */
 function eventKey(ev) {
   return `${ev.ts}:${ev.lockId}:${ev.leaseId}`;
 }
 
 // ---- helpers ----
 
+/**
+ * @param {number} lockId
+ * @param {number} leaseId
+ * @returns {string}
+ */
 function tombstoneKey(lockId, leaseId) {
   return `${lockId}:${leaseId}`;
 }
 
+/**
+ * @param {number} tsMs
+ * @param {JournalEvent["kind"]} kind
+ */
 function bumpRate(tsMs, kind) {
   const sec = Math.floor(tsMs / 1000);
   let b = rateBuckets.get(sec);
@@ -77,6 +97,9 @@ function pruneRates() {
   }
 }
 
+/**
+ * @param {JournalEvent} ev
+ */
 function addRecentEvent(ev) {
   recentEvents.unshift(ev);
   if (recentEvents.length > MAX_RECENT_EVENTS) {
@@ -87,6 +110,7 @@ function addRecentEvent(ev) {
 /**
  * Apply a single event to the active-lock set and tombstone map.
  * Implements the tombstone-ahead rule.
+ * @param {JournalEvent} ev
  */
 function applyEvent(ev) {
   const { kind, ts, lockId, leaseId, holder, expiry } = ev;
@@ -157,11 +181,13 @@ function flushToStore() {
   pruneRates();
 
   // Build sorted rate bucket array.
+  /** @type {RateBucket[]} */
   const buckets = [...rateBuckets.values()].sort((a, b) => a.tsSec - b.tsSec);
   const bucketSec = buckets.length ? buckets[0].tsSec : Math.floor(Date.now() / 1000);
 
   // Build active locks array, filtering expired.
   const now = Date.now();
+  /** @type {import("../types.mjs").JournalLock[]} */
   const locks = [];
   for (const [lockId, info] of activeLocks) {
     if (info.expiry > now) {
@@ -184,19 +210,28 @@ function flushToStore() {
 
 // ---- session storage replay ----
 
+/**
+ * @param {any} buf
+ */
+function replaySessionBuffer(buf) {
+  if (!Array.isArray(buf)) return;
+  // Replay through the same apply logic (tombstone-aware).
+  for (const ev of buf) {
+    applyEvent(ev);
+  }
+}
+
 function loadSessionBuffer() {
   try {
     const raw = sessionStorage.getItem(SESSION_KEY);
     if (!raw) return;
-    const buf = JSON.parse(raw);
-    if (!Array.isArray(buf)) return;
-    // Replay through the same apply logic (tombstone-aware).
-    for (const ev of buf) {
-      applyEvent(ev);
-    }
+    replaySessionBuffer(JSON.parse(raw));
   } catch (_) {}
 }
 
+/**
+ * @param {JournalEvent[]} events
+ */
 function saveSessionBuffer(events) {
   try {
     // Keep only the latest events in session storage (bounded).
@@ -244,6 +279,8 @@ export async function initMerge() {
 /**
  * Ingest a batch of events from a pulled file. Writes to IndexedDB and
  * updates the store.
+ * @param {string} name
+ * @param {JournalEvent[]} events
  */
 export async function ingestFileEvents(name, events) {
   if (!events.length) return;
@@ -263,6 +300,7 @@ export async function ingestFileEvents(name, events) {
 
 /**
  * Ingest a single live event from the WebSocket. Mirrors to session storage.
+ * @param {JournalEvent} ev
  */
 export function ingestLiveEvent(ev) {
   applyEvent(ev);
@@ -270,14 +308,19 @@ export function ingestLiveEvent(ev) {
   flushToStore();
 }
 
-/** Update file counts from the worker. */
+/** Update file counts from the worker.
+ * @param {number} total
+ * @param {number} loaded
+ */
 export function updateFilesStatus(total, loaded) {
   filesTotal = total;
   filesLoaded = loaded;
   flushToStore();
 }
 
-/** Update WS connection status. */
+/** Update WS connection status.
+ * @param {boolean} connected
+ */
 export function updateWsStatus(connected) {
   wsConnected = connected;
   flushToStore();

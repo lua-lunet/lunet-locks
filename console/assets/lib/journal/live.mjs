@@ -2,16 +2,19 @@
 // event messages to a callback, and tells the loader worker when a file rolls.
 // Auto-reconnects with exponential backoff. Exposes wsConnected state.
 
+/** @typedef {import("../types.mjs").JournalEvent} JournalEvent */
+
 const BASE_DELAY_MS = 500;
 const MAX_DELAY_MS = 30000;
 
 /**
  * @param {object} opts
- * @param {(event: object) => void} opts.onEvent - called for each live event
- * @param {(rolled: object) => void} opts.onRolled - called when a file rolls
+ * @param {(event: JournalEvent) => void} opts.onEvent - called for each live event
+ * @param {(rolled: {type: string, file: string}) => void} opts.onRolled - called when a file rolls
  * @param {(connected: boolean) => void} opts.onStatus - connection status
  */
 export function connectJournalWs({ onEvent, onRolled, onStatus }) {
+  /** @type {WebSocket | null} */
   let ws = null;
   let delay = BASE_DELAY_MS;
   let closed = false;

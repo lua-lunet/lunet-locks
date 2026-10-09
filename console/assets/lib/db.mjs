@@ -1,9 +1,14 @@
 // IndexedDB cache for telemetry history. The mock keeps minutes; the browser
 // keeps hours — buckets and events survive reloads and mock restarts.
 
+/** @typedef {import("./types.mjs").Bucket} Bucket */
+/** @typedef {import("./types.mjs").Event} Event */
+/** @typedef {import("./types.mjs").JournalEvent} JournalEvent */
+
 const DB_NAME = "lock-admin";
 const DB_VERSION = 2;
 
+/** @returns {Promise<IDBDatabase>} */
 function open() {
   return new Promise((resolve, reject) => {
     const req = indexedDB.open(DB_NAME, DB_VERSION);
@@ -24,6 +29,13 @@ function open() {
   });
 }
 
+/**
+ * @param {IDBDatabase} db
+ * @param {string} store
+ * @param {IDBTransactionMode} mode
+ * @param {(s: IDBObjectStore) => IDBRequest | void} fn
+ * @returns {Promise<any>}
+ */
 function tx(db, store, mode, fn) {
   return new Promise((resolve, reject) => {
     const t = db.transaction(store, mode);
@@ -34,6 +46,10 @@ function tx(db, store, mode, fn) {
 }
 
 export const db = {
+  /**
+   * @param {Event[]} events
+   * @returns {Promise<void>}
+   */
   async cacheEvents(events) {
     if (!events.length) return;
     const d = await open();
@@ -42,6 +58,10 @@ export const db = {
     });
     d.close();
   },
+  /**
+   * @param {Bucket[]} buckets
+   * @returns {Promise<void>}
+   */
   async cacheBuckets(buckets) {
     if (!buckets.length) return;
     const d = await open();
@@ -50,6 +70,10 @@ export const db = {
     });
     d.close();
   },
+  /**
+   * @param {number} fromMs
+   * @returns {Promise<Bucket[]>}
+   */
   async readBuckets(fromMs) {
     const d = await open();
     const out = await new Promise((resolve, reject) => {
@@ -59,8 +83,12 @@ export const db = {
       req.onerror = () => reject(req.error);
     });
     d.close();
-    return out;
+    return /** @type {Bucket[]} */ (out);
   },
+  /**
+   * @param {number} olderThanMs
+   * @returns {Promise<void>}
+   */
   async prune(olderThanMs) {
     const d = await open();
     await tx(d, "events", "readwrite", (s) => {
@@ -78,7 +106,11 @@ export const db = {
 
   // ---- Journal stores (v2) ----
 
-  /** Upsert journal events (idempotent by [ts, lockId, leaseId] key). */
+  /**
+   * Upsert journal events (idempotent by [ts, lockId, leaseId] key).
+   * @param {JournalEvent[]} events
+   * @returns {Promise<void>}
+   */
   async putJournalEvents(events) {
     if (!events.length) return;
     const d = await open();
@@ -88,7 +120,11 @@ export const db = {
     d.close();
   },
 
-  /** Mark a rolled file as fully ingested. */
+  /**
+   * Mark a rolled file as fully ingested.
+   * @param {string} name
+   * @returns {Promise<void>}
+   */
   async markFileLoaded(name) {
     const d = await open();
     await tx(d, "loadedFiles", "readwrite", (s) => {
@@ -97,7 +133,10 @@ export const db = {
     d.close();
   },
 
-  /** Get all previously loaded file names. */
+  /**
+   * Get all previously loaded file names.
+   * @returns {Promise<string[]>}
+   */
   async getLoadedFiles() {
     const d = await open();
     const rows = await new Promise((resolve, reject) => {
@@ -106,10 +145,13 @@ export const db = {
       req.onerror = () => reject(req.error);
     });
     d.close();
-    return rows.map((r) => r.name);
+    return /** @type {{name: string}[]} */ (rows).map((r) => r.name);
   },
 
-  /** Read all journaled events, ordered by their [ts, lockId, leaseId] key. */
+  /**
+   * Read all journaled events, ordered by their [ts, lockId, leaseId] key.
+   * @returns {Promise<JournalEvent[]>}
+   */
   async readJournalEvents() {
     const d = await open();
     const rows = await new Promise((resolve, reject) => {
@@ -118,6 +160,6 @@ export const db = {
       req.onerror = () => reject(req.error);
     });
     d.close();
-    return rows;
+    return /** @type {JournalEvent[]} */ (rows);
   },
 };

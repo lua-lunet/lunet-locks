@@ -16,9 +16,16 @@ import { parseClock } from "./lib/util.mjs";
 import { initMerge, ingestFileEvents, ingestLiveEvent, updateFilesStatus, updateWsStatus } from "./lib/journal/merge.mjs";
 import { connectJournalWs } from "./lib/journal/live.mjs";
 
+/** @typedef {import("./lib/types.mjs").HttpError} HttpError */
+/** @typedef {import("./lib/types.mjs").LocksParams} LocksParams */
+
 // Failure bookkeeping: any failing poller surfaces on the status bar, and
 // the message clears once every poller succeeds again.
 const failures = new Set();
+/**
+ * @param {string} name
+ * @param {unknown} err
+ */
 function report(name, err) {
   if (err) failures.add(name); else failures.delete(name);
   store.set({ error: failures.size ? `api unreachable: ${[...failures].join(", ")}` : "" });
@@ -29,7 +36,7 @@ async function refreshCluster() {
     // The bridge replays one standby's committed stream; it carries no
     // live membership. The header says so instead of polling a 404.
     store.set({
-      cluster: { era: "—", view: "—", leader: "aof bridge", nodes: [] },
+      cluster: { era: "—", view: "—", leader: "aof bridge", nowMs: Date.now(), nodes: [] },
     });
     report("cluster", null);
     return;
@@ -51,6 +58,7 @@ async function refreshLocksAll() {
 
 async function refreshLocks() {
   const st = store.state;
+  /** @type {LocksParams} */
   const params = { q: st.query };
   if (st.mode === "expiry") {
     const at = parseClock(st.atText, Date.now());
@@ -74,7 +82,7 @@ async function refreshDetail() {
     store.set({ detail });
   } catch (e) {
     // Only a genuine 404 drops the selection; transient failures keep it.
-    if (e.status === 404) store.set({ selectedId: null, detail: null });
+    if (/** @type {HttpError} */ (e).status === 404) store.set({ selectedId: null, detail: null });
   }
 }
 
@@ -124,6 +132,10 @@ window.addEventListener("la:refresh", () => {
 // In-flight guards: a slow tick skips the next one rather than piling up
 // requests that could resolve out of order.
 const pending = new Set();
+/**
+ * @param {string} name
+ * @param {() => unknown} fn
+ */
 function guard(name, fn) {
   if (pending.has(name)) return;
   pending.add(name);

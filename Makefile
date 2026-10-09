@@ -225,6 +225,7 @@ ext: ext-test
 	cargo build --release --manifest-path ext/advisory_lock/Cargo.toml
 	cargo build --release --manifest-path ext/lunet-locks-aof/Cargo.toml
 	cargo build --release --manifest-path ext/paxe-core/Cargo.toml
+	cargo build --release --manifest-path ext/lock_feed/Cargo.toml
 
 ext-check:
 	cargo fmt --manifest-path ext/advisory_lock/Cargo.toml -- --check
@@ -234,6 +235,8 @@ ext-check:
 	mise exec -- zig fmt --check ext/lunet-locks-aof/zig/src
 	cargo fmt --manifest-path ext/paxe-core/Cargo.toml -- --check
 	cargo clippy --manifest-path ext/paxe-core/Cargo.toml --all-targets -- -D warnings
+	cargo fmt --manifest-path ext/lock_feed/Cargo.toml -- --check
+	cargo clippy --manifest-path ext/lock_feed/Cargo.toml --all-targets -- -D warnings
 
 # The example crate is gated like the ext crates, in BOTH its feature
 # shapes: the default build and the flight-recorder bench build. The
@@ -250,6 +253,7 @@ ext-test: ext-check
 	cargo test --manifest-path ext/lunet-locks-aof/Cargo.toml
 	cd ext/lunet-locks-aof/zig && mise exec -- zig build test $(ZIG_TEST_FLAGS)
 	cargo test --manifest-path ext/paxe-core/Cargo.toml
+	cargo test --manifest-path ext/lock_feed/Cargo.toml
 
 # The vendored checksum asserts AES hardware at comptime (vsr/checksum.zig);
 # Linux arm64 CI resolves a generic CPU baseline that lacks the feature, so

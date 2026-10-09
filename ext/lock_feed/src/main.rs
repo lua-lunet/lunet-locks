@@ -703,10 +703,11 @@ async fn rescan_task(
 fn find_open_file_name(dir: &Path) -> Option<String> {
     let rd = std::fs::read_dir(dir).ok()?;
     for entry in rd.flatten() {
-        if let Some(n) = entry.file_name().to_str() {
-            if n.starts_with("ev-open-") && n.ends_with(".bin") {
-                return Some(n.to_string());
-            }
+        if let Some(n) = entry.file_name().to_str()
+            && n.starts_with("ev-open-")
+            && n.ends_with(".bin")
+        {
+            return Some(n.to_string());
         }
     }
     None

@@ -6,7 +6,15 @@
 
 import { store } from "../lib/state.mjs";
 import { api } from "../lib/api.mjs";
-import { esc, fmtClock } from "../lib/util.mjs";
+import { esc, fmtClock, closestFromEvent } from "../lib/util.mjs";
+
+/** @typedef {import("../lib/types.mjs").LogLine} LogLine */
+
+// echarts arrives from ./vendor/echarts.min.js (loaded by index.html) and
+// ships no types here — there is no node_modules to resolve @types from.
+// This is the SPA's single load-bearing `any`: the vendored chart library's
+// untyped surface. Everything above it stays typed.
+const echartsLib = () => /** @type {any} */ (/** @type {any} */ (window).echarts);
 
 const AXIS = {
   axisLabel: { color: "#9397ab", fontFamily: "JetBrains Mono, monospace", fontSize: 10 },
@@ -31,6 +39,17 @@ const TOOLTIP = {
 const LOG_PLOTS = ["arrivals", "failover", "frontier"];
 
 class LaCharts extends HTMLElement {
+  /** @type {Record<string, any>} Live echarts instances, keyed by the plot's data-plot value. */
+  _charts = {};
+  /** @type {Record<string, any>} The last-set log-series options, for the paper exports. */
+  _logOptions = {};
+  /** @type {number | null} */
+  _logEpoch = null;
+  /** @type {(() => void) | undefined} */
+  _unsub;
+  /** @type {ResizeObserver | undefined} */
+  _ro;
+
   connectedCallback() {
     this.innerHTML = `
       <div style="flex:1;display:flex;flex-direction:column;min-height:0">
@@ -64,14 +83,11 @@ class LaCharts extends HTMLElement {
           </div>
         </div>
       </div>`;
-    this._charts = {};
-    this._logOptions = {};
-    this._logEpoch = null;
     this._unsub = store.subscribe(() => this.update());
     this._ro = new ResizeObserver(() => {
       for (const c of Object.values(this._charts)) c.resize();
     });
-    for (const el of this.querySelectorAll(".plot")) this._ro.observe(el);
+    for (const el of /** @type {NodeListOf<HTMLElement>} */ (this.querySelectorAll(".plot"))) this._ro.observe(el);
     this.addEventListener("click", (e) => this._onClick(e));
     this.update();
     this._loadLog();
@@ -82,40 +98,50 @@ class LaCharts extends HTMLElement {
     for (const c of Object.values(this._charts ?? {})) c.dispose();
   }
 
+  /**
+   * Lazily create (and memoise) the echarts instance for one plot. Null when
+   * the vendored lib failed to load or the plot element is missing.
+   * @param {string} key
+   * @returns {any}
+   */
   _chart(key) {
-    if (!window.echarts) return null;
+    const echarts = echartsLib();
+    if (!echarts) return null;
     if (!this._charts[key]) {
       const el = this.querySelector(`[data-plot=${key}]`);
       if (!el) return null;
-      this._charts[key] = window.echarts.init(el, null, { renderer: "canvas" });
+      this._charts[key] = echarts.init(el, null, { renderer: "canvas" });
     }
     return this._charts[key];
   }
 
+  /** @param {MouseEvent} e */
   _onClick(e) {
-    if (e.target.closest("[data-log-reload]")) {
+    if (closestFromEvent(e, "[data-log-reload]")) {
       this._loadLog(true);
       return;
     }
-    const exp = e.target.closest("[data-export]");
+    const exp = closestFromEvent(e, "[data-export]");
     if (exp) {
-      const [key, kind] = exp.dataset.export.split(":");
+      const [key, kind] = /** @type {string} */ (exp.dataset.export).split(":");
       this._export(key, kind);
     }
   }
 
   // The log series fetch: once per panel mount, forceable with the reload
   // affordance. A failure names itself in the plots' fallbacks.
+  /** @param {boolean} [force] */
   async _loadLog(force) {
     try {
       const body = await api.telemetryLog({});
       this._logEpoch = body.span?.first_ms ?? null;
       this._renderLog(body.lines ?? []);
     } catch (err) {
-      this._showLogError(String(err?.message ?? err));
+      this._showLogError(err instanceof Error ? err.message : String(err));
     }
   }
 
+  /** @param {string} message */
   _showLogError(message) {
     for (const key of LOG_PLOTS) {
       const el = this.querySelector(`[data-plot=${key}]`);
@@ -123,8 +149,9 @@ class LaCharts extends HTMLElement {
     }
   }
 
+  /** @param {LogLine[]} lines */
   _renderLog(lines) {
-    if (!window.echarts) return;
+    if (!echartsLib()) return;
 
     // arrivals: per-node inter-arrival deltas of the commit-in events,
     // bucketed per second (open = first delta, close = last, low = min,
@@ -181,15 +208,17 @@ class LaCharts extends HTMLElement {
       grid: { left: 44, right: 14, top: 16, bottom: 24 },
       tooltip: {
         ...TOOLTIP,
-        formatter: (params) => {
-          const rows = (Array.isArray(params) ? params : [params]).map((p) => {
+        // The tooltip payload is echarts' own axis-trigger shape, which the
+        // untyped vendored lib defines; the fields read here are its contract.
+        formatter: (/** @type {any} */ params) => {
+          const rows = (Array.isArray(params) ? params : [params]).map((/** @type {any} */ p) => {
             const l = p.data.source;
             return `${p.marker} ${esc(p.seriesName)} node ${esc(String(l?.node ?? "—"))} · era ${esc(String(l?.era ?? "—"))} · view ${esc(String(l?.view ?? "—"))} · ${esc(fmtClock(p.value[0]))} · ${p.value[1]} ms`;
           });
           return rows.join("<br>");
         },
       },
-      xAxis: { type: "time", ...AXIS, axisLabel: { ...AXIS.axisLabel, formatter: (v) => fmtClock(v) } },
+      xAxis: { type: "time", ...AXIS, axisLabel: { ...AXIS.axisLabel, formatter: (/** @type {number} */ v) => fmtClock(v) } },
       yAxis: { type: "value", name: "ms", nameTextStyle: { color: "#9397ab", fontSize: 10 }, ...AXIS },
       series: [
         {
@@ -207,19 +236,24 @@ class LaCharts extends HTMLElement {
 
     // frontier: the applied slot each node's commit-in / heartbeat-commit
     // lines carry, as per-node step lines (the drift window at a glance).
+    /** @type {Map<string, [number, number][]>} */
     const frontierByNode = new Map();
     for (const line of lines) {
       if ((line.event !== "commit-in" && line.event !== "heartbeat-commit") || line.ts == null) continue;
       const node = String(line.node);
-      if (!frontierByNode.has(node)) frontierByNode.set(node, []);
-      frontierByNode.get(node).push([line.ts, line.slot]);
+      let frontier = frontierByNode.get(node);
+      if (!frontier) {
+        frontier = [];
+        frontierByNode.set(node, frontier);
+      }
+      frontier.push([line.ts, /** @type {number} */ (line.slot)]);
     }
     const frontierOption = {
       animation: false,
       grid: { left: 52, right: 14, top: 16, bottom: 24 },
       tooltip: { ...TOOLTIP },
       legend: { show: true, top: 0, textStyle: { color: "#9397ab", fontSize: 10 } },
-      xAxis: { type: "time", ...AXIS, axisLabel: { ...AXIS.axisLabel, formatter: (v) => fmtClock(v) } },
+      xAxis: { type: "time", ...AXIS, axisLabel: { ...AXIS.axisLabel, formatter: (/** @type {number} */ v) => fmtClock(v) } },
       yAxis: { type: "value", name: "slot", nameTextStyle: { color: "#9397ab", fontSize: 10 }, ...AXIS },
       series: [...frontierByNode.entries()].map(([node, data]) => ({
         name: "node " + node, type: "line", step: "end", symbol: "none",
@@ -234,9 +268,15 @@ class LaCharts extends HTMLElement {
     this._chart("frontier")?.setOption(frontierOption, { notMerge: true });
   }
 
+  /**
+   * Paper export: png from the live canvas instance, svg from a throwaway
+   * renderer off-screen.
+   * @param {string} key
+   * @param {string} kind
+   */
   _export(key, kind) {
     const opt = this._logOptions[key];
-    if (!opt || !window.echarts) return;
+    if (!opt || !echartsLib()) return;
     const name = "lunet-log-" + key + "." + (this._logEpoch ?? "unknown") + "." + kind;
     let href;
     let revoke = false;
@@ -248,7 +288,7 @@ class LaCharts extends HTMLElement {
       const host = document.createElement("div");
       host.style.cssText = "position:absolute;left:-99999px;top:0;width:800px;height:400px";
       document.body.appendChild(host);
-      const svg = window.echarts.init(host, null, { renderer: "svg" });
+      const svg = echartsLib().init(host, null, { renderer: "svg" });
       svg.setOption(opt);
       const blob = new Blob([svg.renderToSVGString()], { type: "image/svg+xml" });
       href = URL.createObjectURL(blob);
@@ -269,15 +309,15 @@ class LaCharts extends HTMLElement {
     // Cluster header still comes from the mock source.
     if (cluster) {
       const held = journalLocks.length;
-      this.querySelector(".cluster-summary").innerHTML =
+      /** @type {HTMLElement} */ (this.querySelector(".cluster-summary")).innerHTML =
         `<span>leader <b>${esc(cluster.leader)}</b></span>` +
         `<span>era <b>${cluster.era}</b></span>` +
         `<span>view <b>${cluster.view}</b></span>` +
         `<span>held <b>${held}</b></span>`;
     }
 
-    if (!window.echarts) {
-      for (const el of this.querySelectorAll(".plot")) {
+    if (!echartsLib()) {
+      for (const el of /** @type {NodeListOf<HTMLElement>} */ (this.querySelectorAll(".plot"))) {
         if (!el.dataset.fb) {
           el.dataset.fb = "1";
           el.innerHTML = '<div class="chart-fallback">echarts failed to load — check that ./vendor/echarts.min.js serves</div>';

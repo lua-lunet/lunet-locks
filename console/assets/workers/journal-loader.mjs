@@ -5,6 +5,8 @@
 
 import { parseRecords } from "../lib/journal/parse.mjs";
 
+/** @typedef {import("../lib/types.mjs").FeedFile} FeedFile */
+
 /** Set of rolled file names already fetched in this worker session. */
 const loaded = new Set();
 
@@ -16,6 +18,7 @@ async function poll() {
   try {
     const resp = await fetch("/feed/files");
     if (!resp.ok) return;
+    /** @type {FeedFile[]} */
     const files = await resp.json();
     // Process rolled files only (open:false), sorted by opMin ascending.
     const rolled = files

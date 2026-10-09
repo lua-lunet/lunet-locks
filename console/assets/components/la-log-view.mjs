@@ -5,15 +5,35 @@ import { store } from "../lib/state.mjs";
 import { esc, fmtClock, parseClock } from "../lib/util.mjs";
 
 class LaLogView extends HTMLElement {
+  /** @type {(() => void) | undefined} */
+  _unsub;
+  /** Skeleton nodes, memoised by selector on first lookup. @type {Map<string, HTMLElement>} */
+  _refs = new Map();
+
   connectedCallback() {
     this.innerHTML = `
       <div class="log-head"><div>time</div><div>event</div><div>lock id</div><div>holder</div><div>lease id</div></div>
       <div class="log-rows"></div>`;
-    this._rowsEl = this.querySelector(".log-rows");
+    // Own markup, so every $() lookup below resolves; results are memoised.
     this._unsub = store.subscribe(() => this.render());
     this.render();
   }
   disconnectedCallback() { this._unsub?.(); }
+
+  /**
+   * Look up one of this component's own skeleton nodes, memoising the result
+   * so the 1s tick does not re-query the DOM.
+   * @param {string} selector
+   * @returns {HTMLElement}
+   */
+  $(selector) {
+    const cached = this._refs.get(selector);
+    if (cached) return cached;
+    const el = this.querySelector(selector);
+    if (!(el instanceof HTMLElement)) throw new Error(`la-log-view: missing ${selector}`);
+    this._refs.set(selector, el);
+    return el;
+  }
 
   render() {
     const { journalEvents, now, fromText, toText } = store.state;
@@ -42,9 +62,9 @@ class LaLogView extends HTMLElement {
         <div class="d">${e.leaseId}</div>
       </div>`).join("");
 
-    const scrollTop = this._rowsEl.scrollTop;
-    this._rowsEl.innerHTML = rows || '<div style="padding:24px;color:var(--color-neutral-500);font-family:var(--font-mono);font-size:12px">no events in range</div>';
-    this._rowsEl.scrollTop = scrollTop;
+    const scrollTop = this.$(".log-rows").scrollTop;
+    this.$(".log-rows").innerHTML = rows || '<div style="padding:24px;color:var(--color-neutral-500);font-family:var(--font-mono);font-size:12px">no events in range</div>';
+    this.$(".log-rows").scrollTop = scrollTop;
   }
 }
 

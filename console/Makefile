@@ -5,8 +5,12 @@
 LUAROCKS ?= luarocks --lua-version=5.1 --tree=../.rocks
 PORT     ?= 8480
 MOCK_PORT ?= 8481
+# The .mjs type gate's compiler, pinned: the SPA has no build step and no
+# node_modules, so the runner installs TypeScript globally in its setup step
+# (`npm install --global typescript@6.0.3`) and the gate below runs offline.
+TSC ?= tsc
 
-.PHONY: init up down status logs vendor vendor-lock check clean
+.PHONY: init up down status logs vendor vendor-lock mjs-check check clean
 
 init:
 	@ls ../.rocks/share/lua/5.1/tl.lua >/dev/null 2>&1 || { \
@@ -39,10 +43,15 @@ vendor:
 vendor-lock:
 	@ECHARTS_VERSION=$(ECHARTS_VERSION) bin/vendor.sh lock
 
-check: init
+# Type-check the SPA from its JSDoc (tsconfig.json). No package.json, no
+# node_modules, no build step: tsc only reads (noEmit) and the .mjs files
+# ship as-is. Fast enough to run on its own as an inner loop.
+mjs-check:
+	$(TSC) -p tsconfig.json
+
+check: init mjs-check
 	shellcheck bin/*.sh
-	@LUA_PATH="../.rocks/share/lua/5.1/?.lua;../.rocks/share/lua/5.1/?/init.lua;;" \
-		../.rocks/bin/tl check tooling/lib/consolectl.tl
+	@../.rocks/bin/cyan check tooling/lib/consolectl.tl
 
 clean: down
 	rm -rf tmp

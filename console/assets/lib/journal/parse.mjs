@@ -2,6 +2,8 @@
 // Mirrors ext/advisory_lock/src/journal.rs parse_file() — stops cleanly at
 // the first invalid or short record (corrupt-tail tolerance).
 
+/** @typedef {import("../types.mjs").JournalEvent} JournalEvent */
+
 const RECORD_SIZE = 61;
 const MAGIC = "LKE1";
 const KIND_HOLD = 1;
@@ -18,7 +20,13 @@ for (let i = 0; i < 256; i++) {
   CRC32_TABLE[i] = c;
 }
 
-/** Compute CRC-32 IEEE over a byte range in a Uint8Array. */
+/**
+ * Compute CRC-32 IEEE over a byte range in a Uint8Array.
+ * @param {Uint8Array} data
+ * @param {number} [start]
+ * @param {number} [end]
+ * @returns {number}
+ */
 export function crc32(data, start = 0, end = data.length) {
   let crc = 0xFFFFFFFF;
   for (let i = start; i < end; i++) {
@@ -27,6 +35,10 @@ export function crc32(data, start = 0, end = data.length) {
   return (crc ^ 0xFFFFFFFF) >>> 0;
 }
 
+/**
+ * @param {number} k
+ * @returns {JournalEvent["kind"] | null}
+ */
 function kindName(k) {
   if (k === KIND_HOLD) return "hold";
   if (k === KIND_RENEW) return "renew";
@@ -34,6 +46,12 @@ function kindName(k) {
   return null;
 }
 
+/**
+ * @param {Uint8Array} u8
+ * @param {number} offset
+ * @param {number} len
+ * @returns {string}
+ */
 function bytesToHex(u8, offset, len) {
   let s = "";
   for (let i = offset; i < offset + len; i++) {
@@ -46,8 +64,11 @@ function bytesToHex(u8, offset, len) {
  * Parse all valid journal records from an ArrayBuffer. Stops at the first
  * invalid magic, bad CRC, unknown kind, or short tail. Returns an array of
  * {kind, ts, lockId, leaseId, holder, expiry}.
+ * @param {ArrayBuffer} buffer
+ * @returns {JournalEvent[]}
  */
 export function parseRecords(buffer) {
+  /** @type {JournalEvent[]} */
   const events = [];
   if (!(buffer instanceof ArrayBuffer) || buffer.byteLength < RECORD_SIZE) {
     return events;

@@ -3,7 +3,13 @@
 
 import { fmtClock } from "./util.mjs";
 
-export const config = JSON.parse(document.getElementById("la-config").textContent);
+/** @typedef {import("./types.mjs").Config} Config */
+/** @typedef {import("./types.mjs").SavedState} SavedState */
+/** @typedef {import("./types.mjs").StoreState} StoreState */
+
+export const config =
+  /** @type {Config} */
+  (JSON.parse(/** @type {HTMLScriptElement} */ (document.getElementById("la-config")).textContent));
 
 // Data-source switch: config carries `dataSource` ("mock" | "bridge",
 // default mock) and `bridgeBase` (the bridge's /api/v1 URL). A query param
@@ -21,8 +27,12 @@ export const config = JSON.parse(document.getElementById("la-config").textConten
 export const isBridge = config.dataSource === "bridge";
 
 const SAVED_KEY = "lock-admin";
+/** @type {SavedState} */
 const saved = JSON.parse(sessionStorage.getItem(SAVED_KEY) ?? "{}");
 
+/**
+ * @param {StoreState} state
+ */
 function persist(state) {
   sessionStorage.setItem(SAVED_KEY, JSON.stringify({
     mode: state.mode,
@@ -36,6 +46,7 @@ function persist(state) {
   }));
 }
 
+/** @type {{state: StoreState, _listeners: Set<(s: StoreState) => void>, set(patch: Partial<StoreState>): void, subscribe(fn: (s: StoreState) => void): () => void}} */
 export const store = {
   state: {
     now: Date.now(),
@@ -76,8 +87,9 @@ export const store = {
   },
 };
 
+/** @type {ReturnType<typeof setTimeout> | undefined} */
 let toastTimer;
-export function toast(text) {
+export function toast(/** @type {string} */ text) {
   clearTimeout(toastTimer);
   store.set({ toast: text });
   toastTimer = setTimeout(() => store.set({ toast: "" }), 5000);
