@@ -14,15 +14,40 @@ session store; the six-system classification is its §2):
   low-latency shape — the Corfu global sequencer, one singleton lease.
 - **Durable named lock** — created **with** a name (required at first
   grant), survives expiry and restart with its identity, and is destroyed
-  only by an explicit release or break of the durable kind, which leaves
-  the free-but-named keeper shape rather than erasing the row. The Corfu
-  stripe-leader lock is this kind. Restart survival rides the WAL's
-  identity sidecar (`wal-snapshot.md`).
+  only by an explicit **delete**. A **release** is not a delete: the
+  record stays with its counters and identity (state: kept), so the
+  fencing token survives and a daily root key does not silently vanish —
+  while a delete is the real tombstone that garbage-collects it, so the
+  table does not accumulate yesterday's business-day keys over a weekend.
+  The Corfu stripe-leader lock is this kind. Restart survival rides the
+  durable stream's fat frames (`wal-snapshot.md`).
 
 One state machine, one table, two classes — not two subsystems. The
 sticky identity inheritance a `SET` already performs over the prior
 record (live or not) is the durable class's seed; the classes make that
 behavior explicit and gated.
+
+## Durable identity: the name→id assignment
+
+A durable lock's u64 is not chosen by its caller — it is **the slot of
+the creating consensus write**. The create path:
+
+1. The leader holds the requested name and asks its own name→id view:
+   has this name been committed? If yes, the create is rejected at the
+   door — no consensus round is spent.
+2. If no, the leader drives the create through consensus. The upcall
+   carries the write's slot; that slot's u64 is the lock's id.
+3. At commit, the check runs again: has a crash-recovery value from
+   another era or view beaten it — is the name already taken under the
+   committed state? If still no, the name is created and its id is the
+   slot's u64.
+
+The mapping stored is **name→id only**; the reverse lookup is YAGNI (an
+id→name resolution scans the durable records when something needs it).
+The two kinds' id spaces never mix: an ephemeral's u64 is caller-chosen,
+a durable's is consensus-assigned, and they live in separated WAL
+streams — one shape per ring, one id space per stream
+(`wal-snapshot.md`).
 
 ## What this service deliberately does not do
 
