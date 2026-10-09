@@ -182,7 +182,10 @@ and carries nothing else.
   fsync covers both streams (one file descriptor). The capacity condition
   is the remaining room: `position + live ≤ capacity`, per stream; a
   generation that overruns it is a refused flush = failed stop, per the
-  law. The stop path submits the current changes through the tick path
+  law. The stop path takes the lazy load it owes (a clean boot that
+  never served a client op has not loaded yet — the table the stop owes
+  the flush is the artefact's own state, never an empty one over it),
+  then submits the current changes through the tick path
   before the eager flush — the flush validates the set against the
   engine's own mirror, and a divergence is the loud failed stop. A
   steady-tick refusal is counted in `refusals` and leaves the serving
@@ -210,7 +213,14 @@ and carries nothing else.
   `flushed`) gates it as everywhere else; a dirty boot reads nothing and
   rebuilds from the replica stream — the "resync-from-commit" of issue
   #30. A loaded snapshot installs into an empty table, once, and never
-  overwrites live state.
+  overwrites live state. The dirty boot forgets the artefact on the
+  write side too (`StateStore::forget`): the store drops its artefact's
+  bookkeeping — the WAL engine's mirrors are seeded from the open scan,
+  and a flush reconciles against them — so a stale mirror can never fail
+  a correct stop. A forgotten store's tick path rebuilds the mirrors
+  from every lock the replica stream re-commits (each is noted as it
+  lands); a forgotten-and-dead store (the reopen refused) refuses its
+  write path loudly, never silently.
 
 ## Capacity honesty
 
@@ -258,24 +268,58 @@ loudly, by design.
   `wal_flush_sync` takes the serialized live sets, validates them against
   the engine's own mirror (a divergence is the loud failed stop), drains
   any outstanding batch first, writes forward, and fsyncs exactly once.
-  `wal_load` answers every content refusal as "none" — checksums, twins
-  and expiry all refuse at open or in the scan, never as an error. A
-  backend IO failure poisons the handle: every call returns `-EIO` until
+   `wal_load` answers every content refusal as "none" — checksums, twins
+   and expiry all refuse at open or in the scan, never as an error. The
+   durable stream's exchange rides the same classes: `wal_durable_submit`
+   (768 B frames, pointer-only, caller-owned), `wal_load_durable` (the
+   durable live set's fat frames), and the frame exchange
+   `wal_frame_encode` / `wal_frame_decode` over the engine's own codec;
+   `wal_flush_sync` takes both streams' serialized live sets and
+   reconciles each against its stream's mirror; `wal_status` reports the
+   counters per stream. A backend IO failure poisons the handle: every
+   call returns `-EIO` until
   it is dropped, and nothing partial is ever silent. The Linux io_uring
   backend is compile-checked on every host by a cross-compile gate and
   exercised at runtime on Linux.
 - **Rust wrapper** (this repo): a `WalSnapshotStore` implementing
-  `StateStore` over that ABI, mounted where the node mounts its store
-  today — nothing above the trait knows which store it holds. The
-  wrapper carries no codec and no checksum code of its own: the record's
-  fields cross the ABI through the `wal_record_encode` /
-  `wal_record_decode` exports, and the codec and checksum live only in
-  the engine behind the ABI (there is exactly one of each, ever — a
-  second implementation on the host would be a permanent agreement
-  burden).
-- **Loop integration** (this repo): the ~1000 ms libuv timer submits and
-  pumps through the node's FFI; on Linux a `uv_poll` on the eventfd fd
-  wakes the loop for completions; the counters ride the status surface.
-  The shutdown path calls `flush` eagerly as the law requires and the
-  trait signature is untouched: the same `StateStore` is drivable sync
-  (shutdown) and async (the tick) without changing the seam.
+  `StateStore` over that ABI, mounted where the node mounts its store —
+  at the C ABI's node construction, beside the node's state path (the
+  state path's name with a `.wal` suffix), replacing the file store;
+  nothing above the trait knows which store it holds. A refused
+  construction — corrupt content at open above all — does NOT block the
+  boot: the mount site says so loudly and boots WITHOUT the artefact on
+  the file store; the WAL is a fallback, never a safety mechanism, and
+  the node rebuilds the table from the replica stream. The wrapper
+  carries no codec and no checksum code of its own: the record's fields
+  cross the ABI through the `wal_record_encode` /
+  `wal_record_decode` exports (the durable frames through
+  `wal_frame_encode` / `wal_frame_decode`), and the codec and checksum
+  live only in the engine behind the ABI (there is exactly one of each,
+  ever — a second implementation on the host would be a permanent
+  agreement burden). The tick path rides the same `StateStore` trait:
+  `note` (one changed lock, at every committed transition and once per
+  lock a lazy load installs), `tick` (the changed set, one generation
+  per stream), `pump` (completions), and `state_status` (the per-stream
+  counters); the file store's defaults are no-ops and `None`.
+- **Loop integration** (this repo): the ~1000 ms timer in the server's
+  own timer style (a spawned loop on `lunet.sleep`) drives the node's
+  `state_tick` FFI entry, which drains completions, submits the changed
+  set, and drains again. On Linux the completions come back through the
+  ring's eventfd and the loop reaps them **on the tick**: the pinned
+  Lunet runtime exposes no raw-fd polling surface (`lunet.sleep`,
+  `lunet.spawn`, `lunet.stop`, `lunet.on_stop` only — no `uv_poll`
+  seat), so the eventfd wake is folded into the submit cadence, which is
+  also its natural drain point: each tick reaps the previous generation
+  before submitting the next, and no generation sits outstanding past
+  the next beat. On darwin the writes complete inline at submit and the
+  pump is a no-op. The counters ride the status surface: the node's
+  `state_status` FFI entry answers the per-stream counters, and the
+  server names them in a `state-status` event every time a generation
+  lands or a refusal is counted.
+  The shutdown path calls `flush` eagerly as the law requires, and the
+  node's stop walks the tick first — the table's current changes ride
+  the tick path (drain, submit, drain) strictly inside the drain window,
+  before the eager flush, so the flush reconciles against a caught-up
+  mirror — and the flush/load signatures are untouched: the same
+  `StateStore` is drivable sync (shutdown) and async (the tick) without
+  changing the seam.

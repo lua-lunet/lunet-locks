@@ -1,5 +1,40 @@
 local advisory_lock = require("advisory_lock")
+local cluster_config = require("cluster_config")
 local tested = require("tested")
+
+-- A unique scratch marker path under the repo's .tmp: each test's node
+-- boots on its own marker and its own WAL artefact.
+local function scratch_state(name: string): string
+    local path = ".tmp/teal-ffi/"
+        .. name
+        .. "-"
+        .. tostring(os.time())
+        .. "-"
+        .. tostring(math.random(1000000))
+        .. ".nonce"
+    os.execute("mkdir -p .tmp/teal-ffi")
+    return path
+end
+
+-- A three-member deployment descriptor: distinct provisioned
+-- identities (the system half in the high sixteen bits, counter 1), the
+-- genesis succession order.
+local function members(): {cluster_config.ClusterNode}
+    local nodes: {cluster_config.ClusterNode} = {}
+    for index = 1, 3 do
+        table.insert(
+            nodes,
+            {
+                id = index * 65536 + 1,
+                name = ({"a", "b", "c"})[index] as string,
+                host = "127.0.0.1",
+                port = 27200 + index,
+                genesis = true,
+            }
+        )
+    end
+    return nodes
+end
 
 tested.test(
     "the read-only console reports the build's own identity",
@@ -33,6 +68,56 @@ tested.test(
                     .. dirty
                     .. ":"
                     .. boolean,
+            }
+        )
+    end
+)
+
+-- The state seam's FFI surface, against the real cdylib: the WAL store
+-- mounts at the node's construction, a tick with nothing changed is a
+-- no-op success, the per-stream counters read all zeros through
+-- `state_status`, and the stop completes clean with the
+-- submit-before-flush seat in place.
+tested.test(
+    "the state tick and the per-stream counters ride the FFI",
+    function()
+        local node = advisory_lock.new(members(), "a", scratch_state("tick"), "", 0)
+        local ok, outcome = node:state_tick()
+        tested.assert(
+            {
+                given = "a fresh node's state tick with nothing changed",
+                should = "submit nothing and report success",
+                expected = "true:",
+                actual = tostring(ok) .. ":" .. (outcome or "?"),
+            }
+        )
+        local counters = node:state_status()
+        tested.assert(
+            {
+                given = "a fresh WAL mount's per-stream counters",
+                should = "read zero across both streams, nothing outstanding",
+                expected = "0:0:0:0:0:0:0:0",
+                actual = table.concat(
+                    {
+                        tostring(counters.ephemeral.completed_generations),
+                        tostring(counters.ephemeral.completed_records),
+                        tostring(counters.ephemeral.refusals),
+                        tostring(counters.ephemeral.in_flight),
+                        tostring(counters.durable.completed_generations),
+                        tostring(counters.durable.completed_records),
+                        tostring(counters.durable.refusals),
+                        tostring(counters.durable.in_flight),
+                    },
+                    ":"
+                ),
+            }
+        )
+        tested.assert(
+            {
+                given = "a node stopped through the drain point",
+                should = "stop clean with the tick-before-flush seat in place",
+                expected = "true",
+                actual = tostring(node:stop()),
             }
         )
     end

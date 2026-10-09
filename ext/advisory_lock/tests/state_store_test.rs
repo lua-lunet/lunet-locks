@@ -410,6 +410,25 @@ fn a_crashed_boot_is_the_verdict_the_load_guard_refuses() {
     );
 }
 
+/// The one-byte label's validation: a single lowercase letter matches
+/// the documented pattern (`^[a-z0-9](?:[-a-z0-9]{0,30}[a-z0-9])?$`) and
+/// must decode — a slice-arithmetic panic on the one-byte form would
+/// crash every request carrying one, silently at the client edge. The
+/// regression guards the boundary the labels ride (the WAL frame's tag
+/// bytes carry them).
+#[test]
+fn a_one_byte_label_decodes() {
+    let request = r#"{"op":"set","message_id":"b0000000-0000-4000-8000-000000000001","client_id":6,"request_num":1,"lock_id":9306,"labels":["x"],"lease":{"lease_id":6,"holder":"33333333-3333-3333-3333-333333333333","lease_ms":30000}}"#;
+    let decoded =
+        Service::decode(request.as_bytes()).expect("a one-byte label is a valid operator label");
+    match decoded {
+        Request::Set { labels, .. } => {
+            assert_eq!(labels, Some(vec!["x".to_string()]));
+        }
+        _ => panic!("the set decodes as a set"),
+    }
+}
+
 /// A three-member descriptor: distinct provisioned identities, the
 /// genesis succession order, NUL-separated, no trailing NUL.
 fn members() -> String {

@@ -380,6 +380,109 @@ function M.main(root: string, _argv: {string}): integer
             fail("the takeover grant failed")
         end
 
+        -- THE CLEAN-RESTART PERSISTENCE SCENARIO (the WAL snapshot
+        -- store's table): a named lock — the durable stream, name,
+        -- labels and counters riding the fat frame — taken and renewed
+        -- once, and an unnamed lock — the ephemeral stream. Leases long
+        -- enough to cross the restart window. Two ticks land them in
+        -- every replica's WAL artefact; then the trio stops CLEANLY
+        -- (the drain point, the eager flush behind it) and boots again:
+        -- every boot classifies CLEAN, every table starts empty, and
+        -- each restores at its first demand from its own artefact. The
+        -- read-back's replies are minted by the serving leader's
+        -- execution — a table that came off the WAL.
+        local persist_lease_ms = 300000
+        if not request_lines(
+            work,
+            28102,
+            {
+                '{"op":"set","message_id":"00000000-0000-0000-0000-0000000000a1","client_id":6,"request_num":1,"lock_id":9301,"name":"/smoke/wal-persist","labels":["persist","wal"],"lease":{"lease_id":6,"holder":"'
+                    .. holder3
+                    .. '","lease_ms":'
+                    .. persist_lease_ms
+                    .. "}}",
+                '{"op":"set","message_id":"00000000-0000-0000-0000-0000000000a2","client_id":6,"request_num":2,"lock_id":9301,"name":"/smoke/wal-persist","labels":["persist","wal"],"lease":{"lease_id":6,"holder":"'
+                    .. holder3
+                    .. '","lease_ms":'
+                    .. persist_lease_ms
+                    .. "}}",
+                '{"op":"set","message_id":"00000000-0000-0000-0000-0000000000a3","client_id":7,"request_num":1,"lock_id":9302,"lease":{"lease_id":7,"holder":"'
+                    .. holder2
+                    .. '","lease_ms":'
+                    .. persist_lease_ms
+                    .. "}}",
+            },
+            {'"granted":true', '"granted":true', '"granted":true'},
+            10
+        ) then
+            fail("the persistence locks failed to take")
+        end
+        -- A generation lands on every replica's WAL before the stops.
+        clock.sleep(2.5)
+        for _, name in ipairs({"n1", "n2", "n3"}) do
+            local p = procs[name]
+            local status = proc.stop(p, 30000)
+            procs[name] = nil
+            if status ~= 0 then
+                fail(
+                    name
+                        .. " exited "
+                        .. status
+                        .. " on the persistence stage's clean stop"
+                )
+            end
+        end
+        start("n1")
+        start("n2")
+        start("n3")
+        clock.sleep(15)
+        -- The named lock: name, labels, the renew counter and the
+        -- holder came back off the durable stream's fat frames.
+        if not request_lines(
+            work,
+            28101,
+            {
+                '{"op":"get","message_id":"00000000-0000-0000-0000-0000000000a4","client_id":8,"request_num":1,"lock_id":9301}',
+            },
+            {
+                '"op":"get"',
+                holder3,
+                '"name":"/smoke/wal-persist"',
+                '"labels":["persist","wal"]',
+                '"renew_count":1',
+            },
+            10
+        ) then
+            fail("the named lock did not survive the clean restart")
+        end
+        -- The unnamed lock: the ephemeral stream's record came back
+        -- with its identity (the holder's uuid) intact.
+        if not request_lines(
+            work,
+            28101,
+            {
+                '{"op":"get","message_id":"00000000-0000-0000-0000-0000000000a5","client_id":8,"request_num":2,"lock_id":9302}',
+            },
+            {
+                '"op":"get"',
+                holder2,
+            },
+            10
+        ) then
+            fail("the unnamed lock did not survive the clean restart")
+        end
+        -- The restoration's own line: the load fires at the read's
+        -- committed entry above, so the assertion rides after it.
+        local persistence_trio = logs.files_for_all(work, {"n1", "n2", "n3"})
+        if logs.count(persistence_trio, "materialised from the clean stop") < 1 then
+            fail(
+                "no restarted replica restored its table from the clean stop's artefact"
+            )
+        end
+        print(
+            "lunet smoke: persistence survived the clean restart (name, labels, counters)"
+        )
+
         -- The crash shape is this stage's subject: SIGKILL (never the
         -- deliberate stop, which the final stop-contract stage exercises)
         -- leaves the running sentinel behind, no drain, no marker write —
@@ -401,6 +504,21 @@ function M.main(root: string, _argv: {string}): integer
             5
         ) then
             fail("the post-restart read failed")
+        end
+        -- THE DIRTY-BOOT REFUSAL (the WAL store's R2 half of the boot
+        -- law): n3 died by SIGKILL with a WAL artefact on disk (the
+        -- replica stream had committed the exchange, the ticks had
+        -- landed it), so the next boot classifies crashed and MUST NOT
+        -- read the artefact — the table rebuilds from the replica
+        -- stream, which is why the read above (served by the rebuilt
+        -- table) succeeds. The refusal is the one line the boot says,
+        -- and no load line ever follows for that life.
+        local n3_evidence = logs.files_for_all(work, {"n3"})
+        if logs.count(n3_evidence, "the state artefact is distrusted") < 1 then
+            fail("the kill -9 restart did not refuse the state artefact")
+        end
+        if logs.count(n3_evidence, "materialised from the clean stop") ~= 0 then
+            fail("the dirty boot loaded the state artefact it must distrust")
         end
         -- The evidence set is every node's stderr/stdout capture, matched
         -- by node-name prefix over the logs DIRECTORY (no globs, no exact

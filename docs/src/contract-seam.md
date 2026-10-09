@@ -24,6 +24,14 @@ environments are interchangeable implementations of the three traits.
   statements, and the trait says which is which.
 - **`StateStore`** — the lock table's persistence: `flush` a snapshot out,
   `load` a snapshot back. The semantics are the law of the next section.
+  The trait also carries the store's **tick surface as defaulted methods**
+  — `note`/`tick`/`pump`/`state_status`, the async half by which the host
+  loop drives changed-set submissions and completion counters without
+  holding anything, and `forget`, the write half of the law's third rule.
+  The defaults are no-ops, so a store with no tick bookkeeping implements
+  nothing extra; a store whose bookkeeping is seeded from its own open
+  scan (the WAL store) implements them. Nothing above the trait knows
+  which store it holds, in either discipline.
 - **`CommitHook`** — a callback invoked at each applied commit. The machinery
   knows nothing about what the callback does. It is the experimental
   harness's failure-injection point and the industrial side's trigger for
@@ -47,7 +55,11 @@ implementation of `StateStore`:
    is crashed, the snapshot is unread regardless of what it contains, and the
    node rebuilds from the replica stream. Only a clean-stop file is loadable.
    A snapshot that fails its own validation loads as nothing, never as an
-   error that blocks boot.
+   error that blocks boot. The distrust is also a **write** rule: a store
+   whose write bookkeeping was seeded from the old artefact's scan carries a
+   stale mirror across the dirty boot, so every non-clean boot tells the
+   store to `forget` — drop the artefact and its bookkeeping, start empty,
+   and let the replica stream's re-commits rebuild the mirrors.
 
 ## The commit hook
 

@@ -51,7 +51,7 @@ pub mod wal_snapshot;
 pub use ffi::{
     Node, NodeOutput, NodeStatus, OUTPUT_REPLY, OUTPUT_SEND, POSITION_APPEND, PRIMARY_TIMEOUT_MS,
     RECONFIGURE_DECREMENT, RECONFIGURE_INCREMENT, RECONFIGURE_JOIN, RECONFIGURE_LEAVE,
-    output_kind_name, replication_state_name,
+    StateStatusRaw, output_kind_name, replication_state_name,
 };
 
 pub use recovery_flush::{FlushOutcome, RecoveryFlush};
