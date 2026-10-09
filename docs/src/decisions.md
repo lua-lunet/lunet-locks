@@ -14,8 +14,7 @@ below that cannot are not deployments.
 - **One node** has no quorum to draw from. It accepts a client
   proposal and can never commit it: the accepted-uncommitted proposal
   sits forever, because there is no self-addressed prepare to advance
-  it and no second member to answer one. It also self-fences
-  periodically against its own compliance clock. A singleton is a
+  it and no second member to answer one. A singleton is a
   process that appears to serve and never does.
 - **Two nodes** are replication without fault tolerance. The quorum is
   both members, so any one failure stops all progress; there is no
