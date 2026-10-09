@@ -144,13 +144,28 @@ impl FileSink {
 
     #[cfg(all(target_os = "linux", feature = "io-uring"))]
     fn from_parts(path: PathBuf, file: DiskFile, offset: u64) -> io::Result<Self> {
-        let ring = match io_uring::IoUring::new(64) {
-            Ok(ring) => Some(ring),
-            Err(e) => {
+        // The ring submits against an operating-system descriptor, so it
+        // is armed only for a handle that has one: an engine-backed
+        // `DiskFile` answers `as_raw_fd` with `None` and writes through
+        // its own engine instead.
+        let ring = match file.as_raw_fd() {
+            Some(_) => match io_uring::IoUring::new(64) {
+                Ok(ring) => Some(ring),
+                Err(e) => {
+                    warn!(
+                        ts = crate::log_millis(),
+                        event = "aof-io-uring-unavailable",
+                        "aof: io_uring unavailable ({e}); falling back to buffered write_all"
+                    );
+                    None
+                }
+            },
+            None => {
                 warn!(
                     ts = crate::log_millis(),
-                    event = "aof-io-uring-unavailable",
-                    "aof: io_uring unavailable ({e}); falling back to buffered write_all"
+                    event = "aof-io-uring-engine-file",
+                    "aof: the open file is engine-backed and carries no descriptor; \
+                     falling back to the engine's own buffered write"
                 );
                 None
             }
@@ -185,7 +200,13 @@ impl FileSink {
     fn write_all_ring(&mut self, ring: &mut io_uring::IoUring, bytes: &[u8]) -> io::Result<()> {
         use io_uring::{opcode, types};
 
-        let fd = types::Fd(self.file.as_raw_fd());
+        // The ring is armed only for a descriptor-bearing handle (see
+        // `from_parts`), so the descriptor is there.
+        let fd = types::Fd(
+            self.file
+                .as_raw_fd()
+                .expect("the ring is armed only for a descriptor-bearing handle"),
+        );
         let mut remaining = bytes;
         while !remaining.is_empty() {
             let sqe = opcode::Write::new(fd, remaining.as_ptr(), remaining.len() as u32)

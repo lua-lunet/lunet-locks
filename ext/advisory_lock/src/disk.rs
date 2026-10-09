@@ -48,51 +48,144 @@ use std::sync::Arc;
 /// embedder's engine can answer them the same way it answers
 /// [`Disk::open_read`] and friends.
 pub struct DiskFile {
-    file: File,
+    inner: DiskFileInner,
+}
+
+/// What a [`DiskFile`] is actually holding. Private by construction: the
+/// handle is opaque to everyone, this crate's own filesystem included, and
+/// the only way to make one is [`DiskFile::from_std`] (this crate's, used
+/// by [`StdDisk`]) or [`DiskFile::from_engine`] (an embedder's, used by a
+/// foreign [`Disk`]).
+enum DiskFileInner {
+    /// The operating system's file, reached through the local filesystem.
+    Std(File),
+    /// An embedder's engine handle, erased behind [`EngineFile`]. It has no
+    /// operating-system descriptor of its own, so every operation the AOF's
+    /// ring fast path needs answers through the engine instead.
+    Engine(Box<dyn EngineFile>),
+}
+
+/// One open file on an embedder's own storage engine.
+///
+/// The counterpart to [`StdDisk`] at the level of an open handle: a foreign
+/// [`Disk`] serves its `open_read`/`create_new_write`/… shapes by returning
+/// a [`DiskFile::from_engine`] over one of these. The operations are exactly
+/// the ones [`DiskFile`] forwards, so an engine answers the same questions
+/// the crate's own filesystem answers and the machinery above the seam
+/// cannot tell which it is holding.
+///
+/// `flush` and `sync_all` stay distinct here for the same reason they are
+/// distinct on [`DiskFile`]: the first is a push to the engine's buffer, the
+/// second is the durability barrier. An engine that conflates them weakens
+/// every fsync obligation in the crate.
+pub trait EngineFile: Send {
+    /// Fill `buf` completely, or fail.
+    fn read_exact(&mut self, buf: &mut [u8]) -> io::Result<()>;
+
+    /// Move the handle's own cursor.
+    fn seek(&mut self, from: SeekFrom) -> io::Result<u64>;
+
+    /// Append every byte, or fail.
+    fn write_all(&mut self, bytes: &[u8]) -> io::Result<()>;
+
+    /// Push buffered bytes toward the medium. NOT a durability barrier.
+    fn flush(&mut self) -> io::Result<()>;
+
+    /// The durability barrier: the bytes are on the medium.
+    fn sync_all(&self) -> io::Result<()>;
+
+    /// Truncate (or extend) the file to `len` bytes.
+    fn set_len(&mut self, len: u64) -> io::Result<()>;
+
+    /// The file's current length in bytes.
+    fn file_len(&self) -> io::Result<u64>;
+
+    /// Positional write: `bytes` at `offset`, independent of the handle's
+    /// own cursor, which callers never rely on.
+    fn write_all_at(&mut self, offset: u64, bytes: &[u8]) -> io::Result<()>;
 }
 
 impl DiskFile {
+    /// The handle over an operating-system file, this crate's own
+    /// [`StdDisk`]. Public because it is the one way to hand the seam a
+    /// local file, and a foreign [`Disk`] that wraps the filesystem itself
+    /// (rather than an engine) needs it.
+    pub fn from_std(file: File) -> Self {
+        Self {
+            inner: DiskFileInner::Std(file),
+        }
+    }
+
+    /// The handle over an embedder's engine file — the seam's own injection
+    /// point at the handle level, and the reason an industrial engine can
+    /// serve [`Disk::open_read`] and its seven siblings at all.
+    pub fn from_engine(engine: Box<dyn EngineFile>) -> Self {
+        Self {
+            inner: DiskFileInner::Engine(engine),
+        }
+    }
     /// Fill `buf` completely, or fail. The journal's and the AOF's resume
     /// scans read one fixed-size record at a time and treat a short read
     /// as the clean end of the valid prefix, so this is the only read
     /// shape the crate opens files with.
     pub fn read_exact(&mut self, buf: &mut [u8]) -> io::Result<()> {
-        self.file.read_exact(buf)
+        match &mut self.inner {
+            DiskFileInner::Std(file) => file.read_exact(buf),
+            DiskFileInner::Engine(engine) => engine.read_exact(buf),
+        }
     }
 
     /// Move the handle's own cursor. Callers seek before every positional
     /// write; no two of them share a cursor.
     pub fn seek(&mut self, from: SeekFrom) -> io::Result<u64> {
-        self.file.seek(from)
+        match &mut self.inner {
+            DiskFileInner::Std(file) => file.seek(from),
+            DiskFileInner::Engine(engine) => engine.seek(from),
+        }
     }
 
     /// Append every byte, or fail.
     pub fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
-        self.file.write_all(bytes)
+        match &mut self.inner {
+            DiskFileInner::Std(file) => file.write_all(bytes),
+            DiskFileInner::Engine(engine) => engine.write_all(bytes),
+        }
     }
 
-    /// Push buffered bytes to the operating system's page cache. NOT a
-    /// durability barrier — see [`DiskFile::sync_all`].
+    /// Push buffered bytes toward the medium. NOT a durability barrier —
+    /// see [`DiskFile::sync_all`].
     pub fn flush(&mut self) -> io::Result<()> {
-        self.file.flush()
+        match &mut self.inner {
+            DiskFileInner::Std(file) => file.flush(),
+            DiskFileInner::Engine(engine) => engine.flush(),
+        }
     }
 
     /// fsync: the bytes are on the medium. The one operation whose loss
     /// window the journal's drain, the AOF's checkpoint and the marker's
     /// durable rounds are stated against.
     pub fn sync_all(&self) -> io::Result<()> {
-        self.file.sync_all()
+        match &self.inner {
+            DiskFileInner::Std(file) => file.sync_all(),
+            DiskFileInner::Engine(engine) => engine.sync_all(),
+        }
     }
 
     /// Truncate (or extend) the file to `len` bytes. The AOF's resume
     /// scan truncates a torn or zero-padded tail away with it.
-    pub fn set_len(&self, len: u64) -> io::Result<()> {
-        self.file.set_len(len)
+    pub fn set_len(&mut self, len: u64) -> io::Result<()> {
+        match &mut self.inner {
+            DiskFileInner::Std(file) => file.set_len(len),
+            DiskFileInner::Engine(engine) => engine.set_len(len),
+        }
     }
 
     /// The file's current length in bytes.
     pub fn file_len(&self) -> io::Result<u64> {
-        Ok(self.file.metadata()?.len())
+        match &self.inner {
+            DiskFileInner::Std(file) => Ok(file.metadata()?.len()),
+            DiskFileInner::Engine(engine) => engine.file_len(),
+        }
     }
 
     /// Positional write, portable across the platforms the crate builds
@@ -101,8 +194,11 @@ impl DiskFile {
     /// seek-plus-write everywhere else. Callers never rely on the handle
     /// cursor.
     #[cfg(unix)]
-    pub fn write_all_at(&self, offset: u64, bytes: &[u8]) -> io::Result<()> {
-        FileExt::write_all_at(&self.file, bytes, offset)
+    pub fn write_all_at(&mut self, offset: u64, bytes: &[u8]) -> io::Result<()> {
+        match &mut self.inner {
+            DiskFileInner::Std(file) => FileExt::write_all_at(file, bytes, offset),
+            DiskFileInner::Engine(engine) => engine.write_all_at(offset, bytes),
+        }
     }
 
     /// Positional write, portable across the platforms the crate builds
@@ -111,8 +207,11 @@ impl DiskFile {
     /// seek-plus-write everywhere else. Callers never rely on the handle
     /// cursor.
     #[cfg(windows)]
-    pub fn write_all_at(&self, offset: u64, bytes: &[u8]) -> io::Result<()> {
-        FileExt::seek_write(&self.file, bytes, offset).map(|_| ())
+    pub fn write_all_at(&mut self, offset: u64, bytes: &[u8]) -> io::Result<()> {
+        match &mut self.inner {
+            DiskFileInner::Std(file) => FileExt::seek_write(file, bytes, offset).map(|_| ()),
+            DiskFileInner::Engine(engine) => engine.write_all_at(offset, bytes),
+        }
     }
 
     /// Positional write, portable across the platforms the crate builds
@@ -129,10 +228,20 @@ impl DiskFile {
     /// The raw descriptor, for the io_uring fast path: the Linux writer
     /// submits its buffered appends through a ring against this file's
     /// descriptor rather than through [`DiskFile::write_all_at`].
+    ///
+    /// `None` on an engine handle: an engine's file is not an operating
+    /// system descriptor and cannot be submitted to a ring. A caller that
+    /// needs the descriptor takes it only when it is there, and takes the
+    /// blocking write when it is not.
     #[cfg(unix)]
-    pub fn as_raw_fd(&self) -> std::os::fd::RawFd {
-        use std::os::fd::AsRawFd;
-        self.file.as_raw_fd()
+    pub fn as_raw_fd(&self) -> Option<std::os::fd::RawFd> {
+        match &self.inner {
+            DiskFileInner::Std(file) => {
+                use std::os::fd::AsRawFd;
+                Some(file.as_raw_fd())
+            }
+            DiskFileInner::Engine(_) => None,
+        }
     }
 }
 
@@ -142,11 +251,18 @@ impl DiskFile {
 /// fsync.
 impl Write for DiskFile {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.file.write(bytes)
+        match &mut self.inner {
+            DiskFileInner::Std(file) => file.write(bytes),
+            // The engine's write is all-or-fail, so the whole slice is
+            // consumed or the error stands; `BufWriter`'s use of this
+            // (the flight recorder's buffered tape lines) advances by the
+            // full length it handed over.
+            DiskFileInner::Engine(engine) => engine.write_all(bytes).map(|()| bytes.len()),
+        }
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.file.flush()
+        DiskFile::flush(self)
     }
 }
 
@@ -287,7 +403,7 @@ pub struct StdDisk;
 
 impl StdDisk {
     fn wrap(file: File) -> DiskFile {
-        DiskFile { file }
+        DiskFile::from_std(file)
     }
 }
 

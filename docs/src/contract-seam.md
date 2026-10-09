@@ -28,7 +28,16 @@ grammar — the three traits and the fence — as one public constructor.
   sync, rename, remove, create-dir, read-dir, metadata. Flush-to-userspace and
   sync-to-device are distinct operations and are never conflated: a journal
   that fsyncs and a trace that merely flushes are different durability
-  statements, and the trait says which is which.
+  statements, and the trait says which is which. A `Disk` implementation
+  serves its path-shaped operations itself and hands back an **open file** as a
+  `DiskFile`: an opaque handle the machinery reads, writes, syncs and
+  positionally writes without knowing what is behind it. The crate's own
+  `StdDisk` answers with the local filesystem; an embedder's engine answers
+  through `EngineFile`, the same eight operations on its own storage. A
+  `DiskFile` over an engine carries no operating-system descriptor and says
+  so — `as_raw_fd()` answers `None` — so a fast path that wants a descriptor
+  (the AOF's io_uring appends on Linux) takes it when it is there and writes
+  through the engine when it is not.
 - **`StateStore`** — the lock table's persistence: `flush` a snapshot out,
   `load` a snapshot back. The semantics are the law of the next section.
 - **`CommitHook`** — a callback invoked at each applied commit. The machinery
