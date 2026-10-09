@@ -15,6 +15,16 @@ document's durability paragraph states. The artefact carries the
 application state alone: the shape of the locks, at the moment of the
 clean halt.
 
+The write-behind AOF writer is built and defended, and not wired into any
+host path: the only in-tree constructor of an AOF sink is the example
+crate's standby mode (`--aof-dir`), while the C ABI and the Lua host carry
+the blocking journal where event evidence is needed (the console feed, the
+bench chain) or the disabled sink elsewhere — both shapes proven by the
+state seam's tests, which run the full stop and boot schedule with the
+sink disabled. The writer stays compiled and tested by `make ext-test`.
+Wiring it into a host surface is gated on the witness watermarks and the
+three sync-point rules (the decisions register).
+
 ## Why a frame and not a running series
 
 The contract that settles the shape is the boot fence's: **a dirty boot
