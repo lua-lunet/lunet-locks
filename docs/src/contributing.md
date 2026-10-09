@@ -47,8 +47,8 @@ stop-and-report issue: file the issue against
 [lua-lunet/uvrr-core](https://github.com/lua-lunet/uvrr-core) and surface
 it to the coordinator before changing the adapter or re-pinning the
 dependency; bugs in dependencies or derived code are reported to this
-project first, then upstreamed to both communities (see
-[`ATTRIBUTIONS.md`](../ATTRIBUTIONS.md)).
+project first, then upstreamed to both communities (see the repo root's
+`ATTRIBUTIONS.md`).
 
 ## Attribution
 
