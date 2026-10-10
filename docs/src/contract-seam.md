@@ -57,7 +57,13 @@ implementation of `StateStore`:
    lock-table snapshot to disk, in the foreground, after the drain window
    closes and before the stop completes. A stop that cannot flush is a failed
    stop: the failure is surfaced through the same channel as any other failed
-   stop, never silently skipped.
+   stop, never silently skipped. The flush has no timeout and no retry: it is
+   one foreground write, bounded only by the medium. A hung flush therefore
+   hangs the stop — the honest shape, because the escape is the operator's
+   `kill -9` and the crash contract is already the designed answer: the
+   markers hold at the halt's first round, so the next boot reads crashed and
+   distrusts everything the stop was writing. What the law forbids is not a
+   slow flush but a stop that lies about having one.
 2. **Load is lazy on the regular path.** Boot never loads eagerly. The table
    starts empty; the first demand that finds the table empty, behind a
    clean-stop verdict from the boot gate, performs exactly one load. Until
