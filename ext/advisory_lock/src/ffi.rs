@@ -1490,6 +1490,7 @@ impl Node {
         }))
         .unwrap_or(Err(PANIC))
     }
+    /// The AOF-backed constructor: the committed-transition hook enqueues
     /// to the AOF write-behind writer instead of the blocking journal. Same
     /// member/own/state grammar as [`Node::open`]; `aof_dir` is the AOF
     /// series directory (created or resumed); `flush_ms` is the periodic
