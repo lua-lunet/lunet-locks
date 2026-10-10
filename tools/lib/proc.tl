@@ -78,7 +78,7 @@ local record M
     suspend: function(Process): boolean
     resume: function(Process): boolean
     stop: function(Process, integer): integer
-    stop_all: function()
+    stop_all: function(): {Process}
     tracked: {Process}
     untrack: function(Process)
     Process: Process
@@ -213,13 +213,20 @@ function M.poll(p: Process): boolean
     return false
 end
 
--- Blocking reap; returns the decoded exit code (128+signal for signals).
+-- Blocking reap; returns the decoded exit code (128+signal for signals),
+-- or -1 when waitpid itself failed — never a fabricated clean exit: an
+-- unreadable waitpid status must not be reported as "exited 0".
 function M.wait(p: Process): integer
     if p.state ~= "running" then
         return p.exit_code
     end
     local status = ffi.new("int[1]") as {integer}
-    C.waitpid(p.pid, status, 0)
+    if C.waitpid(p.pid, status, 0) < 0 then
+        p.state = "failed"
+        p.exit_code = -1
+        M.untrack(p)
+        return p.exit_code
+    end
     decode(p, status[0])
     return p.exit_code
 end
@@ -268,16 +275,34 @@ function M.stop(p: Process, grace_ms: integer): integer
 end
 
 -- Reaps every tracked process through the polite stop: the runners'
--- unconditional cleanup on exit.
-function M.stop_all()
-    -- M.stop reaps and untracks (a table.remove on this very table), so
-    -- an ipairs over the live table skips every second process: the
-    -- 2026-10-09 standby lane's exit left three of seven nodes running.
-    -- Walk the indices backwards — removing the current tail never
-    -- disturbs the indices still to visit.
+-- unconditional cleanup on exit. M.stop reaps and untracks (a
+-- table.remove on this very table), so an ipairs over the live table
+-- skips every second process: the 2026-10-09 standby lane's exit left
+-- three of seven nodes running. Walk the indices backwards — removing
+-- the current tail never disturbs the indices still to visit.
+--
+-- Returns the processes whose exit could not be confirmed — waitpid
+-- failed and the pid is still alive — one loud line each: a cleanup
+-- that fails silently is the skip bug's own class.
+function M.stop_all(): {Process}
+    local survivors: {Process} = {}
     for i = #M.tracked, 1, -1 do
-        M.stop(M.tracked[i], 1000)
+        local p = M.tracked[i]
+        M.stop(p, 1000)
+        if p.exit_code == -1 and C.kill(p.pid, 0) == 0 then
+            survivors[#survivors + 1] = p
+        end
     end
+    for _, p in ipairs(survivors) do
+        io.stderr:write(
+            "proc: stop_all could not stop "
+                .. p.name
+                .. " (pid "
+                .. tostring(p.pid)
+                .. "); it is still alive\n"
+        )
+    end
+    return survivors
 end
 
 return M
