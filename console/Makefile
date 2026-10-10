@@ -13,7 +13,7 @@ MOCK_PORT ?= 8481
 TSC        ?= tsc
 TSC_VERSION ?= 6.0.3
 
-.PHONY: init up down status logs vendor vendor-lock mjs-check check clean
+.PHONY: init up down status logs vendor vendor-lock mjs-check mjs-check-negative check clean
 
 init:
 	@ls ../.rocks/share/lua/5.1/tl.lua >/dev/null 2>&1 || { \
@@ -60,7 +60,22 @@ mjs-check:
 		echo "tsc $$actual: pinned OK"
 	$(TSC) -p tsconfig.json
 
-check: init mjs-check
+# The gate's negative proof: the fixture carries one deliberate type error
+# and tsc must refuse it. If the fixture ever type-checks clean — the
+# tsconfig mis-scoped, checkJs off — the gate is checking nothing, and this
+# target is the one that says so.
+mjs-check-negative:
+	@test -f tooling/mjs-gate-fixture/broken.mjs || { \
+		echo "ERROR: the negative fixture is gone; the gate's ability to fail is unproven" >&2; \
+		exit 1; }
+	@if $(TSC) -p tsconfig-negative.json >/dev/null 2>&1; then \
+		echo "ERROR: the negative fixture type-checked CLEAN — the gate cannot fail and is not a gate" >&2; \
+		exit 1; \
+	else \
+		echo "tsc negative fixture: refused as required — the gate can fail"; \
+	fi
+
+check: init mjs-check mjs-check-negative
 	shellcheck bin/*.sh
 	@../.rocks/bin/cyan check tooling/lib/consolectl.tl
 
