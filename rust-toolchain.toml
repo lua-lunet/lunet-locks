@@ -18,3 +18,10 @@
 
 [toolchain]
 channel = "1.96.0"
+# The lint components, named here because this file is the authority rustup
+# provisions from: ci.yml's toolchain action requests rustfmt and clippy,
+# but the channels a rust-toolchain.toml declares override an action's
+# component list, so a CI toolchain provisioned from this file alone
+# shipped without cargo-fmt and every `make check` lane failed on it. The
+# channel, and therefore the toolchain home, does not move.
+components = ["rustfmt", "clippy"]
