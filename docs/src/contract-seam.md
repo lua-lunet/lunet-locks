@@ -7,7 +7,11 @@ file system, no globals, no environment reach-arounds. In the
 `lunet-advisory-lock` crate, `Disk` and `StateStore` are defined in its
 `disk` and `state` modules, and `CommitHook` is defined in its `spi` module;
 the `spi` module re-exports all three and is the single named surface both
-sides of the seam are written against.
+sides of the seam are written against. The boot fence rides beside the three
+as the fourth mounting point — it is the machinery's own `LifecycleStore`
+contract, not a fourth trait of this seam's, and the embedding API at the
+end of this document states the full mounting grammar as one public
+constructor.
 
 The seam exists because the machinery must live in two environments that are
 never conflated: a minimal experimental harness that proves the protocol and
@@ -15,12 +19,11 @@ measures it, and an industrial deployment that must survive real disks, real
 crashes, and real operators. The machinery is one body of code; the
 environments are interchangeable implementations of the three traits.
 
-The boot fence is the fourth mounting point and not a fourth contract of
-this crate's own: the boot gate's marker store is upstream's
-`LifecycleStore` (`vrr::lifecycle`), and the machinery here routes the
-boot's classification and the marker machine's rounds through it. The
-embedding API, at the end of this document, states the full mounting
-grammar — the three traits and the fence — as one public constructor.
+The fence itself is upstream's `LifecycleStore` (`vrr::lifecycle`), and the
+machinery here routes the boot's classification and the marker machine's
+rounds through it. The embedding API, at the end of this document, states
+the full mounting grammar — the three traits and the fence — as one public
+constructor.
 
 ## The traits
 
