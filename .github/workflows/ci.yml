@@ -71,6 +71,26 @@ jobs:
           sudo ln -sf /usr/bin/luajit /opt/luajit-shim/bin/luajit
           sudo ln -sfn /usr/include /opt/luajit-shim/include
           sudo ln -sfn /usr/lib /opt/luajit-shim/lib
+      # paxe-core requires a static libsodium with the ARM64 AES-256-GCM
+      # hardware path (>= 1.0.20; see PAXE.md "Requirements"), and the
+      # runner image's libsodium is shared-only and older — exactly the
+      # situation docker/Dockerfile.fastbuild solves for the simulation
+      # image. Same source, same checksum, same static-only shape, into
+      # /usr/local where pkg-config resolves the archive first.
+      - name: Build static libsodium (Linux, paxe-core's link input)
+        if: runner.os == 'Linux'
+        run: |
+          curl --fail --location --retry 3 \
+            "https://github.com/jedisct1/libsodium/releases/download/1.0.22-RELEASE/libsodium-1.0.22.tar.gz" \
+            --output /tmp/libsodium.tar.gz
+          echo "adbdd8f16149e81ac6078a03aca6fc03b592b89ef7b5ed83841c086191be3349  /tmp/libsodium.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/libsodium.tar.gz -C /tmp
+          cd /tmp/libsodium-1.0.22
+          ./configure --disable-shared --enable-static --prefix=/usr/local
+          make -j"$(nproc)"
+          sudo make install
+          test -f /usr/local/lib/libsodium.a
+          sudo ldconfig
       - name: Install system dependencies (macOS)
         if: runner.os == 'macOS'
         # zlib: the official lunet-run macOS release binary is dynamically
