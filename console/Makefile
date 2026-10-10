@@ -8,7 +8,10 @@ MOCK_PORT ?= 8481
 # The .mjs type gate's compiler, pinned: the SPA has no build step and no
 # node_modules, so the runner installs TypeScript globally in its setup step
 # (`npm install --global typescript@6.0.3`) and the gate below runs offline.
-TSC ?= tsc
+# The version assert under mjs-check makes a WRONG compiler refuse instead
+# of gate differently — the same version by construction, locally and in CI.
+TSC        ?= tsc
+TSC_VERSION ?= 6.0.3
 
 .PHONY: init up down status logs vendor vendor-lock mjs-check check clean
 
@@ -45,8 +48,16 @@ vendor-lock:
 
 # Type-check the SPA from its JSDoc (tsconfig.json). No package.json, no
 # node_modules, no build step: tsc only reads (noEmit) and the .mjs files
-# ship as-is. Fast enough to run on its own as an inner loop.
+# ship as-is. Fast enough to run on its own as an inner loop. The version
+# assert first: strict over types.mjs is exactly where tsc versions
+# disagree, so a different compiler is a different gate and refuses.
 mjs-check:
+	@actual=$$($(TSC) --version | awk '{print $$NF}'); \
+		test "$$actual" = "$(TSC_VERSION)" || { \
+			echo "ERROR: the .mjs gate pins typescript@$(TSC_VERSION); this machine's tsc is $$actual" >&2; \
+			echo "       install the pinned compiler (npm install --global typescript@$(TSC_VERSION))" >&2; \
+			exit 1; }; \
+		echo "tsc $$actual: pinned OK"
 	$(TSC) -p tsconfig.json
 
 check: init mjs-check
