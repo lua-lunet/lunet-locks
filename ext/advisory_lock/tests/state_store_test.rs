@@ -16,14 +16,39 @@
 //! Real files in the repo's scratch tree (`.tmp` is scratch).
 
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU64, Ordering},
+};
 
 use lunet_advisory_lock::disk::std_disk;
 use lunet_advisory_lock::locks::{Lease, Request, Service, StateSnapshot};
+use lunet_advisory_lock::spi::NoOpHook;
 use lunet_advisory_lock::state::{FileStateStore, StateStore, lazy_load};
-use lunet_advisory_lock::{Node, PRIMARY_TIMEOUT_MS, census_paths};
+use lunet_advisory_lock::{Node, PRIMARY_TIMEOUT_MS, SERVICE, census_paths};
 use uuid::Uuid;
+
+/// The store whose flush refuses — the failing leg of the FAILED-stop
+/// law. Everything else delegates to the real file store, so the test's
+/// only variable is the refusal itself.
+struct FailingFlushStore {
+    inner: FileStateStore,
+}
+
+impl StateStore for FailingFlushStore {
+    fn flush(&mut self, _snap: &StateSnapshot) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::StorageFull,
+            "the store under test refuses every flush",
+        ))
+    }
+
+    fn load(&self) -> io::Result<Option<StateSnapshot>> {
+        self.inner.load()
+    }
+}
 
 /// The framed file's layout, restated here so the test's damages address
 /// the right bytes: version byte | length (u32 BE) | payload | checksum
@@ -407,6 +432,97 @@ fn a_crashed_boot_is_the_verdict_the_load_guard_refuses() {
         lazy_load(&store, false, true).expect("the load does not fail"),
         None,
         "the crashed verdict reads nothing even when a readable file is there"
+    );
+}
+
+/// A stop that cannot flush is a FAILED stop — the law's central claim,
+/// driven through the real `Node` stop path with a store whose flush
+/// refuses. The stop reports the failure instead of skipping it, the
+/// markers never reach the drain-proven `Stopped` round (so the next boot
+/// reads crashed), and no torn half-state file is left behind.
+#[test]
+fn a_stop_that_cannot_flush_is_a_failed_stop() {
+    let dir = scratch("flush-refused");
+    let marker = state_path(&dir);
+    // The store under test wraps the real file store so the refusal is
+    // the only difference from the passing schedule above.
+    let failing = FailingFlushStore {
+        inner: FileStateStore::new(&marker),
+    };
+    let mut node = Node::open_with_seams(
+        &members(),
+        "a",
+        marker.to_str().expect("the scratch path is UTF-8"),
+        None,
+        0,
+        PRIMARY_TIMEOUT_MS,
+        std_disk(),
+        Box::new(failing),
+        Arc::new(Mutex::new(NoOpHook)),
+        None,
+    )
+    .expect("a three-member node boots with a mounted store");
+    let _ = census_paths();
+
+    assert_eq!(node.stop(), SERVICE, "a refused flush fails the stop");
+
+    // The tape names the failure where the law says it lands: past the
+    // drain window, at the flush, and the schedule never resumes — no
+    // flush line, no Stopped round, no completion.
+    let tape = census_paths();
+    assert!(
+        tape.contains(&"stop.drain-window.close"),
+        "the schedule reached the flush's seat: {tape:?}"
+    );
+    assert!(
+        tape.contains(&"stop.refuse.state-flush"),
+        "the refusal is named: {tape:?}"
+    );
+    assert!(
+        !tape.contains(&"state.flush"),
+        "a refused flush is never reported as flushed: {tape:?}"
+    );
+    assert!(
+        !tape.contains(&"stop.round.finish"),
+        "the Stopped round never runs behind a failed flush: {tape:?}"
+    );
+    assert!(
+        !tape.contains(&"stop.complete"),
+        "a failed stop does not complete: {tape:?}"
+    );
+
+    // No torn half-state: the staged write never landed, so the state
+    // file is simply absent — nothing to distrust later, nothing to
+    // half-read.
+    assert!(
+        FileStateStore::new(&marker)
+            .load()
+            .expect("the read is answered")
+            .is_none(),
+        "a failed flush leaves no state file"
+    );
+
+    // The next boot on this marker classifies crashed — the markers hold
+    // the halt's first round — and the guard reads nothing, exactly as
+    // the law's crashed clause states.
+    let _reopened = Node::open(
+        &members(),
+        "a",
+        marker.to_str().expect("the scratch path is UTF-8"),
+        None,
+        0,
+        PRIMARY_TIMEOUT_MS,
+    )
+    .expect("the crashed life reopens as its replacement");
+    let tape = census_paths();
+    assert!(
+        tape.contains(&"boot.crashed"),
+        "the markers held at the first round, so the next boot is crashed: {tape:?}"
+    );
+    assert_eq!(
+        lazy_load(&FileStateStore::new(&marker), false, true).expect("the load does not fail"),
+        None,
+        "the crashed boot reads nothing"
     );
 }
 
