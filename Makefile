@@ -92,7 +92,7 @@ sh-smoke:
 teal-suite: build
 	LUA_PATH="$(abspath build)/?.lua;$(CURDIR)/?.tl;;" $(TESTED) tests
 
-check: build lint teal-suite example-check sh-check sh-smoke
+check: build lint teal-suite example-check example-test sh-check sh-smoke
 	$(CYAN) check $(TEAL_SOURCES)
 
 # The gate under its validation name. The suite runs once, as `check`'s
@@ -247,6 +247,13 @@ example-check:
 	cargo fmt --manifest-path $(BENCH_DIR)/Cargo.toml -- --check
 	cargo clippy --manifest-path $(BENCH_DIR)/Cargo.toml --all-targets -- -D warnings
 	FLIGHT_RECORDER_ALLOW_DIRTY=1 cargo clippy --manifest-path $(BENCH_DIR)/Cargo.toml --all-targets --features "$(BENCH_FEATURES)" -- -D warnings
+
+# The example crate's tests run in the gate like every other crate's: the
+# config-parse gate lives here (the descriptors are this crate's), and the
+# chase-payload contract test rides the same lane. Before 2026-10-09 no
+# lane ran them at all.
+example-test:
+	cargo test --manifest-path $(BENCH_DIR)/Cargo.toml
 
 ext-test: ext-check
 	cargo test --manifest-path ext/advisory_lock/Cargo.toml
