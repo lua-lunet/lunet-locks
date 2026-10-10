@@ -137,8 +137,8 @@ is written against, and nothing else:
   under the persistence law.
 - **`commit_hook: Arc<Mutex<dyn CommitHook>>`** — the trigger at each
   applied commit.
-- **`fence: Option<Box<dyn LifecycleStore<Error = io::Error>>>`** — the
-  boot fence, the boot gate's marker store and the fourth touch point.
+- **`fence: Option<Box<dyn LifecycleStore<Error = io::Error> + Send + Sync>>`** —
+  the boot fence, the boot gate's marker store and the fourth touch point.
   `None` keeps the industrial default: the superblock quorum store over
   the state path, the Zig engine's quorum-of-copies construction with the
   single-file projection mirror. `Some(store)` mounts the embedder's own
