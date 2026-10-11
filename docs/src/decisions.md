@@ -172,6 +172,69 @@ files at its own reboot, and may drop files old enough that every lease
 they record has expired: the live set is small and the dead record is
 bulk.
 
+## The system lease is a lease, not a fault detector
+
+uVRR's own paper puts it plainly: a read that consults the replicas costs a
+round trip, and §6.3.1 names the standard cure — Harp's leader lease, the
+leader answering reads from its own memory inside a lease period it keeps
+renewed, so a read is one hop while the lease holds and the full quorum
+round only once the lease is gone.
+
+This cluster runs that shape as an embedded lock rather than as machinery.
+A leader that can serve reads from its own state holds that claim under a
+lock in the same lock table every other lease lives in, at an address
+reserved for system use. The lock is a lease in the full sense — it is
+granted, it has an expiry, it is broken and cleared like any other — and it
+is dogfood: the node holds the thing it is trying to sell.
+
+**The distinction that makes it coherent.** The system lease is never read
+as a fault detector. A leader that suspects it has been isolated — the
+flavoured-timeout model already knows when that is — routes reads through
+the quorum regardless of what its lease says. The lease says the leader
+believes its reads are fresh; the timeout says the cluster believes the
+leader is reachable. When they disagree, the timeout wins, because the
+timeout is the only one of the two with evidence behind it.
+
+**The reserved band.** System leases are addressed outside the client
+space, and the client space may not reach into it. The band is chosen so
+that no client address can collide with it and so that a lock held at a
+system address is recognisable in a dump, in the console, and in the tape
+without consulting a schema.
+
+**What this binds.** Holding the system lease is never a precondition for
+leadership: a cluster that never sets one behaves identically to one that
+does, and the leader that cannot take the lease — because a predecessor
+still holds it — simply serves reads through the quorum. Only the read path
+is optimised, never the write path and never the failure detector. The
+lease's renewal rides the leader's existing heartbeat commit in the same
+batch, so a heartbeat that already advances the log renews the lease at no
+extra round trip. A leader that abdicates cleanly releases the lease in the
+same batch as the view-change nomination, so a clean handover starts
+without a stale claim. A leader with no read traffic to justify the claim
+stops renewing it; the read path is not worth a slot per heartbeat when
+nothing is reading.
+
+The lease period is set to the failure-detection interval plus a margin
+that covers the recovery's own cost — a leader failover costs two round
+trips for the view change and the view-change commit — so that a new leader
+does not find the lease already expired and lose the read fast path for the
+first moments of its term. The margin is the cluster's clock-drift
+allowance, and the allowance is set by the gap between the heartbeat
+interval and the failure-detection interval, not by taste.
+
+**Where it lives.** The lease mechanism is a core concern: the paper's
+§6.3.1 is the upstream machinery's business, and the optimisations the
+paper describes belong to the replication core, not to a deployment. This
+repository carries the address policy, the dogfooded lock, and the timeout
+arithmetic; the core carries the mechanism. Neither is built until the
+system is released without it — a lock service ships first, and the
+optimisation follows it.
+
+**What this binds.** A client lock never occupies a reserved address, and a
+system lease is never granted to a client: the two spaces do not overlap,
+because one is addressed by a client and the other is a claim the cluster
+makes about itself.
+
 **What this binds.** The shutdown ceremony is enforced by the marker: the
 flushed round vouches for the local frame's end marker, never for the
 process's own intent. The artefact is a frame, not a running series: a
