@@ -139,7 +139,7 @@ unsafe extern "C" {
     /// Open (create or open, never truncate) the fixed-size WAL file.
     /// Returns null on refusal: a bad path, a wrong-size file, a busy
     /// file, corrupt content at open, or an engine-refused config.
-    fn wal_open(path: *const i8, capacity: u32) -> *mut WalHandleRaw;
+    fn wal_open(path: *const core::ffi::c_char, capacity: u32) -> *mut WalHandleRaw;
 
     /// Close the handle. No fsync — the documented dirty-close loss
     /// window; the shutdown flush belongs to `wal_flush_sync`, called

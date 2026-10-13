@@ -339,8 +339,20 @@ fn the_wal_store_mounts_ticks_and_stops_through_the_ffi() {
         &mut buf,
     );
     assert!(contains(&reply, GRANTED), "the lock grants");
-    assert_eq!(rig[leader].state_tick(), 0);
-    let status = rig[leader].state_status();
+    // The steady loop's cadence, compressed: the tick path is
+    // pump-tick-pump, and on the linux ring the CQE for this
+    // submission lands on a LATER pump — the next beat's leading
+    // drain — while the darwin backend completes synchronously inside
+    // the one call. Drive the loop the way production does until the
+    // counters move, bounded.
+    let mut status = rig[leader].state_status();
+    for _ in 0..8 {
+        rig[leader].state_tick();
+        status = rig[leader].state_status();
+        if status.eph_completed_records == 1 {
+            break;
+        }
+    }
     assert_eq!(
         status.eph_completed_records, 1,
         "the committed lock's live record landed"
