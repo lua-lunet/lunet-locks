@@ -339,19 +339,21 @@ fn the_wal_store_mounts_ticks_and_stops_through_the_ffi() {
         &mut buf,
     );
     assert!(contains(&reply, GRANTED), "the lock grants");
-    // The steady loop's cadence, compressed: the tick path is
-    // pump-tick-pump, and on the linux ring the CQE for this
-    // submission lands on a LATER pump — the next beat's leading
-    // drain — while the darwin backend completes synchronously inside
-    // the one call. Drive the loop the way production does until the
-    // counters move, bounded.
+    // The steady loop's cadence, compressed. On the linux ring the
+    // tick SUBMITS the generation and the completion lands on a LATER
+    // pump — "the submit cadence is the drain point", the IO ruling's
+    // own words — while the darwin backend completes synchronously
+    // inside the one call. The test drives the loop the way
+    // production does: a beat, real time, a beat — bounded at four
+    // seconds against an observed ~200 ms landing.
     let mut status = rig[leader].state_status();
-    for _ in 0..8 {
-        rig[leader].state_tick();
-        status = rig[leader].state_status();
+    for _ in 0..40 {
         if status.eph_completed_records == 1 {
             break;
         }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        rig[leader].state_tick();
+        status = rig[leader].state_status();
     }
     assert_eq!(
         status.eph_completed_records, 1,

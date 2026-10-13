@@ -52,6 +52,29 @@ fn wal_path(dir: &Path) -> PathBuf {
     dir.join("node.marker.wal")
 }
 
+/// The node's beat, compressed. The pump reaps only completions the
+/// kernel has posted, and the linux ring posts them with real time —
+/// the darwin backend completes synchronously inside the submit
+/// itself. The beat is the cadence the IO ruling names: the submit
+/// cadence is the drain point. Pump, then a bounded wait for both
+/// streams' outstanding batch to complete, pumping as the completions
+/// arrive — the same thing the node's ~1000 ms loop does, sped up.
+/// Every assertion below that reads a completed counter or submits
+/// again, or flushes against the engine's mirror, holds only past a
+/// beat.
+fn beat(store: &mut WalSnapshotStore) {
+    store.pump().expect("the pump drains");
+    for _ in 0..80 {
+        let status = store.status().expect("the status reads");
+        if status.ephemeral.in_flight == 0 && status.durable.in_flight == 0 {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        store.pump().expect("the pump drains");
+    }
+    panic!("the store's batch never completed");
+}
+
 /// The ephemeral data ring holds the record's bitwise NOT — every byte
 /// flipped — as the redundant second copy. The flip is its own inverse:
 /// the read path un-flips and demands byte-exact agreement with the
@@ -204,7 +227,7 @@ fn flush_load_roundtrip_byte_exact() {
             store.note(*lock_id);
         }
         assert_eq!(store.submit(&table).expect("the submit lands"), 3);
-        store.pump().expect("the pump drains");
+        beat(&mut store);
         store.flush(&table).expect("the flush lands");
     }
 
@@ -302,13 +325,13 @@ fn release_tombstone_drops_the_lock() {
                 .expect("the submit lands"),
             1,
         );
-        store.pump().expect("the pump drains");
+        beat(&mut store);
         // The release: the lock leaves the table, the tick submits again.
         store.note(1);
         store
             .submit(&snapshot(Vec::<(u64, Lease)>::new()))
             .expect("the tombstone lands");
-        store.pump().expect("the pump drains");
+        beat(&mut store);
 
         let status = store.status().expect("the status reads");
         assert_eq!(
@@ -345,7 +368,7 @@ fn expiry_drift_skip_honored() {
                 (2, lease(2, 20, now + 60_000)),
             ]))
             .expect("the submit lands");
-        store.pump().expect("the pump drains");
+        beat(&mut store);
     }
 
     let store = WalSnapshotStore::new(&path).expect("the store reopens");
@@ -378,7 +401,7 @@ fn capacity_refusal_fails_stop() {
     store.note(1);
     store.note(2);
     assert_eq!(store.submit(&table).expect("the submit lands"), 2);
-    store.pump().expect("the pump drains");
+    beat(&mut store);
 
     let error = store.flush(&table).expect_err("the flush refuses");
     assert_eq!(error.kind(), std::io::ErrorKind::StorageFull);
@@ -427,7 +450,7 @@ fn status_counters_move_after_flush() {
         store.note(*lock_id);
     }
     store.submit(&table).expect("the submit lands");
-    store.pump().expect("the pump drains");
+    beat(&mut store);
     store.flush(&table).expect("the flush lands");
     let after = store.status().expect("the status reads");
     assert_eq!(
@@ -470,10 +493,10 @@ fn submit_carries_only_the_changed_locks() {
     store.note(1);
     store.note(2);
     assert_eq!(store.submit(&table).expect("the submit lands"), 2);
-    store.pump().expect("the pump drains");
+    beat(&mut store);
     store.note(1);
     assert_eq!(store.submit(&table).expect("the renew lands"), 1);
-    store.pump().expect("the pump drains");
+    beat(&mut store);
     assert_eq!(store.submit(&table).expect("the set is clear"), 0);
     assert_eq!(
         store
@@ -503,7 +526,7 @@ fn content_refusals_refuse_open() {
             store.note(*lock_id);
         }
         store.submit(&table).expect("the submit lands");
-        store.pump().expect("the pump drains");
+        beat(&mut store);
         store.flush(&table).expect("the flush lands");
     }
 
@@ -588,7 +611,7 @@ fn tick_and_flush_classify_expiry_zero_named_leases_alike() {
     let mut store = WalSnapshotStore::new(&path).expect("the store opens");
     store.note(5);
     assert_eq!(store.submit(&table).expect("the tick lands"), 1);
-    store.pump().expect("the pump drains");
+    beat(&mut store);
     let status = store.status().expect("the status reads");
     assert_eq!(status.durable.completed_records, 1, "one kept frame");
     assert_eq!(status.ephemeral.completed_records, 0);
@@ -627,7 +650,7 @@ fn a_flush_without_a_prior_tick_is_the_loud_failed_stop() {
     // Acquire rides the tick: the mirror holds lock 1.
     store.note(1);
     store.submit(&held).expect("the tick lands");
-    store.pump().expect("the pump drains");
+    beat(&mut store);
 
     // Release — but the changed set never rode a tick before the flush.
     // The mirror still holds lock 1; the caller's set is empty; the
@@ -643,7 +666,7 @@ fn a_flush_without_a_prior_tick_is_the_loud_failed_stop() {
     // The submit-before-flush order: the tombstone catches the mirror
     // up, and the flush reconciles.
     store.submit(&released).expect("the tick lands");
-    store.pump().expect("the pump drains");
+    beat(&mut store);
     store.flush(&released).expect("the flush reconciles");
 }
 
@@ -668,7 +691,7 @@ fn the_loaded_table_rides_the_tick_before_a_clean_flush() {
             store.note(*lock_id);
         }
         store.submit(&held).expect("the tick lands");
-        store.pump().expect("the pump drains");
+        beat(&mut store);
         store.flush(&held).expect("the flush lands");
     }
 
@@ -690,7 +713,7 @@ fn the_loaded_table_rides_the_tick_before_a_clean_flush() {
         2,
         "both loaded locks ride the first tick"
     );
-    reopened.pump().expect("the pump drains");
+    beat(&mut reopened);
     reopened.flush(&loaded).expect("the flush reconciles");
 }
 
@@ -713,7 +736,7 @@ fn the_forgotten_store_reconciles_against_the_rebuilt_mirrors() {
         let mut store = WalSnapshotStore::new(&path).expect("the store opens");
         store.note(1);
         store.submit(&pre_crash).expect("the tick lands");
-        store.pump().expect("the pump drains");
+        beat(&mut store);
         store.flush(&pre_crash).expect("the flush lands");
     }
 
@@ -746,7 +769,7 @@ fn the_forgotten_store_reconciles_against_the_rebuilt_mirrors() {
     // be the loud failed stop.
     store.note(2);
     store.submit(&post_crash).expect("the tick lands");
-    store.pump().expect("the pump drains");
+    beat(&mut store);
     store.flush(&post_crash).expect("the flush reconciles");
     let status = store.status().expect("the status reads");
     assert_eq!(
@@ -772,7 +795,7 @@ fn a_dead_store_refuses_other_and_loads_none() {
         let mut store = WalSnapshotStore::new(&path).expect("the store opens");
         store.note(1);
         store.submit(&held).expect("the tick lands");
-        store.pump().expect("the pump drains");
+        beat(&mut store);
         store.flush(&held).expect("the flush lands");
     }
 
@@ -1304,7 +1327,7 @@ fn durable_submit_load_roundtrip_byte_exact() {
         }
         // Two frames and one record: three members, one generation.
         assert_eq!(store.submit(&table).expect("the submit lands"), 3);
-        store.pump().expect("the pump drains");
+        beat(&mut store);
 
         let status = store.status().expect("the status reads");
         assert_eq!(status.ephemeral.completed_records, 1);
@@ -1356,7 +1379,7 @@ fn durable_release_keeps_the_identity() {
         let mut store = WalSnapshotStore::new(&path).expect("the store opens");
         store.note(5);
         store.submit(&table).expect("the live frame lands");
-        store.pump().expect("the pump drains");
+        beat(&mut store);
 
         // The release: the lock leaves the table, the tick submits the
         // kept frame — the identity retained.
@@ -1364,7 +1387,7 @@ fn durable_release_keeps_the_identity() {
         store
             .submit(&snapshot(Vec::<(u64, Lease)>::new()))
             .expect("the kept frame lands");
-        store.pump().expect("the pump drains");
+        beat(&mut store);
 
         let status = store.status().expect("the status reads");
         assert_eq!(status.durable.completed_records, 2, "one live, one kept");
@@ -1410,12 +1433,12 @@ fn durable_retake_after_kept() {
                 named_lease(5, 50, now_millis() + 60_000),
             )]))
             .expect("the live frame lands");
-        store.pump().expect("the pump drains");
+        beat(&mut store);
         store.note(5);
         store
             .submit(&snapshot(Vec::<(u64, Lease)>::new()))
             .expect("the kept frame lands");
-        store.pump().expect("the pump drains");
+        beat(&mut store);
         store.note(5);
         // Built once: the flush must carry byte-for-byte what the tick
         // submitted — the reconciliation compares them, so a fresh
@@ -1425,7 +1448,7 @@ fn durable_retake_after_kept() {
         store
             .submit(&snapshot([(5u64, retaken.clone())]))
             .expect("the live frame lands again");
-        store.pump().expect("the pump drains");
+        beat(&mut store);
         store
             .flush(&snapshot([(5u64, retaken)]))
             .expect("the flush lands");
@@ -1455,7 +1478,7 @@ fn durable_capacity_refusal_counts_per_stream() {
     store.note(1);
     store.note(2);
     assert_eq!(store.submit(&table).expect("the submit lands"), 2);
-    store.pump().expect("the pump drains");
+    beat(&mut store);
 
     // The third durable lock: the ring cannot take it — counted on the
     // durable row, the serving state untouched.

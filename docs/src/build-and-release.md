@@ -27,7 +27,7 @@
 - **The vendored AOF's zig compiles its explicit target.** The Rust
   build script of `ext/lunet-locks-aof` runs the pinned Zig 0.14.1
   toolchain (the aarch64 one, running natively) and, for a cross
-  invocation, takes the target from `LUNET_LOCKS_AOF_TARGET` (the
+  invocation, takes the target from `TBIO_TARGET` (the
   build's rust target triple, e.g. `x86_64-linux-gnu`); without it the
   library builds for the host. Zig's per-arch baselines omit the
   hardware-AES extensions the AOF checksum hard-requires, so every

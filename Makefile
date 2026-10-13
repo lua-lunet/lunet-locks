@@ -92,7 +92,7 @@ sh-smoke:
 teal-suite: build
 	LUA_PATH="$(abspath build)/?.lua;$(CURDIR)/?.tl;;" $(TESTED) tests
 
-check: build lint teal-suite example-check example-test sh-check sh-smoke
+check: build lint ext-test teal-suite example-check example-test sh-check sh-smoke
 	$(CYAN) check $(TEAL_SOURCES)
 
 # The gate under its validation name. The suite runs once, as `check`'s

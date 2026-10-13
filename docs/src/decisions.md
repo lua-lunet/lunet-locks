@@ -250,3 +250,45 @@ preserves every lock the node's own series recorded; a dirty boot never
 trusts the series it finds. See [the write-behind lock table](write-behind.md)
 for the mechanism and its nuances, and [the telemetry AOF](telemetry-aof.md)
 for the write-behind discipline both series share.
+
+## The WAL lock snapshot is a Zig engine, and its substrates are settled
+
+The lock table's periodic async snapshot is written by a WAL engine written
+in Zig in tbio-core, exposed over a C ABI, and wrapped in Rust only by the
+thin safe `StateStore` the seam already names. No WAL or IO machinery is
+written in Rust, and the engine takes no third-party dependency: the
+surfaces that get called at 2am are written once, from battle-tested
+primitives, and are not improvised per feature.
+
+Two operating scenarios are required of it, and both hold: the clean
+shutdown takes the eager foreground flush — blocking IO, as fast as the
+medium answers — and steady running takes the lazy snapshot on the
+~1000 ms timer, never blocking or backpressuring the serving path.
+Durability in the steady state is page-cached writes with one fsync
+closing each flush generation; a crash mid-period is a dirty boot, and
+the dirty boot never reads the artefact, so only the shutdown generation
+must be durable.
+
+**The substrates are settled with numbers.**
+
+- The lifecycle marker store is not the snapshot's substrate. Its payload
+  space is ~1,920 bytes — about 26 locks at 72 bytes — and every marker
+  round forces four 24 KiB writes. It fences; it does not hold a table.
+- The AOF is not the snapshot's substrate. The AOF is the
+  cross-datacenter archive: cold, deep, fully hashed, riding redundancy
+  across machines and regions. The crash-restart load must be fast, and
+  the AOF's chained hashing and single-copy torn-tail refusal are the
+  wrong shape for a hot path that rehydrates a live set in seconds.
+- The upstream journal is not revendored. It is compile-time-fused to the
+  VSR replica — a slot is a 256-byte header and a 1 MiB prepare body, the
+  journal carries 84 `Message.Prepare` references and 46 replica call
+  sites, and torn tails repair from a peer replica. It cannot hold a
+  72-byte lock record without destroying the properties that make it
+  battle-tested.
+
+New logic rides vendored upstream primitives and never replaces them: the
+engine's append-only file discipline is the upstream AOF's taken as a
+pure strip (503 lines deleted, zero added, zero modified), the checksum
+and message-header modules are byte-identical, and the superblock is
+carved, not rewritten (27 lines added out of reserved padding, 13 test
+asserts removed).

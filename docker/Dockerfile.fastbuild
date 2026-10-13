@@ -88,7 +88,7 @@ RUN mkdir -p /opt/zig \
     && echo "f7a654acc967864f7a050ddacfaa778c7504a0eca8d2b678839c21eea47c992b  /tmp/zig.tar.xz" | sha256sum -c - \
     && tar -xJf /tmp/zig.tar.xz -C /opt/zig --strip-components=1 \
     && rm -f /tmp/zig.tar.xz
-ENV LUNET_LOCKS_AOF_ZIG=/opt/zig/zig
+ENV TBIO_ZIG=/opt/zig/zig
 
 # Sanity profile: no optimisation, no debug info, no incremental — while
 # debug_assertions stays ON (the maybe! tripwires still execute). The
@@ -130,12 +130,12 @@ RUN mkdir -p ext/advisory_lock/src examples/lease-sequencer/src \
     && printf 'fn main() {}\n' > examples/lease-sequencer/src/main.rs \
     && cargo check --manifest-path ext/advisory_lock/Cargo.toml \
         --target aarch64-unknown-linux-gnu \
-    && LUNET_LOCKS_AOF_TARGET=x86_64-linux-gnu \
+    && TBIO_TARGET=x86_64-linux-gnu \
         cargo check --manifest-path ext/advisory_lock/Cargo.toml \
         --target x86_64-unknown-linux-gnu \
     && cargo check --locked --manifest-path examples/lease-sequencer/Cargo.toml \
         --target aarch64-unknown-linux-gnu \
-    && LUNET_LOCKS_AOF_TARGET=x86_64-linux-gnu \
+    && TBIO_TARGET=x86_64-linux-gnu \
         cargo check --locked --manifest-path examples/lease-sequencer/Cargo.toml \
         --target x86_64-unknown-linux-gnu
 
@@ -151,10 +151,10 @@ RUN cargo check --manifest-path ext/advisory_lock/Cargo.toml \
     && cargo check --manifest-path ext/advisory_lock/Cargo.toml \
         --features flight-recorder \
         --target aarch64-unknown-linux-gnu \
-    && LUNET_LOCKS_AOF_TARGET=x86_64-linux-gnu \
+    && TBIO_TARGET=x86_64-linux-gnu \
         cargo check --manifest-path ext/advisory_lock/Cargo.toml \
         --target x86_64-unknown-linux-gnu \
-    && LUNET_LOCKS_AOF_TARGET=x86_64-linux-gnu \
+    && TBIO_TARGET=x86_64-linux-gnu \
         cargo check --manifest-path ext/advisory_lock/Cargo.toml \
         --features flight-recorder \
         --target x86_64-unknown-linux-gnu \
@@ -163,10 +163,10 @@ RUN cargo check --manifest-path ext/advisory_lock/Cargo.toml \
     && cargo check --locked --manifest-path examples/lease-sequencer/Cargo.toml \
         --features flight-recorder \
         --target aarch64-unknown-linux-gnu \
-    && LUNET_LOCKS_AOF_TARGET=x86_64-linux-gnu \
+    && TBIO_TARGET=x86_64-linux-gnu \
         cargo check --locked --manifest-path examples/lease-sequencer/Cargo.toml \
         --target x86_64-unknown-linux-gnu \
-    && LUNET_LOCKS_AOF_TARGET=x86_64-linux-gnu \
+    && TBIO_TARGET=x86_64-linux-gnu \
         cargo check --locked --manifest-path examples/lease-sequencer/Cargo.toml \
         --features flight-recorder \
         --target x86_64-unknown-linux-gnu \
@@ -196,18 +196,18 @@ RUN mkdir -p /srv/staging/arm64-flight /srv/staging/amd64-flight \
         /srv/staging/arm64-flight/liblunet_advisory_lock_flight.so \
     && cp examples/lease-sequencer/target/aarch64-unknown-linux-gnu/release/lease-sequencer \
         /srv/staging/arm64-flight/ \
-    && LUNET_LOCKS_AOF_TARGET=x86_64-linux-gnu \
+    && TBIO_TARGET=x86_64-linux-gnu \
         cargo build --release --manifest-path ext/advisory_lock/Cargo.toml \
         --features flight-recorder \
         --target x86_64-unknown-linux-gnu \
-    && LUNET_LOCKS_AOF_TARGET=x86_64-linux-gnu \
+    && TBIO_TARGET=x86_64-linux-gnu \
         cargo build --release --locked --manifest-path examples/lease-sequencer/Cargo.toml \
         --features flight-recorder \
         --target x86_64-unknown-linux-gnu \
-    && LUNET_LOCKS_AOF_TARGET=x86_64-linux-gnu \
+    && TBIO_TARGET=x86_64-linux-gnu \
         cp ext/advisory_lock/target/x86_64-unknown-linux-gnu/release/liblunet_advisory_lock.so \
         /srv/staging/amd64-flight/liblunet_advisory_lock_flight.so \
-    && LUNET_LOCKS_AOF_TARGET=x86_64-linux-gnu \
+    && TBIO_TARGET=x86_64-linux-gnu \
         cp examples/lease-sequencer/target/x86_64-unknown-linux-gnu/release/lease-sequencer \
         /srv/staging/amd64-flight/ \
     && cargo build --release --manifest-path ext/advisory_lock/Cargo.toml \
@@ -218,16 +218,16 @@ RUN mkdir -p /srv/staging/arm64-flight /srv/staging/amd64-flight \
         /srv/staging/arm64-flight/liblunet_advisory_lock_prod.so \
     && cp examples/lease-sequencer/target/aarch64-unknown-linux-gnu/release/lease-sequencer \
         /srv/staging/arm64-flight/lease-sequencer-prod \
-    && LUNET_LOCKS_AOF_TARGET=x86_64-linux-gnu \
+    && TBIO_TARGET=x86_64-linux-gnu \
         cargo build --release --manifest-path ext/advisory_lock/Cargo.toml \
         --target x86_64-unknown-linux-gnu \
-    && LUNET_LOCKS_AOF_TARGET=x86_64-linux-gnu \
+    && TBIO_TARGET=x86_64-linux-gnu \
         cargo build --release --locked --manifest-path examples/lease-sequencer/Cargo.toml \
         --target x86_64-unknown-linux-gnu \
-    && LUNET_LOCKS_AOF_TARGET=x86_64-linux-gnu \
+    && TBIO_TARGET=x86_64-linux-gnu \
         cp ext/advisory_lock/target/x86_64-unknown-linux-gnu/release/liblunet_advisory_lock.so \
         /srv/staging/amd64-flight/liblunet_advisory_lock_prod.so \
-    && LUNET_LOCKS_AOF_TARGET=x86_64-linux-gnu \
+    && TBIO_TARGET=x86_64-linux-gnu \
         cp examples/lease-sequencer/target/x86_64-unknown-linux-gnu/release/lease-sequencer \
         /srv/staging/amd64-flight/lease-sequencer-prod
 

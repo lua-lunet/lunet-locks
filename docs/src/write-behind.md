@@ -15,15 +15,26 @@ document's durability paragraph states. The artefact carries the
 application state alone: the shape of the locks, at the moment of the
 clean halt.
 
+The **WAL snapshot store** — the lock table's periodic async snapshot over
+the tbio-core engine — is the C ABI's mounted store: the node constructor
+mounts it beside the state path (the state path's name with a `.wal`
+suffix), and nothing above the `StateStore` trait knows which store the
+node holds. The node's ~1000 ms tick loop drives it — completions drained,
+one generation submitted per stream, completions drained again — and the
+clean-shutdown stop pumps, ticks, pumps, then takes the eager flush. Zero
+fsync in the steady state: a crash mid-period is a dirty boot, and the
+dirty boot never reads the artefact. A refused construction never blocks
+the boot — the store is a fallback mechanism, never a safety mechanism, so
+the node boots on the file store and says so loudly; the lock table
+rebuilds from the replica stream. The shapes are proven by the WAL node
+tests (clean-restart persistence, dirty-boot refusal) beside the state
+seam's tests.
+
 The write-behind AOF writer is built and defended, and not wired into any
 host path: the only in-tree constructor of an AOF sink is the example
-crate's standby mode (`--aof-dir`), while the C ABI — and the Lua host
-through it — carries the blocking journal where event evidence is needed
-(the console feed, the bench chain) or the disabled sink elsewhere — both
-shapes proven by the state seam's tests, which run the full stop and boot
-schedule with the sink disabled. The writer stays compiled and tested by `make ext-test`.
-Wiring it into a host surface is gated on the witness watermarks and the
-three sync-point rules (the decisions register).
+crate's standby mode (`--aof-dir`). The writer stays compiled and tested
+by `make ext-test`. Wiring it into a host surface is gated on the witness
+watermarks and the three sync-point rules (the decisions register).
 
 ## Why a frame and not a running series
 

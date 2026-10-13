@@ -4,7 +4,7 @@
 //!    zig cdylib's install name is `@rpath/libtbio.dylib`, so
 //!    the binary needs an LC_RPATH (macOS) / RUNPATH (Linux) at the
 //!    crate's artifact directory, which the `links` contract propagates
-//!    as the `DEP_LUNET_LOCKS_AOF_METADATA` entries (one `lib_dir=<path>`
+//!    as the `DEP_TBIO_METADATA` entries (one `lib_dir=<path>`
 //!    per the AOF crate's build script).
 //! 2. The Flight Recorder reader's commit facts: the extraction path
 //!    (`skaffold_flight_tape`) refuses a recording whose commit the
@@ -15,7 +15,7 @@
 use std::process::Command;
 
 fn main() {
-    if let Ok(metadata) = std::env::var("DEP_LUNET_LOCKS_AOF_METADATA")
+    if let Ok(metadata) = std::env::var("DEP_TBIO_METADATA")
         && let Some(lib_dir) = metadata
             .split_whitespace()
             .find_map(|entry| entry.strip_prefix("lib_dir=").map(|path| path.to_string()))

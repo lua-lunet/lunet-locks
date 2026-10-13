@@ -58,7 +58,7 @@ RUN apt-get update \
 FROM native-base AS native-deps
 
 COPY --from=aof /out /opt/aof
-ENV LUNET_LOCKS_AOF_LIB_DIR=/opt/aof/lib
+ENV TBIO_LIB_DIR=/opt/aof/lib
 
 WORKDIR /app
 COPY .cargo/config.toml /usr/local/cargo/config.toml
@@ -87,7 +87,7 @@ FROM rust:1.96-slim AS demo
 
 ARG LUNET_LOCKS_HEAD=unknown
 COPY --from=aof /out /opt/aof
-ENV LUNET_LOCKS_AOF_LIB_DIR=/opt/aof/lib
+ENV TBIO_LIB_DIR=/opt/aof/lib
 ENV LUNET_LOCKS_HEAD=${LUNET_LOCKS_HEAD}
 
 WORKDIR /app
