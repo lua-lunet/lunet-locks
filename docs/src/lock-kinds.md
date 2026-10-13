@@ -96,7 +96,14 @@ ZooKeeper copied — and its details matter for where lunet sits:
 
 ## Status
 
-Spec for the future implementation; the WAL snapshot work
-(`wal-snapshot.md`) proceeds independently and serves both classes as
-specified there. The durable kind's restart survival is the identity
-sidecar's job; nothing above the store changes for the ephemeral kind.
+The durable stream of the WAL store (`wal-snapshot.md`) is live: named
+locks' identity — name, labels, counters, the consistency hash — rides
+their fat frames today, and the frames survive a clean restart. What
+lands with the durable lock model's own implementation is the **destroy
+verb** (the `delete` kind the format already carries and the scan
+already honours, with no producer this release) and the **name→id
+assignment by the creating consensus write's slot**; the consensus
+upcall carries its slot, and the store is ready for the assignment the
+day the model writes it. Nothing above the store changes for the
+ephemeral kind, and the identity sidecar this design once called for is
+gone — the fat frames cover every row it carried.

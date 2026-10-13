@@ -158,7 +158,7 @@ local record advisory_lock
         own_id: function(Node): integer
         status: function(Node): Status
         state_tick: function(Node): boolean, string
-        state_status: function(Node): StateStatus
+        state_status: function(Node): (StateStatus, boolean, string)
         leader_for_view: function(Node, integer, integer): integer
         outputs: function(Node): {Output}
         close: function(Node): boolean
@@ -350,49 +350,57 @@ function Node:status(): Status
     }
 end
 
--- The steady tick's non-raising refusals: a refusal is the store's
--- counted `refusals` and the serving path is untouched (the design
--- doc's steady-tick discipline), so the call reports the outcome as a
--- boolean instead of raising — the ~1000 ms timer keeps the node
--- serving whatever the WAL answers.
-local state_tick_refusals: {integer: string} = {
-    [-5] = "the WAL backend failed",
-    [-10] = "the node has stopped",
-    [-11] = "a previous generation is still outstanding",
-    [-22] = "the engine refused a change",
-    [-28] = "a stream's ring cannot take the generation",
-}
-
--- The steady tick: the changed set (noted at every committed lock
--- transition and once per lock a lazy load installs) rides the tick
--- path, completions drained either side. Never raises: `false` with the
--- refusal's name is a counted steady-tick refusal, retried on the next
--- tick.
+-- The steady tick, reporting its outcome instead of raising: the store's
+-- own refusals (a capacity overrun, an outstanding batch, a backend IO
+-- failure) never reach this call at all — the native tick counts them in
+-- the per-stream `refusals` and answers OK, because a steady tick's
+-- failure mode is the store's business and the serving path must not see
+-- it. What can come back is the node's own state: OK, `node stopped` past
+-- the drain point, and the ABI's own failures. So the tick reports a
+-- boolean and the refusal's name, and the counters on `state_status` are
+-- where a store refusal is read.
 function Node:state_tick(): boolean, string
     local rc = (tonumber(native.lunet_lock_node_state_tick(self._handle)) or -127)
         as integer
     if rc == 0 then
         return true, ""
     end
-    local reason = state_tick_refusals[rc]
-        or (errors[rc] or ("native error " .. tostring(rc)))
-    return false, reason
+    return false, errors[rc] or ("native error " .. tostring(rc))
 end
 
 -- The store's per-stream counters (ephemeral and durable generations,
 -- records, refusals, in flight, and the last completion's wall
--- timestamp). A store without counters — the file store the
--- construction-refusal fallback boots with — reads all zeros. The u64
--- fields cross as LuaJIT cdata; tonumber is the honest narrowing for
--- every counter a node can actually carry.
-function Node:state_status(): advisory_lock.StateStatus
-    check(
-        (
-            tonumber(
-                native.lunet_lock_node_state_status(self._handle, self._state_status)
-            ) or -127
-        ) as integer
-    )
+-- timestamp), plus an ok flag and, on a refusal, its name — the same
+-- never-raises discipline as `state_tick`: a failed status read is a
+-- reported outcome, never a raise that would kill the caller's tick
+-- loop. On a refusal the counters read all zeros and the ok flag is
+-- false; a caller must read the flag, not the zeros (a store without
+-- counters — the file store the construction-refusal fallback boots
+-- with — reads all zeros WITH the flag true). The u64 fields cross as
+-- LuaJIT cdata; tonumber is the honest narrowing for every counter a
+-- node can actually carry.
+function Node:state_status(): advisory_lock.StateStatus, boolean, string
+    local rc = (
+        tonumber(native.lunet_lock_node_state_status(self._handle, self._state_status))
+        or -127
+    ) as integer
+    if rc ~= 0 then
+        return {
+            ephemeral = {
+                completed_generations = 0,
+                completed_records = 0,
+                refusals = 0,
+                in_flight = 0,
+            },
+            durable = {
+                completed_generations = 0,
+                completed_records = 0,
+                refusals = 0,
+                in_flight = 0,
+            },
+            last_completed_unix_ns = 0,
+        }, false, errors[rc] or ("native error " .. tostring(rc))
+    end
     local raw = self._state_status[0] as RawStateStatus
     local function counters(
         generations: any, records: any, refusals: any, in_flight: any
@@ -419,7 +427,7 @@ function Node:state_status(): advisory_lock.StateStatus
         ),
         last_completed_unix_ns = (tonumber(raw.last_completed_unix_ns) or 0)
             as integer,
-    }
+    }, true, ""
 end
 
 function Node:leader_for_view(era: integer, view: integer): integer

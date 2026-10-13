@@ -217,6 +217,7 @@ use crate::state::{self, FileStateStore, StateStore};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{OsString, c_void};
+use std::mem::{offset_of, size_of};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::ptr;
@@ -1403,6 +1404,27 @@ pub struct StateStatusRaw {
     pub present: u32,
 }
 
+/// This host ABI's binding layout, pinned at compile time on every build:
+/// the record is flat and deliberately so — the two streams' counters
+/// side by side, the timestamp, the `present` flag — and it is mirrored in
+/// the Teal host's cdef, where a LuaJIT `uint64_t` reads the same eight
+/// bytes at the same offset. The offsets are therefore the ABI's, not
+/// Rust's: asserted here so a field added, reordered or retyped on either
+/// side is a compile error, never a silently shifted read.
+const STATE_STATUS_RAW_LAYOUT: () = assert!(
+    size_of::<StateStatusRaw>() == 80
+        && offset_of!(StateStatusRaw, eph_completed_generations) == 0
+        && offset_of!(StateStatusRaw, eph_completed_records) == 8
+        && offset_of!(StateStatusRaw, eph_refusals) == 16
+        && offset_of!(StateStatusRaw, eph_in_flight) == 24
+        && offset_of!(StateStatusRaw, dur_completed_generations) == 32
+        && offset_of!(StateStatusRaw, dur_completed_records) == 40
+        && offset_of!(StateStatusRaw, dur_refusals) == 48
+        && offset_of!(StateStatusRaw, dur_in_flight) == 56
+        && offset_of!(StateStatusRaw, last_completed_unix_ns) == 64
+        && offset_of!(StateStatusRaw, present) == 72
+);
+
 impl StateStatusRaw {
     /// The raw record a `None` (a store without counters) answers with:
     /// present = 0, everything zeroed.
@@ -2186,32 +2208,17 @@ impl Node {
         self.load_state_on_demand();
         // THE TICK BEFORE THE FLUSH (R2). The flush reconciles each set
         // against the engine's own mirror, so the table's current changes
-        // ride the tick path first: drain completions, submit the changed
-        // set, drain again. A tick refusal here cannot be caught up by
-        // the flush (the mirror would stay behind and the reconciliation
-        // would refuse) — it is the failed stop itself, named
-        // `stop.refuse.state-tick`.
-        if let Err(error) = self.state_store.pump() {
+        // ride the tick path first — the same drain, submit, drain the
+        // steady tick runs, in the drain window, with nothing after it but
+        // the flush. A refusal here cannot be caught up by the flush (the
+        // mirror would stay behind and the reconciliation would refuse) —
+        // it is the failed stop itself, named `stop.refuse.state-tick`.
+        if let Err(error) = self.state_tick_path() {
             trace_line!("stop.refuse.state-tick");
             eprintln!(
-                "lunet-advisory-lock: the stop's state pump failed ({error}); \
-                     the marker stays at the first round; {UNFLUSHED_RUNBOOK}"
-            );
-            return SERVICE;
-        }
-        if let Err(error) = self.state_store.tick(&self.service.snapshot()) {
-            trace_line!("stop.refuse.state-tick");
-            eprintln!(
-                "lunet-advisory-lock: the stop's state tick failed ({error}); \
-                     the marker stays at the first round; {UNFLUSHED_RUNBOOK}"
-            );
-            return SERVICE;
-        }
-        if let Err(error) = self.state_store.pump() {
-            trace_line!("stop.refuse.state-tick");
-            eprintln!(
-                "lunet-advisory-lock: the stop's state pump failed ({error}); \
-                     the marker stays at the first round; {UNFLUSHED_RUNBOOK}"
+                "lunet-advisory-lock: the stop's state tick path failed \
+                 ({error}); the marker stays at the first round; \
+                 {UNFLUSHED_RUNBOOK}"
             );
             return SERVICE;
         }
@@ -2287,6 +2294,20 @@ impl Node {
         }
     }
 
+    /// THE TICK PATH, as the one ordered sequence every seat runs:
+    /// completions drained, the changed set submitted, completions
+    /// drained again. The steady tick (the ~1000 ms timer) and the stop
+    /// (the drain window, immediately before the eager flush) are the
+    /// same three steps in the same order — the stop's is load-bearing
+    /// because the flush reconciles against the mirror the submit moves,
+    /// so the sequence lives here once and cannot be reordered at one
+    /// seat only.
+    fn state_tick_path(&mut self) -> std::io::Result<()> {
+        self.state_store.pump()?;
+        self.state_store.tick(&self.service.snapshot())?;
+        self.state_store.pump()
+    }
+
     /// THE STEADY TICK — the ~1000 ms timer's one call. The changed
     /// set (noted at every committed lock transition, and once per lock
     /// a lazy load installs) rides the tick path: completions drained,
@@ -2305,38 +2326,14 @@ impl Node {
         if self.stopped {
             return STOPPED;
         }
-        if let Err(error) = self.state_store.pump() {
+        if let Err(error) = self.state_tick_path() {
             warn!(
                 ts = log_millis(),
-                event = "state-tick-pump-refused",
+                event = "state-tick-refused",
                 node = self.replica.own().0,
                 error = %error,
-                "the state tick's completion drain was refused"
-            );
-        }
-        match self.state_store.tick(&self.service.snapshot()) {
-            Ok(_) => {}
-            Err(error) => {
-                // The steady tick's refusal: counted in the store's
-                // per-stream `refusals`, the changed set kept, the
-                // serving path untouched. Named once per tick, never
-                // silent.
-                warn!(
-                    ts = log_millis(),
-                    event = "state-tick-refused",
-                    node = self.replica.own().0,
-                    error = %error,
-                    "the state tick was refused; the changed set retries on the next tick"
-                );
-            }
-        }
-        if let Err(error) = self.state_store.pump() {
-            warn!(
-                ts = log_millis(),
-                event = "state-tick-pump-refused",
-                node = self.replica.own().0,
-                error = %error,
-                "the state tick's completion drain was refused"
+                "the state tick path was refused; the changed set retries on \
+                 the next tick"
             );
         }
         OK
@@ -3847,6 +3844,10 @@ pub unsafe extern "C" fn lunet_lock_node_state_status(
         let node = unsafe { &*node.cast::<Node>() };
         let status = node.state_status();
         unsafe {
+            // The binding pin, demanded at the one site that writes the
+            // record: a layout drift in the struct, or in the Teal cdef
+            // mirroring it, is a compile error on every build.
+            const _: () = STATE_STATUS_RAW_LAYOUT;
             *out_status = StateStatusRaw::from(status.as_ref());
         }
         OK

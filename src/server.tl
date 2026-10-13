@@ -643,6 +643,7 @@ local function main(options: Options)
     -- its lock table to disk".
     local last_state_report = -1
     local last_tick_outcome = ""
+    local last_status_outcome = ""
     local function state_tick_loop()
         while true do
             lunet.sleep(STATE_TICK_MS)
@@ -656,30 +657,52 @@ local function main(options: Options)
                 )
             end
             last_tick_outcome = ok and "" or outcome
-            local counters = node:state_status()
-            local generations = counters.ephemeral.completed_generations + counters.durable.completed_generations + counters.ephemeral.refusals + counters.durable.refusals
-            if generations ~= last_state_report then
-                last_state_report = generations
-                log_event(
-                    "state-status",
-                    {
-                        '"node":' .. tostring(own_id),
-                        '"eph_completed_generations":'
-                            .. tostring(counters.ephemeral.completed_generations),
-                        '"eph_completed_records":'
-                            .. tostring(counters.ephemeral.completed_records),
-                        '"eph_refusals":' .. tostring(counters.ephemeral.refusals),
-                        '"dur_completed_generations":'
-                            .. tostring(counters.durable.completed_generations),
-                        '"dur_completed_records":'
-                            .. tostring(counters.durable.completed_records),
-                        '"dur_refusals":' .. tostring(counters.durable.refusals),
-                        '"last_completed_ms":'
-                            .. tostring(
-                                math.floor(counters.last_completed_unix_ns / 1000000)
-                            ),
-                    }
-                )
+            -- The status read never raises and never kills the loop: a
+            -- refused read is said once per outcome change, and the tick
+            -- keeps beating — the counters are telemetry, the writes are
+            -- the work.
+            local counters, status_ok, status_error = node:state_status()
+            if not status_ok then
+                if status_error ~= last_status_outcome then
+                    log_membership(
+                        "advisory-lock "
+                            .. options.node
+                            .. " state status unavailable: "
+                            .. status_error
+                    )
+                end
+                last_status_outcome = status_error
+            else
+                last_status_outcome = ""
+                -- One number for the change test: the generations landed and
+                -- the refusals counted, across both streams. The event rides
+                -- only when one of them moves.
+                local moved = counters.ephemeral.completed_generations + counters.durable.completed_generations + counters.ephemeral.refusals + counters.durable.refusals
+                if moved ~= last_state_report then
+                    last_state_report = moved
+                    log_event(
+                        "state-status",
+                        {
+                            '"node":' .. tostring(own_id),
+                            '"eph_completed_generations":'
+                                .. tostring(counters.ephemeral.completed_generations),
+                            '"eph_completed_records":'
+                                .. tostring(counters.ephemeral.completed_records),
+                            '"eph_refusals":' .. tostring(counters.ephemeral.refusals),
+                            '"dur_completed_generations":'
+                                .. tostring(counters.durable.completed_generations),
+                            '"dur_completed_records":'
+                                .. tostring(counters.durable.completed_records),
+                            '"dur_refusals":' .. tostring(counters.durable.refusals),
+                            '"last_completed_ms":'
+                                .. tostring(
+                                    math.floor(
+                                        counters.last_completed_unix_ns / 1000000
+                                    )
+                                ),
+                        }
+                    )
+                end
             end
         end
     end

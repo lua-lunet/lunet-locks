@@ -757,6 +757,54 @@ fn the_forgotten_store_reconciles_against_the_rebuilt_mirrors() {
     assert_eq!(status.ephemeral.refusals, 0);
 }
 
+/// A forget whose reopen is refused leaves the store DEAD, and the dead
+/// store's answers are the discipline the trait promises: the ops are
+/// the EIO refusal mapped to `Other` (a poisoned handle is no kind of
+/// content refusal, and an unknown code must not be given a discipline
+/// it does not carry), and the load is the cold-start `Ok(None)` —
+/// never a call into the closed handle, never an `Err` a boot trips on.
+#[test]
+fn a_dead_store_refuses_other_and_loads_none() {
+    let dir = scratch("dead-store");
+    let path = wal_path(&dir);
+    let held = snapshot([(1u64, lease(1, 10, now_millis() + 60_000))]);
+    {
+        let mut store = WalSnapshotStore::new(&path).expect("the store opens");
+        store.note(1);
+        store.submit(&held).expect("the tick lands");
+        store.pump().expect("the pump drains");
+        store.flush(&held).expect("the flush lands");
+    }
+
+    // The reopen the forget runs removes the artefact and reopens the
+    // path — the one way it is refused is the filesystem's: the parent
+    // directory is gone, so the reopen fails and the store dies.
+    let mut store = WalSnapshotStore::new(&path).expect("the store reopens");
+    fs::remove_dir_all(&dir).expect("the directory goes");
+    {
+        let sealed: &mut dyn lunet_advisory_lock::spi::StateStore = &mut store;
+        sealed.forget();
+    }
+
+    let error = store.pump().expect_err("the dead pump refuses");
+    assert_eq!(
+        error.kind(),
+        std::io::ErrorKind::Other,
+        "the dead pump is the EIO class"
+    );
+    let error = store.status().expect_err("the dead status refuses");
+    assert_eq!(
+        error.kind(),
+        std::io::ErrorKind::Other,
+        "the dead status is the EIO class"
+    );
+    assert_eq!(
+        store.load().expect("the dead load answers"),
+        None,
+        "a dead store loads as nothing, never an Err"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The copy canary: the cross-ABI interop proof. See the engine's
 // wal_canary.zig for the full contract and the mirror-side sentinels.
@@ -1369,18 +1417,17 @@ fn durable_retake_after_kept() {
             .expect("the kept frame lands");
         store.pump().expect("the pump drains");
         store.note(5);
+        // Built once: the flush must carry byte-for-byte what the tick
+        // submitted — the reconciliation compares them, so a fresh
+        // `now_millis()` here would be a real divergence, not a test
+        // artifact.
+        let retaken = named_lease(5, 51, now_millis() + 120_000);
         store
-            .submit(&snapshot([(
-                5u64,
-                named_lease(5, 51, now_millis() + 120_000),
-            )]))
+            .submit(&snapshot([(5u64, retaken.clone())]))
             .expect("the live frame lands again");
         store.pump().expect("the pump drains");
         store
-            .flush(&snapshot([(
-                5u64,
-                named_lease(5, 51, now_millis() + 120_000),
-            )]))
+            .flush(&snapshot([(5u64, retaken)]))
             .expect("the flush lands");
     }
 

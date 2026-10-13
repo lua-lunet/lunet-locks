@@ -17,8 +17,9 @@
 //!   + [`WalSnapshotStore::submit`] + [`WalSnapshotStore::pump`]) writes
 //!   page-cached generations; a crash mid-period is a dirty boot and the
 //!   dirty boot never reads the artefact. On Linux completions come back
-//!   through the ring's eventfd ([`WalSnapshotStore::event_fd`], polled by
-//!   the loop); on darwin every write completes inline at submit.
+//!   through the ring's eventfd ([`WalSnapshotStore::event_fd`], whose
+//!   wake the host folds into the tick cadence — the pinned runtime seats
+//!   no raw-fd poll); on darwin every write completes inline at submit.
 //! - **The shutdown generation.** [`StateStore::flush`] writes the whole
 //!   live set in the foreground and the engine fsyncs exactly once,
 //!   blocking, before it returns. A refusal (`StorageFull` for capacity,
@@ -55,13 +56,19 @@
 //!   `wal_record_encode` / `wal_record_decode` exports, and the engine
 //!   stamps and verifies the checksum behind them.
 //!
-//! What rides a record is the record format's business, and the format
-//! carries no more than a lease's identity: lease id, holder (16 bytes),
-//! absolute expiry, and the granted window. A lease's `name`, `labels`,
-//! `taken_at_ms` and `renew_count` have no room in 64 bytes and are NOT
-//! durable here — a loaded lease carries them defaulted, and the loaded
-//! snapshot installs only into an empty table (the lazy-load guard), so
-//! live state is never overwritten by the reduced view.
+//! The two streams carry different amounts of a lease, by design. An
+//! **ephemeral** lock is one cache line and "is" its caller-supplied u64:
+//! what rides its record is the identity — lease id, holder (16 bytes),
+//! absolute expiry, the granted window — and nothing else. A lease's
+//! `name`, `labels`, `taken_at_ms` and `renew_count` have no room in 64
+//! bytes, so an ephemeral record does not persist them and a loaded
+//! ephemeral carries them defaulted. A **durable** lock's fat frame is 12
+//! cache lines and does carry them, in the frame's name and tags areas,
+//! round-tripped byte-exact (see [`DurableFrame`]).
+//!
+//! Whichever stream a lock rode, a loaded snapshot installs only into an
+//! empty table (the lazy-load guard), so live state is never overwritten
+//! by what came off the artefact.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
@@ -83,14 +90,16 @@ use crate::state::StateStore;
 pub const RECORD_SIZE: usize = 64;
 
 /// The engine's default capacity (records per ring). A caller passing
+/// The engine's default ring capacity (wal_c.zig's `capacity_default`):
 /// [`DEFAULT_CAPACITY_MARKER`] (0) opens with this.
-pub const DEFAULT_CAPACITY: u32 = 1024;
+const DEFAULT_CAPACITY: u32 = 1024;
 
 /// The capacity argument that selects [`DEFAULT_CAPACITY`] at the engine.
-pub const DEFAULT_CAPACITY_MARKER: u32 = 0;
+const DEFAULT_CAPACITY_MARKER: u32 = 0;
 
-/// Milliseconds per nanosecond: the lease expiry's conversion.
-const MS_TO_NS: u64 = 1_000_000;
+/// Nanoseconds per millisecond: the lease expiry's conversion, in both
+/// directions (`expiry_to_ns` in, `expiry_to_ms` out).
+const NS_PER_MS: u64 = 1_000_000;
 
 // The ABI's errno-style result codes (wal_c.zig).
 const OK: i32 = 0;
@@ -104,10 +113,12 @@ const ENOBUFS: i32 = -105;
 enum WalHandleRaw {}
 
 /// The ABI's status record (wal_c.zig `WalStreamStatus`), C-ABI layout
-/// mirrored: one stream's completion-driven counters.
+/// mirrored: one stream's completion-driven counters. Private: the ABI
+/// mirror exists for this module's `wal_status` read alone — the seam's
+/// named [`StoreStatus`](crate::state::StoreStatus) is what callers see.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct WalStreamStatusRaw {
+struct WalStreamStatusRaw {
     completed_generations: u64,
     completed_records: u64,
     refusals: u64,
@@ -212,26 +223,30 @@ unsafe extern "C" {
     fn wal_frame_decode(out: *mut FatFrame, bytes: *const u8, len: usize) -> i32;
 }
 
-/// The completion-driven counters (the design doc's status table, per
-/// stream), as the store reports them: each stream's generations and
-/// records landed since open, its refusals, and its submission
-/// currently outstanding (0 or one generation's worth).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct WalStreamStatus {
-    pub completed_generations: u64,
-    pub completed_records: u64,
-    pub refusals: u64,
-    pub in_flight: u32,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct WalStatus {
-    /// The ephemeral stream's counters.
-    pub ephemeral: WalStreamStatus,
-    /// The durable stream's counters.
-    pub durable: WalStreamStatus,
-    /// The last completion's wall timestamp, either stream.
-    pub last_completed_unix_ns: u64,
+/// The ABI's per-stream counters → the seam's own record: the one
+/// deliberate mirror in this module. [`WalStatusRaw`] is the C ABI's
+/// layout (wal_c.zig's status, one row per stream); the seam's
+/// [`StoreStatus`](crate::state::StoreStatus) is the named surface the
+/// trait's `state_status` answers and the host ABI reads. The four
+/// counters per stream are the same four facts in both, so they are
+/// converted here, once, rather than mapped field by field at each of the
+/// two call sites.
+impl From<&WalStatusRaw> for crate::state::StoreStatus {
+    fn from(raw: &WalStatusRaw) -> Self {
+        fn counters(raw: &WalStreamStatusRaw) -> crate::state::StreamCounters {
+            crate::state::StreamCounters {
+                completed_generations: raw.completed_generations,
+                completed_records: raw.completed_records,
+                refusals: raw.refusals,
+                in_flight: raw.in_flight,
+            }
+        }
+        Self {
+            ephemeral: counters(&raw.ephemeral),
+            durable: counters(&raw.durable),
+            last_completed_unix_ns: raw.last_completed_unix_ns,
+        }
+    }
 }
 
 /// The record kind, encoded in the tag's low nibble (the format version
@@ -244,7 +259,11 @@ pub enum RecordKind {
     Tombstone,
 }
 
-/// The record kind's ABI code (the engine's `Kind` enum values).
+/// The record kind's ABI code (the engine's `Kind` enum values). Pinned
+/// behaviourally, not by a compile-time assert — the round-trip tests
+/// encode each kind through the engine's codec and read it back, so a
+/// renumbering on either side fails a test rather than a production
+/// write.
 const KIND_LIVE: u32 = 1;
 const KIND_TOMBSTONE: u32 = 2;
 
@@ -271,9 +290,12 @@ pub struct WalRecord {
 }
 
 /// The record's binding layout, asserted at compile time on every build
-/// (size, every offset, one cache line). Public so downstream builds (the
-/// copy canary) can import and reuse the pin.
-pub const RECORD_LAYOUT: () = assert!(
+/// (size, every offset, one cache line). Private: no downstream build
+/// imports it (the copy canary is the engine's own Zig test, it pins the
+/// C layout from that side); the byte-image accessor below demands the
+/// pin on every build, so a struct drift is a compile error, never a
+/// silent corruption.
+const RECORD_LAYOUT: () = assert!(
     size_of::<WalRecord>() == RECORD_SIZE
         && size_of::<WalRecord>() == 64
         && offset_of!(WalRecord, stamp) == 0
@@ -288,10 +310,11 @@ pub const RECORD_LAYOUT: () = assert!(
 
 /// The one unsafe in this module: the record's layout-exact byte image —
 /// the memcpy round trip's Rust half (`std.mem.asBytes` on the engine
-/// side). Sound because the const asserts above pin the struct to exactly
-/// 64 bytes of plain little-endian fields with no padding.
+/// side). Sound because [`RECORD_LAYOUT`] pins the struct to exactly 64
+/// bytes of plain little-endian fields with no padding, and the pin is
+/// demanded here on every build this function is compiled into.
 pub fn record_as_bytes(record: &WalRecord) -> &[u8; RECORD_SIZE] {
-    const _: () = assert!(size_of::<WalRecord>() == RECORD_SIZE);
+    const _: () = RECORD_LAYOUT;
     unsafe { &*(record as *const WalRecord as *const [u8; RECORD_SIZE]) }
 }
 
@@ -370,16 +393,12 @@ pub fn record_decode(bytes: &[u8; RECORD_SIZE]) -> Option<Record> {
 /// (CL6-7), and the consistency area (CL8-11).
 pub const FAT_FRAME_SIZE: usize = 768;
 
-/// The name area's byte budget (the u16 length plus the name bytes).
-pub const FAT_NAME_CAPACITY: usize = 518;
-
-/// The tag bytes' budget (a u16 length plus the tag bytes).
-pub const FAT_TAG_BYTES_CAPACITY: usize = 114;
-
 // The frame's fixed offsets, the engine's own (data-area offsets are
 // frame offsets; the mirror's `data` starts after the 64-byte header).
 // Public: the binding's offsets, the mirror tests' and the canary's
-// shared pin.
+// shared pin. The areas' byte budgets are the engine's to enforce — a
+// name or tag span that overruns its area is a refusal at
+// `wal_frame_encode`, and this binding carries no budget of its own.
 pub const FAT_NAME_LEN_OFFSET: usize = 64;
 pub const FAT_NAME_OFFSET: usize = 66;
 pub const FAT_TAKEN_AT_OFFSET: usize = 384;
@@ -397,11 +416,20 @@ pub enum DurableKind {
     /// Released but not destroyed: the record stands with its identity,
     /// the fencing token survives.
     Kept,
-    /// The destruction: the real tombstone of the durable kind.
+    /// The destruction: the real tombstone of the durable kind. The
+    /// format carries the kind and the scan honours it (a delete frame
+    /// drops the record on load); no operation produces one in this
+    /// release — the durable kind's destroy verb lands with the
+    /// durable-lock model, and until then nothing writes it.
     Delete,
 }
 
 /// The durable kind's ABI code (the engine's `DurableKind` enum values).
+/// The numbers are the engine's, and no compile-time assert can reach
+/// across the C ABI to bind them — the pin is behavioural: the durable
+/// round-trip tests encode each kind through the engine's own codec and
+/// decode it back, so a renumbering on either side fails a test rather
+/// than silently mis-tagging a record.
 const DKIND_LIVE: u32 = 1;
 const DKIND_KEPT: u32 = 2;
 const DKIND_DELETE: u32 = 3;
@@ -444,7 +472,9 @@ impl FatFrame {
         &self.data[FAT_NAME_OFFSET - RECORD_SIZE..][..len]
     }
 
-    /// The counters' taken-at wall clock, milliseconds.
+    /// The counters' taken-at wall clock, milliseconds — the leader's
+    /// execution tick at the holder-changing SET that installed the
+    /// current holder.
     pub fn taken_at_ms(&self) -> u64 {
         u64::from_le_bytes(
             self.data[FAT_TAKEN_AT_OFFSET - RECORD_SIZE..][..8]
@@ -453,6 +483,8 @@ impl FatFrame {
         )
     }
 
+    /// The renew counter: the same-holder renewals the record has seen
+    /// since the current holder took it.
     pub fn renew_count(&self) -> u32 {
         u32::from_le_bytes(
             self.data[FAT_RENEW_COUNT_OFFSET - RECORD_SIZE..][..4]
@@ -473,9 +505,11 @@ impl FatFrame {
 }
 
 /// The frame's layout-exact byte image — the memcpy round trip's Rust
-/// half. Sound because the const asserts above pin the struct to exactly
-/// 768 bytes of plain little-endian fields with no padding.
+/// half. Sound because [`FAT_FRAME_LAYOUT`] pins the struct to exactly
+/// 768 bytes of plain little-endian fields with no padding, and the pin
+/// is demanded here on every build this function is compiled into.
 pub fn frame_as_bytes(frame: &FatFrame) -> &[u8; FAT_FRAME_SIZE] {
+    const _: () = FAT_FRAME_LAYOUT;
     unsafe { &*(frame as *const FatFrame as *const [u8; FAT_FRAME_SIZE]) }
 }
 
@@ -702,13 +736,16 @@ impl Record {
 }
 
 /// The lease expiry's units: the table's leader-stamped milliseconds in,
-/// the engine's nanoseconds out.
+/// the engine's nanoseconds out. The conversion is saturating on the way in
+/// (a saturating result is a lease past the end of the engine's clock, never
+/// a wrapped one) and truncating on the way out (the read path's drift
+/// threshold is seconds wide).
 fn expiry_to_ns(expiry_ms: u64) -> u64 {
-    expiry_ms.saturating_mul(MS_TO_NS)
+    expiry_ms.saturating_mul(NS_PER_MS)
 }
 
 fn expiry_to_ms(expiry_ns: u64) -> u64 {
-    expiry_ns / MS_TO_NS
+    expiry_ns / NS_PER_MS
 }
 
 fn unix_ns() -> u64 {
@@ -789,16 +826,17 @@ impl WalSnapshotStore {
     /// ring, the operator's sizing knob). 0 selects the default; a
     /// capacity beyond the ring geometry is refused like any other open
     /// refusal.
-    pub fn new_with_capacity(path: &Path, capacity: u32) -> io::Result<Self> {
-        let cpath = match std::ffi::CString::new(path.as_os_str().as_bytes()) {
-            Ok(cpath) => cpath,
-            Err(_) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "wal snapshot path contains a NUL byte",
-                ));
-            }
-        };
+    /// Open (create or open, never truncate) the pre-laid-out file at
+    /// `path` with `capacity` records per ring, or the refusal. The one
+    /// place the handle is ever opened: construction and the forget's
+    /// reopen both come through here, so neither can drift from the other.
+    fn open_handle(path: &Path, capacity: u32) -> io::Result<*mut WalHandleRaw> {
+        let cpath = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "wal snapshot path contains a NUL byte",
+            )
+        })?;
         let handle = unsafe { wal_open(cpath.as_ptr(), capacity) };
         if handle.is_null() {
             return Err(io::Error::new(
@@ -806,8 +844,12 @@ impl WalSnapshotStore {
                 format!("wal snapshot refused to open at {}", path.display()),
             ));
         }
+        Ok(handle)
+    }
+
+    pub fn new_with_capacity(path: &Path, capacity: u32) -> io::Result<Self> {
         Ok(Self {
-            handle,
+            handle: Self::open_handle(path, capacity)?,
             path: path.to_path_buf(),
             // The engine's effective capacity: 0 selects the default.
             capacity: if capacity == DEFAULT_CAPACITY_MARKER {
@@ -819,12 +861,6 @@ impl WalSnapshotStore {
             durable: BTreeMap::new(),
             dead: false,
         })
-    }
-
-    /// The file this store reads and writes: the path it was opened at
-    /// (the mount site's state path with a `.wal` suffix).
-    pub fn path(&self) -> &Path {
-        &self.path
     }
 
     /// Record a changed lock: the loop calls this on every committed lock
@@ -863,8 +899,6 @@ impl WalSnapshotStore {
         for &lock_id in &self.changed {
             match snap.locks.get(&lock_id) {
                 Some(lease) if lease.name.is_some() => {
-                    let name = lease.name.as_ref().expect("the durable lock's name");
-                    let labels = lease.labels.clone().unwrap_or_default();
                     // The classification the flush carries: a named lease
                     // with an expiry (a live durable lock) is a live
                     // frame; a named record with none (a loaded kept
@@ -872,33 +906,27 @@ impl WalSnapshotStore {
                     // kept frame as it stands. Tick and flush must
                     // classify identically — the flush reconciles its
                     // frames against the mirror these submits built.
-                    if lease.expiry == 0 {
-                        self.durable.insert(
-                            lock_id,
-                            DurableEntry {
-                                name: name.clone(),
-                                labels,
-                                taken_at_ms: lease.taken_at_ms,
-                                renew_count: lease.renew_count,
-                                lease_id: lease.lease_id,
-                                kept: true,
-                            },
-                        );
-                        frames.extend_from_slice(&self.durable_frame_kept(stamp, lock_id)?);
+                    let kept = lease.expiry == 0;
+                    self.durable.insert(
+                        lock_id,
+                        DurableEntry {
+                            name: lease.name.clone().expect("the durable lock's name"),
+                            labels: lease.labels.clone().unwrap_or_default(),
+                            taken_at_ms: lease.taken_at_ms,
+                            renew_count: lease.renew_count,
+                            lease_id: lease.lease_id,
+                            kept,
+                        },
+                    );
+                    // Both frames read the lease, not the map: the entry
+                    // above is the release path's record of this identity,
+                    // and the frame for the lease in hand is one builder
+                    // either way.
+                    frames.extend_from_slice(&if kept {
+                        self.durable_frame_kept_from_lease(stamp, lock_id, lease)?
                     } else {
-                        self.durable.insert(
-                            lock_id,
-                            DurableEntry {
-                                name: name.clone(),
-                                labels,
-                                taken_at_ms: lease.taken_at_ms,
-                                renew_count: lease.renew_count,
-                                lease_id: lease.lease_id,
-                                kept: false,
-                            },
-                        );
-                        frames.extend_from_slice(&self.durable_frame_live(stamp, lock_id, lease)?);
-                    }
+                        self.durable_frame_live(stamp, lock_id, lease)?
+                    });
                 }
                 Some(lease) => encode_into(
                     &mut records,
@@ -1071,15 +1099,15 @@ impl WalSnapshotStore {
                 return;
             }
         }
-        match Self::new(&self.path) {
-            Ok(reopened) => {
-                // Take the fresh handle; the bookkeeping the old life
-                // held (the changed set, the durable map) is dropped
-                // with the replaced fields.
-                self.handle = reopened.handle;
+        match Self::open_handle(&self.path, DEFAULT_CAPACITY_MARKER) {
+            Ok(handle) => {
+                // The fresh handle, and the bookkeeping the old life held
+                // dropped with it: the changed set and the durable map are
+                // this life only, and the engine's mirrors behind the new
+                // handle start empty.
+                self.handle = handle;
                 self.changed = BTreeSet::new();
                 self.durable = BTreeMap::new();
-                std::mem::forget(reopened);
             }
             Err(error) => {
                 self.dead = true;
@@ -1094,14 +1122,23 @@ impl WalSnapshotStore {
     }
 
     /// The ring's eventfd to poll (Linux), or `None` where there is no
-    /// ring (darwin completes inline).
+    /// ring (darwin completes inline). The platform fact is the whole of
+    /// this accessor: the pinned host runtime seats no raw-fd poll, so the
+    /// host folds the wake into the tick cadence — each
+    /// [`WalSnapshotStore::pump`] reaps the previous generation before the
+    /// next [`WalSnapshotStore::submit`] — and reads this to know which of
+    /// the two platforms it is on.
     pub fn event_fd(&self) -> Option<i32> {
         let fd = unsafe { wal_event_fd(self.handle) };
         (fd >= 0).then_some(fd)
     }
 
-    /// The counters.
-    pub fn status(&self) -> io::Result<WalStatus> {
+    /// The counters, the seam's record: one row per stream (the
+    /// generations and records landed since open, the refusals, the
+    /// submissions outstanding) plus the last completion's wall
+    /// timestamp. `Err` only when the store is dead (see
+    /// [`WalSnapshotStore::forget_artifact`]).
+    pub fn status(&self) -> io::Result<crate::state::StoreStatus> {
         if self.dead {
             return Err(wal_error(
                 EIO,
@@ -1115,21 +1152,7 @@ impl WalSnapshotStore {
         };
         let rc = unsafe { wal_status(self.handle, &mut raw) };
         match rc {
-            OK => Ok(WalStatus {
-                ephemeral: WalStreamStatus {
-                    completed_generations: raw.ephemeral.completed_generations,
-                    completed_records: raw.ephemeral.completed_records,
-                    refusals: raw.ephemeral.refusals,
-                    in_flight: raw.ephemeral.in_flight,
-                },
-                durable: WalStreamStatus {
-                    completed_generations: raw.durable.completed_generations,
-                    completed_records: raw.durable.completed_records,
-                    refusals: raw.durable.refusals,
-                    in_flight: raw.durable.in_flight,
-                },
-                last_completed_unix_ns: raw.last_completed_unix_ns,
-            }),
+            OK => Ok(crate::state::StoreStatus::from(&raw)),
             other => Err(wal_error(other, "unexpected wal_status result")),
         }
     }
@@ -1176,10 +1199,9 @@ impl WalSnapshotStore {
         for chunk in frames.chunks_exact(FAT_FRAME_SIZE) {
             let bytes: &[u8; FAT_FRAME_SIZE] = chunk.try_into().ok()?;
             let frame = frame_decode(bytes)?;
-            let kind = match frame.kind {
-                DurableKind::Live | DurableKind::Kept => frame.kind,
-                DurableKind::Delete => return None,
-            };
+            if frame.kind == DurableKind::Delete {
+                return None;
+            }
             let name = String::from_utf8(frame.name.clone()).ok()?;
             let labels = if frame.tag_bytes.is_empty() {
                 None
@@ -1199,7 +1221,6 @@ impl WalSnapshotStore {
                     renew_count: frame.renew_count,
                 },
             );
-            let _ = kind;
         }
         Some(StateSnapshot { locks })
     }
@@ -1261,24 +1282,10 @@ impl StateStore for WalSnapshotStore {
         self.forget_artifact()
     }
 
-    /// The per-stream counters, mapped to the seam's record.
+    /// The per-stream counters, read straight off the engine (see
+    /// [`WalSnapshotStore::status`]).
     fn state_status(&self) -> Option<crate::state::StoreStatus> {
-        let status = self.status().ok()?;
-        Some(crate::state::StoreStatus {
-            ephemeral: crate::state::StreamCounters {
-                completed_generations: status.ephemeral.completed_generations,
-                completed_records: status.ephemeral.completed_records,
-                refusals: status.ephemeral.refusals,
-                in_flight: status.ephemeral.in_flight,
-            },
-            durable: crate::state::StreamCounters {
-                completed_generations: status.durable.completed_generations,
-                completed_records: status.durable.completed_records,
-                refusals: status.durable.refusals,
-                in_flight: status.durable.in_flight,
-            },
-            last_completed_unix_ns: status.last_completed_unix_ns,
-        })
+        self.status().ok()
     }
 
     /// The shutdown generation: the whole live sets, serialized here on
@@ -1307,41 +1314,27 @@ impl StateStore for WalSnapshotStore {
                 // The durable class: a live frame while the lease holds
                 // (a nonzero expiry), the kept frame once it does not
                 // (a released durable lock carries no expiry — the
-                // loaded kept locks come back exactly so).
-                let kind = if lease.expiry == 0 {
-                    DurableKind::Kept
+                // loaded kept locks come back exactly so). The same
+                // classification the tick path makes, deliberately: the
+                // flush reconciles these frames against the mirror the
+                // ticks built, and the two must agree lock for lock.
+                let kept = lease.expiry == 0;
+                frames.extend_from_slice(&if kept {
+                    self.durable_frame_kept_from_lease(stamp, lock_id, lease)?
                 } else {
-                    DurableKind::Live
-                };
-                if kind == DurableKind::Live {
-                    frames.extend_from_slice(&self.durable_frame_live(stamp, lock_id, lease)?);
-                    self.durable.insert(
-                        lock_id,
-                        DurableEntry {
-                            name: lease.name.clone().expect("the durable lock's name"),
-                            labels: lease.labels.clone().unwrap_or_default(),
-                            taken_at_ms: lease.taken_at_ms,
-                            renew_count: lease.renew_count,
-                            lease_id: lease.lease_id,
-                            kept: false,
-                        },
-                    );
-                } else {
-                    frames.extend_from_slice(
-                        &self.durable_frame_kept_from_lease(stamp, lock_id, lease)?,
-                    );
-                    self.durable.insert(
-                        lock_id,
-                        DurableEntry {
-                            name: lease.name.clone().expect("the durable lock's name"),
-                            labels: lease.labels.clone().unwrap_or_default(),
-                            taken_at_ms: lease.taken_at_ms,
-                            renew_count: lease.renew_count,
-                            lease_id: lease.lease_id,
-                            kept: true,
-                        },
-                    );
-                }
+                    self.durable_frame_live(stamp, lock_id, lease)?
+                });
+                self.durable.insert(
+                    lock_id,
+                    DurableEntry {
+                        name: lease.name.clone().expect("the durable lock's name"),
+                        labels: lease.labels.clone().unwrap_or_default(),
+                        taken_at_ms: lease.taken_at_ms,
+                        renew_count: lease.renew_count,
+                        lease_id: lease.lease_id,
+                        kept,
+                    },
+                );
             } else {
                 encode_into(
                     &mut records,
@@ -1427,6 +1420,12 @@ impl StateStore for WalSnapshotStore {
     /// stream. An `Err` is only IO trouble or this wrapper's own sizing
     /// bug; a content refusal cannot block a boot.
     fn load(&self) -> io::Result<Option<StateSnapshot>> {
+        if self.dead {
+            // A forgotten-and-dead store holds no handle and no artefact,
+            // so there is nothing to read: the cold-start answer, never a
+            // failure and never a call into a closed handle.
+            return Ok(None);
+        }
         let mut buf = vec![0u8; self.capacity as usize * RECORD_SIZE];
         let mut out_len: usize = 0;
         let rc = unsafe { wal_load(self.handle, buf.as_mut_ptr(), buf.len(), &mut out_len) };
@@ -1512,13 +1511,17 @@ impl Drop for WalSnapshotStore {
 /// The error an ABI result code maps to. The kind carries the discipline
 /// (capacity refusals are `StorageFull`, an outstanding batch is
 /// `WouldBlock`); the message names the path.
+///
+/// `EIO` — a poisoned handle and every other IO failure — and any code
+/// this build does not know are one class, `Other`: the store's callers
+/// surface both as a failed operation, and a code this build cannot name
+/// must not be given a discipline it does not carry.
 fn wal_error(code: i32, what: &str) -> io::Error {
     let kind = match code {
         EINVAL => io::ErrorKind::InvalidInput,
         EAGAIN => io::ErrorKind::WouldBlock,
         ENOSPC => io::ErrorKind::StorageFull,
         ENOBUFS => io::ErrorKind::InvalidData,
-        EIO => io::ErrorKind::Other,
         _ => io::ErrorKind::Other,
     };
     io::Error::new(kind, format!("wal snapshot: {what} (code {code})"))

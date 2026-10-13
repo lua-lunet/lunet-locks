@@ -91,7 +91,15 @@ tested.test(
                 actual = tostring(ok) .. ":" .. (outcome or "?"),
             }
         )
-        local counters = node:state_status()
+        local counters, status_ok, status_error = node:state_status()
+        tested.assert(
+            {
+                given = "a fresh WAL mount's per-stream status read",
+                should = "answer with the counters, never raise",
+                expected = "true:",
+                actual = tostring(status_ok) .. ":" .. (status_error or "?"),
+            }
+        )
         tested.assert(
             {
                 given = "a fresh WAL mount's per-stream counters",

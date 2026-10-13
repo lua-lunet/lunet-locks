@@ -490,9 +490,7 @@ function M.main(root: string, _argv: {string}): integer
         local n3 = procs.n3
         proc.kill(n3)
         proc.wait(n3)
-        procs.n3 = nil -- (reassigned below)
-        local n3_restarted = start("n3")
-        local _n3r = n3_restarted
+        procs.n3 = start("n3")
         clock.sleep(10)
         if not request_lines(
             work,
@@ -511,13 +509,29 @@ function M.main(root: string, _argv: {string}): integer
         -- landed it), so the next boot classifies crashed and MUST NOT
         -- read the artefact — the table rebuilds from the replica
         -- stream, which is why the read above (served by the rebuilt
-        -- table) succeeds. The refusal is the one line the boot says,
-        -- and no load line ever follows for that life.
+        -- table) succeeds.
+        --
+        -- The control is positional, never a count delta across the
+        -- restart: a node's capture files are REPLACED by a restart
+        -- (they do not append every life), so a before/after count
+        -- false-fails whenever the killed life legitimately said the
+        -- line. The dirty life's own story is exact under any capture
+        -- discipline: its boot classification is the LAST
+        -- `crashed boot … distrusted` line in the node's evidence, and
+        -- everything AFTER that line — the life's post-classification
+        -- output, where a wrong load would speak — must never say the
+        -- table materialised.
         local n3_evidence = logs.files_for_all(work, {"n3"})
-        if logs.count(n3_evidence, "the state artefact is distrusted") < 1 then
+        local distrust_hits = logs.count(
+            n3_evidence, "the state artefact is distrusted"
+        )
+        if distrust_hits < 1 then
             fail("the kill -9 restart did not refuse the state artefact")
         end
-        if logs.count(n3_evidence, "materialised from the clean stop") ~= 0 then
+        local tail_text = logs.after_last(
+            n3_evidence, "the state artefact is distrusted"
+        )
+        if logs.count({tail_text}, "materialised from the clean stop") ~= 0 then
             fail("the dirty boot loaded the state artefact it must distrust")
         end
         -- The evidence set is every node's stderr/stdout capture, matched

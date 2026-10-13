@@ -54,19 +54,30 @@ use crate::locks::StateSnapshot;
 /// currently outstanding (0 or one generation's worth).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct StreamCounters {
+    /// Generations fully written since the store was opened.
     pub completed_generations: u64,
+    /// Records landed since the store was opened.
     pub completed_records: u64,
+    /// Submissions refused (capacity) since the store was opened. A
+    /// refused submission changes nothing on the serving path.
     pub refusals: u64,
+    /// Submissions outstanding right now: 0 or one generation's worth.
     pub in_flight: u32,
 }
 
 /// The per-stream counters the status surface reads: one row per stream
 /// plus the last completion's wall timestamp. `state_status` answers
-/// this or `None`.
+/// this or `None` — a store with no counters of its own (the file store)
+/// answers `None`, never zeros, so a reader can tell "no counters" from
+/// "nothing has landed yet".
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct StoreStatus {
+    /// The ephemeral (one-cache-line record) stream's counters.
     pub ephemeral: StreamCounters,
+    /// The durable (fat frame) stream's counters.
     pub durable: StreamCounters,
+    /// The last completion's wall timestamp, either stream — the operator
+    /// answer to "when did this node last get its lock table to disk".
     pub last_completed_unix_ns: u64,
 }
 

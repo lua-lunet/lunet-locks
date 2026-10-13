@@ -254,6 +254,37 @@ fn corrupted_file_loads_as_none_not_an_error() {
     );
 }
 
+/// The seam's defaulted answers, as the file store inherits them: a
+/// store without a tick path records nothing, submits nothing, drains
+/// nothing, reports no counters, and forgets nothing — the five
+/// defaults are the no-ops the file-store half of the law stands on,
+/// and a flush the store never made leaves the load exactly where it
+/// started.
+#[test]
+fn the_defaulted_seam_answers_are_the_no_ops() {
+    let dir = scratch("defaults");
+    let path = state_path(&dir);
+    let mut store = FileStateStore::new_on(std_disk(), &path);
+    StateStore::note(&mut store, 1);
+    assert_eq!(
+        StateStore::tick(&mut store, &table()).expect("the default tick"),
+        0,
+        "the default submits nothing"
+    );
+    StateStore::pump(&mut store).expect("the default pump drains");
+    assert_eq!(
+        StateStore::state_status(&store),
+        None,
+        "the file store reports no counters, never zeros"
+    );
+    StateStore::forget(&mut store);
+    assert_eq!(
+        store.load().expect("the load reads"),
+        None,
+        "nothing was ever written, and the defaults wrote nothing either"
+    );
+}
+
 /// (c) The lazy-load guard. A crashed boot's verdict reads nothing — not
 /// even a perfectly good file — and only a clean verdict loads. Driven
 /// through `lazy_load`, the seam's own guard, against the real store

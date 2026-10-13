@@ -25,15 +25,17 @@ be serialized; the serialization happens on the loop and the kernel does
 the rest asynchronously.
 
 - **Linux**: the steady tick submits `pwrite` operations through **io_uring**
-  and carries on. The ring's **eventfd** is registered with the ring and
-  polled by libuv (`uv_poll`); when completions arrive, the loop drains the
-  CQEs. This is the standard event-loop integration — gRPC-C++'s EventEngine,
-  Swift System, and the liburing documentation all register an eventfd with
-  the ring and let the host event loop poll it for readiness; the DBMS
-  literature recommends io_uring precisely to *avoid* dedicated blocking-IO
-  threads ("the asynchrony of io_uring enables us to avoid the approach of
-  using dedicated I/O threads", one ring per thread, completions co-located
-  with compute).
+  and carries on. The ring's **eventfd** is registered with the ring so
+  completions are wakeable from the fd; the pinned Lunet runtime exposes no
+  raw-fd polling seat (`uv_poll` does not exist there), so the loop drains
+  completions on the tick — the submit cadence is the drain point. The
+  integration pattern is the standard one regardless of where the readiness
+  is observed — gRPC-C++'s EventEngine, Swift System, and the liburing
+  documentation all register an eventfd with the ring and let the host
+  event loop poll it; the DBMS literature recommends io_uring precisely to
+  *avoid* dedicated blocking-IO threads ("the asynchrony of io_uring
+  enables us to avoid the approach of using dedicated I/O threads", one
+  ring per thread, completions co-located with compute).
 - **macOS (darwin)**: there is no kernel-asynchronous regular-file IO to
   buy — kqueue has no file-IO filter (`EVFILT_AIO` is documented
   "currently unsupported"), POSIX AIO is threadpool glibc-style machinery,
@@ -87,11 +89,11 @@ erase block:
 
 ```text
 offset 0        ephemeral pair A data ring     (capacity × 64 B)
-offset 1 MiB    ephemeral pair A header ring   (capacity × 64 B)
+offset 1 MiB    ephemeral pair A header ring   (capacity × 40 B)
 offset 2 MiB    ephemeral pair B data ring
 offset 3 MiB    ephemeral pair B header ring
 offset 4 MiB    durable pair A data ring       (capacity × 768 B)
-offset 5 MiB    durable pair A header ring     (capacity × 64 B)
+offset 5 MiB    durable pair A header ring     (capacity × 40 B)
 offset 6 MiB    durable pair B data ring
 offset 7 MiB    durable pair B header ring
 total file size 8 MiB (default capacity 1024 per stream)
@@ -140,7 +142,10 @@ A **fat frame**, 12 CL fixed, one budget:
 CL0     the header — the same 64-byte struct as above, unflipped:
         stamp, expiry, lock id (the consensus-assigned u64), lease id,
         holder, lease_ms, tag, checksum.
-        The tag's kinds: live | kept | delete.
+        The tag's kinds: live | kept | delete. The format carries all
+        three and the scan honours all three; the delete kind has no
+        producer in this release (the durable lock model's destroy verb
+        writes it — see `lock-kinds.md`).
         The checksum spans the WHOLE 12-CL frame (computed with the
         checksum field zeroed) — so an ephemeral header and a durable
         header are checksum-distinguishable without any type bit.
@@ -226,7 +231,7 @@ and carries nothing else.
 
 Each ring holds a fixed count of records — the capacity, an operator
 sizing knob (default 1024 per stream; ephemeral data ring 64 KiB, durable
-data ring 768 KiB, header rings 64 KiB each). The record size is fixed,
+data ring 768 KiB, header rings 40 KiB each). The record size is fixed,
 so "how full" is arithmetic, never discovery. A generation that exceeds
 capacity is a **refused flush**: on the shutdown path a failed stop; on
 the steady tick a refusal counted in `refusals` with the serving path
@@ -315,7 +320,10 @@ loudly, by design.
   pump is a no-op. The counters ride the status surface: the node's
   `state_status` FFI entry answers the per-stream counters, and the
   server names them in a `state-status` event every time a generation
-  lands or a refusal is counted.
+  lands or a refusal is counted. Neither the tick nor the status read
+  raises in the host — both answer with a refusal the loop says once
+  per outcome change, because a persistence loop that dies on a failed
+  read has stopped persisting.
   The shutdown path calls `flush` eagerly as the law requires, and the
   node's stop walks the tick first — the table's current changes ride
   the tick path (drain, submit, drain) strictly inside the drain window,
