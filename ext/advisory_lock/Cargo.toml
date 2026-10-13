@@ -26,7 +26,7 @@ clap = { version = "4", features = ["derive"] }
 # cdylib, no packaging change). The vendored AOF build is unix-only
 # (blocking POSIX file I/O); Windows keeps the single-file marker.
 [target.'cfg(not(target_os = "windows"))'.dependencies]
-lunet-locks-aof = { path = "../lunet-locks-aof", features = ["static"] }
+tbio-core = { path = "../lunet-locks-aof", features = ["static"] }
 
 [features]
 default = ["io-uring"]

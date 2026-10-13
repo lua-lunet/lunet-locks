@@ -2140,7 +2140,7 @@ impl Node {
             serde_json::json!({
                 "what": "the halt's first round (Stopping) begins",
                 "identity": session.identity().0,
-                "state": lunet_locks_aof::marker::MarkerState::Stopped.code(),
+                "state": tbio::marker::MarkerState::Stopped.code(),
             }),
         );
         #[cfg(feature = "flight-recorder")]
@@ -2250,7 +2250,7 @@ impl Node {
             serde_json::json!({
                 "what": "the drain-proven second round (Stopped) begins",
                 "identity": identity.0,
-                "state": lunet_locks_aof::marker::MarkerState::Flushed.code(),
+                "state": tbio::marker::MarkerState::Flushed.code(),
             }),
         );
         if let Err((_, error)) = draining.finish_stop() {

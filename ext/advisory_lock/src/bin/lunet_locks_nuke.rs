@@ -36,7 +36,7 @@ use std::path::{Path, PathBuf};
 use clap::Parser;
 
 use lunet_advisory_lock::disk::{Disk, std_disk};
-use lunet_locks_aof::marker::{self, CopyInfo};
+use tbio::marker::{self, CopyInfo};
 
 const PREFIX: &str = "lunet_locks_nuke";
 const EXIT_FAILURE: i32 = 1;
