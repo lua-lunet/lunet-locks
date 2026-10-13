@@ -41,12 +41,12 @@ use lunet_advisory_lock::{
     NOT_LEADER, Node, OK, POSITION_APPEND, RECONFIGURE_DECREMENT, RECONFIGURE_INCREMENT,
     RECONFIGURE_JOIN, RECONFIGURE_LEAVE, RecoveryFlush, maybe_invariant,
 };
-use lunet_locks_aof::envelope::{Marker, Record, local_ns};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
 use std::process::exit;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tbio::envelope::{Marker, Record, local_ns};
 use tracing::info;
 use tracing_appender::non_blocking::WorkerGuard;
 use vrr::ids::NodeId;

@@ -6,13 +6,13 @@
 //! permanently-empty panel is the failure this suite exists to prevent.
 
 use lease_sequencer::bridge::Server;
-use lunet_locks_aof::AofFile;
-use lunet_locks_aof::envelope::{Marker, Record};
 use serde_json::Value;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use tbio::AofFile;
+use tbio::envelope::{Marker, Record};
 
 /// The scratch tree, inside the repo (`.tmp` is scratch).
 fn scratch(name: &str) -> PathBuf {

@@ -40,11 +40,20 @@ pub mod spi;
 /// gate's verdict) distrusts the state file and rebuilds from the replica
 /// stream: only a clean-stop file is loadable.
 pub mod state;
+/// The WAL lock snapshot store: a [`state::StateStore`] over the WAL C
+/// ABI (`wal_open` … `wal_close`, the vendored Zig engine's surface), for
+/// the node's lock table to survive a clean stop and restart without
+/// replaying anything. Flush is EAGER (the shutdown generation, one
+/// fsync); load is LAZY and answers every content refusal with
+/// `Ok(None)`; the tick path (`note`/`submit`/`pump`/`event_fd`) writes
+/// page-cached generations with zero fsync, on the calling thread only.
+#[cfg(not(target_os = "windows"))]
+pub mod wal_snapshot;
 
 pub use ffi::{
     Node, NodeOutput, NodeStatus, OUTPUT_REPLY, OUTPUT_SEND, POSITION_APPEND, PRIMARY_TIMEOUT_MS,
     RECONFIGURE_DECREMENT, RECONFIGURE_INCREMENT, RECONFIGURE_JOIN, RECONFIGURE_LEAVE,
-    output_kind_name, replication_state_name,
+    StateStatusRaw, output_kind_name, replication_state_name,
 };
 
 pub use recovery_flush::{FlushOutcome, RecoveryFlush};

@@ -43,8 +43,8 @@ RUN case "$(dpkg --print-architecture)" in \
     esac \
     && /opt/zig/zig build -Doptimize=ReleaseSafe \
         -Dtarget="$zig_target" -Dcpu="$zig_cpu" --prefix /out \
-    && test -f /out/lib/liblunet_locks_aof.so \
-    && test -f /out/lib/liblunet_locks_aof.a
+    && test -f /out/lib/libtbio.so \
+    && test -f /out/lib/libtbio.a
 
 FROM rust:1.96-slim AS native-base
 

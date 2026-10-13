@@ -51,7 +51,7 @@ TAGS = {2: "2 Prepare", 3: "3 PrepareOk", 4: "4 Commit", 5: "5 StartViewChange",
         9: "9 GetState", 10: "10 NewState", 13: "13 Reincarnation"}
 
 DEFAULT_LIB = Path(__file__).parent.parent / (
-    "ext/lunet-locks-aof/zig/zig-out/lib/liblunet_locks_aof.dylib")
+    "ext/lunet-locks-aof/zig/zig-out/lib/libtbio.dylib")
 
 
 class FixtureDir(tempfile.TemporaryDirectory):

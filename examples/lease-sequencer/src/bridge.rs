@@ -40,8 +40,6 @@
 //! or deletes — the standby owns the series.
 
 use lunet_advisory_lock::locks::{Response, Service, Transition};
-use lunet_locks_aof::envelope::{Marker, Record};
-use lunet_locks_aof::retention;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
@@ -49,6 +47,8 @@ use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tbio::envelope::{Marker, Record};
+use tbio::retention;
 use uuid::Uuid;
 use vrr::journal::Payload;
 use vrr::message::{Body, Message};
@@ -734,7 +734,7 @@ fn read_telemetry_log(log_dir: Option<&Path>, aof_dir: &Path) -> TelemetryLog {
 fn read_file_records(path: &Path, metrics: &mut BridgeMetrics) -> Vec<Record> {
     let mut records = Vec::new();
     let Ok(mut iterator) =
-        (unsafe { lunet_locks_aof::ffi::RawIter::open(path.as_os_str().as_encoded_bytes()) })
+        (unsafe { tbio::ffi::RawIter::open(path.as_os_str().as_encoded_bytes()) })
     else {
         metrics.undecodable += 1;
         return records;

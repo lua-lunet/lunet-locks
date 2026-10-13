@@ -3,6 +3,18 @@ local ffi = require("ffi")
 
 ffi.cdef(
     [[
+    typedef struct lunet_lock_state_status {
+        uint64_t eph_completed_generations;
+        uint64_t eph_completed_records;
+        uint64_t eph_refusals;
+        uint32_t eph_in_flight;
+        uint64_t dur_completed_generations;
+        uint64_t dur_completed_records;
+        uint64_t dur_refusals;
+        uint32_t dur_in_flight;
+        uint64_t last_completed_unix_ns;
+        uint32_t present;
+    } lunet_lock_state_status;
     int32_t lunet_lock_node_new(
         size_t members_len, const uint8_t* members,
         size_t own_len, const uint8_t* own,
@@ -32,6 +44,9 @@ ffi.cdef(
         uint32_t* slot_hi, uint32_t* slot_lo,
         uint8_t* message_id,
         size_t capacity, size_t* len, uint8_t* data);
+    int32_t lunet_lock_node_state_tick(void* node);
+    int32_t lunet_lock_node_state_status(
+        void* node, struct lunet_lock_state_status* out);
     int32_t lunet_lock_node_stop(void* node);
     int32_t lunet_lock_version_properties(uint8_t* data, size_t capacity, size_t* len);
 ]]
@@ -93,6 +108,8 @@ local record Native
         {number},
         any
     ): number
+    lunet_lock_node_state_tick: function(any): number
+    lunet_lock_node_state_status: function(any, any): number
     lunet_lock_node_stop: function(any): number
     lunet_lock_version_properties: function(any, integer, {number}): number
 end
@@ -130,6 +147,7 @@ local record advisory_lock
         _buffer: any
         _status: {number}
         _leader: {number}
+        _state_status: {any}
 
         request: function(Node, string): boolean, string
         reconfigure: function(Node, string, integer): boolean, string
@@ -139,6 +157,8 @@ local record advisory_lock
         recover: function(Node): boolean
         own_id: function(Node): integer
         status: function(Node): Status
+        state_tick: function(Node): boolean, string
+        state_status: function(Node): (StateStatus, boolean, string)
         leader_for_view: function(Node, integer, integer): integer
         outputs: function(Node): {Output}
         close: function(Node): boolean
@@ -162,6 +182,19 @@ local record advisory_lock
         view: integer
     end
 
+    record StateStream
+        completed_generations: integer
+        completed_records: integer
+        refusals: integer
+        in_flight: integer
+    end
+
+    record StateStatus
+        ephemeral: StateStream
+        durable: StateStream
+        last_completed_unix_ns: integer
+    end
+
     new: function({cluster_config.ClusterNode}, string, string, string, integer): Node
     version_properties: function(): {string: string}
 end
@@ -169,6 +202,21 @@ end
 local Node = advisory_lock.Node
 local Output = advisory_lock.Output
 local Status = advisory_lock.Status
+
+-- The cdata mirror of the FFI's `lunet_lock_state_status` (the fields
+-- the Rust `StateStatusRaw` declares; LuaJIT reads the u64s as cdata).
+local record RawStateStatus
+    eph_completed_generations: any
+    eph_completed_records: any
+    eph_refusals: any
+    eph_in_flight: any
+    dur_completed_generations: any
+    dur_completed_records: any
+    dur_refusals: any
+    dur_in_flight: any
+    last_completed_unix_ns: any
+    present: any
+end
 
 local function check(rc: integer): boolean
     if rc < 0 then
@@ -300,6 +348,86 @@ function Node:status(): Status
         era = (tonumber(self._era[0]) or 0) as integer,
         view = (tonumber(self._view[0]) or 0) as integer,
     }
+end
+
+-- The steady tick, reporting its outcome instead of raising: the store's
+-- own refusals (a capacity overrun, an outstanding batch, a backend IO
+-- failure) never reach this call at all — the native tick counts them in
+-- the per-stream `refusals` and answers OK, because a steady tick's
+-- failure mode is the store's business and the serving path must not see
+-- it. What can come back is the node's own state: OK, `node stopped` past
+-- the drain point, and the ABI's own failures. So the tick reports a
+-- boolean and the refusal's name, and the counters on `state_status` are
+-- where a store refusal is read.
+function Node:state_tick(): boolean, string
+    local rc = (tonumber(native.lunet_lock_node_state_tick(self._handle)) or -127)
+        as integer
+    if rc == 0 then
+        return true, ""
+    end
+    return false, errors[rc] or ("native error " .. tostring(rc))
+end
+
+-- The store's per-stream counters (ephemeral and durable generations,
+-- records, refusals, in flight, and the last completion's wall
+-- timestamp), plus an ok flag and, on a refusal, its name — the same
+-- never-raises discipline as `state_tick`: a failed status read is a
+-- reported outcome, never a raise that would kill the caller's tick
+-- loop. On a refusal the counters read all zeros and the ok flag is
+-- false; a caller must read the flag, not the zeros (a store without
+-- counters — the file store the construction-refusal fallback boots
+-- with — reads all zeros WITH the flag true). The u64 fields cross as
+-- LuaJIT cdata; tonumber is the honest narrowing for every counter a
+-- node can actually carry.
+function Node:state_status(): advisory_lock.StateStatus, boolean, string
+    local rc = (
+        tonumber(native.lunet_lock_node_state_status(self._handle, self._state_status))
+        or -127
+    ) as integer
+    if rc ~= 0 then
+        return {
+            ephemeral = {
+                completed_generations = 0,
+                completed_records = 0,
+                refusals = 0,
+                in_flight = 0,
+            },
+            durable = {
+                completed_generations = 0,
+                completed_records = 0,
+                refusals = 0,
+                in_flight = 0,
+            },
+            last_completed_unix_ns = 0,
+        }, false, errors[rc] or ("native error " .. tostring(rc))
+    end
+    local raw = self._state_status[0] as RawStateStatus
+    local function counters(
+        generations: any, records: any, refusals: any, in_flight: any
+    ): advisory_lock.StateStream
+        return {
+            completed_generations = (tonumber(generations) or 0) as integer,
+            completed_records = (tonumber(records) or 0) as integer,
+            refusals = (tonumber(refusals) or 0) as integer,
+            in_flight = (tonumber(in_flight) or 0) as integer,
+        }
+    end
+    return {
+        ephemeral = counters(
+            raw.eph_completed_generations,
+            raw.eph_completed_records,
+            raw.eph_refusals,
+            raw.eph_in_flight
+        ),
+        durable = counters(
+            raw.dur_completed_generations,
+            raw.dur_completed_records,
+            raw.dur_refusals,
+            raw.dur_in_flight
+        ),
+        last_completed_unix_ns = (tonumber(raw.last_completed_unix_ns) or 0)
+            as integer,
+    }, true, ""
 end
 
 function Node:leader_for_view(era: integer, view: integer): integer
@@ -467,6 +595,7 @@ function M.new(
         _buffer = ffi.new("uint8_t[?]", MAX_DATAGRAM),
         _status = ffi.new("uint32_t[1]") as {number},
         _leader = ffi.new("uint32_t[1]") as {number},
+        _state_status = ffi.new("lunet_lock_state_status[1]") as {any},
         request = Node.request,
         reconfigure = Node.reconfigure,
         receive = Node.receive,
@@ -475,6 +604,8 @@ function M.new(
         recover = Node.recover,
         own_id = Node.own_id,
         status = Node.status,
+        state_tick = Node.state_tick,
+        state_status = Node.state_status,
         leader_for_view = Node.leader_for_view,
         outputs = Node.outputs,
         close = Node.close,

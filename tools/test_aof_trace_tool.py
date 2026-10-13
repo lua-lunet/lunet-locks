@@ -18,7 +18,7 @@ sys.modules["aof_trace_tool"] = tool
 _spec.loader.exec_module(tool)
 
 LIB = Path(__file__).parent.parent / (
-    "ext/lunet-locks-aof/zig/zig-out/lib/liblunet_locks_aof.dylib")
+    "ext/lunet-locks-aof/zig/zig-out/lib/libtbio.dylib")
 
 REAL_TRACE = (Path(__file__).parent.parent / (
     ".tmp/telemetry/nine-node-2026-09-12/w1b/aof"))

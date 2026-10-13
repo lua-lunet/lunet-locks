@@ -43,12 +43,12 @@
 //! lock verb, and `frame_hex` — the raw wire bytes hex-encoded:
 //! byte-exact playback needs the original datagram.
 
-use lunet_locks_aof::envelope::{Marker, Record};
-use lunet_locks_aof::retention;
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use tbio::envelope::{Marker, Record};
+use tbio::retention;
 
 /// The wire tag table (uVRR `wire.rs`), for the line's honest `tag`.
 pub fn tag_name(tag: u32) -> &'static str {
@@ -224,12 +224,12 @@ fn lock_fields(json: &[u8]) -> Option<Map<String, Value>> {
 
 /// The safe iterator wrapper over one AOF file (the same FFI the host
 /// uses — never a shell-out to the python tool).
-fn retention_iter(path: &Path) -> Result<lunet_locks_aof::ffi::RawIter, i32> {
-    unsafe { lunet_locks_aof::ffi::RawIter::open(path.to_string_lossy().as_bytes()) }
+fn retention_iter(path: &Path) -> Result<tbio::ffi::RawIter, i32> {
+    unsafe { tbio::ffi::RawIter::open(path.to_string_lossy().as_bytes()) }
 }
 
 /// The series' `.aof` files, oldest first.
-fn series(dir: &Path) -> Vec<lunet_locks_aof::retention::ListedAofFile> {
+fn series(dir: &Path) -> Vec<tbio::retention::ListedAofFile> {
     retention::list_aof_files(dir).unwrap_or_default()
 }
 
@@ -498,8 +498,8 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lunet_locks_aof::{AofFile, Options};
     use std::path::Path;
+    use tbio::{AofFile, Options};
 
     /// One uVRR Commit frame: tag(4 BE) | era | view | slot, the body
     /// discriminant repeating the tag's low byte, the committed frontier.

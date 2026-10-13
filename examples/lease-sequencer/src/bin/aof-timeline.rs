@@ -9,8 +9,8 @@
 //! aof-timeline <dir>... [--limit N] [--stats]
 //! ```
 
-use lunet_locks_aof::envelope::{Marker, Record};
 use std::path::{Path, PathBuf};
+use tbio::envelope::{Marker, Record};
 
 fn main() {
     let mut dirs: Vec<PathBuf> = Vec::new();
@@ -125,9 +125,8 @@ fn read_series(dir: &Path) -> Vec<Record> {
     files.sort();
     let mut records = Vec::new();
     for file in files {
-        let mut it =
-            unsafe { lunet_locks_aof::ffi::RawIter::open(file.as_os_str().as_encoded_bytes()) }
-                .unwrap_or_else(|e| die(&format!("cannot open {}: code {e}", file.display())));
+        let mut it = unsafe { tbio::ffi::RawIter::open(file.as_os_str().as_encoded_bytes()) }
+            .unwrap_or_else(|e| die(&format!("cannot open {}: code {e}", file.display())));
         while let Ok(Some(entry)) = it.next_entry() {
             match Record::decode(&entry.bytes) {
                 Some(record) => records.push(record),

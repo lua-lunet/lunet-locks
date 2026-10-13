@@ -61,6 +61,19 @@ pub enum Transition {
     },
 }
 
+impl Transition {
+    /// The transition's lock: the address every committed lock
+    /// transition is noted under (the tick path's changed set).
+    pub fn lock_id(&self) -> u64 {
+        match self {
+            Transition::Hold { lock_id, .. }
+            | Transition::Renew { lock_id, .. }
+            | Transition::Release { lock_id, .. }
+            | Transition::Break { lock_id, .. } => *lock_id,
+        }
+    }
+}
+
 /// The state machine's stored lease record and the reply shape. Every field
 /// is serialized in every reply (`name`/`labels` as `null` when the lock
 /// carries none), so observers classify events without diffing successive
@@ -142,7 +155,13 @@ fn valid_label(label: &str) -> bool {
         return false;
     }
     let alnum = |byte: u8| byte.is_ascii_lowercase() || byte.is_ascii_digit();
-    if !alnum(bytes[0]) || !alnum(bytes[bytes.len() - 1]) {
+    if !alnum(bytes[0]) {
+        return false;
+    }
+    if bytes.len() == 1 {
+        return true;
+    }
+    if !alnum(bytes[bytes.len() - 1]) {
         return false;
     }
     bytes[1..bytes.len() - 1]

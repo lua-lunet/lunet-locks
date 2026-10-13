@@ -87,6 +87,16 @@ local ADMIN_CACHE_LIMIT = 1024
 local DISCOVERY_ROUND_TICKS = 20
 local DISCOVERY_DEADLINE_TICKS = 1500
 local WRITE_BEHIND_MS = 500
+-- The WAL snapshot store's steady tick (docs/src/wal-snapshot.md): the
+-- changed set rides the store's tick path on this cadence, completions
+-- drained either side. The choice, stated: the pinned Lunet v0.10.0
+-- runtime exposes no raw-fd polling surface (lunet.sleep/spawn/stop/
+-- on_stop only), so there is no uv_poll seat for the Linux eventfd —
+-- completions are reaped ON THE TICK, which is also the submit cadence:
+-- each tick drains the previous generation before submitting the next,
+-- and no generation can sit outstanding past the next beat. On darwin
+-- the writes complete inline at submit and the pump is a no-op.
+local STATE_TICK_MS = 1000
 local MAX_CLIENT_REQUEST = transport.MAX_DATAGRAM - transport.PEER_HEADER_BYTES - 1 - MESSAGE_ID_BYTES
 -- The native adapter reports u32::MAX when no leader is known for an era/view
 -- (booting or recovering cluster, or an era outside the retention window).
@@ -617,6 +627,80 @@ local function main(options: Options)
                     log_membership(
                         "advisory-lock membership sidecar write failed;"
                             .. " write-behind disabled for this process"
+                    )
+                end
+            end
+        end
+    end
+
+    -- The steady state tick: the WAL snapshot store's ~1000 ms cadence.
+    -- A refusal is a counted steady-tick refusal (the serving state is
+    -- untouched, the changed set retries) — said once per outcome
+    -- change, never silently and never as a crash. The per-stream
+    -- counters ride the status surface: a `state-status` event names
+    -- them every time a generation lands or a refusal is counted, so an
+    -- operator (or the console) can answer "when did this node last get
+    -- its lock table to disk".
+    local last_state_report = -1
+    local last_tick_outcome = ""
+    local last_status_outcome = ""
+    local function state_tick_loop()
+        while true do
+            lunet.sleep(STATE_TICK_MS)
+            local ok, outcome = node:state_tick()
+            if not ok and outcome ~= last_tick_outcome then
+                log_membership(
+                    "advisory-lock "
+                        .. options.node
+                        .. " state tick refused: "
+                        .. outcome
+                )
+            end
+            last_tick_outcome = ok and "" or outcome
+            -- The status read never raises and never kills the loop: a
+            -- refused read is said once per outcome change, and the tick
+            -- keeps beating — the counters are telemetry, the writes are
+            -- the work.
+            local counters, status_ok, status_error = node:state_status()
+            if not status_ok then
+                if status_error ~= last_status_outcome then
+                    log_membership(
+                        "advisory-lock "
+                            .. options.node
+                            .. " state status unavailable: "
+                            .. status_error
+                    )
+                end
+                last_status_outcome = status_error
+            else
+                last_status_outcome = ""
+                -- One number for the change test: the generations landed and
+                -- the refusals counted, across both streams. The event rides
+                -- only when one of them moves.
+                local moved = counters.ephemeral.completed_generations + counters.durable.completed_generations + counters.ephemeral.refusals + counters.durable.refusals
+                if moved ~= last_state_report then
+                    last_state_report = moved
+                    log_event(
+                        "state-status",
+                        {
+                            '"node":' .. tostring(own_id),
+                            '"eph_completed_generations":'
+                                .. tostring(counters.ephemeral.completed_generations),
+                            '"eph_completed_records":'
+                                .. tostring(counters.ephemeral.completed_records),
+                            '"eph_refusals":' .. tostring(counters.ephemeral.refusals),
+                            '"dur_completed_generations":'
+                                .. tostring(counters.durable.completed_generations),
+                            '"dur_completed_records":'
+                                .. tostring(counters.durable.completed_records),
+                            '"dur_refusals":' .. tostring(counters.durable.refusals),
+                            '"last_completed_ms":'
+                                .. tostring(
+                                    math.floor(
+                                        counters.last_completed_unix_ns / 1000000
+                                    )
+                                ),
+                        }
                     )
                 end
             end
@@ -1501,9 +1585,21 @@ local function main(options: Options)
                     end
                 else
                     local sent = false
-                    local waited = pcall(
-                        function() sent = wait_for_reply(client, json) end
+                    local waited, wait_marker = pcall(
+                        function(): string
+                            sent = wait_for_reply(client, json)
+                            return "ok"
+                        end
                     )
+                    if not waited then
+                        -- The client path's one silent close: an error
+                        -- here closed the connection with no trace of
+                        -- why. Name it, then close as before.
+                        log_membership(
+                            "advisory-lock client request failed: "
+                                .. tostring(wait_marker)
+                        )
+                    end
                     if not waited or not sent then
                         active_clients[client_key] = nil
                         close_client(client)
@@ -1520,6 +1616,7 @@ local function main(options: Options)
     lunet.spawn(recovery_loop)
     lunet.spawn(discovery_loop)
     lunet.spawn(write_behind_loop)
+    lunet.spawn(state_tick_loop)
     -- The supported v0.10.0 signal bridge (the runtime's own mechanics,
     -- not a private handler): arming a one-shot watcher overrides the
     -- default signal disposition, the first matching signal resumes that

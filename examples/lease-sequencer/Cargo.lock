@@ -341,12 +341,12 @@ dependencies = [
  "flate2",
  "hmac",
  "lunet-advisory-lock",
- "lunet-locks-aof",
  "serde",
  "serde_json",
  "sha2",
  "signal-hook",
  "tar",
+ "tbio-core",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
@@ -378,17 +378,13 @@ version = "0.2.0"
 dependencies = [
  "clap",
  "io-uring",
- "lunet-locks-aof",
  "serde",
  "serde_json",
+ "tbio-core",
  "tracing",
  "uuid",
  "uvrr-core",
 ]
-
-[[package]]
-name = "lunet-locks-aof"
-version = "0.1.0"
 
 [[package]]
 name = "matchers"
@@ -665,6 +661,10 @@ dependencies = [
  "libc",
  "xattr",
 ]
+
+[[package]]
+name = "tbio-core"
+version = "0.2.0"
 
 [[package]]
 name = "thiserror"

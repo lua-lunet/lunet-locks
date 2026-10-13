@@ -48,6 +48,39 @@ use crate::disk::{Disk, std_disk};
 use crate::journal::crc32_ieee;
 use crate::locks::StateSnapshot;
 
+/// One stream's completion-driven counters (the design doc's status
+/// table, per stream): the generations and records landed since open,
+/// the flushes refused (capacity) since open, and the submissions
+/// currently outstanding (0 or one generation's worth).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StreamCounters {
+    /// Generations fully written since the store was opened.
+    pub completed_generations: u64,
+    /// Records landed since the store was opened.
+    pub completed_records: u64,
+    /// Submissions refused (capacity) since the store was opened. A
+    /// refused submission changes nothing on the serving path.
+    pub refusals: u64,
+    /// Submissions outstanding right now: 0 or one generation's worth.
+    pub in_flight: u32,
+}
+
+/// The per-stream counters the status surface reads: one row per stream
+/// plus the last completion's wall timestamp. `state_status` answers
+/// this or `None` — a store with no counters of its own (the file store)
+/// answers `None`, never zeros, so a reader can tell "no counters" from
+/// "nothing has landed yet".
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StoreStatus {
+    /// The ephemeral (one-cache-line record) stream's counters.
+    pub ephemeral: StreamCounters,
+    /// The durable (fat frame) stream's counters.
+    pub durable: StreamCounters,
+    /// The last completion's wall timestamp, either stream — the operator
+    /// answer to "when did this node last get its lock table to disk".
+    pub last_completed_unix_ns: u64,
+}
+
 /// The on-disk format's version byte. Bump it when the payload's schema
 /// changes; a reader that does not recognise the byte refuses the file
 /// (there is no conversion and no fallback — this crate is alpha and
@@ -81,6 +114,52 @@ pub trait StateStore: Send + Sync {
     /// marker round. An `Err` fails the stop — the caller surfaces it and
     /// never skips it.
     fn flush(&mut self, snap: &StateSnapshot) -> io::Result<()>;
+
+    /// Record one changed lock: the loop calls this at each committed
+    /// lock transition and once per lock a lazy load installs. The next
+    /// [`StateStore::tick`] carries the lock. The default records
+    /// nothing — a store without a tick path (the file store) ignores it.
+    fn note(&mut self, lock_id: u64) {
+        let _ = lock_id;
+    }
+
+    /// The steady tick's write: submit the noted locks' current values as
+    /// one generation per stream, page-cached, zero fsync, and answer
+    /// with the number of records and frames submitted. Refusals are
+    /// `Err` — a capacity refusal is counted by the store and the
+    /// changed set is kept so the next tick retries; the serving state
+    /// is never affected. The default submits nothing.
+    fn tick(&mut self, snap: &StateSnapshot) -> io::Result<usize> {
+        let _ = snap;
+        Ok(0)
+    }
+
+    /// Drain completions non-blocking: the eventfd wake's work on Linux,
+    /// a no-op success where completions are inline. The default is that
+    /// no-op.
+    fn pump(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+
+    /// The per-stream counters, when the store carries them (the WAL
+    /// snapshot store does; the file store reports `None`).
+    fn state_status(&self) -> Option<StoreStatus> {
+        None
+    }
+
+    /// Forget the artefact: the dirty boot's write half of the law's
+    /// third clause. A boot whose verdict is not a clean stop distrusts
+    /// the state artefact for READING (the load guard above) — and it
+    /// must not write against it either: a store whose write path
+    /// carries forward the old artefact's bookkeeping (the WAL
+    /// engine's mirrors are seeded from the open scan) would reconcile
+    /// a flush against a stale mirror and fail a correct stop. The
+    /// default forgets nothing — a store that rewrites its artefact
+    /// whole on every flush (the file store) carries no stale
+    /// bookkeeping.
+    fn forget(&mut self) {
+        let _ = self;
+    }
 
     /// Read the state back, or report that there is none to read.
     ///

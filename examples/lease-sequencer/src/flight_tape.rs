@@ -291,7 +291,7 @@ pub fn event_tape_line(event: &FlightEvent, own_node: u32) -> Option<TapeLine> {
         }
         "marker" => {
             if let Some(code) = json.get("state").and_then(serde_json::Value::as_u64) {
-                match lunet_locks_aof::marker::state_name(code as u32) {
+                match tbio::marker::state_name(code as u32) {
                     Some(name) => json.insert("state_name".into(), serde_json::Value::from(name)),
                     None => json.insert("state_name".into(), serde_json::Value::from("invalid")),
                 };

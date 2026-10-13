@@ -34,12 +34,12 @@
 //! usage or input errors.
 
 use flate2::read::GzDecoder;
-use lunet_locks_aof::marker::{self, Classified, MarkerState};
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tbio::marker::{self, Classified, MarkerState};
 
 /// The check's verdict: every node consistent, or findings exist.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

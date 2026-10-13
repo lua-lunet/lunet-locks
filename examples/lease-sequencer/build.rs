@@ -1,7 +1,7 @@
 //! Two compile-time duties, no runtime behavior change:
 //!
 //! 1. The runtime lookup for the vendored TigerBeetle AOF cdylib: the
-//!    zig cdylib's install name is `@rpath/liblunet_locks_aof.dylib`, so
+//!    zig cdylib's install name is `@rpath/libtbio.dylib`, so
 //!    the binary needs an LC_RPATH (macOS) / RUNPATH (Linux) at the
 //!    crate's artifact directory, which the `links` contract propagates
 //!    as the `DEP_LUNET_LOCKS_AOF_METADATA` entries (one `lib_dir=<path>`

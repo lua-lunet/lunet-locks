@@ -101,9 +101,7 @@ local function default_lib(): string
     local dir = ((debug.getinfo(1, "S") as DebugInfo).source):match("^@(.+)/[^/]+$")
         or "."
     local suffix = ffi.os == "OSX" and "dylib" or "so"
-    return dir
-        .. "/../ext/lunet-locks-aof/zig/zig-out/lib/liblunet_locks_aof."
-        .. suffix
+    return dir .. "/../ext/lunet-locks-aof/zig/zig-out/lib/libtbio." .. suffix
 end
 
 local native = ffi.load(os.getenv("AOF_LIB") or default_lib()) as Native

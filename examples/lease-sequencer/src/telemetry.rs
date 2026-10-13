@@ -29,9 +29,9 @@
 //! `{epoch}.aof` files are the between-restart history; the in-run
 //! rollover still keeps exactly current + one closed old.
 
-use lunet_locks_aof::envelope::{Marker, Record, local_ns};
-use lunet_locks_aof::{AofFile, Error, Options, retention};
 use std::path::{Path, PathBuf};
+use tbio::envelope::{Marker, Record, local_ns};
+use tbio::{AofFile, Error, Options, retention};
 
 // ----------------------------------------------------------------- gate ----
 

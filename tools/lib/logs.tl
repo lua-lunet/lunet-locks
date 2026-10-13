@@ -25,6 +25,7 @@ local record M
     node_files: function(string, string): {string}
     node_logs: function(string, string): {string}
     files_for_all: function(string, {string}): {string}
+    after_last: function({string}, string): string
     grep: function({string}, string): {string}
     count: function({string}, string): integer
     count_where: function({string}, string, {string: string}): integer
@@ -108,6 +109,32 @@ end
 -- Count of matching lines across the file set.
 function M.count(files: {string}, pattern: string): integer
     return #M.grep(files, pattern)
+end
+
+-- Everything the file set says after the LAST occurrence of the
+-- pattern: the tail of the evidence past the marker's final sighting.
+-- The control that reads a life's post-marker story uses this — a
+-- before/after count delta over these files is unsound, because a
+-- restart REPLACES the captures (they do not append every life), and
+-- the delta then compares counts from different file generations.
+-- The concatenation is file order (sorted by `files_for_all`), so the
+-- last match in the concatenation is the last match in the run.
+function M.after_last(files: {string}, pattern: string): string
+    local text = table.concat(all_lines(files), "\n")
+    local last: integer = 0
+    local from = 1
+    while true do
+        local at = text:find(pattern, from, true)
+        if at == nil then
+            break
+        end
+        last = at
+        from = at + 1
+    end
+    if last == 0 then
+        return ""
+    end
+    return text:sub(last + #pattern)
 end
 
 -- Count of lines carrying this `event` whose members also equal these.

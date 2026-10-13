@@ -94,7 +94,7 @@ use vrr::ids::Slot;
 
 pub use crate::disk::{Disk, DiskDirEntry, DiskFile, EngineFile, StdDisk, std_disk};
 pub use crate::locks::StateSnapshot;
-pub use crate::state::{FileStateStore, StateStore};
+pub use crate::state::{FileStateStore, StateStore, StoreStatus, StreamCounters};
 pub use vrr::lifecycle::LifecycleStore;
 
 /// A trigger fired at each applied commit.

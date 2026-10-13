@@ -218,6 +218,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{OsString, c_void};
 use std::io;
+use std::mem::{offset_of, size_of};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::ptr;
@@ -855,14 +856,37 @@ impl Node {
         self.state_loaded = true;
         let clean_boot = self.clean_boot;
         let table_empty = self.service.is_empty();
+        if !clean_boot {
+            // The crashed verdict, said where the operator reads: this
+            // life will not read the state artefact whatever it
+            // carries — the table rebuilds from the replica stream.
+            // The release build's one log line for the law's clause 2.
+            trace_line!("state.load-distrusted");
+            eprintln!(
+                "lunet-advisory-lock: crashed boot: the state artefact is \
+                 distrusted; the lock table rebuilds from the replica stream"
+            );
+        }
         match state::lazy_load(&*self.state_store, clean_boot, table_empty) {
             Ok(Some(snapshot)) => {
+                for lock_id in snapshot.locks.keys() {
+                    // The WAL store's mirrors start empty in this new
+                    // life; the loaded locks are noted so the first
+                    // tick re-submits the whole loaded set and the
+                    // mirrors catch up — the stop flush reconciles
+                    // against them.
+                    self.state_store.note(*lock_id);
+                }
                 self.service.restore(snapshot);
                 info!(
                     ts = log_millis(),
                     event = "state-loaded",
                     node = self.replica.own().0,
                     "the lock table materialised from the clean stop's state file"
+                );
+                eprintln!(
+                    "lunet-advisory-lock: the lock table materialised from \
+                     the clean stop's state artefact"
                 );
             }
             // Every refusal — a distrusted verdict, a populated table, an
@@ -1162,6 +1186,12 @@ impl Node {
                 // serving. The AOF sink enqueues and never fails: overflow
                 // drops into the writer's drop counter.
                 if let Some(transition) = transition {
+                    // The tick path's changed set: every committed lock
+                    // transition notes its lock, so the store's next tick
+                    // carries the lock's current value (a live record or
+                    // frame, a tombstone for a release). A store without a
+                    // tick path ignores the note.
+                    self.state_store.note(transition.lock_id());
                     let ts = unix_millis().unwrap_or(0);
                     let event = match &transition {
                         Transition::Hold {
@@ -1356,6 +1386,70 @@ impl NodeStatus {
     }
 }
 
+/// The state store's counters, the C ABI's layout: one field set per
+/// stream plus the last completion's timestamp and a `present` flag.
+/// Natural C layout (u64 fields 8-aligned; the u32s pack into the tail
+/// the C compiler assigns identically both sides — the fields are
+/// declared in the same order in every consumer). The Teal mirror lives
+/// in `src/advisory_lock.tl`'s cdef.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StateStatusRaw {
+    pub eph_completed_generations: u64,
+    pub eph_completed_records: u64,
+    pub eph_refusals: u64,
+    pub eph_in_flight: u32,
+    pub dur_completed_generations: u64,
+    pub dur_completed_records: u64,
+    pub dur_refusals: u64,
+    pub dur_in_flight: u32,
+    pub last_completed_unix_ns: u64,
+    pub present: u32,
+}
+
+/// This host ABI's binding layout, pinned at compile time on every build:
+/// the record is flat and deliberately so — the two streams' counters
+/// side by side, the timestamp, the `present` flag — and it is mirrored in
+/// the Teal host's cdef, where a LuaJIT `uint64_t` reads the same eight
+/// bytes at the same offset. The offsets are therefore the ABI's, not
+/// Rust's: asserted here so a field added, reordered or retyped on either
+/// side is a compile error, never a silently shifted read.
+const STATE_STATUS_RAW_LAYOUT: () = assert!(
+    size_of::<StateStatusRaw>() == 80
+        && offset_of!(StateStatusRaw, eph_completed_generations) == 0
+        && offset_of!(StateStatusRaw, eph_completed_records) == 8
+        && offset_of!(StateStatusRaw, eph_refusals) == 16
+        && offset_of!(StateStatusRaw, eph_in_flight) == 24
+        && offset_of!(StateStatusRaw, dur_completed_generations) == 32
+        && offset_of!(StateStatusRaw, dur_completed_records) == 40
+        && offset_of!(StateStatusRaw, dur_refusals) == 48
+        && offset_of!(StateStatusRaw, dur_in_flight) == 56
+        && offset_of!(StateStatusRaw, last_completed_unix_ns) == 64
+        && offset_of!(StateStatusRaw, present) == 72
+);
+
+impl StateStatusRaw {
+    /// The raw record a `None` (a store without counters) answers with:
+    /// present = 0, everything zeroed.
+    fn from(status: Option<&crate::state::StoreStatus>) -> Self {
+        match status {
+            None => Self::default(),
+            Some(status) => Self {
+                eph_completed_generations: status.ephemeral.completed_generations,
+                eph_completed_records: status.ephemeral.completed_records,
+                eph_refusals: status.ephemeral.refusals,
+                eph_in_flight: status.ephemeral.in_flight,
+                dur_completed_generations: status.durable.completed_generations,
+                dur_completed_records: status.durable.completed_records,
+                dur_refusals: status.durable.refusals,
+                dur_in_flight: status.durable.in_flight,
+                last_completed_unix_ns: status.last_completed_unix_ns,
+                present: 1,
+            },
+        }
+    }
+}
+
 /// The default state store for a node state path: this crate's own
 /// [`FileStateStore`] over the very disk the node is being built on,
 /// exactly as every defaulting entry point defaults its disk. The
@@ -1368,6 +1462,52 @@ impl NodeStatus {
 /// standalone seam).
 fn default_state_store(disk: &Arc<dyn Disk>, state: &str) -> Box<dyn StateStore> {
     Box::new(FileStateStore::new_on(Arc::clone(disk), Path::new(state)))
+}
+
+/// The WAL snapshot store mounted beside the node's state path: the
+/// state path's name with a `.wal` suffix (the design doc's file rule),
+/// default capacity. The mounted store replaces the file store at the
+/// node's construction — nothing above the trait knows which store the
+/// node holds.
+///
+/// The mount site's cold-start fallback (R4): a refused construction —
+/// corrupt content at open above all — must NOT block the boot. The WAL
+/// is a fallback mechanism, never a safety mechanism, so a store that
+/// cannot open is said loudly (the crate's trace surface) and the node
+/// boots WITHOUT the artefact on the file store: the lock table
+/// rebuilds from the replica stream and the node remains correct.
+fn wal_state_store(state: &str) -> Box<dyn StateStore> {
+    let mut os = PathBuf::from(state).into_os_string();
+    os.push(".wal");
+    let path = PathBuf::from(os);
+    match crate::wal_snapshot::WalSnapshotStore::new(&path) {
+        Ok(store) => {
+            info!(
+                ts = log_millis(),
+                event = "wal-mounted",
+                path = %path.display(),
+                "the WAL snapshot store is mounted (the lock table persists beside the state path)"
+            );
+            Box::new(store)
+        }
+        Err(error) => {
+            warn!(
+                ts = log_millis(),
+                event = "wal-mount-refused",
+                path = %path.display(),
+                error = %error,
+                "the WAL snapshot store refused to open; booting without the \
+                 artefact — the lock table rebuilds from the replica stream"
+            );
+            eprintln!(
+                "lunet-advisory-lock: the WAL snapshot store refused to open at \
+                 {} ({error}); booting without the artefact — the lock table \
+                 rebuilds from the replica stream",
+                path.display()
+            );
+            Box::new(FileStateStore::new_on(std_disk(), Path::new(state)))
+        }
+    }
 }
 
 /// The default commit hook: this crate's own no-op, behind the seam's own
@@ -2072,7 +2212,7 @@ impl Node {
             serde_json::json!({
                 "what": "the halt's first round (Stopping) begins",
                 "identity": session.identity().0,
-                "state": lunet_locks_aof::marker::MarkerState::Stopped.code(),
+                "state": tbio::marker::MarkerState::Stopped.code(),
             }),
         );
         #[cfg(feature = "flight-recorder")]
@@ -2125,6 +2265,36 @@ impl Node {
             }
         };
         trace_line!("stop.drain-window.close");
+        // THE STOP'S OWN FIRST DEMAND. A clean boot that never served a
+        // client op never took the lazy load — and the store's mirrors
+        // hold exactly what its artefact carries. The table this stop
+        // owes to the eager flush is the table the node would have
+        // served: the artefact's own state, not an empty one (an empty
+        // flush over the artefact would destroy the very state a clean
+        // stop exists to persist, and the reconciliation would call the
+        // divergence loudly). So the load is taken here — the same
+        // guard, the same once-only clause, the law's "first demand
+        // that finds the table empty" — and the loaded locks are noted,
+        // so the tick below re-submits them and the flush reconciles
+        // against a caught-up mirror.
+        self.load_state_on_demand();
+        // THE TICK BEFORE THE FLUSH (R2). The flush reconciles each set
+        // against the engine's own mirror, so the table's current changes
+        // ride the tick path first — the same drain, submit, drain the
+        // steady tick runs, in the drain window, with nothing after it but
+        // the flush. A refusal here cannot be caught up by the flush (the
+        // mirror would stay behind and the reconciliation would refuse) —
+        // it is the failed stop itself, named `stop.refuse.state-tick`.
+        if let Err(error) = self.state_tick_path() {
+            trace_line!("stop.refuse.state-tick");
+            eprintln!(
+                "lunet-advisory-lock: the stop's state tick path failed \
+                 ({error}); the marker stays at the first round; \
+                 {UNFLUSHED_RUNBOOK}"
+            );
+            return SERVICE;
+        }
+        trace_line!("state.tick");
         // THE EAGER FLUSH. The law: flush is EAGER — on the shutdown path
         // the whole lock-table state is written in the foreground before
         // the stop completes. The seat in the schedule is the only one
@@ -2152,7 +2322,7 @@ impl Node {
             serde_json::json!({
                 "what": "the drain-proven second round (Stopped) begins",
                 "identity": identity.0,
-                "state": lunet_locks_aof::marker::MarkerState::Flushed.code(),
+                "state": tbio::marker::MarkerState::Flushed.code(),
             }),
         );
         if let Err((_, error)) = draining.finish_stop() {
@@ -2194,6 +2364,60 @@ impl Node {
             poisoned: self.poisoned,
             fault_note: self.fault_note.clone(),
         }
+    }
+
+    /// THE TICK PATH, as the one ordered sequence every seat runs:
+    /// completions drained, the changed set submitted, completions
+    /// drained again. The steady tick (the ~1000 ms timer) and the stop
+    /// (the drain window, immediately before the eager flush) are the
+    /// same three steps in the same order — the stop's is load-bearing
+    /// because the flush reconciles against the mirror the submit moves,
+    /// so the sequence lives here once and cannot be reordered at one
+    /// seat only.
+    fn state_tick_path(&mut self) -> std::io::Result<()> {
+        self.state_store.pump()?;
+        self.state_store.tick(&self.service.snapshot())?;
+        self.state_store.pump()
+    }
+
+    /// THE STEADY TICK — the ~1000 ms timer's one call. The changed
+    /// set (noted at every committed lock transition, and once per lock
+    /// a lazy load installs) rides the tick path: completions drained,
+    /// one generation submitted per stream, completions drained again.
+    /// Zero fsync — a crash mid-period is a dirty boot and the dirty
+    /// boot never reads the artefact.
+    ///
+    /// A capacity refusal is a counted refusal (`refusals`, per stream)
+    /// that leaves the serving state untouched: the changed set is kept
+    /// and the next tick retries. That answer is `OK` — the tick's
+    /// failure mode is the store's business, surfaced through
+    /// [`Node::state_status`], never the node's serving path. `STOPPED`
+    /// past the drain point (the wire is closed; the timer's last
+    /// beats change nothing).
+    pub fn state_tick(&mut self) -> i32 {
+        if self.stopped {
+            return STOPPED;
+        }
+        if let Err(error) = self.state_tick_path() {
+            warn!(
+                ts = log_millis(),
+                event = "state-tick-refused",
+                node = self.replica.own().0,
+                error = %error,
+                "the state tick path was refused; the changed set retries on \
+                 the next tick"
+            );
+        }
+        OK
+    }
+
+    /// The store's per-stream counters, for the status surface: the
+    /// ephemeral and durable generations, records, refusals and
+    /// outstanding submissions, and the last completion's wall
+    /// timestamp. `None` when the mounted store carries no counters
+    /// (the file store).
+    pub fn state_status(&self) -> Option<crate::state::StoreStatus> {
+        self.state_store.state_status()
     }
 
     /// This node's voting weight in the current folded configuration
@@ -3050,7 +3274,7 @@ fn node_from_sink(
     store_ctl: Option<&str>,
     construction: Construction,
     disk: Arc<dyn Disk>,
-    state_store: Box<dyn StateStore>,
+    mut state_store: Box<dyn StateStore>,
     commit_hook: Arc<Mutex<dyn CommitHook>>,
     fence: Option<Box<dyn LifecycleStore<Error = io::Error> + Send + Sync>>,
 ) -> Result<Node, i32> {
@@ -3184,6 +3408,16 @@ fn node_from_sink(
             .map(|(variant, dir)| (variant, dir.as_path())),
     )?;
     let own_id = decision.identity;
+    // The dirty boot's write half of the law's third clause: every boot
+    // that is not a clean resume forgets the state artefact — the store
+    // drops its artefact's bookkeeping (the WAL engine's mirrors are
+    // seeded from the open scan) so the tick path rebuilds them from
+    // the replica stream's own commits. A stale mirror would fail a
+    // correct stop; a forgotten one reconciles by construction.
+    let not_a_clean_boot = decision.vouched.is_none();
+    if not_a_clean_boot {
+        state_store.forget();
+    }
     // The life's number for the run's logs: the decided pair's crash
     // counter (the pair is lawful — the boot gate's decision is
     // asserted below).
@@ -3480,6 +3714,7 @@ pub unsafe extern "C" fn lunet_lock_node_new(
         };
         match catch_unwind(AssertUnwindSafe(|| {
             let disk = std_disk();
+            let state = std::str::from_utf8(state_data).unwrap_or_default();
             node_from_parts(
                 members_data,
                 own_data,
@@ -3488,7 +3723,7 @@ pub unsafe extern "C" fn lunet_lock_node_new(
                 roll_bytes,
                 PRIMARY_TIMEOUT_MS,
                 Arc::clone(&disk),
-                default_state_store(&disk, std::str::from_utf8(state_data).unwrap_or_default()),
+                wal_state_store(state),
                 default_commit_hook(),
                 None,
             )
@@ -3659,6 +3894,51 @@ pub unsafe extern "C" fn lunet_lock_node_recover(node: *mut c_void) -> i32 {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lunet_lock_node_stop(node: *mut c_void) -> i32 {
     guarded(|| unsafe { node.cast::<Node>().as_mut().map_or(INVALID, Node::stop) })
+}
+
+/// The steady tick (the ~1000 ms libuv timer's entry): the changed set —
+/// noted at every committed lock transition and once per lock a lazy
+/// load installs — rides the tick path, completions drained either side.
+/// A steady-tick refusal (capacity) is counted in the store's per-stream
+/// `refusals` and leaves the serving state untouched: the answer is
+/// still [`OK`], readable through [`lunet_lock_node_state_status`].
+/// `STOPPED` past the drain point.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lunet_lock_node_state_tick(node: *mut c_void) -> i32 {
+    guarded(|| unsafe {
+        node.cast::<Node>()
+            .as_mut()
+            .map_or(INVALID, Node::state_tick)
+    })
+}
+
+/// The state store's per-stream counters, the C ABI's mirror of
+/// `state::StoreStatus`: one field set per stream (completed generations,
+/// completed records, refusals, in flight), the last completion's wall
+/// nanosecond timestamp, and a `present` flag — 1 when the mounted store
+/// reports counters (the WAL snapshot store), 0 when it does not (the
+/// file store), in which case every other field reads zero. Pull-style:
+/// the caller owns the struct, the call never drives the node.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lunet_lock_node_state_status(
+    node: *mut c_void,
+    out_status: *mut StateStatusRaw,
+) -> i32 {
+    guarded(|| {
+        if node.is_null() || out_status.is_null() {
+            return INVALID;
+        }
+        let node = unsafe { &*node.cast::<Node>() };
+        let status = node.state_status();
+        unsafe {
+            // The binding pin, demanded at the one site that writes the
+            // record: a layout drift in the struct, or in the Teal cdef
+            // mirroring it, is a compile error on every build.
+            const _: () = STATE_STATUS_RAW_LAYOUT;
+            *out_status = StateStatusRaw::from(status.as_ref());
+        }
+        OK
+    })
 }
 
 #[unsafe(no_mangle)]

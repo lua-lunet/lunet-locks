@@ -75,7 +75,7 @@ use vrr::lifecycle::{CopyState, LifecycleStore, Marker, SuperblockCopies};
 use crate::ffi::{JournalSink, ViewRecord, read_marker, read_view_record, write_marker};
 
 #[cfg(not(target_os = "windows"))]
-use lunet_locks_aof::marker;
+use tbio::marker;
 
 /// The shared door to the committed-transition sink: the Node appends
 /// through it during operation, and the halt's `drain` forces it.
@@ -121,8 +121,8 @@ fn boot_read_checksum_panic(superblock: &Path, what: &str) -> ! {
 /// round, and the latches (`Restarting`, `Joining`) are the running
 /// sentinel the next boot reads as an operating process.
 #[cfg(not(target_os = "windows"))]
-fn zig_state(marker: Marker) -> lunet_locks_aof::marker::MarkerState {
-    use lunet_locks_aof::marker::MarkerState;
+fn zig_state(marker: Marker) -> tbio::marker::MarkerState {
+    use tbio::marker::MarkerState;
     match marker {
         Marker::Stopping => MarkerState::Stopped,
         Marker::Stopped => MarkerState::Flushed,
@@ -145,8 +145,8 @@ pub(crate) fn projection_word(marker: Marker) -> &'static str {
 /// `unflushed` is the running sentinel — the anchor a crash reads as a
 /// crash through.
 #[cfg(not(target_os = "windows"))]
-fn engine_marker(state: lunet_locks_aof::marker::MarkerState) -> Marker {
-    use lunet_locks_aof::marker::MarkerState;
+fn engine_marker(state: tbio::marker::MarkerState) -> Marker {
+    use tbio::marker::MarkerState;
     match state {
         MarkerState::Unflushed => Marker::Joining,
         MarkerState::Stopped => Marker::Stopping,
