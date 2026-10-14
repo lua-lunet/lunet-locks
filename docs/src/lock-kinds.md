@@ -89,7 +89,7 @@ ZooKeeper copied — and its details matter for where lunet sits:
    matters** — Chubby's sequencer, ZK's `zxid`, etcd's `mod_revision`;
    Redis lacks one and is criticised for precisely that. The bumped
    `lease_id` of the break's keeper record is this system's token, and
-   it survives a restart through the identity sidecar.
+   it survives a restart through the durable stream's fat frames.
 4. Size caps live at the door — ZK's 1 MiB znode check, etcd's 1.5 MiB
    request cap — and this service's admission validation of
    name/labels before the replication log is the same pattern.
