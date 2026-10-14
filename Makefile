@@ -256,6 +256,13 @@ example-test:
 	cargo test --manifest-path $(BENCH_DIR)/Cargo.toml
 
 ext-test: ext-check
+	# The WAL test targets run serialized: each case's store opens a
+	# kernel ring, the rings lock memory, and a parallel runner's Nth
+	# concurrent setup can be refused transiently — the engine's honest
+	# open refusal, not a defect. One ring at a time is the environment
+	# the contract prices.
+	cargo test --manifest-path ext/advisory_lock/Cargo.toml --test wal_snapshot_test -- --test-threads=1
+	cargo test --manifest-path ext/advisory_lock/Cargo.toml --test wal_node_test -- --test-threads=1
 	cargo test --manifest-path ext/advisory_lock/Cargo.toml
 	cargo test --manifest-path ext/lunet-locks-aof/Cargo.toml
 	cd ext/lunet-locks-aof/zig && mise exec -- zig build test $(ZIG_TEST_FLAGS)
