@@ -117,9 +117,12 @@ fn named_lease(lock_id: u64, lease_id: u64, expiry_ms: u64) -> Lease {
 }
 
 fn snapshot(locks: impl IntoIterator<Item = (u64, Lease)>) -> StateSnapshot {
-    StateSnapshot {
-        locks: locks.into_iter().collect::<BTreeMap<_, _>>(),
-    }
+    let locks = locks.into_iter().collect::<BTreeMap<_, _>>();
+    let generations = locks
+        .iter()
+        .map(|(&lock_id, lease)| (lock_id, lease.lease_id))
+        .collect();
+    StateSnapshot { locks, generations }
 }
 
 fn now_millis() -> u64 {

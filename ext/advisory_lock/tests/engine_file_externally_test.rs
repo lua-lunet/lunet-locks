@@ -390,8 +390,8 @@ fn the_state_seam_flushes_and_loads_over_a_foreign_store() {
         path: path.clone(),
     };
 
-    let table: StateSnapshot =
-        serde_json::from_str(r#"{"locks":{}}"#).expect("an empty table is a table");
+    let table: StateSnapshot = serde_json::from_str(r#"{"locks":{},"generations":{}}"#)
+        .expect("an empty table is a table");
     store.flush(&table).expect("the foreign store flushes");
     assert!(disk.exists(&path), "the state file landed on the engine");
 
@@ -414,7 +414,8 @@ fn the_crates_own_state_store_runs_on_a_foreign_disk() {
     let node_state = PathBuf::from("/engine/node");
     let store = FileStateStore::new_on(Arc::clone(&disk), &node_state);
 
-    let table: StateSnapshot = serde_json::from_str(r#"{"locks":{}}"#).expect("an empty table");
+    let table: StateSnapshot =
+        serde_json::from_str(r#"{"locks":{},"generations":{}}"#).expect("an empty table");
     let mut store = store;
     store
         .flush(&table)

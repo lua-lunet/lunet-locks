@@ -1206,7 +1206,16 @@ impl WalSnapshotStore {
                 },
             );
         }
-        Some(StateSnapshot { locks })
+        // The watermark the stream can answer: the highest id each
+        // loaded record carries. The ids a retired generation spent
+        // beyond the live set ride the tombstones, which the load path
+        // drops — the known bound of a WAL-loaded table's monotonicity,
+        // the engine's own ticket to lift.
+        let generations = locks
+            .iter()
+            .map(|(&lock_id, lease)| (lock_id, lease.lease_id))
+            .collect();
+        Some(StateSnapshot { locks, generations })
     }
 
     /// The durable stream's live set decoded: one named lease per fat
@@ -1241,7 +1250,13 @@ impl WalSnapshotStore {
                 },
             );
         }
-        Some(StateSnapshot { locks })
+        // The watermark the durable stream can answer, the same bound
+        // the ephemeral load states beside it.
+        let generations = locks
+            .iter()
+            .map(|(&lock_id, lease)| (lock_id, lease.lease_id))
+            .collect();
+        Some(StateSnapshot { locks, generations })
     }
 
     /// The kept frame for a lease the snapshot still holds with no
@@ -1514,6 +1529,9 @@ impl StateStore for WalSnapshotStore {
             }
         }
         ephemeral.locks.append(&mut durable.locks);
+        // The streams' watermarks merge with the records: a durable lock's
+        // spent generations are as spent as an ephemeral one's.
+        ephemeral.generations.append(&mut durable.generations);
         Ok(Some(ephemeral))
     }
 }

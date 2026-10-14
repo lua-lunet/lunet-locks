@@ -85,7 +85,7 @@ pub struct StoreStatus {
 /// changes; a reader that does not recognise the byte refuses the file
 /// (there is no conversion and no fallback — this crate is alpha and
 /// unreleased, and old files are deleted).
-const FORMAT_VERSION: u8 = 1;
+const FORMAT_VERSION: u8 = 2;
 
 /// The lock table's persistence contract: flush the whole table on the
 /// shutdown path, load it back on the regular path.

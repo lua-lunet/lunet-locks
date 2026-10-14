@@ -52,13 +52,31 @@ ARG APT_REFRESH=off
 
 RUN apt-get update \
     && if [ "$APT_REFRESH" != off ]; then apt-get upgrade -y; fi \
-    && apt-get install -y --no-install-recommends ca-certificates \
+    && apt-get install -y --no-install-recommends ca-certificates curl make \
     && rm -rf /var/lib/apt/lists/*
+
+# paxe-core's static link input: the same static libsodium the CI lane
+# builds (the pinned 1.0.22, the ARM64 AES-256-GCM floor), installed to
+# /usr/local and named to the paxe build script by the env var both build
+# stages below carry — the image has no pkg-config sodium for the
+# script's fallback to find.
+RUN curl --fail --location --retry 3 \
+        "https://github.com/jedisct1/libsodium/releases/download/1.0.22-RELEASE/libsodium-1.0.22.tar.gz" \
+        --output /tmp/libsodium.tar.gz \
+    && echo "adbdd8f16149e81ac6078a03aca6fc03b592b89ef7b5ed83841c086191be3349  /tmp/libsodium.tar.gz" | sha256sum -c - \
+    && tar -xzf /tmp/libsodium.tar.gz -C /tmp \
+    && cd /tmp/libsodium-1.0.22 \
+    && ./configure --disable-shared --enable-static --prefix=/usr/local \
+    && make -j"$(nproc)" \
+    && make install \
+    && test -f /usr/local/lib/libsodium.a \
+    && rm -rf /tmp/libsodium.tar.gz /tmp/libsodium-1.0.22
 
 FROM native-base AS native-deps
 
 COPY --from=aof /out /opt/aof
 ENV TBIO_LIB_DIR=/opt/aof/lib
+ENV PAXE_SODIUM_LIB_DIR=/usr/local/lib
 
 WORKDIR /app
 COPY .cargo/config.toml /usr/local/cargo/config.toml
@@ -82,12 +100,14 @@ RUN cargo clean --release --manifest-path /app/ext/advisory_lock/Cargo.toml \
 # so this stage pins its own rust above the cdylib stage's 1.85 and vendors
 # from the demo crate's own Cargo.lock. It consumes the same AOF artifact
 # (built by the image's own aof stage from the submodule) as the native
-# adapter stage.
-FROM rust:1.96-slim AS demo
+# adapter stage, and rides the same base: the static sodium the paxe link
+# needs is in it.
+FROM native-base AS demo
 
 ARG LUNET_LOCKS_HEAD=unknown
 COPY --from=aof /out /opt/aof
 ENV TBIO_LIB_DIR=/opt/aof/lib
+ENV PAXE_SODIUM_LIB_DIR=/usr/local/lib
 ENV LUNET_LOCKS_HEAD=${LUNET_LOCKS_HEAD}
 
 WORKDIR /app

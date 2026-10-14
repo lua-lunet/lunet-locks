@@ -42,7 +42,9 @@ fn the_chase_set_payload_is_granted_and_renews() {
     let request = Service::decode(payload.as_bytes()).expect("the chase payload decodes");
     let message_id = message_id_of(&request);
 
-    // The hold: execution tick 1000, a 500 ms window -> expiry 1500.
+    // The hold: execution tick 1000, a 500 ms window -> expiry 1500. The
+    // generation is the core's watermark mint: the candidate's `lease_id`
+    // crosses nowhere, so the first grant mints the lock's generation 1.
     let mut service = Service::default();
     let (bytes, transition) = service
         .execute(message_id, 1, 7, 1000, payload.as_bytes())
@@ -52,12 +54,17 @@ fn the_chase_set_payload_is_granted_and_renews() {
     assert_eq!(reply["lease"]["expiry"], Value::from(1500));
     assert_eq!(reply["lease"]["lease_ms"], Value::from(500));
     assert_eq!(reply["lease"]["renew_count"], Value::from(0));
+    assert_eq!(
+        reply["lease"]["lease_id"],
+        Value::from(1),
+        "the mint's first"
+    );
     assert!(
         matches!(
             transition,
             Some(Transition::Hold {
                 lock_id: 0x0DDBA11,
-                lease_id: 42,
+                lease_id: 1,
                 ..
             })
         ),
@@ -79,10 +86,15 @@ fn the_chase_set_payload_is_granted_and_renews() {
     );
     assert_eq!(reply["lease"]["expiry"], Value::from(1600));
     assert_eq!(reply["lease"]["renew_count"], Value::from(1));
+    assert_eq!(
+        reply["lease"]["lease_id"],
+        Value::from(1),
+        "the renewal keeps the minted generation"
+    );
     assert!(
         matches!(
             transition,
-            Some(Transition::Renew { lock_id: 0x0DDBA11, lease_id: 43, holder, .. })
+            Some(Transition::Renew { lock_id: 0x0DDBA11, lease_id: 1, holder, .. })
                 if holder == [0x0f, 0x0e, 0x0d, 0x0c, 0x0b, 0x0a, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x00]
         ),
         "the renew transition, got {transition:?}"

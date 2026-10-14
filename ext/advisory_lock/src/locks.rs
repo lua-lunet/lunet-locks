@@ -1,6 +1,30 @@
+//! The lock service: our gateway envelope over the core's machinery.
+//!
+//! The machinery is upstream's (`vrr::demo::locks`): the four verbs, the
+//! CAS grant, the generation watermark that never hands a generation out
+//! twice, the truthful release, and the nil holder no request can name.
+//! This module owns the envelope — the gateway wire the clients and the
+//! console speak — and adapts between the two, keeping the lease
+//! semantics the deployment already runs: the executing node hands its
+//! own wallclock as the core's clock, so `expiry = clock + window` is
+//! the leader-stamped absolute expiry the clients have always seen.
+//!
+//! Ours, beside the envelope: the display identity (`name`/`labels`, the
+//! sticky, validated, canonically sorted identity a SET installs and a
+//! release keeps), the counters (`taken_at_ms`/`renew_count`), and the
+//! [`Transition`] classification the journal and the changed-set notes
+//! ride. The core's generation watermark mints every `lease_id`: the
+//! candidate's `lease_id` field stays on the wire for the envelope's
+//! compatibility and crosses nowhere — a client can never name a
+//! generation.
+
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use uuid::Uuid;
+use vrr::demo::locks::{
+    ClientId, Lease as CoreLease, Request as CoreRequest, Response as CoreResponse,
+    Service as CoreService, StateSnapshot as CoreSnapshot,
+};
 
 /// The wire's UUID identity discipline: every id a client puts on the wire
 /// must be the canonical hyphenated lowercase rendering (`Uuid::to_string`)
@@ -110,9 +134,15 @@ pub struct Lease {
 /// client clock enters the lease's semantics. The shape decodes strictly:
 /// a candidate that still carries the retired absolute-`expiry` field is
 /// refused at decode, before the request can enter the replication log.
+///
+/// The `lease_id` field is the envelope's vestige: the core's generation
+/// watermark mints every id, so the value a client sends crosses nowhere.
+/// It stays on the wire because the clients already send it, and the reply
+/// carries the minted id.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct LeaseCandidate {
+    #[serde(default)]
     pub lease_id: u64,
     #[serde(deserialize_with = "canonical_uuid::deserialize")]
     pub holder: Uuid,
@@ -210,8 +240,13 @@ pub fn taken_at_ms_on_holder_change(prior_taken_at_ms: u64, execution_time: u64)
     }
 }
 
+/// The client request, as the gateway's envelope carries it: the
+/// replication identity (`message_id`/`client_id`/`request_num`) beside
+/// the lock operation. The state machine reads none of the envelope —
+/// the leader stamps its own clock and the holder names itself inside the
+/// operation's payload.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(tag = "op", rename_all = "snake_case")]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
     Get {
         #[serde(deserialize_with = "canonical_uuid::deserialize")]
@@ -267,25 +302,25 @@ pub enum Request {
 impl Request {
     pub fn ids(&self) -> (Uuid, u64, u64) {
         match self {
-            Self::Get {
+            Request::Get {
                 message_id,
                 client_id,
                 request_num,
                 ..
             }
-            | Self::Set {
+            | Request::Set {
                 message_id,
                 client_id,
                 request_num,
                 ..
             }
-            | Self::Release {
+            | Request::Release {
                 message_id,
                 client_id,
                 request_num,
                 ..
             }
-            | Self::Break {
+            | Request::Break {
                 message_id,
                 client_id,
                 request_num,
@@ -295,6 +330,9 @@ impl Request {
     }
 }
 
+/// What the leader answered. Every field is carried in every reply
+/// (`lease` as `null` where no record stands), so replies are
+/// self-describing.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Response {
@@ -345,24 +383,46 @@ pub enum Response {
 
 /// The lock table's whole durable state as one serialisable value: every
 /// lock id's stored record — its holder, its lease id, its expiry, its
-/// window, its display identity and its counters.
+/// window, its display identity and its counters — and every lock id's
+/// generation watermark.
 ///
 /// This is the payload the state seam flushes and loads (see
 /// [`crate::state`]): the table is the only state the lock service keeps,
-/// so its serialisable view IS its state. It is deliberately plain — the
-/// derive is the schema, and the file carries the format-version byte that
-/// says which derive a reader is looking at.
+/// so its serialisable view IS its state. The watermark is deliberately
+/// not defaulted: a snapshot without it is a decode refusal, never an
+/// empty one, because a resumed table that read it as absent would hand
+/// out a generation the lock had already spent.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct StateSnapshot {
     /// The table itself: lock id -> stored record, ordered so the encoded
     /// bytes are a function of the state and never of the map's insertion
     /// history.
     pub locks: BTreeMap<u64, Lease>,
+    /// Every lock's generation watermark: the highest generation the lock
+    /// has ever handed out or reserved, which outlives the record a
+    /// release removes.
+    pub generations: BTreeMap<u64, u64>,
 }
 
+/// The display identity and the counters the envelope keeps beside the
+/// core's machinery: the sticky identity a SET installs and a release
+/// keeps (the durable class's kept frame carries it), and the counters
+/// the console's audit reads. Never a protocol decision's input.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct DurableEntry {
+    name: Option<String>,
+    labels: Option<Vec<String>>,
+    taken_at_ms: u64,
+    renew_count: u32,
+}
+
+/// The lock service: the core's machinery wrapped in the gateway's
+/// envelope. Clone and default because a node constructs an empty table
+/// and installs a loaded snapshot wholesale.
 #[derive(Clone, Default)]
 pub struct Service {
-    locks: BTreeMap<u64, Lease>,
+    core: CoreService,
+    durable: BTreeMap<u64, DurableEntry>,
 }
 
 impl Service {
@@ -388,6 +448,18 @@ impl Service {
             .is_ok_and(|request| request.ids() == (message_id, client_id, request_num))
     }
 
+    /// Executes one committed operation against the lock table.
+    ///
+    /// The machinery is the core's: the payload crosses into the core's
+    /// request shape (the holder's 128 bits become the core's client
+    /// identity, the nil pair refused at this door exactly as the core
+    /// refuses it at its own), the core executes against the leader's
+    /// own wallclock, and the reply crosses back into the envelope's
+    /// shape with the display identity and the counters the side table
+    /// holds. The [`Transition`] classification — the journal's and the
+    /// changed set's feed — derives from the reply and the
+    /// pre-execution record.
+    #[allow(clippy::type_complexity)]
     pub fn execute(
         &mut self,
         message_id: Uuid,
@@ -402,209 +474,232 @@ impl Service {
                 "replicated envelope does not match lock payload",
             ));
         }
-        let (response, transition) = match request {
-            Request::Get {
-                message_id,
-                request_num,
+        // The pre-execution facts, read off the core's own state at the
+        // moment: the stored record (live or expired — the break's prior
+        // and the counters' prior), the live incumbent (the grant's
+        // classification prior), and the sticky identity the side table
+        // holds.
+        let lock_id = match &request {
+            Request::Get { lock_id, .. }
+            | Request::Set { lock_id, .. }
+            | Request::Release { lock_id, .. }
+            | Request::Break { lock_id, .. } => *lock_id,
+        };
+        let stored = self.core.snapshot().locks.get(&lock_id).cloned();
+        let incumbent = stored
+            .as_ref()
+            .filter(|lease| lease.expiry > execution_time)
+            .cloned();
+        let prior_entry = self.durable.get(&lock_id).cloned().unwrap_or_default();
+        let (set_name, set_labels) = match &request {
+            Request::Set { name, labels, .. } => (name.clone(), labels.clone()),
+            _ => (None, None),
+        };
+
+        // The translation: the envelope's request into the core's payload.
+        // The candidate's lease_id crosses nowhere — the core's watermark
+        // mints every id.
+        let core_request = match request {
+            Request::Get { lock_id, .. } => CoreRequest::Get { lock_id },
+            Request::Set { lock_id, lease, .. } => CoreRequest::Set {
+                client: client_of(lease.holder)?,
                 lock_id,
+                window: lease.lease_ms,
+            },
+            Request::Release {
+                lock_id,
+                holder,
+                lease_id,
                 ..
+            } => CoreRequest::Release {
+                client: client_of(holder)?,
+                lock_id,
+                lease_id,
+            },
+            Request::Break { lock_id, .. } => CoreRequest::Break { lock_id },
+        };
+        let core_payload = serde_json::to_vec(&core_request)?;
+        let reply: CoreResponse =
+            serde_json::from_slice(&self.core.execute(execution_time, &core_payload)?)?;
+
+        let (response, transition) = match reply {
+            CoreResponse::Get {
+                lock_id,
+                lease,
+                executed_at,
             } => (
                 Response::Get {
                     message_id,
                     request_num,
                     lock_id,
-                    lease: self.live(execution_time, lock_id),
-                    executed_at: execution_time,
+                    lease: lease.map(|lease| self.compose(lock_id, &lease)),
+                    executed_at,
                 },
                 None,
             ),
-            Request::Set {
-                message_id,
-                request_num,
+            CoreResponse::Set {
                 lock_id,
+                granted,
                 lease,
-                name,
-                labels,
-                ..
+                executed_at,
             } => {
-                // The liveness check on the leader's own wallclock:
-                // instantaneous "is the lock held by another live holder?"
-                // The candidate's duration is the only client input.
-                let held = self.live(execution_time, lock_id);
-                let granted = held
-                    .as_ref()
-                    .is_none_or(|current| current.holder == lease.holder)
-                    && lease.lease_ms > 0;
-                if granted {
-                    // The replaced record, live or not: it donates the
-                    // counters' prior values and the sticky identity.
-                    let prior = self.locks.get(&lock_id).cloned();
-                    let name = name.or_else(|| prior.as_ref().and_then(|p| p.name.clone()));
-                    let labels = labels.or_else(|| prior.as_ref().and_then(|p| p.labels.clone()));
-                    let (taken_at_ms, renew_count) = if let Some(incumbent) = &held {
-                        // Same-holder renewal over a live lease.
-                        (
-                            incumbent.taken_at_ms,
-                            incumbent.renew_count.saturating_add(1),
-                        )
-                    } else {
-                        let taken_at_ms = match prior.as_ref() {
-                            // A same-ms holder change over a replaced record
-                            // bumps by 1 ms so consecutive takes stay
-                            // distinguishable.
-                            Some(prior) => {
-                                taken_at_ms_on_holder_change(prior.taken_at_ms, execution_time)
-                            }
-                            None => execution_time,
-                        };
-                        (taken_at_ms, 0)
-                    };
-                    // THE expiry stamp: one host's clock. The lease lives
-                    // exactly `lease_ms` from this execution tick on the
-                    // leader's timeline — the client's clock never enters
-                    // the lease's semantics.
-                    let expiry = execution_time.saturating_add(lease.lease_ms);
-                    let transition = if held.is_some() {
-                        // Same-holder regrant with a prior live lease → Renew.
-                        Some(Transition::Renew {
-                            lock_id,
-                            lease_id: lease.lease_id,
-                            holder: *lease.holder.as_bytes(),
-                            expiry,
-                        })
-                    } else {
-                        // No prior live lease → Hold.
-                        Some(Transition::Hold {
-                            lock_id,
-                            lease_id: lease.lease_id,
-                            holder: *lease.holder.as_bytes(),
-                            expiry,
-                        })
-                    };
-                    let stored = Lease {
-                        lease_id: lease.lease_id,
-                        holder: lease.holder,
-                        expiry,
-                        lease_ms: lease.lease_ms,
-                        name,
-                        labels,
-                        taken_at_ms,
-                        renew_count,
-                    };
-                    self.locks.insert(lock_id, stored.clone());
-                    (
-                        Response::Set {
-                            message_id,
-                            request_num,
-                            lock_id,
-                            granted: true,
-                            lease: Some(stored),
-                            executed_at: execution_time,
-                        },
-                        transition,
-                    )
-                } else {
+                if !granted {
                     (
                         Response::Set {
                             message_id,
                             request_num,
                             lock_id,
                             granted: false,
-                            lease: held,
-                            executed_at: execution_time,
+                            lease: lease.map(|lease| self.compose(lock_id, &lease)),
+                            executed_at,
+                        },
+                        None,
+                    )
+                } else {
+                    let granted_lease = lease.expect("a granted Set carries the stored lease");
+                    // The counters: a renewal over the live incumbent
+                    // extends the take; a fresh grant installs one.
+                    let entry = if incumbent.is_some() {
+                        DurableEntry {
+                            name: set_name.or(prior_entry.name),
+                            labels: set_labels.or(prior_entry.labels),
+                            taken_at_ms: prior_entry.taken_at_ms,
+                            renew_count: prior_entry.renew_count.saturating_add(1),
+                        }
+                    } else {
+                        DurableEntry {
+                            name: set_name.or(prior_entry.name),
+                            labels: set_labels.or(prior_entry.labels),
+                            taken_at_ms: match self.durable.get(&lock_id) {
+                                Some(prior) => {
+                                    taken_at_ms_on_holder_change(prior.taken_at_ms, execution_time)
+                                }
+                                None => execution_time,
+                            },
+                            renew_count: 0,
+                        }
+                    };
+                    self.durable.insert(lock_id, entry);
+                    let transition = if incumbent.is_some() {
+                        Transition::Renew {
+                            lock_id,
+                            lease_id: granted_lease.lease_id,
+                            holder: client_bytes(&granted_lease.holder),
+                            expiry: granted_lease.expiry,
+                        }
+                    } else {
+                        Transition::Hold {
+                            lock_id,
+                            lease_id: granted_lease.lease_id,
+                            holder: client_bytes(&granted_lease.holder),
+                            expiry: granted_lease.expiry,
+                        }
+                    };
+                    (
+                        Response::Set {
+                            message_id,
+                            request_num,
+                            lock_id,
+                            granted: true,
+                            lease: Some(self.compose(lock_id, &granted_lease)),
+                            executed_at,
+                        },
+                        Some(transition),
+                    )
+                }
+            }
+            CoreResponse::Release {
+                lock_id,
+                released,
+                lease,
+                executed_at,
+            } => {
+                if released {
+                    // The retired lease's fields, as they were: the journal
+                    // record is self-describing exactly like the core's.
+                    let transition = incumbent.map(|lease| Transition::Release {
+                        lock_id,
+                        lease_id: lease.lease_id,
+                        holder: client_bytes(&lease.holder),
+                        expiry: lease.expiry,
+                    });
+                    // The counters clear; the identity sticks (the kept
+                    // frame the durable class carries).
+                    if let Some(entry) = self.durable.get_mut(&lock_id) {
+                        entry.taken_at_ms = 0;
+                        entry.renew_count = 0;
+                    }
+                    (
+                        Response::Release {
+                            message_id,
+                            request_num,
+                            lock_id,
+                            released: true,
+                            lease: None,
+                            executed_at,
+                        },
+                        transition,
+                    )
+                } else {
+                    (
+                        Response::Release {
+                            message_id,
+                            request_num,
+                            lock_id,
+                            released: false,
+                            lease: lease.map(|lease| self.compose(lock_id, &lease)),
+                            executed_at,
                         },
                         None,
                     )
                 }
             }
-            Request::Release {
-                message_id,
-                request_num,
+            CoreResponse::Break {
                 lock_id,
-                holder,
-                lease_id,
-                ..
+                broken,
+                lease,
+                executed_at,
             } => {
-                let held = self.live(execution_time, lock_id);
-                let released = held
-                    .as_ref()
-                    .is_none_or(|lease| lease.holder == holder && lease.lease_id == lease_id);
-                let transition = if released {
-                    // Carry the removed lease's fields (tombstone must be
-                    // self-describing).
-                    held.clone().map(|lease| Transition::Release {
+                if broken {
+                    // The broken record's fields as they were: the stored
+                    // record (a live lease or an expired one), read before
+                    // the machinery moved.
+                    let transition = stored.map(|lease| Transition::Break {
                         lock_id,
                         lease_id: lease.lease_id,
-                        holder: *lease.holder.as_bytes(),
+                        holder: client_bytes(&lease.holder),
                         expiry: lease.expiry,
-                    })
-                } else {
-                    None
-                };
-                if released {
-                    self.locks.remove(&lock_id);
-                }
-                (
-                    Response::Release {
-                        message_id,
-                        request_num,
-                        lock_id,
-                        released,
-                        lease: if released { None } else { held },
-                        executed_at: execution_time,
-                    },
-                    transition,
-                )
-            }
-            Request::Break {
-                message_id,
-                request_num,
-                lock_id,
-                ..
-            } => {
-                // Unconditional force-release: whatever record the lock
-                // table stores is replaced by the bumped, cleared keeper.
-                match self.locks.remove(&lock_id) {
-                    Some(broken) => {
-                        let keeper = Lease {
-                            lease_id: broken.lease_id.saturating_add(1),
-                            holder: Uuid::nil(),
-                            expiry: 0,
-                            lease_ms: 0,
-                            name: broken.name.clone(),
-                            labels: broken.labels.clone(),
-                            taken_at_ms: 0,
-                            renew_count: 0,
-                        };
-                        self.locks.insert(lock_id, keeper.clone());
-                        (
-                            Response::Break {
-                                message_id,
-                                request_num,
-                                lock_id,
-                                broken: true,
-                                lease: Some(keeper),
-                                executed_at: execution_time,
-                            },
-                            Some(Transition::Break {
-                                lock_id,
-                                lease_id: broken.lease_id,
-                                holder: *broken.holder.as_bytes(),
-                                expiry: broken.expiry,
-                            }),
-                        )
+                    });
+                    // The counters clear; the identity sticks — the
+                    // keeper the reply carries composes from the side
+                    // table after the clear.
+                    if let Some(entry) = self.durable.get_mut(&lock_id) {
+                        entry.taken_at_ms = 0;
+                        entry.renew_count = 0;
                     }
-                    None => (
+                    (
+                        Response::Break {
+                            message_id,
+                            request_num,
+                            lock_id,
+                            broken: true,
+                            lease: lease.map(|lease| self.compose(lock_id, &lease)),
+                            executed_at,
+                        },
+                        transition,
+                    )
+                } else {
+                    (
                         Response::Break {
                             message_id,
                             request_num,
                             lock_id,
                             broken: false,
-                            lease: None,
-                            executed_at: execution_time,
+                            lease: lease.map(|lease| self.compose(lock_id, &lease)),
+                            executed_at,
                         },
                         None,
-                    ),
+                    )
                 }
             }
         };
@@ -612,45 +707,150 @@ impl Service {
         Ok((bytes, transition))
     }
 
+    /// The envelope's reply identity: the message id a reply echoes, for
+    /// the deduplication the leader keeps at its own edge.
     pub fn response_message_id(bytes: &[u8]) -> Option<Uuid> {
-        match serde_json::from_slice(bytes).ok()? {
-            Response::Get { message_id, .. }
-            | Response::Set { message_id, .. }
-            | Response::Release { message_id, .. }
-            | Response::Break { message_id, .. } => Some(message_id),
+        #[derive(Deserialize)]
+        struct ReplyId {
+            #[serde(deserialize_with = "canonical_uuid::deserialize")]
+            message_id: Uuid,
         }
+        serde_json::from_slice::<ReplyId>(bytes)
+            .ok()
+            .map(|reply| reply.message_id)
     }
 
-    fn live(&self, execution_time: u64, lock_id: u64) -> Option<Lease> {
-        self.locks
-            .get(&lock_id)
-            .cloned()
-            .filter(|lease| lease.expiry > execution_time)
-    }
-
-    /// Whether the table holds no record at all. The lazy-load seam's
-    /// first clause: a table with anything in it was materialised by the
-    /// regular path (or by an earlier load), so a load now would overwrite
-    /// state the node already holds.
+    /// Whether the table holds nothing at all: the core's records and
+    /// watermarks. The sticky identity a released lock leaves in the side
+    /// table does not hold the table up — a load replaces it wholesale,
+    /// exactly as the load always replaced the records.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.locks.is_empty()
+        self.core.is_empty()
     }
 
-    /// The table's whole state as one serialisable value — the state
-    /// seam's flush payload, captured at the moment the caller asks.
+    /// The table's whole state as one serialisable value, captured at the
+    /// moment the caller asks. The state seam's flush payload.
+    #[must_use]
     pub fn snapshot(&self) -> StateSnapshot {
+        let core = self.core.snapshot();
         StateSnapshot {
-            locks: self.locks.clone(),
+            locks: core
+                .locks
+                .iter()
+                .map(|(&lock_id, lease)| (lock_id, self.compose(lock_id, lease)))
+                .collect(),
+            generations: core.generations,
         }
     }
 
     /// Install a loaded snapshot as the table's whole contents.
     ///
-    /// Wholesale, not a merge: the loaded value IS the pre-stop table, so
-    /// a merge against whatever the node holds would fabricate records the
-    /// stop never wrote. The seam calls this on the lazy-load path only,
-    /// against a table it has just established is empty.
+    /// Wholesale, not a merge: the loaded value is the pre-stop table, so
+    /// a merge against whatever the node holds would fabricate records
+    /// the stop never wrote. The seam calls this on the lazy-load path
+    /// only, against a table it has just established is empty. The
+    /// watermarks install with the records: a resumed table that dropped
+    /// them would hand out a generation the lock had already spent.
     pub fn restore(&mut self, snapshot: StateSnapshot) {
-        self.locks = snapshot.locks;
+        let mut locks = BTreeMap::new();
+        let mut durable = BTreeMap::new();
+        for (lock_id, lease) in &snapshot.locks {
+            locks.insert(
+                *lock_id,
+                CoreLease {
+                    lease_id: lease.lease_id,
+                    holder: client_of(lease.holder).unwrap_or_else(|_| {
+                        // The keeper record's nil holder: the one identity
+                        // the mint refuses and a restored table may lawfully
+                        // carry. It re-enters by the serde door — the core's
+                        // derived deserialiser constructs the private halves
+                        // the public mint refuses.
+                        core_nil_client()
+                    }),
+                    expiry: lease.expiry,
+                    window: lease.lease_ms,
+                },
+            );
+            durable.insert(
+                *lock_id,
+                DurableEntry {
+                    name: lease.name.clone(),
+                    labels: lease.labels.clone(),
+                    taken_at_ms: lease.taken_at_ms,
+                    renew_count: lease.renew_count,
+                },
+            );
+        }
+        self.core.restore(CoreSnapshot {
+            locks,
+            generations: snapshot.generations,
+        });
+        self.durable = durable;
     }
+
+    /// The envelope's stored record: the core's lease with the side
+    /// table's identity and counters composed in.
+    fn compose(&self, lock_id: u64, lease: &CoreLease) -> Lease {
+        let entry = self.durable.get(&lock_id);
+        Lease {
+            lease_id: lease.lease_id,
+            holder: holder_uuid(lease.holder),
+            expiry: lease.expiry,
+            lease_ms: lease.window,
+            name: entry.and_then(|entry| entry.name.clone()),
+            labels: entry.and_then(|entry| entry.labels.clone()),
+            taken_at_ms: entry.map_or(0, |entry| entry.taken_at_ms),
+            renew_count: entry.map_or(0, |entry| entry.renew_count),
+        }
+    }
+}
+
+/// The holder's 128 bits as the core's client identity. The nil pair is
+/// refused here, at the envelope's own door, exactly as the core refuses
+/// it at its own: a request that names no holder names nothing.
+fn client_of(holder: Uuid) -> Result<ClientId, serde_json::Error> {
+    let bytes = holder.as_bytes();
+    let msb = u64::from_be_bytes(bytes[0..8].try_into().expect("the holder's first half"));
+    let lsb = u64::from_be_bytes(bytes[8..16].try_into().expect("the holder's second half"));
+    ClientId::new(msb, lsb).ok_or_else(|| {
+        <serde_json::Error as serde::de::Error>::custom("the nil holder is not a client")
+    })
+}
+
+/// The nil client identity, by the serde door: the core's derived
+/// deserialiser constructs the private halves the public mint refuses.
+/// The one lawful use is the keeper record's restore — the record a
+/// break writes and a snapshot may carry back.
+fn core_nil_client() -> ClientId {
+    serde_json::from_value(serde_json::json!({"msb": 0, "lsb": 0}))
+        .expect("the core's deserialiser constructs the nil identity")
+}
+
+/// The core's client identity as the envelope's holder UUID.
+fn holder_uuid(client: ClientId) -> Uuid {
+    Uuid::from_bytes(client_bytes(&client))
+}
+
+/// The identity's 128 bits, big-endian, as the UUID wire form and the
+/// journal's holder field carry them. The halves are the core's private;
+/// the serde shape is the one door they cross by — the same door the nil
+/// identity's restore uses, in the other direction.
+fn client_bytes(client: &ClientId) -> [u8; 16] {
+    let bits: ClientIdBits = serde_json::from_value(
+        serde_json::to_value(client).expect("the client identity serialises"),
+    )
+    .expect("the client identity's serde shape is its two halves");
+    let mut bytes = [0u8; 16];
+    bytes[0..8].copy_from_slice(&bits.msb.to_be_bytes());
+    bytes[8..16].copy_from_slice(&bits.lsb.to_be_bytes());
+    bytes
+}
+
+/// The holder pair as the serde wire carries it, the door the private
+/// halves cross by.
+#[derive(Deserialize)]
+struct ClientIdBits {
+    msb: u64,
+    lsb: u64,
 }
