@@ -1099,25 +1099,44 @@ impl WalSnapshotStore {
                 return;
             }
         }
-        match Self::open_handle(&self.path, DEFAULT_CAPACITY_MARKER) {
-            Ok(handle) => {
-                // The fresh handle, and the bookkeeping the old life held
-                // dropped with it: the changed set and the durable map are
-                // this life only, and the engine's mirrors behind the new
-                // handle start empty.
-                self.handle = handle;
-                self.changed = BTreeSet::new();
-                self.durable = BTreeMap::new();
+        // The reopen, with a transient belt: the forget runs at boot,
+        // off the serving path, and the reopen's refusal under load —
+        // the ring's setup and the exclusive flock contending with the
+        // cohort's own teardowns — is transient, not a property of the
+        // artefact. Three attempts over ~50 ms; a refusal that persists
+        // is real, and the store dies loudly below. The boot is never
+        // blocked longer than that.
+        let mut opened = None;
+        for attempt in 0..3 {
+            match Self::open_handle(&self.path, DEFAULT_CAPACITY_MARKER) {
+                Ok(handle) => {
+                    opened = Some(handle);
+                    break;
+                }
+                Err(error) => {
+                    if attempt == 2 {
+                        self.dead = true;
+                        eprintln!(
+                            "lunet-advisory-lock: the WAL snapshot store \
+                             could not reopen after forgetting its artefact \
+                             at {} ({error}); the store is dead — the flush \
+                             at stop will refuse loudly",
+                            self.path.display()
+                        );
+                    } else {
+                        std::thread::sleep(std::time::Duration::from_millis(25));
+                    }
+                }
             }
-            Err(error) => {
-                self.dead = true;
-                eprintln!(
-                    "lunet-advisory-lock: the WAL snapshot store could not \
-                     reopen after forgetting its artefact at {} ({error}); \
-                     the store is dead — the flush at stop will refuse loudly",
-                    self.path.display()
-                );
-            }
+        }
+        if let Some(handle) = opened {
+            // The fresh handle, and the bookkeeping the old life held
+            // dropped with it: the changed set and the durable map are
+            // this life only, and the engine's mirrors behind the new
+            // handle start empty.
+            self.handle = handle;
+            self.changed = BTreeSet::new();
+            self.durable = BTreeMap::new();
         }
     }
 
