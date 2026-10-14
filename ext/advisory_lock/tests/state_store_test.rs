@@ -117,6 +117,7 @@ fn table() -> StateSnapshot {
         ]
         .into_iter()
         .collect(),
+        generations: [(7u64, 70), (9, 91), (11, 110)].into_iter().collect(),
     }
 }
 

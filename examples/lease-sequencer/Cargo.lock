@@ -436,6 +436,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
+name = "paxe-core"
+version = "0.3.0"
+source = "git+https://github.com/lua-lunet/paxe-core.git?rev=a92242e5a87e3bcbc47331390ff47886ac765e34#a92242e5a87e3bcbc47331390ff47886ac765e34"
+
+[[package]]
 name = "pin-project-lite"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -843,6 +848,11 @@ dependencies = [
 name = "uvrr-core"
 version = "0.14.0"
 source = "git+https://github.com/lua-lunet/uvrr-core.git?tag=v0.15.1#e7a552f57018fbbf0b2fb0407815b438b0666653"
+dependencies = [
+ "paxe-core",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "valuable"

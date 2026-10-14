@@ -203,6 +203,7 @@ fn the_store_mounts_the_out_of_crate_disk() {
                 renew_count: 1,
             },
         )]),
+        generations: BTreeMap::from([(1, 7)]),
     };
 
     // The eager half through the trait, then the lazy half: the flushed

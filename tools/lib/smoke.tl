@@ -666,7 +666,7 @@ function M.main(root: string, _argv: {string}): integer
             {
                 '{"op":"release","message_id":"00000000-0000-0000-0000-00000000000f","client_id":5,"request_num":2,"lock_id":9201,"holder":"'
                     .. holder3
-                    .. '","lease_id":5}',
+                    .. '","lease_id":1}',
             },
             {'"released":true'},
             5

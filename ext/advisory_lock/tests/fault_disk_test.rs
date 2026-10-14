@@ -143,7 +143,7 @@ fn scratch(name: &str) -> PathBuf {
 
 /// The empty-table snapshot the flush paths are driven with.
 fn empty_table() -> StateSnapshot {
-    serde_json::from_str(r#"{"locks":{}}"#).expect("an empty table")
+    serde_json::from_str(r#"{"locks":{},"generations":{}}"#).expect("an empty table")
 }
 
 /// A faulting create_new_write surfaces through FileStateStore::flush: the
