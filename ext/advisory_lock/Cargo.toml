@@ -13,7 +13,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"
 uuid = { version = "1", features = ["serde"] }
-vrr = { package = "uvrr-core", git = "https://github.com/lua-lunet/uvrr-core.git", tag = "v0.14.0" }
+vrr = { package = "uvrr-core", git = "https://github.com/lua-lunet/uvrr-core.git", tag = "v0.15.1" }
 # The `lunet_locks_nuke` admin tool's argument parsing (the operator
 # review gate's flags). Library code depends on none of it; the
 # dependency exists for the bin.
