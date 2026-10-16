@@ -87,7 +87,7 @@ function bumpRate(tsMs, kind) {
   }
   if (kind === "hold") b.acquire++;
   else if (kind === "renew") b.renew++;
-  else if (kind === "release") b.release++;
+  else if (kind === "release" || kind === "break") b.release++;
 }
 
 function pruneRates() {
@@ -164,14 +164,17 @@ function applyEvent(ev) {
         activeLocks.delete(lockId);
       }
     }
-  } else if (kind === "release") {
+  } else if (kind === "release" || kind === "break") {
     const cur = activeLocks.get(lockId);
     if (cur && cur.leaseId === leaseId) {
-      // Acquisition was seen: apply tombstone immediately.
+      // Acquisition was seen: apply tombstone immediately. A break's
+      // record carries the broken lease's values as they were, so the
+      // same leaseId match decides.
       activeLocks.delete(lockId);
     } else {
-      // TOMBSTONE-AHEAD: release arrived before its acquisition. Store as
-      // pending so it gets applied when the acquisition lands from a file pull.
+      // TOMBSTONE-AHEAD: the retirement arrived before its acquisition.
+      // Store as pending so it gets applied when the acquisition lands
+      // from a file pull.
       pendingTombstones.set(tombstoneKey(lockId, leaseId), { ts, expiry });
     }
   }

@@ -75,9 +75,15 @@ mjs-check-negative:
 		echo "tsc negative fixture: refused as required — the gate can fail"; \
 	fi
 
-check: init mjs-check mjs-check-negative
+check: init mjs-check mjs-check-negative journal-test
 	shellcheck bin/*.sh
 	@../.rocks/bin/cyan check tooling/lib/consolectl.tl
+
+# The journal data layer's unit tests: the LKE1 parser (a break record
+# mid-stream parses whole) and the merge engine's break arm (the sweeper
+# writes break records into every series).
+journal-test:
+	node --test tooling/journal_test.mjs
 
 clean: down
 	rm -rf tmp

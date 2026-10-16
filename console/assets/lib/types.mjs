@@ -219,7 +219,7 @@
  * One LKE1 journal record (lib/journal/parse.mjs) — the .bin series the
  * journal data layer replays. `holder` is the hex-encoded 16-byte holder id.
  * @typedef {object} JournalEvent
- * @property {"hold" | "renew" | "release"} kind
+ * @property {"hold" | "renew" | "release" | "break"} kind
  * @property {number} ts
  * @property {number} lockId
  * @property {number} leaseId

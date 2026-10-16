@@ -9,6 +9,7 @@ const MAGIC = "LKE1";
 const KIND_HOLD = 1;
 const KIND_RENEW = 2;
 const KIND_RELEASE = 3;
+const KIND_BREAK = 4;
 
 // CRC-32 IEEE table (polynomial 0xEDB88320, reflected).
 const CRC32_TABLE = new Uint32Array(256);
@@ -43,6 +44,7 @@ function kindName(k) {
   if (k === KIND_HOLD) return "hold";
   if (k === KIND_RENEW) return "renew";
   if (k === KIND_RELEASE) return "release";
+  if (k === KIND_BREAK) return "break";
   return null;
 }
 
