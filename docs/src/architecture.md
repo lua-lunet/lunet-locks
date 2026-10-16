@@ -363,6 +363,20 @@ See [the event journal reference](event-journal.md) for record and metafile
 byte layouts, file naming, resume-on-reopen semantics, corrupt-tail
 tolerance, and the full console catch-up model.
 
+## The write-behind AOF mount
+
+A replica mounts the write-behind AOF writer in the journal's place: the
+server takes `--aof-dir PATH` (with the `--aof-flush-ms N` periodic fsync
+cadence, 0 fsyncing only at roll and shutdown), and the C ABI takes
+`lunet_lock_node_new_aof` with the same two parameters. The mounts are
+exclusive — a replica carries the blocking journal or the AOF writer, never
+both — and the AOF directory is required: an empty one is refused at
+construction, never silently demoted to journaling. The roll threshold is
+fixed at the 2 MiB erasure block. The state artefact (the WAL snapshot
+store) is unaffected: the two mounts differ only in where the
+committed-transition stream goes. See [write-behind](write-behind.md) for
+the writer's own contract.
+
 ## The console telemetry panel
 
 The console's telemetry view charts the observability contract's JSON log

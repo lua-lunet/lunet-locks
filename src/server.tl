@@ -113,6 +113,8 @@ local record Options
     recovery_ms: integer
     event_journal_dir: string
     event_journal_roll_bytes: integer
+    aof_dir: string
+    aof_flush_ms: integer
 end
 
 local record Pending
@@ -172,7 +174,8 @@ local function usage(): string
         .. "--state PATH --cluster PATH (JSONL deployment descriptor, "
         .. "at least three entries) "
         .. "[--heartbeat-ms N] [--election-ms N] [--recovery-ms N] "
-        .. "[--event-journal-dir PATH] [--event-journal-roll-bytes N]"
+        .. "[--event-journal-dir PATH] [--event-journal-roll-bytes N] "
+        .. "[--aof-dir PATH] [--aof-flush-ms N]"
 end
 
 local function positive(value: string, name: string): integer
@@ -204,6 +207,8 @@ local function parse_options(argv: {string}): Options
     local recovery_ms: integer = 2500
     local event_journal_dir: string = ""
     local event_journal_roll_bytes: integer = 8388608
+    local aof_dir: string = ""
+    local aof_flush_ms: integer = 0
     local index = 1
     while index <= #argv do
         local flag = argv[index]
@@ -236,6 +241,11 @@ local function parse_options(argv: {string}): Options
             event_journal_roll_bytes = positive(
                 value, "server: --event-journal-roll-bytes"
             )
+        elseif flag == "--aof-dir" then
+            assert(aof_dir == "", "server: --aof-dir may appear once")
+            aof_dir = value
+        elseif flag == "--aof-flush-ms" then
+            aof_flush_ms = positive(value, "server: --aof-flush-ms")
         else
             error("server: unknown option " .. flag)
         end
@@ -252,6 +262,10 @@ local function parse_options(argv: {string}): Options
         election_ms >= heartbeat_ms,
         "server: election timeout must be at least heartbeat"
     )
+    assert(
+        aof_dir == "" or event_journal_dir == "",
+        "server: --aof-dir and --event-journal-dir are exclusive mounts"
+    )
     return {
         node = node,
         client = client,
@@ -263,6 +277,8 @@ local function parse_options(argv: {string}): Options
         recovery_ms = recovery_ms,
         event_journal_dir = event_journal_dir,
         event_journal_roll_bytes = event_journal_roll_bytes,
+        aof_dir = aof_dir,
+        aof_flush_ms = aof_flush_ms,
     }
 end
 
@@ -348,13 +364,24 @@ local function main(options: Options)
     end
     assert(udp_host ~= "", "server: own member missing")
 
-    local node = advisory_lock.new(
-        options.nodes,
-        options.node,
-        options.state,
-        options.event_journal_dir,
-        options.event_journal_roll_bytes
-    )
+    local node: advisory_lock.Node
+    if options.aof_dir ~= "" then
+        node = advisory_lock.new_aof(
+            options.nodes,
+            options.node,
+            options.state,
+            options.aof_dir,
+            options.aof_flush_ms
+        )
+    else
+        node = advisory_lock.new(
+            options.nodes,
+            options.node,
+            options.state,
+            options.event_journal_dir,
+            options.event_journal_roll_bytes
+        )
+    end
     own_id = node:own_id()
     log_membership(membership_log)
     -- The v0.10.0 stop contract's drain point, wired to the reference
