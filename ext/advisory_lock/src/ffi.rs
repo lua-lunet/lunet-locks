@@ -205,6 +205,25 @@
 //! NUL-separated `<u32-id>:<name>` entries in descriptor (genesis succession)
 //! order, with post-genesis entries suffixed `:j` (see Identity above);
 //! `own_data` is the local member's name.
+//!
+//! ```text
+//! lunet_lock_node_new_aof(
+//!     members_len: usize, members_data: *const u8,
+//!     own_len: usize, own_data: *const u8,
+//!     state_len: usize, state_data: *const u8,
+//!     aof_dir_len: usize, aof_dir_data: *const u8,
+//!     flush_ms: u64,
+//!     out: *mut *mut c_void,
+//! ) -> i32
+//! ```
+//!
+//! The AOF-backed creator: the committed-transition hook enqueues to the
+//! write-behind AOF writer instead of the blocking journal. `aof_dir` is
+//! required — an empty directory is an `INVALID` call, not a journal
+//! fallback. `flush_ms` is the periodic fsync cadence; 0 fsyncs only at
+//! roll and shutdown. The roll threshold is fixed at the 2 MiB erasure
+//! block and `members_data`/`own_data`/`state_data` follow the same
+//! grammar as `lunet_lock_node_new`.
 
 use crate::aof::{AofConfig, AofWriter};
 use crate::disk::{Disk, StdDisk, std_disk};
@@ -1637,8 +1656,7 @@ impl Node {
     /// fsync knob (`None` fsyncs only at roll and shutdown). The roll
     /// threshold is fixed at the 2 MiB erasure block.
     ///
-    /// The C ABI never takes this path; the ABI's journal surface is
-    /// unchanged.
+    /// The C ABI takes this path through [`lunet_lock_node_new_aof`].
     pub fn open_aof(
         members: &str,
         own: &str,
@@ -3726,6 +3744,75 @@ pub unsafe extern "C" fn lunet_lock_node_new(
                 wal_state_store(state),
                 default_commit_hook(),
                 None,
+            )
+        })) {
+            Ok(Ok(node)) => {
+                unsafe { *out = Box::into_raw(Box::new(node)).cast() };
+                OK
+            }
+            Ok(Err(code)) => code,
+            Err(_) => PANIC,
+        }
+    })
+}
+
+/// The AOF-backed creator: the committed-transition hook enqueues to the
+/// write-behind AOF writer instead of the blocking journal. Same grammar
+/// as [`lunet_lock_node_new`] with `journal_dir`/`roll_bytes` replaced by
+/// the required `aof_dir` and the `flush_ms` cadence (0 fsyncs only at
+/// roll and shutdown).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lunet_lock_node_new_aof(
+    members_len: usize,
+    members_data: *const u8,
+    own_len: usize,
+    own_data: *const u8,
+    state_len: usize,
+    state_data: *const u8,
+    aof_dir_len: usize,
+    aof_dir_data: *const u8,
+    flush_ms: u64,
+    out: *mut *mut c_void,
+) -> i32 {
+    guarded(|| {
+        if out.is_null() {
+            return INVALID;
+        }
+        let Ok(members_data) = (unsafe { bytes(members_len, members_data) }) else {
+            return INVALID;
+        };
+        let Ok(own_data) = (unsafe { bytes(own_len, own_data) }) else {
+            return INVALID;
+        };
+        let Ok(state_data) = (unsafe { bytes(state_len, state_data) }) else {
+            return INVALID;
+        };
+        let Ok(aof_dir_data) = (unsafe { bytes(aof_dir_len, aof_dir_data) }) else {
+            return INVALID;
+        };
+        let Ok(aof_dir) = std::str::from_utf8(aof_dir_data) else {
+            return INVALID;
+        };
+        if aof_dir.is_empty() {
+            return INVALID;
+        }
+        let flush_interval = if flush_ms == 0 {
+            None
+        } else {
+            Some(Duration::from_millis(flush_ms))
+        };
+        match catch_unwind(AssertUnwindSafe(|| {
+            let disk = std_disk();
+            let state = std::str::from_utf8(state_data).unwrap_or_default();
+            node_from_aof(
+                members_data,
+                own_data,
+                state_data,
+                aof_dir,
+                flush_interval,
+                Arc::clone(&disk),
+                wal_state_store(state),
+                default_commit_hook(),
             )
         })) {
             Ok(Ok(node)) => {

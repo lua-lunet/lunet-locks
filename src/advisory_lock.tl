@@ -22,6 +22,13 @@ ffi.cdef(
         size_t journal_dir_len, const uint8_t* journal_dir,
         uint32_t roll_bytes,
         void** out);
+    int32_t lunet_lock_node_new_aof(
+        size_t members_len, const uint8_t* members,
+        size_t own_len, const uint8_t* own,
+        size_t state_len, const uint8_t* state,
+        size_t aof_dir_len, const uint8_t* aof_dir,
+        uint64_t flush_ms,
+        void** out);
     void lunet_lock_node_free(void* node);
     int32_t lunet_lock_node_request(void* node, size_t json_len, const uint8_t* json);
     int32_t lunet_lock_node_reconfigure(
@@ -81,6 +88,9 @@ local errors: {integer: string} = {
 
 local record Native
     lunet_lock_node_new: function(
+        integer, any, integer, any, integer, any, integer, any, integer, {any}
+    ): number
+    lunet_lock_node_new_aof: function(
         integer, any, integer, any, integer, any, integer, any, integer, {any}
     ): number
     lunet_lock_node_free: function(any)
@@ -196,6 +206,9 @@ local record advisory_lock
     end
 
     new: function({cluster_config.ClusterNode}, string, string, string, integer): Node
+    new_aof: function(
+        {cluster_config.ClusterNode}, string, string, string, integer
+    ): Node
     version_properties: function(): {string: string}
 end
 
@@ -523,14 +536,9 @@ local M: advisory_lock = {}
 -- genesis, fenced until the stream proves currency). `own` is matched by
 -- name; every peer address on the ABI (receive `from`, send `to`, leader
 -- outs) is a member id.
-function M.new(
-    members: {cluster_config.ClusterNode},
-    own: string,
-    state_path: string,
-    journal_dir: string,
-    journal_roll_bytes: integer
-): Node
+local function pack_members(members: {cluster_config.ClusterNode}): string
     assert(#members >= 3, "advisory_lock: at least three members are required")
+    local entries: {string} = {}
     for _, member in ipairs(members) do
         local entry = tostring(member.id) .. ":" .. member.name
         if not member.genesis then
@@ -539,49 +547,12 @@ function M.new(
         assert(
             entry:find("\0", 1, true) == nil, "advisory_lock: membership contains NUL"
         )
-    end
-    assert(own:find("\0", 1, true) == nil, "advisory_lock: own member contains NUL")
-    assert(
-        state_path ~= "" and state_path:find("\0", 1, true) == nil,
-        "advisory_lock: invalid state path"
-    )
-    assert(
-        journal_dir:find("\0", 1, true) == nil,
-        "advisory_lock: journal dir contains NUL"
-    )
-    assert(
-        journal_roll_bytes >= 0,
-        "advisory_lock: journal roll bytes must be non-negative"
-    )
-    local entries: {string} = {}
-    for _, member in ipairs(members) do
-        local entry = tostring(member.id) .. ":" .. member.name
-        if not member.genesis then
-            entry = entry .. ":j"
-        end
         table.insert(entries, entry)
     end
-    local packed = table.concat(entries, "\0")
-    local out = ffi.new("void*[1]") as {any}
-    check(
-        (
-            tonumber(
-                native.lunet_lock_node_new(
-                    #packed,
-                    packed,
-                    #own,
-                    own,
-                    #state_path,
-                    state_path,
-                    #journal_dir,
-                    journal_dir,
-                    journal_roll_bytes,
-                    out
-                )
-            ) or -127
-        ) as integer
-    )
-    local handle: any = ffi.gc(out[0], native.lunet_lock_node_free)
+    return table.concat(entries, "\0")
+end
+
+local function node_record(handle: any): Node
     return {
         _handle = handle,
         _kind = ffi.new("uint32_t[1]") as {number},
@@ -611,6 +582,94 @@ function M.new(
         close = Node.close,
         stop = Node.stop,
     }
+end
+
+function M.new(
+    members: {cluster_config.ClusterNode},
+    own: string,
+    state_path: string,
+    journal_dir: string,
+    journal_roll_bytes: integer
+): Node
+    local packed = pack_members(members)
+    assert(own:find("\0", 1, true) == nil, "advisory_lock: own member contains NUL")
+    assert(
+        state_path ~= "" and state_path:find("\0", 1, true) == nil,
+        "advisory_lock: invalid state path"
+    )
+    assert(
+        journal_dir:find("\0", 1, true) == nil,
+        "advisory_lock: journal dir contains NUL"
+    )
+    assert(
+        journal_roll_bytes >= 0,
+        "advisory_lock: journal roll bytes must be non-negative"
+    )
+    local out = ffi.new("void*[1]") as {any}
+    check(
+        (
+            tonumber(
+                native.lunet_lock_node_new(
+                    #packed,
+                    packed,
+                    #own,
+                    own,
+                    #state_path,
+                    state_path,
+                    #journal_dir,
+                    journal_dir,
+                    journal_roll_bytes,
+                    out
+                )
+            ) or -127
+        ) as integer
+    )
+    return node_record(ffi.gc(out[0], native.lunet_lock_node_free))
+end
+
+-- The AOF-backed mount: the committed transitions enqueue to the
+-- write-behind AOF writer instead of the blocking journal. `aof_dir` is
+-- required (the ABI refuses an empty directory rather than falling back to
+-- the journal); `flush_ms` is the periodic fsync cadence, 0 fsyncing only
+-- at roll and shutdown.
+function M.new_aof(
+    members: {cluster_config.ClusterNode},
+    own: string,
+    state_path: string,
+    aof_dir: string,
+    flush_ms: integer
+): Node
+    local packed = pack_members(members)
+    assert(own:find("\0", 1, true) == nil, "advisory_lock: own member contains NUL")
+    assert(
+        state_path ~= "" and state_path:find("\0", 1, true) == nil,
+        "advisory_lock: invalid state path"
+    )
+    assert(
+        aof_dir ~= "" and aof_dir:find("\0", 1, true) == nil,
+        "advisory_lock: invalid AOF directory"
+    )
+    assert(flush_ms >= 0, "advisory_lock: AOF flush ms must be non-negative")
+    local out = ffi.new("void*[1]") as {any}
+    check(
+        (
+            tonumber(
+                native.lunet_lock_node_new_aof(
+                    #packed,
+                    packed,
+                    #own,
+                    own,
+                    #state_path,
+                    state_path,
+                    #aof_dir,
+                    aof_dir,
+                    flush_ms,
+                    out
+                )
+            ) or -127
+        ) as integer
+    )
+    return node_record(ffi.gc(out[0], native.lunet_lock_node_free))
 end
 
 -- The read-only information console: this build's own identity facts as

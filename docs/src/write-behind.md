@@ -30,11 +30,17 @@ rebuilds from the replica stream. The shapes are proven by the WAL node
 tests (clean-restart persistence, dirty-boot refusal) beside the state
 seam's tests.
 
-The write-behind AOF writer is built and defended, and not wired into any
-host path: the only in-tree constructor of an AOF sink is the example
-crate's standby mode (`--aof-dir`). The writer stays compiled and tested
-by `make ext-test`. Wiring it into a host surface is gated on the witness
-watermarks and the three sync-point rules (the decisions register).
+The write-behind AOF writer is built and defended, and the host surface
+reaches it: the C ABI's `lunet_lock_node_new_aof` and the server's
+`--aof-dir` (with `--aof-flush-ms`) mount the writer in the journal's
+place — the mounts exclusive, the AOF directory required, the roll
+threshold fixed at the 2 MiB erasure block. The example crate's standby
+mode (`--aof-dir`) constructs the same sink. The writer is compiled and
+tested by `make ext-test` and the WAL node tests. What the witness
+watermarks and the three sync-point rules (the decisions register) still
+gate is the deployment's durability posture: which members of a running
+cluster mount the writer as their committed-transition series is decided
+with the witness certificate in hand.
 
 ## Why a frame and not a running series
 
