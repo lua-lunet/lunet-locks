@@ -49,6 +49,7 @@ pub mod state;
 /// page-cached generations with zero fsync, on the calling thread only.
 #[cfg(not(target_os = "windows"))]
 pub mod wal_snapshot;
+pub mod witness;
 
 pub use ffi::{
     Node, NodeOutput, NodeStatus, OUTPUT_REPLY, OUTPUT_SEND, POSITION_APPEND, PRIMARY_TIMEOUT_MS,
