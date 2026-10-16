@@ -81,13 +81,18 @@ synced. The reader sees the old frame or the new one, never a half.
 ## The sweeper
 
 Leases run for hours or days, and a lock nothing renews is a dead record
-carried forever. The **sweeper** reaps them, and it is driven by the
-leader's heartbeat cadence rather than a timer of its own: the heartbeat
-already paces the cluster's liveness, and piggybacking it keeps the
-sweep deterministic and centralised. A lock whose lease has expired is
-released in the table; the frame at shutdown then contains the live set
-alone. No tombstones are written: there is no running series to keep
-consistent, and the dead are simply absent from the frame.
+carried forever. The **sweeper** reaps them, and it rides the leader's
+steady state tick rather than a timer of its own: the tick already paces
+the node's durability loop, and sweeping on the leader only keeps the
+reaping deterministic and centralised. Each expired lease is broken as a
+committed operation — the break rides the replication log, so every
+replica's table agrees; a local mutation of one node's table would
+diverge the quorum state. The break is the keeper's verb: the generation
+is bumped, the holder is nil, and the frame at shutdown then contains
+the live set alone. No tombstones are written: there is no running
+series to keep consistent, and the dead are simply absent from the
+frame. The sweep is bounded per tick — a backlog of dead leases drains
+over ticks, never stampedes the log.
 
 The sweeper is what keeps the artefact honest to its sizing claim: the
 live set is tiny because the dead set is removed, and the shutdown flush
