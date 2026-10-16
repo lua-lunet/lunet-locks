@@ -1,6 +1,6 @@
 //! The lock service: our gateway envelope over the core's machinery.
 //!
-//! The machinery is upstream's (`vrr::demo::locks`): the four verbs, the
+//! The machinery is upstream's (`vrr::locks`): the four verbs, the
 //! CAS grant, the generation watermark that never hands a generation out
 //! twice, the truthful release, and the nil holder no request can name.
 //! This module owns the envelope — the gateway wire the clients and the
@@ -21,7 +21,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use uuid::Uuid;
-use vrr::demo::locks::{
+use vrr::locks::{
     ClientId, Lease as CoreLease, Request as CoreRequest, Response as CoreResponse,
     Service as CoreService, StateSnapshot as CoreSnapshot,
 };
