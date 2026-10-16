@@ -563,6 +563,93 @@ fn the_aof_mount_serves_stops_and_leaves_the_series() {
     );
 }
 
+/// The sweeper: a lease left to expire leaves the live table at the
+/// leader's heartbeat cadence — reaped as a committed break that rides
+/// the replication log (the generation counter advances), not merely
+/// filtered at the next request. A live lease survives the same beats
+/// untouched.
+#[test]
+fn the_sweeper_reaps_an_expired_lease_at_the_heartbeat() {
+    let root = scratch("sweeper");
+    let mut buf = vec![0u8; DATAGRAM];
+    let mut rig = vec![
+        AbiNode::new(&root, "a"),
+        AbiNode::new(&root, "b"),
+        AbiNode::new(&root, "c"),
+    ];
+    let _ = census_paths();
+
+    // The leader takes one lock that dies in 1 ms and one that lives
+    // for 30 s.
+    let leader = elect(&mut rig, &mut buf);
+    let holder = "55555555-5555-5555-5555-555555555555";
+    let dead_json = format!(
+        "{{\"op\":\"set\",\"message_id\":\"00000000-0000-4000-8000-000000000005\",\
+\"client_id\":1,\"request_num\":1,\"lock_id\":9005,\"lease\":{{\"lease_id\":1,\
+\"holder\":\"{holder}\",\"lease_ms\":1}}}}"
+    );
+    assert_eq!(rig[leader].request(&dead_json), 0);
+    let mut granted = false;
+    for _ in 0..64 {
+        let replies = round(&mut rig, &mut buf);
+        if replies.iter().any(|bytes| contains(bytes, GRANTED)) {
+            granted = true;
+            break;
+        }
+    }
+    assert!(granted, "the doomed lock grants");
+    let _ = census_paths();
+    let live_json = set_json("00000000-0000-4000-8000-000000000006", 9006, 1, holder);
+    let reply = take_lock(&mut rig, leader, &live_json, &mut buf);
+    assert!(contains(&reply, GRANTED), "the live lock grants");
+    let baseline = rig[leader].state_status().eph_completed_generations;
+
+    // The beats: the leader heartbeats on its own cadence; the sweeper
+    // rides each beat. The expired lease's break is a committed
+    // operation — the generation counter advances past the baseline —
+    // while the live lease's table row is never broken.
+    let mut swept = false;
+    for _ in 0..40 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        rig[leader].state_tick();
+        let _ = round(&mut rig, &mut buf);
+        let now = rig[leader].state_status().eph_completed_generations;
+        if now > baseline + 1 {
+            swept = true;
+            break;
+        }
+        if now > baseline {
+            // The grant's completion landed (the tick submitted it);
+            // the sweep's break is the next advance.
+            continue;
+        }
+    }
+    assert!(swept, "the expired lease's break never committed");
+
+    // The live lease still stands: a get answers it, and the
+    // sweeper's beats did not touch it.
+    let get_json = "{\"op\":\"get\",\"message_id\":\"00000000-0000-4000-8000-000000000007\",\
+\"client_id\":1,\"request_num\":2,\"lock_id\":9006}"
+        .to_string();
+    assert_eq!(rig[leader].request(&get_json), 0);
+    let mut answered = false;
+    for _ in 0..64 {
+        let replies = round(&mut rig, &mut buf);
+        if replies
+            .iter()
+            .any(|bytes| contains(bytes, b"\"lock_id\":9006") && contains(bytes, b"\"lease\":{"))
+        {
+            answered = true;
+            break;
+        }
+    }
+    assert!(answered, "the live lease survives the sweeper's beats");
+    let _ = census_paths();
+    for node in rig.iter() {
+        assert_eq!(node.stop(), 0, "the stop is clean");
+    }
+}
+
 /// The construction-refusal fallback (R4): a corrupt artefact refuses
 /// the store's open, the node boots anyway — the WAL is a fallback,
 /// never a safety mechanism — and the fallback store reports no

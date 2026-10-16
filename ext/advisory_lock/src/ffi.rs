@@ -502,6 +502,9 @@ pub struct Node {
     pending: HashMap<OperationId, [u8; 16]>,
     last_tick: u64,
     poisoned: bool,
+    /// The sweeper's own request_num sequence (the keeper's client
+    /// numbering never collides with a client's).
+    sweep_seq: u64,
     /// The recorded reason of the FIRST self-arrest observation (the
     /// core's never-repair fault, or a boundary panic): `None` until the
     /// node arrests. The sticky fault would otherwise repeat the
@@ -827,6 +830,53 @@ impl Node {
         }
         self.report();
         OK
+    }
+
+    /// The sweeper: expired leases leave the live table on the leader's
+    /// steady tick, never on a timer of its own. The tick already paces
+    /// the node's durability loop, and riding it on the leader only
+    /// keeps the sweep deterministic and centralised: the leader breaks
+    /// each expired lease as a committed operation, so the break rides
+    /// the replication log and every replica's table agrees — a local
+    /// mutation of one node's table would diverge the quorum state. The
+    /// break is the keeper's verb (the admin edge's authorisation, never
+    /// the state machine's), the post-break record's generation is
+    /// bumped and its holder is nil, and no tombstones are written: the
+    /// dead are simply absent from the next frame. Bounded per tick —
+    /// at most [`SWEEP_BUDGET`] breaks per sweep — so a backlog of dead
+    /// leases drains over ticks without stampeding the log.
+    fn sweep_expired(&mut self) {
+        const SWEEP_BUDGET: usize = 8;
+        const SYSTEM_CLIENT: u64 = 0;
+        if self.primary_index() != self.replica.own().0 {
+            return;
+        }
+        let Ok(now) = unix_millis() else {
+            return;
+        };
+        let snapshot = self.service.snapshot();
+        let expired: Vec<u64> = snapshot
+            .locks
+            .iter()
+            .filter(|(_, lease)| lease.expiry <= now)
+            .map(|(lock_id, _)| *lock_id)
+            .take(SWEEP_BUDGET)
+            .collect();
+        for lock_id in expired {
+            self.sweep_seq += 1;
+            let request = serde_json::json!({
+                "op": "break",
+                "message_id": uuid::Uuid::new_v4().to_string(),
+                "client_id": SYSTEM_CLIENT,
+                "request_num": self.sweep_seq,
+                "lock_id": lock_id,
+            });
+            let payload = serde_json::to_vec(&request).unwrap_or_default();
+            if payload.is_empty() {
+                continue;
+            }
+            let _ = self.request(&payload);
+        }
     }
 
     /// THE LAZY LOAD — the one place the lock table is read back, and
@@ -2416,6 +2466,10 @@ impl Node {
         if self.stopped {
             return STOPPED;
         }
+        // The sweeper's seat: the leader's steady tick is the sweep's
+        // cadence, and the tick is over (no re-entrancy into the store's
+        // pump/submit sequence).
+        self.sweep_expired();
         if let Err(error) = self.state_tick_path() {
             warn!(
                 ts = log_millis(),
@@ -3620,6 +3674,7 @@ fn node_from_sink(
         pending: HashMap::new(),
         last_tick: 0,
         poisoned: false,
+        sweep_seq: 0,
         fault_note: None,
         reincarnate_from,
         known_ids,
