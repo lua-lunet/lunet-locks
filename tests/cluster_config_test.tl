@@ -7,6 +7,71 @@ local function fails(f: function(): boolean): boolean
 end
 
 tested.test(
+    "cluster_config parses the static witness list: one name and endpoint per line, never cluster config",
+    function()
+        local text = [[
+# the witnesses are host config, outside the roster, never purged
+
+{"name":"dr-a","endpoint":"127.0.0.1:28200"}
+{"name":"dr-b","endpoint":"10.0.0.4:28200"}
+]]
+        local witnesses = cluster_config.parse_witnesses(text)
+        tested.assert(
+            {
+                given = "a comment-and-blank-line-tolerant witness JSONL of two rows",
+                should = "parse both witnesses' names and endpoints",
+                expected = "dr-a:127.0.0.1:28200|dr-b:10.0.0.4:28200",
+                actual = witnesses[1].name
+                    .. ":"
+                    .. witnesses[1].host
+                    .. ":"
+                    .. tostring(witnesses[1].port)
+                    .. "|"
+                    .. witnesses[2].name
+                    .. ":"
+                    .. witnesses[2].host
+                    .. ":"
+                    .. tostring(witnesses[2].port),
+            }
+        )
+        tested.assert(
+            {
+                given = "a witness file with a duplicate witness name",
+                should = "refuse the file: the witnesses are static config and a duplicate is an operator error",
+                expected = "true",
+                actual = tostring(
+                    fails(
+                        function(): boolean
+                            cluster_config.parse_witnesses(
+                                '{"name":"dr-a","endpoint":"127.0.0.1:28200"}\n{"name":"dr-a","endpoint":"127.0.0.1:28201"}\n'
+                            )
+                            return true
+                        end
+                    )
+                ),
+            }
+        )
+        tested.assert(
+            {
+                given = "a witness line whose endpoint is not literal IPv4",
+                should = "refuse the line",
+                expected = "true",
+                actual = tostring(
+                    fails(
+                        function(): boolean
+                            cluster_config.parse_witnesses(
+                                '{"name":"dr-a","endpoint":"witness.internal:28200"}\n'
+                            )
+                            return true
+                        end
+                    )
+                ),
+            }
+        )
+    end
+)
+
+tested.test(
     "cluster_config parses sparse admin-assigned ids and round-trips to JSONL",
     function()
         local text = [[

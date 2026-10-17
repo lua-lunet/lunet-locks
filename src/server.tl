@@ -115,6 +115,7 @@ local record Options
     event_journal_roll_bytes: integer
     aof_dir: string
     aof_flush_ms: integer
+    witnesses: {cluster_config.Witness}
 end
 
 local record Pending
@@ -175,7 +176,7 @@ local function usage(): string
         .. "at least three entries) "
         .. "[--heartbeat-ms N] [--election-ms N] [--recovery-ms N] "
         .. "[--event-journal-dir PATH] [--event-journal-roll-bytes N] "
-        .. "[--aof-dir PATH] [--aof-flush-ms N]"
+        .. "[--aof-dir PATH] [--aof-flush-ms N] [--witnesses PATH]"
 end
 
 local function positive(value: string, name: string): integer
@@ -209,6 +210,7 @@ local function parse_options(argv: {string}): Options
     local event_journal_roll_bytes: integer = 8388608
     local aof_dir: string = ""
     local aof_flush_ms: integer = 0
+    local witnesses_path: string = ""
     local index = 1
     while index <= #argv do
         local flag = argv[index]
@@ -246,6 +248,9 @@ local function parse_options(argv: {string}): Options
             aof_dir = value
         elseif flag == "--aof-flush-ms" then
             aof_flush_ms = positive(value, "server: --aof-flush-ms")
+        elseif flag == "--witnesses" then
+            assert(witnesses_path == "", "server: --witnesses may appear once")
+            witnesses_path = value
         else
             error("server: unknown option " .. flag)
         end
@@ -266,6 +271,14 @@ local function parse_options(argv: {string}): Options
         aof_dir == "" or event_journal_dir == "",
         "server: --aof-dir and --event-journal-dir are exclusive mounts"
     )
+    local witnesses: {cluster_config.Witness} = {}
+    if witnesses_path ~= "" then
+        local file = io.open(witnesses_path, "r")
+        assert(file ~= nil, "server: cannot read witnesses file " .. witnesses_path)
+        local text = file:read("a")
+        file:close()
+        witnesses = cluster_config.parse_witnesses(text)
+    end
     return {
         node = node,
         client = client,
@@ -279,6 +292,7 @@ local function parse_options(argv: {string}): Options
         event_journal_roll_bytes = event_journal_roll_bytes,
         aof_dir = aof_dir,
         aof_flush_ms = aof_flush_ms,
+        witnesses = witnesses,
     }
 end
 
@@ -768,6 +782,36 @@ local function main(options: Options)
         assert(ok ~= nil, "server: UDP send failed: " .. (send_error or "unknown"))
     end
 
+    -- The static witnesses: host config, outside the roster, never
+    -- purged. Every datagram the node sends a peer, each witness's
+    -- endpoint receives the same bytes, fire and forget — a witness's
+    -- absence costs one datagram, never a wait, so the send is a UDP
+    -- write the protocol never hears about.
+    local witness_endpoints: {string} = {}
+    for _, witness in ipairs(options.witnesses) do
+        table.insert(witness_endpoints, witness.host .. ":" .. tostring(witness.port))
+        log_membership(
+            "advisory-lock witness "
+                .. witness.name
+                .. " at "
+                .. witness.host
+                .. ":"
+                .. tostring(witness.port)
+        )
+    end
+
+    local function forward_witnesses(encoded: string)
+        for _, witness_endpoint in ipairs(witness_endpoints) do
+            local ok = pcall(send_endpoint, witness_endpoint, encoded)
+            if not ok then
+                -- A witness's unreachability is never fatal: the stream
+                -- is fire and forget, and the witness's own gap is its
+                -- own affair.
+                log_membership("advisory-lock witness send failed; datagram dropped")
+            end
+        end
+    end
+
     local function send_vrr(replica: integer, payload: string)
         local endpoint = endpoint_by_id[replica]
         -- A replica this process cannot address yet (a joining member whose
@@ -783,9 +827,9 @@ local function main(options: Options)
             )
             return
         end
-        send_endpoint(
-            endpoint, transport.encode_peer(transport.PEER_VRR, fingerprint, payload)
-        )
+        local encoded = transport.encode_peer(transport.PEER_VRR, fingerprint, payload)
+        forward_witnesses(encoded)
+        send_endpoint(endpoint, encoded)
     end
 
     local function send_application(endpoint: string, payload: string)

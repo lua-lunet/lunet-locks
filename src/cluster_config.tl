@@ -41,6 +41,15 @@ local record ClusterNode
     genesis: boolean
 end
 
+-- A static witness: outside the roster, never votes, never part of the
+-- cluster configuration. Every member loads the same list from its own
+-- host config, so any leader knows where to send the stream.
+local record Witness
+    name: string
+    host: string
+    port: integer
+end
+
 local function ipv4(host: string): boolean
     local count = 0
     for part in host:gmatch("[^.]+") do
@@ -170,6 +179,67 @@ local function parse_jsonl(text: string): {ClusterNode}
     return nodes
 end
 
+-- Parses witness JSONL text: one {"name":"...","endpoint":"ipv4:port"} per
+-- non-blank, non-comment (#...) line. The witnesses are static host config
+-- — outside the roster, never purged, never part of any cluster
+-- configuration — so the parse rejects only what a file cannot carry:
+-- duplicates by name, and endpoints that are not literal IPv4.
+local function parse_witnesses(text: string): {Witness}
+    local witnesses: {Witness} = {}
+    local seen_names: {string: boolean} = {}
+    local line_no = 0
+    for line in (text .. "\n"):gmatch("([^\n]*)\n") do
+        line_no = line_no + 1
+        local trimmed = line:match("^%s*(.-)%s*$")
+        if trimmed ~= "" and trimmed:sub(1, 1) ~= "#" then
+            local name_text = trimmed:match('"name"%s*:%s*"([^"]*)"')
+            local endpoint_text = trimmed:match('"endpoint"%s*:%s*"([^"]*)"')
+            assert(
+                name_text ~= nil and endpoint_text ~= nil,
+                "cluster_config: witness line "
+                    .. tostring(line_no)
+                    .. [[ must be {"name":"...","endpoint":"ipv4:port"}]]
+            )
+            assert(
+                name_text:match("^[%w_-]+$") ~= nil,
+                "cluster_config: witness line "
+                    .. tostring(line_no)
+                    .. " name must be [%w_-]+"
+            )
+            assert(
+                not seen_names[name_text],
+                "cluster_config: duplicate witness name "
+                    .. name_text
+                    .. " at line "
+                    .. tostring(line_no)
+            )
+            seen_names[name_text] = true
+            local host_text, port_text = endpoint_text:match("^(.+):(%d+)$")
+            assert(
+                host_text ~= nil and port_text ~= nil,
+                "cluster_config: witness line "
+                    .. tostring(line_no)
+                    .. " endpoint must be ipv4:port"
+            )
+            local port = tonumber(port_text) as integer
+            assert(
+                ipv4(host_text),
+                "cluster_config: witness line "
+                    .. tostring(line_no)
+                    .. " endpoint host must be literal IPv4"
+            )
+            assert(
+                port >= 1 and port <= 65535,
+                "cluster_config: witness line "
+                    .. tostring(line_no)
+                    .. " endpoint port must be 1..65535"
+            )
+            table.insert(witnesses, {name = name_text, host = host_text, port = port})
+        end
+    end
+    return witnesses
+end
+
 -- The genesis succession: the descriptor's genesis lines, in line order.
 -- This is the founding membership every replica must carry identically and
 -- the order the core folds as the genesis configuration.
@@ -238,7 +308,9 @@ end
 
 return {
     ClusterNode = ClusterNode,
+    Witness = Witness,
     parse_jsonl = parse_jsonl,
+    parse_witnesses = parse_witnesses,
     encode_jsonl = encode_jsonl,
     encode_line = encode_line,
     genesis_members = genesis_members,
