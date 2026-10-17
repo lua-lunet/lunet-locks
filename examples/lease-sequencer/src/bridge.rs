@@ -341,15 +341,13 @@ fn set_lease_ms(request: &lunet_advisory_lock::locks::Request) -> Option<u64> {
 /// Replay one series directory: every `.aof` file in epoch order, every
 /// record decoded, every committed lock op executed through the real
 /// Service state machine. Read-only on disk; deterministic across runs.
-pub fn replay_series(dir: &Path) -> (Vec<LockEvent>, LockState, BridgeMetrics) {
-    let mut metrics = BridgeMetrics::default();
+/// Pass 1 of the replay: decode every record; classify Wire payloads and
+/// collect the committed lock work (Prepare entries whose payload passes
+/// the same `Service::decode` gate the adapter applies at commit).
+fn committed_ops(dir: &Path, metrics: &mut BridgeMetrics) -> Vec<CommittedOp> {
     let mut committed: Vec<CommittedOp> = Vec::new();
-
-    // Pass 1: decode every record; classify Wire payloads and collect the
-    // committed lock work (Prepare entries whose payload passes the same
-    // `Service::decode` gate the adapter applies at commit).
     for file in series_files(dir) {
-        for record in read_file_records(&file, &mut metrics) {
+        for record in read_file_records(&file, metrics) {
             metrics.records += 1;
             let ns = record.ns;
             if metrics.first_ns.is_none() {
@@ -413,11 +411,51 @@ pub fn replay_series(dir: &Path) -> (Vec<LockEvent>, LockState, BridgeMetrics) {
             });
         }
     }
+    committed
+}
 
-    // Pass 2: replay the committed stream in slot order (record order) —
-    // slot order IS record order within the standby's trace, since the
-    // standby appends each datagram at its local ns receipt and commits
-    // follow the Prepare stream it records.
+/// One replayed transition, raw: the state machine's own shapes — the
+/// transition's lease_id, holder bytes and expiry ride whole, exactly
+/// what the LKE1 record encodes — with the receipt time it committed at.
+#[derive(Debug, Clone)]
+pub struct RawTransition {
+    pub ns: u64,
+    pub ts_ms: u64,
+    pub transition: Transition,
+}
+
+/// The committed stream's transitions, in slot order: the same replay
+/// the events derive from, carrying the state machine's own shapes. The
+/// witness's LKE1 series is written from these.
+pub fn replay_transitions(dir: &Path) -> Vec<RawTransition> {
+    let mut metrics = BridgeMetrics::default();
+    let mut committed = committed_ops(dir, &mut metrics);
+    committed.sort_by_key(|op| op.ns);
+
+    let mut service = Service::default();
+    let mut out = Vec::new();
+    for op in committed {
+        let now_ms = ns_to_ms(op.ns);
+        if let Ok((_bytes, Some(transition))) = service.execute(
+            op.message_id,
+            op.client_id,
+            op.request_num,
+            now_ms,
+            &op.payload,
+        ) {
+            out.push(RawTransition {
+                ns: op.ns,
+                ts_ms: now_ms,
+                transition,
+            });
+        }
+    }
+    out
+}
+
+pub fn replay_series(dir: &Path) -> (Vec<LockEvent>, LockState, BridgeMetrics) {
+    let mut metrics = BridgeMetrics::default();
+    let mut committed = committed_ops(dir, &mut metrics);
     committed.sort_by_key(|op| op.ns);
 
     let mut service = Service::default();

@@ -35,7 +35,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use tbio::envelope::Record;
 
+use lease_sequencer::bridge::{RawTransition, replay_transitions};
 use lease_sequencer::telemetry::TelemetryLog;
+use lunet_advisory_lock::journal::{
+    Journal, JournalEvent, KIND_BREAK, KIND_HOLD, KIND_RELEASE, KIND_RENEW,
+};
+use lunet_advisory_lock::locks::Transition;
 use lunet_advisory_lock::witness::{Frontier, WitnessWatermarks};
 
 fn main() {
@@ -103,6 +108,13 @@ fn main() {
 
     let mut watermarks = WitnessWatermarks::new();
     let mut last_flush = now_ms();
+    // The lock-event series: the lift's own write seat, the same
+    // directory the wire tape occupies — one directory, two series (the
+    // feed globs the ev-* names, the tape's envelopes are the epoch
+    // names; neither collides).
+    let mut journal = Journal::open(&dir, 8 * 1024 * 1024)
+        .unwrap_or_else(|e| die(&format!("cannot open the event series: {e}")));
+    let mut derived: usize = 0;
 
     loop {
         let mut buf = [0u8; 65_536];
@@ -124,8 +136,12 @@ fn main() {
         }
 
         // The flush cadence: the timer, never the receive path. The
-        // flushed watermark moves with the tape's flush, and the held
-        // sync points it covers are acknowledged — logged, never awaited.
+        // flushed watermark moves with the tape's flush, the held sync
+        // points it covers are acknowledged — logged, never awaited —
+        // and the lift writes the newly derived lock events to the
+        // series: the committed stream replayed through the real state
+        // machine, the transitions' own shapes (the lease id, the holder
+        // bytes, the absolute expiry) encoded whole.
         let now = now_ms();
         tape.tick(now);
         if flush_ms > 0 && now.saturating_sub(last_flush) >= flush_ms {
@@ -138,8 +154,68 @@ fn main() {
                 watermarks.buffered(),
                 watermarks.held().len()
             );
+            let transitions = replay_transitions(&dir);
+            for raw in transitions.iter().skip(derived) {
+                let RawTransition {
+                    ts_ms, transition, ..
+                } = raw;
+                let event = transition_event(transition, *ts_ms);
+                if let Err(error) = journal.append(&event) {
+                    eprintln!("witness: the event series refused an append ({error})");
+                    break;
+                }
+                derived += 1;
+            }
+            if let Err(error) = journal.flush() {
+                eprintln!("witness: the event series' flush failed ({error})");
+            }
             last_flush = now;
         }
+    }
+}
+
+/// The LKE1 record one transition encodes: the fields are the state
+/// machine's own — the lease id, the holder bytes, the absolute expiry.
+fn transition_event(transition: &Transition, ts_ms: u64) -> JournalEvent {
+    let (lock_id, lease_id, holder, expiry) = match transition {
+        Transition::Hold {
+            lock_id,
+            lease_id,
+            holder,
+            expiry,
+        }
+        | Transition::Renew {
+            lock_id,
+            lease_id,
+            holder,
+            expiry,
+        }
+        | Transition::Release {
+            lock_id,
+            lease_id,
+            holder,
+            expiry,
+        }
+        | Transition::Break {
+            lock_id,
+            lease_id,
+            holder,
+            expiry,
+        } => (*lock_id, *lease_id, *holder, *expiry),
+    };
+    let kind = match transition {
+        Transition::Hold { .. } => KIND_HOLD,
+        Transition::Renew { .. } => KIND_RENEW,
+        Transition::Release { .. } => KIND_RELEASE,
+        Transition::Break { .. } => KIND_BREAK,
+    };
+    JournalEvent {
+        kind,
+        ts: ts_ms,
+        lock_id,
+        lease_id,
+        holder,
+        expiry,
     }
 }
 
