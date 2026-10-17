@@ -862,12 +862,19 @@ function M.main(root: string, _argv: {string}): integer
         local witness_aof = fs.join(work, "witness/aof")
         local entries, _list_err = fs.list_dir(witness_aof)
         local tape_bytes = 0
+        local lifted_series = false
         for _, entry in ipairs(entries or {}) do
             local text = fs.read_all(fs.join(witness_aof, entry))
             tape_bytes = tape_bytes + #text
+            if entry:find("ev-", 1, true) then
+                lifted_series = true
+            end
         end
         if tape_bytes == 0 then
             fail("the witness's tape is empty: no datagram ever landed")
+        end
+        if not lifted_series then
+            fail("the witness's lock-event series never landed: the lift wrote nothing")
         end
 
         started = true
