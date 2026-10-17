@@ -279,6 +279,15 @@ function M.main(root: string, _argv: {string}): integer
         ) then
             fail("cargo build failed")
         end
+        -- The witness receiver is the smoke's own spawn: its binary is
+        -- built by this lane or the witness stage has nothing to boot.
+        if not shell.run(
+            "cargo build --release --manifest-path "
+                .. shell.quote(fs.join(root, "examples/lease-sequencer/Cargo.toml"))
+                .. " --bin witness"
+        ) then
+            fail("the witness binary's build failed")
+        end
         if not shell.run(shell.quote(cyan) .. " build --prune") then
             fail("cyan build failed")
         end
