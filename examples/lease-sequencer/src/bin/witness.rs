@@ -83,6 +83,11 @@ fn main() {
     };
     let socket =
         UdpSocket::bind(&listen).unwrap_or_else(|e| die(&format!("cannot bind {listen}: {e}")));
+    // The receive waits in short slices so the flush cadence stays the
+    // timer's, not the traffic's: an idle witness still flushes.
+    socket
+        .set_read_timeout(Some(std::time::Duration::from_millis(100)))
+        .expect("the read timeout sets");
     let mut tape = TelemetryLog::open(
         &dir,
         flush_ms,
@@ -97,42 +102,45 @@ fn main() {
     );
 
     let mut watermarks = WitnessWatermarks::new();
+    let mut last_flush = now_ms();
 
     loop {
         let mut buf = [0u8; 65_536];
-        let (size, _peer) = socket
-            .recv_from(&mut buf)
-            .unwrap_or_else(|e| die(&format!("the receive loop failed: {e}")));
-        let datagram = &buf[..size];
-
-        // The wire tape: the datagram whole, byte-identical, and the
-        // buffered watermark observes the frontier its wire header
-        // carries.
-        tape.record(Record::wire(local_ns(), datagram));
-        if let Some(frontier) = header_frontier(datagram) {
-            watermarks.observe(frontier);
+        match socket.recv_from(&mut buf) {
+            Ok((size, _peer)) => {
+                // The wire tape: the datagram whole, byte-identical, and
+                // the buffered watermark observes the frontier its wire
+                // header carries.
+                let datagram = &buf[..size];
+                tape.record(Record::wire(local_ns(), datagram));
+                if let Some(frontier) = header_frontier(datagram) {
+                    watermarks.observe(frontier);
+                }
+            }
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    || error.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(error) => die(&format!("the receive loop failed: {error}")),
         }
 
-        // The flush cadence: the timer, never the receive path.
+        // The flush cadence: the timer, never the receive path. The
+        // flushed watermark moves with the tape's flush, and the held
+        // sync points it covers are acknowledged — logged, never awaited.
         let now = now_ms();
         tape.tick(now);
-        if let Some(acked) = tape_just_flushed() {
-            // The flushed watermark moved with the flush: the held sync
-            // points it covers are acknowledged (logged; never awaited).
+        if flush_ms > 0 && now.saturating_sub(last_flush) >= flush_ms {
+            let acked = watermarks.flushed_through_buffer();
             for point in acked {
                 eprintln!("witness: sync point {point:?} acknowledged");
             }
+            eprintln!(
+                "witness: the tape flushed (buffered {:?}, held {})",
+                watermarks.buffered(),
+                watermarks.held().len()
+            );
+            last_flush = now;
         }
     }
-}
-
-/// Whether the last tick's flush moved the flushed watermark, and the
-/// held points it covered. The tape owns the fsync; the watermarks own
-/// the rule; the witness owns the log line.
-fn tape_just_flushed() -> Option<Vec<Frontier>> {
-    // The sync-point frame's arrival and the forced flush ride W3; the
-    // timer's flush resolves through the same watermarks then.
-    None
 }
 
 /// The datagram's wire header's identity: (era, view, slot). `None` for
