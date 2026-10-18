@@ -794,7 +794,7 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lunet_advisory_lock::journal::Journal;
+    use lunet_advisory_lock::aof::{AofConfig, AofWriter};
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1205,20 +1205,21 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// Feed over the lock-event series: the journal writer produces the
+    /// Feed over the AOF series: the async write-behind writer produces the
     /// file series, the follower tails it, and the server hands the events
-    /// to clients.
+    /// to clients — no journal anywhere in the path.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_feed_over_aof_series() {
         let dir = temp_dir("aof-feed");
-        let mut journal = Journal::open(&dir, 8 * 1024 * 1024).unwrap();
-        journal
-            .append(&sample_event(journal::KIND_HOLD, 700, 21, 1200))
-            .unwrap();
-        journal
-            .append(&sample_event(journal::KIND_RENEW, 800, 21, 1300))
-            .unwrap();
-        journal.flush().unwrap();
+        let writer = AofWriter::open(
+            &dir,
+            AofConfig {
+                flush_bytes: 1,
+                flush_interval: None,
+                queue_cap: 64,
+            },
+        )
+        .unwrap();
 
         let dir_arc = Arc::new(dir.clone());
         let (tx, _) = broadcast::channel(256);
@@ -1249,6 +1250,10 @@ mod tests {
         let url = format!("ws://{addr}/ws");
         let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
 
+        // The writer lands bytes in the AOF; the feed picks them up.
+        writer.enqueue(sample_event(journal::KIND_HOLD, 700, 21, 1200));
+        writer.enqueue(sample_event(journal::KIND_RENEW, 800, 21, 1300));
+
         let val = ws_wait_for(&mut ws, Duration::from_secs(5), |v| {
             v["type"] == "event" && v["ts"] == 700
         })
@@ -1261,18 +1266,22 @@ mod tests {
         .await;
         assert_eq!(val["kind"], "renew");
 
-        // The REST listing serves the same series.
+        // The REST listing serves the same AOF series.
         let resp = http_get(addr, "/files").await;
         assert_eq!(resp.status, 200);
         let listing: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
         assert_eq!(listing.as_array().unwrap().len(), 1);
         assert_eq!(listing[0]["open"], true);
 
-        // The file endpoint returns the raw series bytes.
+        // The file endpoint returns the raw AOF bytes.
         let name = listing[0]["name"].as_str().unwrap().to_string();
         let resp = http_get(addr, &format!("/files/{name}")).await;
         assert_eq!(resp.status, 200);
         assert_eq!(resp.body.len(), 2 * RECORD_SIZE);
+
+        // Only two events through a 64-slot queue: nothing dropped.
+        assert_eq!(writer.drops(), 0);
+        drop(writer); // graceful shutdown: drains and fsyncs
         let _ = fs::remove_dir_all(&dir);
     }
 }

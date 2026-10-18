@@ -102,6 +102,7 @@ local record M
     cdylib: function(string): Profile
     lease_node: function(string): Profile
     lease_ladder: function(string): Profile
+    standby_stack: function(string): Profile
     snapshot_tools: function(string): Profile
     lock_feed: function(string): Profile
     image: function(string): Profile
@@ -511,6 +512,25 @@ end
 -- serves the standby's AOF series to the console, and no other rig entry
 -- boots it, so it belongs to the standby's artifact set and to nobody's
 -- else.
+function M.standby_stack(root: string): Profile
+    local profile = M.lease_node(root)
+    profile.label = "the lease-sequencer standby stack"
+    profile.rebuild = LEASE_REBUILD
+        .. " && cargo build --release --manifest-path ext/lock_feed/Cargo.toml"
+    profile.sources = {
+        "ext/lock_feed",
+        "examples/lease-sequencer",
+        "ext/advisory_lock",
+        "ext/lunet-locks-aof",
+        ".cargo",
+        "rust-toolchain.toml",
+    }
+    profile.artifacts[#profile.artifacts + 1] = binary(
+        "the console feed", fs.join(root, "ext/lock_feed/target/release/lock-feed")
+    )
+    return profile
+end
+
 -- The snapshot acceptance run's two tools: the flight-tape reader, from the
 -- example crate, and the admin nuke, from the adapter crate.
 function M.snapshot_tools(root: string): Profile

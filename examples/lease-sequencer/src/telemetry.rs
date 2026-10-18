@@ -178,17 +178,6 @@ impl TelemetryLog {
         self.gate.active()
     }
 
-    /// The sync point's forced flush: the batch in hand is durable NOW,
-    /// and the flush cadence re-arms from this moment (the ceremony's
-    /// rule 2 — the frontier is in the buffer, so the witness forces the
-    /// flush and acknowledges with it).
-    pub fn force_flush(&mut self, now_ms: u64) {
-        if !self.closed && self.gate.active() {
-            self.flush();
-            self.gate.note_flush(now_ms);
-        }
-    }
-
     /// The 1000 ms forced-flush loop's body, plus the rollover check. Runs
     /// only while the gate is active.
     pub fn tick(&mut self, now_ms: u64) {

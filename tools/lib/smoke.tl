@@ -243,8 +243,6 @@ function M.main(root: string, _argv: {string}): integer
                 fs.join(work, name .. ".nonce"),
                 "--cluster",
                 fs.join(work, "cluster.jsonl"),
-                "--witnesses",
-                fs.join(work, "witnesses.jsonl"),
             },
             name,
             {
@@ -279,17 +277,6 @@ function M.main(root: string, _argv: {string}): integer
         ) then
             fail("cargo build failed")
         end
-        -- The witness receiver is the smoke's own spawn: its binary is
-        -- built by this lane or the witness stage has nothing to boot.
-        -- The replay tool rides the same build: the operator's recovery
-        -- reads the witness's series.
-        if not shell.run(
-            "cargo build --release --manifest-path "
-                .. shell.quote(fs.join(root, "examples/lease-sequencer/Cargo.toml"))
-                .. " --bin witness --bin witness-replay"
-        ) then
-            fail("the witness binaries' build failed")
-        end
         if not shell.run(shell.quote(cyan) .. " build --prune") then
             fail("cyan build failed")
         end
@@ -300,39 +287,6 @@ function M.main(root: string, _argv: {string}): integer
         -- rebuild was about to replace; asking after it can only catch an
         -- artifact that survived the rebuild without matching its source.
         stale_binary.check(root, stale_binary.cdylib(root))
-
-        -- The static witness: outside the roster, host-config-listed, the
-        -- stream's backup certificate. Every member carries the same
-        -- --witnesses file and forwards every peer datagram to it, fire
-        -- and forget; the witness tapes the datagrams whole into its
-        -- {epoch}.aof series with the two high-watermarks riding.
-        fs.write_all(
-            fs.join(work, "witnesses.jsonl"),
-            '{"name":"dr-a","endpoint":"127.0.0.1:28300"}\n'
-        )
-        local witness = proc.spawn(
-            {
-                fs.join(root, "examples/lease-sequencer/target/release/witness"),
-                "--listen",
-                "127.0.0.1:28300",
-                "--aof-dir",
-                fs.join(work, "witness/aof"),
-                "--flush-ms",
-                "500",
-                "--bind",
-                "127.0.0.1:28301",
-                "--follow",
-            },
-            "witness",
-            {
-                out_path = fs.join(work, "witness.out"),
-                err_path = fs.join(work, "witness.err"),
-                combine = false,
-                env = {},
-            }
-        )
-        procs.witness = witness
-        clock.sleep(1)
 
         start("n1")
         start("n2")
@@ -853,72 +807,6 @@ function M.main(root: string, _argv: {string}): integer
                     .. marker:gsub("\n", " ")
                     .. ")"
             )
-        end
-
-        -- The witness's certificate: by now the members have forwarded
-        -- the whole stream across every stage — the witness's tape
-        -- flushed on its own cadence and carries the received datagrams.
-        local witness_err = fs.read_all(fs.join(work, "witness.err"))
-        if not witness_err:find("the tape flushed", 1, true) then
-            io.stderr:write("lunet smoke: the witness's tape never flushed:\n")
-            io.stderr:write(witness_err)
-            fail("the witness's tape never flushed")
-        end
-        -- The ceremony's step 1 on the wire: the persistence stage's
-        -- clean stops broadcast the sync point; the witness answers by
-        -- the rules — the acknowledged line is the ack's log.
-        if not witness_err:find("sync point", 1, true) then
-            io.stderr:write("lunet smoke: the witness never saw a sync point:\n")
-            io.stderr:write(witness_err)
-            fail("the witness never saw a sync point")
-        end
-        local witness_aof = fs.join(work, "witness/aof")
-        local entries, _list_err = fs.list_dir(witness_aof)
-        local tape_bytes = 0
-        local lifted_series = false
-        for _, entry in ipairs(entries or {}) do
-            local text = fs.read_all(fs.join(witness_aof, entry))
-            tape_bytes = tape_bytes + #text
-            if entry:find("ev-", 1, true) then
-                lifted_series = true
-            end
-        end
-        if tape_bytes == 0 then
-            fail("the witness's tape is empty: no datagram ever landed")
-        end
-        if not lifted_series then
-            fail("the witness's lock-event series never landed: the lift wrote nothing")
-        end
-        -- The served cache: the witness IS the console's backend — the
-        -- bridge's read-only server rides this very process and
-        -- directory. Its announcement is the process's stdout.
-        local witness_out = fs.read_all(fs.join(work, "witness.out"))
-        if not witness_out:find("serving the console", 1, true) then
-            io.stderr:write(
-                "lunet smoke: the witness's console server never announced:\n"
-            )
-            io.stderr:write(witness_out)
-            fail("the witness's console server never announced")
-        end
-        -- The operator's cold-start recovery: the witness series replayed
-        -- through the real state machine recovers the locks the stream
-        -- recorded — the ordered shutdown's certificate, read by the
-        -- driven tool, never by any startup path.
-        if not shell.run(
-            fs.join(root, "examples/lease-sequencer/target/release/witness-replay")
-                .. " --aof-dir "
-                .. shell.quote(fs.join(work, "witness/aof"))
-                .. " | tee "
-                .. shell.quote(fs.join(work, "witness-replay.out"))
-        ) then
-            fail("the witness replay failed")
-        end
-        local replay_out = fs.read_all(fs.join(work, "witness-replay.out"))
-        if not replay_out:find("/smoke/wal-persist", 1, true) then
-            io.stderr:write(
-                "lunet smoke: the replay's recovered table:\n" .. replay_out
-            )
-            fail("the replay did not recover the named lock the stream recorded")
         end
 
         started = true

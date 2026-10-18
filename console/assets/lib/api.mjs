@@ -1,6 +1,6 @@
 // Thin fetch client for the admin API (see ../../openapi.yaml).
 
-import { config } from "./state.mjs";
+import { config, isBridge } from "./state.mjs";
 
 /** @typedef {import("./types.mjs").Cluster} Cluster */
 /** @typedef {import("./types.mjs").EventsParams} EventsParams */
@@ -15,10 +15,11 @@ import { config } from "./state.mjs";
 /** @typedef {import("./types.mjs").TelemetryLogParams} TelemetryLogParams */
 /** @typedef {import("./types.mjs").TelemetryLogResponse} TelemetryLogResponse */
 
-// The base: the nginx edge's /api/v1 (the witness's served cache behind
-// it in the live shape, the mock in development) — one OpenAPI surface.
+// The data source decides the base: the nginx edge's /api/v1 (mock or live
+// cluster behind it) or the aof-console-bridge's absolute URL. Both speak
+// the same OpenAPI shapes.
 function base() {
-  return config.apiBase;
+  return isBridge ? config.bridgeBase : config.apiBase;
 }
 
 /**
@@ -66,7 +67,7 @@ export const api = {
   series: (params) => call("GET", "/metrics/series", params),
   // The telemetry panel's data source: the observability contract's JSON
   // log series (the named protocol events plus the tape's slot-frontier
-  // records). The mock serves the same shape.
+  // records). The mock and the aof-console-bridge serve the same shape.
   /** @param {TelemetryLogParams} params @returns {Promise<TelemetryLogResponse>} */
   telemetryLog: (params) => call("GET", "/telemetry/log", params),
 };

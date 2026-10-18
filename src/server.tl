@@ -113,7 +113,8 @@ local record Options
     recovery_ms: integer
     event_journal_dir: string
     event_journal_roll_bytes: integer
-    witnesses: {cluster_config.Witness}
+    aof_dir: string
+    aof_flush_ms: integer
 end
 
 local record Pending
@@ -174,7 +175,7 @@ local function usage(): string
         .. "at least three entries) "
         .. "[--heartbeat-ms N] [--election-ms N] [--recovery-ms N] "
         .. "[--event-journal-dir PATH] [--event-journal-roll-bytes N] "
-        .. "[--witnesses PATH]"
+        .. "[--aof-dir PATH] [--aof-flush-ms N]"
 end
 
 local function positive(value: string, name: string): integer
@@ -206,7 +207,8 @@ local function parse_options(argv: {string}): Options
     local recovery_ms: integer = 2500
     local event_journal_dir: string = ""
     local event_journal_roll_bytes: integer = 8388608
-    local witnesses_path: string = ""
+    local aof_dir: string = ""
+    local aof_flush_ms: integer = 0
     local index = 1
     while index <= #argv do
         local flag = argv[index]
@@ -239,9 +241,11 @@ local function parse_options(argv: {string}): Options
             event_journal_roll_bytes = positive(
                 value, "server: --event-journal-roll-bytes"
             )
-        elseif flag == "--witnesses" then
-            assert(witnesses_path == "", "server: --witnesses may appear once")
-            witnesses_path = value
+        elseif flag == "--aof-dir" then
+            assert(aof_dir == "", "server: --aof-dir may appear once")
+            aof_dir = value
+        elseif flag == "--aof-flush-ms" then
+            aof_flush_ms = positive(value, "server: --aof-flush-ms")
         else
             error("server: unknown option " .. flag)
         end
@@ -258,14 +262,10 @@ local function parse_options(argv: {string}): Options
         election_ms >= heartbeat_ms,
         "server: election timeout must be at least heartbeat"
     )
-    local witnesses: {cluster_config.Witness} = {}
-    if witnesses_path ~= "" then
-        local file = io.open(witnesses_path, "r")
-        assert(file ~= nil, "server: cannot read witnesses file " .. witnesses_path)
-        local text = file:read("a")
-        file:close()
-        witnesses = cluster_config.parse_witnesses(text)
-    end
+    assert(
+        aof_dir == "" or event_journal_dir == "",
+        "server: --aof-dir and --event-journal-dir are exclusive mounts"
+    )
     return {
         node = node,
         client = client,
@@ -277,7 +277,8 @@ local function parse_options(argv: {string}): Options
         recovery_ms = recovery_ms,
         event_journal_dir = event_journal_dir,
         event_journal_roll_bytes = event_journal_roll_bytes,
-        witnesses = witnesses,
+        aof_dir = aof_dir,
+        aof_flush_ms = aof_flush_ms,
     }
 end
 
@@ -363,13 +364,24 @@ local function main(options: Options)
     end
     assert(udp_host ~= "", "server: own member missing")
 
-    local node: advisory_lock.Node = advisory_lock.new(
-        options.nodes,
-        options.node,
-        options.state,
-        options.event_journal_dir,
-        options.event_journal_roll_bytes
-    )
+    local node: advisory_lock.Node
+    if options.aof_dir ~= "" then
+        node = advisory_lock.new_aof(
+            options.nodes,
+            options.node,
+            options.state,
+            options.aof_dir,
+            options.aof_flush_ms
+        )
+    else
+        node = advisory_lock.new(
+            options.nodes,
+            options.node,
+            options.state,
+            options.event_journal_dir,
+            options.event_journal_roll_bytes
+        )
+    end
     own_id = node:own_id()
     log_membership(membership_log)
     -- The v0.10.0 stop contract's drain point, wired to the reference
@@ -377,66 +389,6 @@ local function main(options: Options)
     -- synchronous only, and the hosted node's graceful stop (wire close,
     -- `stopped` marker, sink drain, `flushed` marker) executes there. No
     -- Teal-side close machinery of our own runs outside this hook.
-    -- those bytes instead of opening a client transaction, so an idle
-    -- leader costs the journal no slots.
-    local last_commit: {integer: Commit} = {}
-    local commit_since_beat = false
-    -- Forward declarations: the discovery loop and the admin drive are
-    -- defined before the send helpers they route through.
-    local send_endpoint: function(string, string)
-    local flush: function({Output})
-    -- The static witnesses: host config, outside the roster, never
-    -- purged. Every datagram the node sends a peer, each witness's
-    -- endpoint receives the same bytes, fire and forget — a witness's
-    -- absence costs one datagram, never a wait, so the send is a UDP
-    -- write the protocol never hears about.
-    local witness_endpoints: {string} = {}
-    for _, witness in ipairs(options.witnesses) do
-        table.insert(witness_endpoints, witness.host .. ":" .. tostring(witness.port))
-        log_membership(
-            "advisory-lock witness "
-                .. witness.name
-                .. " at "
-                .. witness.host
-                .. ":"
-                .. tostring(witness.port)
-        )
-    end
-
-    -- The node's committed frontier rides the forwards: the highest
-    -- (era, view, slot) this node has ever forwarded is the frontier
-    -- its stop's sync point names. The forwarded frame's own frontier
-    -- sits after the peer envelope (the magic, the kind byte, the
-    -- fingerprint); its VRR header is tag|era|view|slot, 20 bytes,
-    -- big-endian.
-    local witness_era, witness_view, witness_slot = 0, 0, 0
-
-    local function forward_witnesses(encoded: string)
-        for _, witness_endpoint in ipairs(witness_endpoints) do
-            local ok = pcall(send_endpoint, witness_endpoint, encoded)
-            if not ok then
-                -- A witness's unreachability is never fatal: the stream
-                -- is fire and forget, and the witness's own gap is its
-                -- own affair.
-                log_membership("advisory-lock witness send failed; datagram dropped")
-            end
-        end
-    end
-
-    -- The node's committed frontier rides the drain: the highest
-    -- (era, view, slot) this node has ever put on the wire is the
-    -- frontier its stop's sync point names. The drain's outputs carry
-    -- the fields already parsed — no byte reading on the send path.
-    local function observe_frontier(era: integer, view: integer, slot: integer)
-        if
-            era > witness_era
-            or (era == witness_era and view > witness_view)
-            or (era == witness_era and view == witness_view and slot > witness_slot)
-        then
-            witness_era, witness_view, witness_slot = era, view, slot
-        end
-    end
-
     lunet.on_stop(
         function()
             log_membership(
@@ -464,6 +416,15 @@ local function main(options: Options)
     -- The heartbeat of a commit: the leader's LAST commit per peer, with
     -- the ballot that authorised it, and whether the last beat interval
     -- carried a Commit out of this node. The idle beat re-announces
+    -- those bytes instead of opening a client transaction, so an idle
+    -- leader costs the journal no slots.
+    local last_commit: {integer: Commit} = {}
+    local commit_since_beat = false
+    -- Forward declarations: the discovery loop and the admin drive are
+    -- defined before the send helpers they route through.
+    local send_endpoint: function(string, string)
+    local flush: function({Output})
+
     local guard = membership_guard.new(fingerprint)
     local listener_open = true
 
@@ -657,8 +618,8 @@ local function main(options: Options)
     -- The lazy write-behind: adopted membership facts persist on this
     -- routine tick, never on the message path. The sidecar is rewritten
     -- atomically (temporary file, rename) with no fsync -- the same
-    -- documented loss window any deferred writer carries, and nothing
-    -- depends on the file for safety.
+    -- documented loss window the AOF writer carries, and nothing depends
+    -- on the file for safety.
     local function write_behind_loop()
         while true do
             lunet.sleep(WRITE_BEHIND_MS)
@@ -822,9 +783,9 @@ local function main(options: Options)
             )
             return
         end
-        local encoded = transport.encode_peer(transport.PEER_VRR, fingerprint, payload)
-        forward_witnesses(encoded)
-        send_endpoint(endpoint, encoded)
+        send_endpoint(
+            endpoint, transport.encode_peer(transport.PEER_VRR, fingerprint, payload)
+        )
     end
 
     local function send_application(endpoint: string, payload: string)
@@ -1017,9 +978,6 @@ local function main(options: Options)
                 -- The core emits one unicast send per destination; route as
                 -- addressed (a self-addressed send is delivered like any other).
                 send_vrr(output.replica, output.bytes)
-                -- The node's committed frontier: the highest output's
-                -- identity is the stop's sync point.
-                observe_frontier(output.era, output.view, output.slot)
                 -- The heartbeat of a commit: the last Commit this node put
                 -- on the wire, kept per peer for the idle beat to
                 -- re-announce. The tag is the header's own first word
@@ -1711,28 +1669,6 @@ local function main(options: Options)
                         .. signal_name
                         .. " received"
                 )
-                -- The ceremony's step 1: the sync point — this node's own
-                -- committed frontier, the highest it ever forwarded —
-                -- broadcast to every witness, fire and forget, BEFORE the
-                -- runtime stops. The seat is here and not in the stop
-                -- hook: the hook runs inside the teardown, where the
-                -- runtime's sockets are already refusing; here the send
-                -- lands. Every witness applies the same rule: flushed
-                -- covers the point — ack at once; in the buffer — force
-                -- the flush and ack; unseen — hold the point open, flush
-                -- the moment the stream covers it, ack then. No reply is
-                -- awaited: the witnesses' series are the backup
-                -- certificate, and the node's certificate is its own
-                -- flush.
-                for _, witness_endpoint in ipairs(witness_endpoints) do
-                    pcall(
-                        send_endpoint,
-                        witness_endpoint,
-                        transport.encode_witness_sync(
-                            fingerprint, witness_era, witness_view, witness_slot
-                        )
-                    )
-                end
                 __lunet_exit_code = 0
                 lunet.stop()
             end

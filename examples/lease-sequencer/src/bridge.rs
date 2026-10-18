@@ -40,7 +40,6 @@
 //! or deletes — the standby owns the series.
 
 use lunet_advisory_lock::locks::{Response, Service, Transition};
-use lunet_advisory_lock::witness::Frontier;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
@@ -159,7 +158,7 @@ pub struct LockView {
 }
 
 impl LockView {
-    pub fn to_json(&self, now_ms: u64) -> Value {
+    fn to_json(&self, now_ms: u64) -> Value {
         // The live-lease rule is the Service's own: expiry > now and a
         // real holder. The keeper record a break installs (nil holder,
         // expiry 0) renders free.
@@ -301,9 +300,6 @@ struct CommittedOp {
     /// The Set's offered lease_ms (the requested duration), when the op
     /// is a Set.
     lease_ms: Option<u64>,
-    /// The carrying Prepare's wire-header frontier — the stream's
-    /// progress identity (era, view, slot).
-    frontier: Frontier,
 }
 
 /// The request's wire kind name, from its decoded envelope.
@@ -345,13 +341,15 @@ fn set_lease_ms(request: &lunet_advisory_lock::locks::Request) -> Option<u64> {
 /// Replay one series directory: every `.aof` file in epoch order, every
 /// record decoded, every committed lock op executed through the real
 /// Service state machine. Read-only on disk; deterministic across runs.
-/// Pass 1 of the replay: decode every record; classify Wire payloads and
-/// collect the committed lock work (Prepare entries whose payload passes
-/// the same `Service::decode` gate the adapter applies at commit).
-fn committed_ops(dir: &Path, metrics: &mut BridgeMetrics) -> Vec<CommittedOp> {
+pub fn replay_series(dir: &Path) -> (Vec<LockEvent>, LockState, BridgeMetrics) {
+    let mut metrics = BridgeMetrics::default();
     let mut committed: Vec<CommittedOp> = Vec::new();
+
+    // Pass 1: decode every record; classify Wire payloads and collect the
+    // committed lock work (Prepare entries whose payload passes the same
+    // `Service::decode` gate the adapter applies at commit).
     for file in series_files(dir) {
-        for record in read_file_records(&file, metrics) {
+        for record in read_file_records(&file, &mut metrics) {
             metrics.records += 1;
             let ns = record.ns;
             if metrics.first_ns.is_none() {
@@ -381,9 +379,6 @@ fn committed_ops(dir: &Path, metrics: &mut BridgeMetrics) -> Vec<CommittedOp> {
                 .entry(tag_name(message.header.tag).to_string())
                 .or_insert(0) += 1;
 
-            // The header's frontier triple: the stream's progress
-            // identity the carrying Prepare proposed at.
-            let frontier = message_frontier(&message.header);
             let Body::Prepare { entry, .. } = message.body else {
                 continue;
             };
@@ -415,89 +410,14 @@ fn committed_ops(dir: &Path, metrics: &mut BridgeMetrics) -> Vec<CommittedOp> {
                 lock_id: request_lock_id(&request),
                 offered: set_holder(&request),
                 lease_ms: set_lease_ms(&request),
-                frontier,
             });
         }
     }
-    committed
-}
 
-/// One replayed transition, raw: the state machine's own shapes — the
-/// transition's lease_id, holder bytes and expiry ride whole, exactly
-/// what the LKE1 record encodes — with the receipt time it committed at
-/// and the frontier the carrying Prepare proposed at.
-#[derive(Debug, Clone)]
-pub struct RawTransition {
-    pub ns: u64,
-    pub ts_ms: u64,
-    /// The carrying Prepare's wire-header frontier: the stream's
-    /// progress identity, the lift's cursor shape.
-    pub frontier: Frontier,
-    pub transition: Transition,
-}
-
-/// The committed stream's transitions, in slot order: the same replay
-/// the events derive from, carrying the state machine's own shapes. The
-/// witness's LKE1 series is written from these.
-pub fn replay_transitions(dir: &Path) -> Vec<RawTransition> {
-    let mut metrics = BridgeMetrics::default();
-    let mut committed = committed_ops(dir, &mut metrics);
-    committed.sort_by_key(|op| op.ns);
-
-    let mut service = Service::default();
-    let mut out = Vec::new();
-    for op in committed {
-        let now_ms = ns_to_ms(op.ns);
-        if let Ok((_bytes, Some(transition))) = service.execute(
-            op.message_id,
-            op.client_id,
-            op.request_num,
-            now_ms,
-            &op.payload,
-        ) {
-            out.push(RawTransition {
-                ns: op.ns,
-                ts_ms: now_ms,
-                frontier: op.frontier,
-                transition,
-            });
-        }
-    }
-    out
-}
-
-/// The wire header's frontier triple: (era, view, slot), the stream's
-/// progress identity the witness's own watermarks order by.
-fn message_frontier(header: &vrr::wire::Header) -> Frontier {
-    Frontier {
-        era: header.view.era.0,
-        view: header.view.view.0,
-        slot: header.slot.0,
-    }
-}
-
-/// The lift's cursor step: the transitions strictly above the recorded
-/// frontier. The cursor is the frontier reached — the last written
-/// transition's (era, view, slot) — never a count: the retention drops
-/// the tape's oldest files and the replay window re-bases underneath
-/// the lift, so a count cursor then names the wrong transitions (real
-/// work skipped, written work re-written). Whatever the window still
-/// carries at or below the frontier is already in the series; the lift
-/// resumes exactly past it, whatever retention did to the tape's head.
-pub fn lift_transitions(
-    transitions: &[RawTransition],
-    cursor: Option<Frontier>,
-) -> Vec<RawTransition> {
-    transitions
-        .iter()
-        .filter(|raw| cursor.is_none_or(|reached| raw.frontier > reached))
-        .cloned()
-        .collect()
-}
-
-pub fn replay_series(dir: &Path) -> (Vec<LockEvent>, LockState, BridgeMetrics) {
-    let mut metrics = BridgeMetrics::default();
-    let mut committed = committed_ops(dir, &mut metrics);
+    // Pass 2: replay the committed stream in slot order (record order) —
+    // slot order IS record order within the standby's trace, since the
+    // standby appends each datagram at its local ns receipt and commits
+    // follow the Prepare stream it records.
     committed.sort_by_key(|op| op.ns);
 
     let mut service = Service::default();
@@ -1063,7 +983,7 @@ fn route(
             json!({
                 "status": "ok",
                 "nowMs": unix_millis(),
-                "source": "witness",
+                "source": "aof-console-bridge",
             })
             .to_string(),
         ),

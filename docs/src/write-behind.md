@@ -30,13 +30,17 @@ rebuilds from the replica stream. The shapes are proven by the WAL node
 tests (clean-restart persistence, dirty-boot refusal) beside the state
 seam's tests.
 
-clean-restart persistence, dirty-boot refusal) beside the state
-seam's tests. The witness's tape and series are the write-behind
-capture plane ([the witness capture](telemetry-aof.md)), served to the
-console from the witness process. The witness watermarks and the three
-sync-point rules (the decisions register) carry the deployment's
-durability posture: the sync-point certificate is what a witness's
-flushed tape vouches for.
+The write-behind AOF writer is built and defended, and the host surface
+reaches it: the C ABI's `lunet_lock_node_new_aof` and the server's
+`--aof-dir` (with `--aof-flush-ms`) mount the writer in the journal's
+place — the mounts exclusive, the AOF directory required, the roll
+threshold fixed at the 2 MiB erasure block. The example crate's standby
+mode (`--aof-dir`) constructs the same sink. The writer is compiled and
+tested by `make ext-test` and the WAL node tests. What the witness
+watermarks and the three sync-point rules (the decisions register) still
+gate is the deployment's durability posture: which members of a running
+cluster mount the writer as their committed-transition series is decided
+with the witness certificate in hand.
 
 ## Why a frame and not a running series
 

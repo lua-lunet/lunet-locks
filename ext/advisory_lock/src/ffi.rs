@@ -205,7 +205,27 @@
 //! NUL-separated `<u32-id>:<name>` entries in descriptor (genesis succession)
 //! order, with post-genesis entries suffixed `:j` (see Identity above);
 //! `own_data` is the local member's name.
+//!
+//! ```text
+//! lunet_lock_node_new_aof(
+//!     members_len: usize, members_data: *const u8,
+//!     own_len: usize, own_data: *const u8,
+//!     state_len: usize, state_data: *const u8,
+//!     aof_dir_len: usize, aof_dir_data: *const u8,
+//!     flush_ms: u64,
+//!     out: *mut *mut c_void,
+//! ) -> i32
+//! ```
+//!
+//! The AOF-backed creator: the committed-transition hook enqueues to the
+//! write-behind AOF writer instead of the blocking journal. `aof_dir` is
+//! required — an empty directory is an `INVALID` call, not a journal
+//! fallback. `flush_ms` is the periodic fsync cadence; 0 fsyncs only at
+//! roll and shutdown. The roll threshold is fixed at the 2 MiB erasure
+//! block and `members_data`/`own_data`/`state_data` follow the same
+//! grammar as `lunet_lock_node_new`.
 
+use crate::aof::{AofConfig, AofWriter};
 use crate::disk::{Disk, StdDisk, std_disk};
 use crate::journal::{self, Journal as LockJournal, JournalEvent};
 use crate::locks::{Service, Transition};
@@ -222,7 +242,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, trace, warn};
 use vrr::configuration::{EraTable, INIT_SLOT, MAX_MEMBERS, SystemOperation, VOID_SLOT};
 use vrr::effects::{Effect, Stability};
@@ -511,6 +531,10 @@ pub struct Node {
     ///
     /// - `Blocking` writes the classic per-replica journal: blocking
     ///   buffered appends on the apply path; an append error disables it.
+    /// - `Aof` enqueues to the async write-behind writer: producers never
+    ///   wait on disk, overflow drops (the writer's drop counter tracks
+    ///   it), and fsync happens only on the timer, at roll, at checkpoint,
+    ///   and at shutdown.
     ///
     /// The door is shared with the boot gate's store: the engine's halt
     /// schedule forces it through `LifecycleStore::drain`, strictly
@@ -578,6 +602,7 @@ pub struct Node {
 /// The committed-transition sink behind `Node`'s journal hook.
 pub(crate) enum JournalSink {
     Blocking(LockJournal),
+    Aof(AofWriter),
 }
 
 impl Node {
@@ -1227,7 +1252,8 @@ impl Node {
                 // Append a journal event for first-execution transitions
                 // only (never on cached duplicate replay). A blocking-journal
                 // error disables journaling for the process; the node keeps
-                // serving.
+                // serving. The AOF sink enqueues and never fails: overflow
+                // drops into the writer's drop counter.
                 if let Some(transition) = transition {
                     // The tick path's changed set: every committed lock
                     // transition notes its lock, so the store's next tick
@@ -1314,6 +1340,7 @@ impl Node {
                                 *sink = None;
                             }
                         }
+                        Some(JournalSink::Aof(writer)) => writer.enqueue(event),
                         None => {}
                     }
                     drop(sink);
@@ -1632,7 +1659,7 @@ impl Node {
     ///   projection mechanics stay the machinery's.
     ///
     /// The defaulting entry points stay exactly as they are —
-    /// [`Node::open`],
+    /// [`Node::open`], [`Node::open_aof`],
     /// [`Node::open_with_recovery_flush`], [`Node::open_bench`], and the
     /// C ABI's `lunet_lock_node_new` hard-default all four seams and the
     /// C ABI takes no new surface.
@@ -1668,6 +1695,36 @@ impl Node {
                 state_store,
                 commit_hook,
                 fence,
+            )
+        }))
+        .unwrap_or(Err(PANIC))
+    }
+    /// The AOF-backed constructor: the committed-transition hook enqueues
+    /// to the AOF write-behind writer instead of the blocking journal. Same
+    /// member/own/state grammar as [`Node::open`]; `aof_dir` is the AOF
+    /// series directory (created or resumed); `flush_ms` is the periodic
+    /// fsync knob (`None` fsyncs only at roll and shutdown). The roll
+    /// threshold is fixed at the 2 MiB erasure block.
+    ///
+    /// The C ABI takes this path through [`lunet_lock_node_new_aof`].
+    pub fn open_aof(
+        members: &str,
+        own: &str,
+        state: &str,
+        aof_dir: &str,
+        flush_ms: Option<u64>,
+    ) -> Result<Node, i32> {
+        catch_unwind(AssertUnwindSafe(|| {
+            let disk = std_disk();
+            node_from_aof(
+                members.as_bytes(),
+                own.as_bytes(),
+                state.as_bytes(),
+                aof_dir,
+                flush_ms.map(Duration::from_millis),
+                Arc::clone(&disk),
+                default_state_store(&disk, state),
+                default_commit_hook(),
             )
         }))
         .unwrap_or(Err(PANIC))
@@ -2115,8 +2172,9 @@ impl Node {
     ///    (`Stopping`, 4x): termination has begun, it vouches for
     ///    nothing.
     /// 3. **The drain** — the host's, through the engine's schedule: the
-    ///    committed-transition sink drains to quiescence (the blocking
-    ///    journal fsynced), strictly between the two rounds.
+    ///    committed-transition sink drains to quiescence (the AOF
+    ///    writer's queue appended and fsynced; the blocking journal
+    ///    fsynced), strictly between the two rounds.
     /// 4. **The state flush** — the lock table's whole state, in the
     ///    foreground, in the drain window: after the drain closes and
     ///    before the `Stopped` round is written. The eager half of the
@@ -3217,6 +3275,57 @@ fn node_from_parts(
     )
 }
 
+/// The AOF-backed variant: the committed-transition hook enqueues to the
+/// async write-behind writer instead of the blocking journal. Same node
+/// construction; the C ABI never takes this path.
+// The parameter list IS the node construction grammar, one caller-supplied
+// fact per parameter: the descriptor buffers, the AOF series and its flush
+// interval, the disk, the state store and the commit hook. It pays here for
+// the same reason [`node_from_sink`]'s pays — folding them into a carrier
+// struct would rewrite the construction grammar's shape at every call site,
+// and the seams are the only things this file may move.
+#[allow(clippy::too_many_arguments)]
+fn node_from_aof(
+    members_data: &[u8],
+    own_data: &[u8],
+    state_data: &[u8],
+    aof_dir: &str,
+    flush_interval: Option<Duration>,
+    disk: Arc<dyn Disk>,
+    state_store: Box<dyn StateStore>,
+    commit_hook: Arc<Mutex<dyn CommitHook>>,
+) -> Result<Node, i32> {
+    let config = AofConfig {
+        flush_interval,
+        ..AofConfig::default()
+    };
+    let sink = match AofWriter::open_on(Arc::clone(&disk), Path::new(aof_dir), config) {
+        Ok(writer) => Some(JournalSink::Aof(writer)),
+        Err(e) => {
+            eprintln!(
+                "lunet-advisory-lock: aof open failed ({e}); \
+                 telemetry disabled for this process"
+            );
+            None
+        }
+    };
+    node_from_sink(
+        members_data,
+        own_data,
+        state_data,
+        sink,
+        None,
+        None,
+        Construction {
+            primary_timeout: PRIMARY_TIMEOUT_MS,
+        },
+        disk,
+        state_store,
+        commit_hook,
+        None,
+    )
+}
+
 // The parameter list IS the node construction grammar, one caller-supplied
 // fact per parameter: the three descriptor buffers, the event sink, the
 // recovery boundary, the bench control socket, the runtime policy, the
@@ -3690,6 +3799,75 @@ pub unsafe extern "C" fn lunet_lock_node_new(
                 wal_state_store(state),
                 default_commit_hook(),
                 None,
+            )
+        })) {
+            Ok(Ok(node)) => {
+                unsafe { *out = Box::into_raw(Box::new(node)).cast() };
+                OK
+            }
+            Ok(Err(code)) => code,
+            Err(_) => PANIC,
+        }
+    })
+}
+
+/// The AOF-backed creator: the committed-transition hook enqueues to the
+/// write-behind AOF writer instead of the blocking journal. Same grammar
+/// as [`lunet_lock_node_new`] with `journal_dir`/`roll_bytes` replaced by
+/// the required `aof_dir` and the `flush_ms` cadence (0 fsyncs only at
+/// roll and shutdown).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lunet_lock_node_new_aof(
+    members_len: usize,
+    members_data: *const u8,
+    own_len: usize,
+    own_data: *const u8,
+    state_len: usize,
+    state_data: *const u8,
+    aof_dir_len: usize,
+    aof_dir_data: *const u8,
+    flush_ms: u64,
+    out: *mut *mut c_void,
+) -> i32 {
+    guarded(|| {
+        if out.is_null() {
+            return INVALID;
+        }
+        let Ok(members_data) = (unsafe { bytes(members_len, members_data) }) else {
+            return INVALID;
+        };
+        let Ok(own_data) = (unsafe { bytes(own_len, own_data) }) else {
+            return INVALID;
+        };
+        let Ok(state_data) = (unsafe { bytes(state_len, state_data) }) else {
+            return INVALID;
+        };
+        let Ok(aof_dir_data) = (unsafe { bytes(aof_dir_len, aof_dir_data) }) else {
+            return INVALID;
+        };
+        let Ok(aof_dir) = std::str::from_utf8(aof_dir_data) else {
+            return INVALID;
+        };
+        if aof_dir.is_empty() {
+            return INVALID;
+        }
+        let flush_interval = if flush_ms == 0 {
+            None
+        } else {
+            Some(Duration::from_millis(flush_ms))
+        };
+        match catch_unwind(AssertUnwindSafe(|| {
+            let disk = std_disk();
+            let state = std::str::from_utf8(state_data).unwrap_or_default();
+            node_from_aof(
+                members_data,
+                own_data,
+                state_data,
+                aof_dir,
+                flush_interval,
+                Arc::clone(&disk),
+                wal_state_store(state),
+                default_commit_hook(),
             )
         })) {
             Ok(Ok(node)) => {

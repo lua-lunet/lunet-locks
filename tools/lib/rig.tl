@@ -1,5 +1,6 @@
 -- The lease-sequencer rig: the typed runner library behind the example
--- entries (run.lua, run-takeover.lua, run-acceptance.lua).
+-- entries (run.lua, run-takeover.lua, run-acceptance.lua,
+-- check-standby.lua).
 -- Six storage nodes, two per three datacenters, each a release rig
 -- binary binding a UDP peer port and a TCP client NDJSON port. The
 -- gates read the logs DIRECTORY and match node-name prefixes — no
@@ -24,11 +25,14 @@ local record NodeSpec
     client_port: integer
 end
 
--- The per-run node knobs: cadences and the descriptor the node boots.
+-- The per-run node knobs: cadences, the standby's AOF feed, and the
+-- descriptor the node boots.
 local record NodeOpts
     heartbeat_ms: integer
     election_ms: integer
     recovery_ms: integer
+    aof_dir: string
+    aof_flush_ms: integer
     descriptor: string
 end
 
@@ -42,6 +46,8 @@ local function opts(
         heartbeat_ms = heartbeat_ms,
         election_ms = election_ms,
         recovery_ms = recovery_ms,
+        aof_dir = "",
+        aof_flush_ms = 0,
         descriptor = descriptor,
     }
 end
@@ -63,6 +69,7 @@ local record M
     stability: function(string): integer
     takeover: function(string): integer
     acceptance: function(string): integer
+    standby: function(string): integer
     Rig: Rig
 end
 
@@ -122,11 +129,18 @@ end
 -- The snapshot rule gates the wipe: the old run state is removed only
 -- after a successful snapshot of it; a failed snapshot refuses the wipe
 -- loudly and the run stops rather than writing over unvouched state.
-local function prepare_run(rig: Rig)
+local function prepare_run(rig: Rig, with_aof: boolean)
     -- The stale-binary rule: every rig entry (stability, takeover,
-    -- acceptance) prepares its run here, so this is the one place
-    -- the check runs and nothing is booted before it has passed.
-    stale_binary.check(rig.root, stale_binary.lease_node(rig.root))
+    -- acceptance, standby) prepares its run here, so this is the one place
+    -- the check runs and nothing is booted before it has passed. The
+    -- standby's AOF feed is the one rig path that boots a binary from
+    -- another crate, so it is also the one path that has to prove that
+    -- crate's binary fresh too.
+    if with_aof then
+        stale_binary.check(rig.root, stale_binary.standby_stack(rig.root))
+    else
+        stale_binary.check(rig.root, stale_binary.lease_node(rig.root))
+    end
 
     local ok, message = snapshot.snapshot_then_wipe(rig.run_dir)
     if not ok then
@@ -134,6 +148,9 @@ local function prepare_run(rig: Rig)
     end
     fs.mkdir_p(fs.join(rig.run_dir, "logs"))
     fs.mkdir_p(fs.join(rig.run_dir, "state"))
+    if with_aof then
+        fs.mkdir_p(fs.join(rig.run_dir, "aof"))
+    end
     fs.write_all(fs.join(rig.run_dir, "pids"), "")
 end
 
@@ -162,6 +179,14 @@ local function start_node(rig: Rig, spec: NodeSpec, node_opts: NodeOpts): proc.P
     if node_opts.recovery_ms > 0 then
         argv[#argv + 1] = "--recovery-ms"
         argv[#argv + 1] = tostring(node_opts.recovery_ms)
+    end
+    if node_opts.aof_dir ~= "" then
+        argv[#argv + 1] = "--aof-dir"
+        argv[#argv + 1] = node_opts.aof_dir
+    end
+    if node_opts.aof_flush_ms > 0 then
+        argv[#argv + 1] = "--aof-flush-ms"
+        argv[#argv + 1] = tostring(node_opts.aof_flush_ms)
     end
     -- Per-node info-level files by default; the operator opts the
     -- cluster into debug/trace detail by exporting RUST_LOG (see README).
@@ -508,7 +533,7 @@ local function stability_body(root: string)
     end
 
     local rig = new_rig(root, "run/check", "config/cluster.jsonl")
-    prepare_run(rig)
+    prepare_run(rig, false)
 
     start_all(rig, opts(100, 1000, 1000, rig.config))
 
@@ -777,7 +802,7 @@ function M.takeover(root: string): integer
             end
 
             local rig = new_rig(root, report_dir .. "/takeover-run", config_path)
-            prepare_run(rig)
+            prepare_run(rig, false)
             start_all(rig, opts(10, 0, 0, config_path))
 
             wait_gate(
@@ -974,7 +999,7 @@ function M.acceptance(root: string): integer
                 fs.join(example_dir, "run/acceptance"),
                 fs.join(example_dir, "config/cluster.jsonl")
             )
-            prepare_run(rig)
+            prepare_run(rig, false)
 
             local genesis = fs.join(example_dir, "config/cluster-genesis.jsonl")
             if not fs.exists(genesis) then
@@ -1191,6 +1216,295 @@ function M.acceptance(root: string): integer
             )
 
             print("acceptance: passed")
+            return 0
+        end
+    )
+end
+
+-- ------------------------------------------------------ standby check --
+
+-- The standby AOF + console demo check: six nodes with dc1-node2 as the
+-- STANDBY TELEMETRY NODE (weight 0, never promoted, feeding its
+-- committed lock transitions to the async AOF writer), then the console
+-- stack (bun mock + lock-feed + nginx) driven headless. Asserts the
+-- events land in the standby's AOF series, the feed serves them, the
+-- console's edge returns them, and the cluster cadence is unaffected.
+function M.standby(root: string): integer
+    return guarded(
+        function(): integer
+            clear_stale()
+            local example_dir = fs.join(root, "examples/lease-sequencer")
+            if not shell.run(
+                "cargo build --release --quiet --manifest-path "
+                    .. shell.quote(fs.join(root, "examples/lease-sequencer/Cargo.toml"))
+            ) then
+                gate.fail("build")
+            end
+            if not shell.run(
+                "cargo build --release --quiet --manifest-path "
+                    .. shell.quote(fs.join(root, "ext/lock_feed/Cargo.toml"))
+            ) then
+                gate.fail("feed build")
+            end
+
+            local rig = new_rig(
+                root,
+                fs.join(example_dir, "run/standby"),
+                fs.join(example_dir, "config/cluster.jsonl")
+            )
+            prepare_run(rig, true)
+
+            local standby_name = "dc1-node2"
+
+            local function node_opts_for(spec: NodeSpec): NodeOpts
+                local base = opts(100, 1000, 1000, rig.config)
+                if spec.name == standby_name then
+                    base.aof_dir = fs.join(rig.run_dir, "aof")
+                    base.aof_flush_ms = 500
+                end
+                return base
+            end
+            for _, spec in ipairs(rig.specs) do
+                start_node(rig, spec, node_opts_for(spec))
+            end
+
+            wait_gate(
+                clock.now_ms() + 60000,
+                "cluster did not stabilize",
+                function(): boolean, string
+                    local n = total_renews(rig)
+                    return n >= 4, "renews=" .. n
+                end
+            )
+            print("boot: cluster stabilized, holder stream running")
+
+            -- The standby must be the FIRST post-genesis joiner: the learner
+            -- folds the era that admits it and then tracks the cluster across
+            -- the later eras.
+            for _, spec_line in ipairs(
+                {
+                    "262145 dc1-node2 127.0.0.1:41104",
+                    "327681 dc2-node2 127.0.0.1:41105",
+                    "393217 dc3-node2 127.0.0.1:41106",
+                }
+            ) do
+                local id, name, endpoint = spec_line:match("^(%d+) (%S+) (%S+)")
+                local reply = drive_verb(
+                    rig, "join", (tonumber(id) or 0) as integer, name, endpoint, 90000
+                )
+                if reply == "" then
+                    gate.fail(
+                        "join " .. name .. " (id " .. id .. ") not accepted within 90s"
+                    )
+                end
+                print("join: id " .. id .. " (" .. name .. ") accepted")
+            end
+            if drive_verb(rig, "increment", 327681, "", "", 90000) == "" then
+                gate.fail("increment 327681 not accepted within 90s")
+            end
+            print("increment: id 327681 accepted")
+            if drive_verb(rig, "increment", 393217, "", "", 90000) == "" then
+                gate.fail("increment 393217 not accepted within 90s")
+            end
+            print(
+                "increment: id 393217 accepted ("
+                    .. standby_name
+                    .. " stays at weight 0: the standby telemetry node)"
+            )
+
+            local before_joins = total_renews(rig)
+            wait_gate(
+                clock.now_ms() + 30000,
+                "cluster did not re-stabilize after joins",
+                function(): boolean, string
+                    local n = total_renews(rig)
+                    return (n - before_joins) >= 8, "renews=" .. n
+                end
+            )
+
+            -- The AOF event count: LKE1 magic occurrences across the
+            -- standby's capture series.
+            local aof_events = function(): integer
+                local n = 0
+                for _, rel in ipairs(fs.walk(fs.join(rig.run_dir, "aof"))) do
+                    if rel:match("%.bin$") then
+                        local data = fs.read_all(fs.join(rig.run_dir, "aof", rel))
+                        for _ in data:gmatch("LKE1") do
+                            n = n + 1
+                        end
+                    end
+                end
+                return n
+            end
+
+            -- Console stack: lock-feed serves the standby's AOF series; nginx
+            -- serves the static SPA and maps /feed/ to the feed. The bun mock
+            -- backs the console's admin views.
+            local console_dir = fs.join(root, "console")
+            local feed_bin = fs.join(root, "ext/lock_feed/target/release/lock-feed")
+            -- Absolute FEED_DIR: the console recipe's cwd is console/, not
+            -- the repo root, and the feed's dir check dies on a relative path.
+            local up_cmd = "env PORT=8480 MOCK_PORT=8481 FEED_PORT=8482"
+                .. " FEED_DIR="
+                .. shell.quote(fs.resolve(fs.join(rig.run_dir, "aof")))
+                .. " FEED_BIN="
+                .. shell.quote(fs.resolve(feed_bin))
+                .. " make -C "
+                .. shell.quote(console_dir)
+                .. " up"
+            if shell.status(up_cmd .. " >/dev/null") ~= 0 then
+                gate.fail(
+                    "console stack did not come up (see " .. console_dir .. "/tmp)"
+                )
+            end
+            local creds = fs.read_all(fs.join(console_dir, "tmp/credentials")):gsub(
+                "\n", ""
+            )
+            print(
+                "console: up (127.0.0.1:8480, feed port 8482, AOF dir "
+                    .. fs.join(rig.run_dir, "aof")
+                    .. ")"
+            )
+
+            -- 1. Events land in the standby's AOF files.
+            wait_gate(
+                clock.now_ms() + 30000,
+                "standby AOF never received events",
+                function(): boolean, string
+                    local n = aof_events()
+                    return n >= 20, "count=" .. n
+                end
+            )
+            local aof_count = aof_events()
+            print("aof: " .. aof_count .. " events landed in the standby's AOF series")
+
+            -- 2. The feed serves them (REST listing + file bytes).
+            local files_json, files_err = client.http_get(8482, "/files", "")
+            if files_err ~= "" then
+                gate.fail("feed /files unreachable: " .. files_err)
+            end
+            if not files_json:find('"open":true', 1, true) then
+                gate.fail("feed /files shows no open AOF file: " .. files_json)
+            end
+            local open_name = files_json:match('"name":"(ev%-open%-%d+%.bin)"')
+            if not open_name then
+                gate.fail("feed /files missing the open AOF file name: " .. files_json)
+            end
+            local feed_bytes, feed_err = client.http_get(
+                8482, "/files/" .. open_name, ""
+            )
+            if feed_err ~= "" and feed_bytes == "" then
+                gate.fail("feed /files/" .. open_name .. " unreachable: " .. feed_err)
+            end
+            local feed_count = 0
+            for _ in feed_bytes:gmatch("LKE1") do
+                feed_count = feed_count + 1
+            end
+            if feed_count < 20 then
+                gate.fail(
+                    "feed served only "
+                        .. feed_count
+                        .. " events from the AOF open file"
+                )
+            end
+            print(
+                "feed: served "
+                    .. feed_count
+                    .. " events from "
+                    .. open_name
+                    .. " (of "
+                    .. aof_count
+                    .. " in the series)"
+            )
+            fs.write_all(fs.join(rig.run_dir, "feed-bytes.bin"), feed_bytes)
+
+            -- 3. The console's data endpoint (/feed/* through the nginx edge)
+            -- returns the same series to the SPA.
+            local edge_json, edge_err = client.http_get(8480, "/feed/files", creds)
+            if edge_err ~= "" then
+                gate.fail("console edge /feed/files unreachable: " .. edge_err)
+            end
+            if not edge_json:find('"open":true', 1, true) then
+                gate.fail(
+                    "console edge /feed/files shows no open AOF file: " .. edge_json
+                )
+            end
+            if not edge_json:find(open_name, 1, true) then
+                gate.fail(
+                    "console edge /feed/files missing the AOF open file: " .. edge_json
+                )
+            end
+            local edge_bytes_raw, edge_bytes_err = client.http_get(
+                8480, "/feed/files/" .. open_name, creds
+            )
+            if edge_bytes_err ~= "" and edge_bytes_raw == "" then
+                gate.fail(
+                    "console edge /feed/files/"
+                        .. open_name
+                        .. " unreachable: "
+                        .. edge_bytes_err
+                )
+            end
+            local edge_count = 0
+            for _ in edge_bytes_raw:gmatch("LKE1") do
+                edge_count = edge_count + 1
+            end
+            if edge_count ~= feed_count then
+                gate.fail(
+                    "console edge served "
+                        .. edge_count
+                        .. " events, feed served "
+                        .. feed_count
+                )
+            end
+            print(
+                "console: /feed/files through the edge returns the AOF series ("
+                    .. edge_count
+                    .. " events)"
+            )
+            fs.write_all(fs.join(rig.run_dir, "edge-bytes.bin"), edge_bytes_raw)
+
+            -- 4. The cluster cadence is unaffected.
+            local T0 = clock.now_ms()
+            clock.sleep(6)
+            local T1 = clock.now_ms()
+            print("stability window: " .. T0 .. " .. " .. T1)
+            local cad_ok, report = cadence_report(rig, T0, T1)
+            if not cad_ok then
+                gate.fail("stability-window assertions: " .. report)
+            end
+            print(report)
+            print(
+                "measured renewal cadence with the standby running: "
+                    .. measured_field(report, "renew")
+                    .. " ms"
+            )
+
+            -- The AOF kept receiving events through the window.
+            local final_count = aof_events()
+            if final_count <= aof_count then
+                gate.fail(
+                    "the AOF series stopped growing during the stability window ("
+                        .. aof_count
+                        .. " -> "
+                        .. final_count
+                        .. ")"
+                )
+            end
+            print(
+                "aof: series grew "
+                    .. aof_count
+                    .. " -> "
+                    .. final_count
+                    .. " events across the stability window"
+            )
+
+            shell.status(
+                "make -C " .. shell.quote(console_dir) .. " down >/dev/null 2>&1"
+            )
+
+            print("")
+            print("GREEN: standby AOF + console check passed")
             return 0
         end
     )

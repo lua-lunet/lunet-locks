@@ -46,6 +46,7 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
 use std::process::exit;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tbio::envelope::{Marker, Record, local_ns};
 use tracing::info;
 use tracing_appender::non_blocking::WorkerGuard;
 use vrr::ids::NodeId;
@@ -215,7 +216,8 @@ struct Host {
     last_leader_commit_ms: u64,
     /// The slot frontier: the highest slot this node has put on the wire
     /// (`flush_outputs`' established frontier, never lower). It rides
-    /// the periodic frontier line; no protocol decision reads it.
+    /// the periodic frontier line and the telemetry tape; no protocol
+    /// decision reads it.
     frontier_slot: u64,
     /// The keepalive proposer's own client identity and request counter.
     /// The leader's idle beat — the heartbeat of a commit — re-announces
@@ -247,10 +249,26 @@ struct Host {
     /// random wait in `[min, max]` per watched (era, leader) key,
     /// re-armed on leader evidence, firing the §14.2 forced view when due.
     leader_timeout: timeouts::LeaderTimeout,
+    /// The last replication state the transition recorder saw; a change
+    /// emits a `TelemetryStateTransition` record.
+    last_state: u32,
+    /// The last voting weight the transition recorder saw; a change emits
+    /// a `TelemetryStateTransition` record (the AOF on/off story).
+    last_weight: Option<u32>,
     /// The election wait the tick loop currently runs (ms): the uniform
     /// random draw from the leader-timeout schedule, re-armed when it
     /// changes.
     election_wait_armed: u64,
+    /// The telemetry AOF: the envelope record layer over the
+    /// vendored TigerBeetle AOF, gated by the node's voting weight —
+    /// weight 0 (or the boot Recovering/Joining phase) = ON, weight > 0 =
+    /// OFF. Carries the boot trace (state transitions + outbound), every
+    /// received VRR message as a Wire record while active, and the
+    /// the timeout-decision records. `None` when no `--telemetry-aof-dir`
+    /// (or `--aof-dir` fallback) is configured, or after an append failure
+    /// disabled the stream for the process (telemetry contract: never
+    /// poison the replication path).
+    telemetry: Option<telemetry::TelemetryLog>,
     /// The embedded lock client runner: N contender loops against
     /// this node's own service, ticked from the host loop behind the
     /// host's SIGUSR1/SIGUSR2 client gate. `None` when launched without
@@ -435,6 +453,24 @@ struct Options {
     client: String,
     state: String,
     log: String,
+    /// The AOF series directory. Non-empty turns the node into the standby
+    /// telemetry host: the committed-transition hook feeds the async
+    /// write-behind writer instead of the blocking journal, and the lease
+    /// driver stays idle.
+    aof_dir: String,
+    /// The AOF's periodic-fsync knob (ms). 0 = only at roll and shutdown.
+    aof_flush_ms: u64,
+    /// The vendored TigerBeetle AOF's retention threshold, in MiB of
+    /// `{epoch}.aof` series on disk. Default 10.
+    aof_retention_mib: u64,
+    /// The telemetry AOF's series directory. Empty = fall back to
+    /// `aof_dir`. Every node can carry one: voting nodes log the boot
+    /// trace, then the gate disarms at weight > 0; standbys stay ON.
+    telemetry_aof_dir: String,
+    /// The telemetry active file's rollover threshold, in MiB.
+    /// Default 4; the series keeps exactly the current file + one closed
+    /// old.
+    telemetry_rollover_mib: u64,
     /// The leader timeout's clamp floor, in ms.
     leader_timeout_min_ms: u64,
     /// The leader timeout's clamp ceiling, in ms.
@@ -476,8 +512,9 @@ struct Options {
     /// (`docs/src/bench-harness.md`). Non-empty puts the node on the
     /// bench: the lifecycle marker store rides the driver's socket, the
     /// SIGUSR1/SIGUSR2 pair carries the clean/dirty in-process cycles
-    /// (the client gate never registers) — the journal (`--journal-dir`),
-    /// the logs, and the flight tape are the evidence.
+    /// (the client gate never registers), and the AOF/telemetry options
+    /// are refused — the journal (`--journal-dir`), the logs, and the
+    /// flight tape are the evidence.
     bench_store: String,
     /// The blocking lock-event journal's directory (the committed-
     /// transition CAS chain). Empty = journaling off, as before.
@@ -491,6 +528,11 @@ fn parse_options() -> Options {
         client: String::new(),
         state: String::new(),
         log: String::new(),
+        aof_dir: String::new(),
+        aof_flush_ms: 1000,
+        aof_retention_mib: 10,
+        telemetry_aof_dir: String::new(),
+        telemetry_rollover_mib: 4,
         leader_timeout_min_ms: 500,
         leader_timeout_max_ms: 1000,
         viewchange_timeout_min_ms: 100,
@@ -523,6 +565,13 @@ fn parse_options() -> Options {
             "--client" => options.client = value.clone(),
             "--state" => options.state = value.clone(),
             "--log" => options.log = value.clone(),
+            "--aof-dir" => options.aof_dir = value.clone(),
+            "--aof-flush-ms" => options.aof_flush_ms = value.parse().unwrap_or(1000),
+            "--aof-retention-mib" => options.aof_retention_mib = value.parse().unwrap_or(10),
+            "--telemetry-aof-dir" => options.telemetry_aof_dir = value.clone(),
+            "--telemetry-rollover-mib" => {
+                options.telemetry_rollover_mib = value.parse().unwrap_or(4)
+            }
             "--leader-timeout-min-ms" => {
                 options.leader_timeout_min_ms = value.parse().unwrap_or(500)
             }
@@ -582,7 +631,9 @@ fn parse_options() -> Options {
     {
         eprintln!(
             "usage: lease-sequencer --name NAME --config PATH --client IPv4:PORT \
-         --state PATH --log PATH [--leader-timeout-min-ms N] \
+         --state PATH --log PATH [--aof-dir PATH] [--aof-flush-ms N] \
+         [--aof-retention-mib N] [--telemetry-aof-dir PATH] \
+         [--telemetry-rollover-mib N] [--leader-timeout-min-ms N] \
          [--leader-timeout-max-ms N] \
          [--viewchange-timeout-min-ms N] [--viewchange-timeout-max-ms N] \
          [--recovery-flush diskless|single|double-ring] [--recovery-scratch-dir PATH] \
@@ -594,6 +645,14 @@ fn parse_options() -> Options {
         exit(2);
     }
     if !options.bench_store.is_empty() {
+        if !options.aof_dir.is_empty() || !options.telemetry_aof_dir.is_empty() {
+            eprintln!(
+                "lease-sequencer: --bench-store excludes --aof-dir and \
+                 --telemetry-aof-dir (the journal, the logs, and the flight \
+                 tape are the bench's evidence)"
+            );
+            exit(2);
+        }
         if options.recovery_flush != RecoveryFlush::Diskless {
             eprintln!(
                 "lease-sequencer: --bench-store excludes --recovery-flush \
@@ -659,16 +718,59 @@ impl Host {
             .note_timeout_toggle(record.timedout, record.at_ms, record.previous_ms);
     }
 
+    /// One telemetry record into the gated AOF (a no-op without a series
+    /// or with the gate disarmed — telemetry never touches the
+    /// replication path).
+    fn record_telemetry(&mut self, record: Record) {
+        if let Some(log) = self.telemetry.as_mut() {
+            log.record(record);
+        }
+    }
+
+    /// One `TelemetryStateTransition` record: the boot decisions
+    /// (Recovering/Restarting/Joining), the replication state changes,
+    /// and the voting-weight moves — the node's own story, with the local
+    /// nanosecond clock in the envelope header.
+    fn record_state_transition(&mut self, fields: String) {
+        let ns = local_ns();
+        self.record_telemetry(Record::telemetry(
+            Marker::TelemetryStateTransition,
+            ns,
+            fields.as_bytes(),
+        ));
+    }
+
+    /// One `TelemetryOutbound` record: what this node decided to send
+    /// (peer, era/view/slot, byte length), so the trace shows what the
+    /// node decided it was.
+    fn record_outbound(&mut self, out: &lunet_advisory_lock::NodeOutput) {
+        let json = format!(
+            "{{\"to\":{},\"era\":{},\"view\":{},\"slot\":{},\"bytes\":{}}}",
+            out.to,
+            out.era,
+            out.view,
+            out.slot,
+            out.bytes.len()
+        );
+        let ns = local_ns();
+        self.record_telemetry(Record::telemetry(
+            Marker::TelemetryOutbound,
+            ns,
+            json.as_bytes(),
+        ));
+    }
+
     /// The election wait the tick loop runs: the armed uniform random in
     /// `[min, max]` — re-armed on a leader change and the fresh-commit
-    /// resume only (`rearm_election_wait`), stable otherwise.
+    /// resume only (`rearm_election_wait`), stable otherwise. One
+    /// `TelemetryTimeoutDecision` record per CHANGED armed wait.
     fn election_wait(&self) -> u64 {
         self.election_wait_armed
     }
 
     /// Re-arms the election wait on leader change / fresh-commit: one
-    /// uniform random in `[min, max]`, logged with the note when the
-    /// armed wait changed.
+    /// uniform random in `[min, max]`, logged with the note and the
+    /// timeout-decision record when the armed wait changed.
     fn rearm_election_wait(&mut self, _now: u64, unit: f64) {
         let (min_ms, max_ms) = (self.leader_timeout.min_ms(), self.leader_timeout.max_ms());
         let wait = timeouts::random_wait_ms(min_ms, max_ms, unit);
@@ -689,6 +791,18 @@ impl Host {
                 max_ms = max_ms,
                 "timeout-wait"
             );
+            let json = format!(
+                "{{\"leader\":{},\"era\":{},\"view\":{},\
+                 \"prev_wait_ms\":{previous},\"next_wait_ms\":{wait},\
+                 \"min_ms\":{min_ms},\"max_ms\":{max_ms}}}",
+                status.leader, status.era, status.view
+            );
+            let ns = local_ns();
+            self.record_telemetry(Record::telemetry(
+                Marker::TelemetryTimeoutDecision,
+                ns,
+                json.as_bytes(),
+            ));
         }
     }
 
@@ -925,6 +1039,33 @@ impl Host {
         );
     }
 
+    /// The slot frontier onto the telemetry tape: one periodic record
+    /// carrying the frontier this node reached and the ballot that
+    /// authorised it. The frontier is not gate-silenced — a voting node's
+    /// lifecycle gate is disarmed, and that is exactly the node an
+    /// operator asks the tape about. Telemetry stays downstream of the
+    /// recorder: a failed append disables the stream and no protocol
+    /// decision reads this record.
+    fn record_frontier(&mut self, status: &lunet_advisory_lock::NodeStatus) {
+        let json = format!(
+            "{{\"event\":\"slot-frontier\",\"era\":{},\"view\":{},\"leader\":{},\
+             \"state\":\"{}\",\"slot\":{}}}",
+            status.era,
+            status.view,
+            status.leader,
+            status.state_name(),
+            self.frontier_slot,
+        );
+        let ns = local_ns();
+        if let Some(log) = self.telemetry.as_mut() {
+            log.record_frontier(Record::telemetry(
+                Marker::TelemetryStateTransition,
+                ns,
+                json.as_bytes(),
+            ));
+        }
+    }
+
     fn lease_attempt(&self, node_id: u32, op: &str, expiry: u64) {
         let status = self.node.status();
         info!(
@@ -1104,6 +1245,10 @@ impl Host {
                         bytes: out.bytes.clone(),
                     });
                 }
+                // The outbound trace: what this node decided it
+                // was — one TelemetryOutbound record per sent datagram
+                // while the AOF gate is active.
+                self.record_outbound(&out);
             } else if out.kind == OUTPUT_REPLY {
                 if let Some((dest, _)) = self.forwarded_from.remove(&out.message_id) {
                     self.send_forward_response(dest, &out.message_id, &out.bytes);
@@ -1743,6 +1888,46 @@ fn serve(options: &Options, nodes: &[ClusterNode], lifecycle: &Lifecycle) -> Ser
         .collect();
     let fingerprint = transport::genesis_fingerprint(&genesis);
 
+    let standby = !options.aof_dir.is_empty();
+    // The telemetry AOF: the envelope record layer over the
+    // vendored TigerBeetle AOF, gated by the node's voting weight. The
+    // series directory is `--telemetry-aof-dir`, falling back to
+    // `--aof-dir` (the standby's). EVERY node can carry one: the boot
+    // Recovering/Restarting/Joining trace always logs; once the node's
+    // voting weight exceeds 0 the gate disarms (the flusher stops, the
+    // trace pauses), and 1→0 re-arms it. An open failure logs and
+    // disables the stream for the process; the node keeps serving (the
+    // telemetry contract).
+    let telemetry_dir = if options.telemetry_aof_dir.is_empty() {
+        options.aof_dir.clone()
+    } else {
+        options.telemetry_aof_dir.clone()
+    };
+    let telemetry = if telemetry_dir.is_empty() {
+        None
+    } else {
+        match telemetry::TelemetryLog::open(
+            std::path::Path::new(&telemetry_dir),
+            options.aof_flush_ms,
+            options.telemetry_rollover_mib * 1024 * 1024,
+            options.aof_retention_mib * 1024 * 1024,
+        ) {
+            Ok(log) => {
+                eprintln!(
+                    "lease-sequencer: telemetry aof active file {}",
+                    log.active_path().display()
+                );
+                Some(log)
+            }
+            Err(error) => {
+                eprintln!(
+                    "lease-sequencer: telemetry aof open failed ({error}); \
+                     the telemetry stream is disabled for this process"
+                );
+                None
+            }
+        }
+    };
     let journal_dir = (!options.journal_dir.is_empty()).then_some(options.journal_dir.as_str());
     let node = if !options.bench_store.is_empty() {
         // The bench boot: the lifecycle marker store rides the driver's
@@ -1756,6 +1941,21 @@ fn serve(options: &Options, nodes: &[ClusterNode], lifecycle: &Lifecycle) -> Ser
         )
         .unwrap_or_else(|code| {
             eprintln!("lease-sequencer: bench node boot failed with code {code}");
+            exit(2);
+        })
+    } else if standby {
+        // The standby telemetry host: the committed-transition hook feeds
+        // the async AOF writer (the LKE1 journal producer path, deferred
+        // durability target) and the lease driver stays idle.
+        Node::open_aof(
+            &members,
+            &options.name,
+            &options.state,
+            &options.aof_dir,
+            (options.aof_flush_ms > 0).then_some(options.aof_flush_ms),
+        )
+        .unwrap_or_else(|code| {
+            eprintln!("lease-sequencer: standby node boot failed with code {code}");
             exit(2);
         })
     } else if options.recovery_flush == RecoveryFlush::Diskless {
@@ -1942,7 +2142,10 @@ fn serve(options: &Options, nodes: &[ClusterNode], lifecycle: &Lifecycle) -> Ser
             options.leader_timeout_min_ms,
             options.leader_timeout_max_ms,
         ),
+        last_state: STATE_RECOVERING,
+        last_weight: None,
         election_wait_armed: options.election_ms,
+        telemetry,
         embedded,
     };
     {
@@ -1983,6 +2186,32 @@ fn serve(options: &Options, nodes: &[ClusterNode], lifecycle: &Lifecycle) -> Ser
             source = model_source,
             "membership-model"
         );
+    }
+    // The boot trace: every node's startup decision —
+    // Restarting on a dirty restart (incarnation bump), Recovering when
+    // the core boots into the recovering state, Joining for a fresh
+    // member already Normal — lands in its AOF with the outbound messages
+    // that follow while the gate is ON, whatever the node's future
+    // weight.
+    {
+        let status = host.node.status();
+        let decision = if incarnation > 1 {
+            "restarting"
+        } else if status.state == STATE_RECOVERING {
+            "recovering"
+        } else {
+            "joining"
+        };
+        host.record_state_transition(format!(
+            "{{\"event\":\"boot\",\"decision\":\"{decision}\",\"detector\":\"{DETECTOR}\",\
+             \"incarnation\":{incarnation},\
+             \"state\":\"{}\",\"leader\":{},\"era\":{},\"view\":{},\"config_era\":{}}}",
+            lunet_advisory_lock::replication_state_name(status.state),
+            status.leader,
+            status.era,
+            status.view,
+            status.config_era
+        ));
     }
     let now = millis();
     let mut rng = Rng::new(millis() ^ (own_desc_id as u64) ^ (std::process::id() as u64));
@@ -2057,6 +2286,13 @@ fn serve(options: &Options, nodes: &[ClusterNode], lifecycle: &Lifecycle) -> Ser
         host.driver_step(now, &mut rng);
         embedded_step(&mut host, now, &mut rng);
         host.flush_outputs(now, &mut rng);
+        // The AOF lifecycle gate + the 1000 ms forced flusher + the
+        // rollover: the gate follows the node's voting
+        // weight, the flusher runs only while the AOF is ON.
+        if let Some(log) = host.telemetry.as_mut() {
+            log.on_weight(host.node.voting_weight(), now);
+            log.tick(now);
+        }
         std::thread::sleep(Duration::from_millis(TICK_MS));
     }
     // Clean stop (the uVRR termination obligations): the loop break IS
@@ -2069,6 +2305,12 @@ fn serve(options: &Options, nodes: &[ClusterNode], lifecycle: &Lifecycle) -> Ser
     let code = host.node.stop();
     if code != OK {
         eprintln!("lease-sequencer: node stop failed with code {code}");
+    }
+    // The telemetry teardown record LAST and the unconditional flush.
+    if let Some(log) = host.telemetry.as_mut()
+        && let Err(error) = log.teardown()
+    {
+        eprintln!("lease-sequencer: telemetry aof teardown failed ({error})");
     }
     Serve::Exit(0)
 }
@@ -2205,6 +2447,33 @@ fn timers(host: &mut Host, now: u64, rng: &mut Rng) {
             }
         }
     }
+    // The state-transition trace: Recovering/Restarting/Joining
+    // decisions and the voting-weight moves land in the AOF while its
+    // gate is active.
+    if status.state != host.last_state {
+        host.last_state = status.state;
+        host.record_state_transition(format!(
+            "{{\"event\":\"state\",\"state\":\"{}\",\"leader\":{},\"era\":{},\"view\":{},\
+             \"config_era\":{}}}",
+            lunet_advisory_lock::replication_state_name(status.state),
+            status.leader,
+            status.era,
+            status.view,
+            status.config_era
+        ));
+    }
+    let weight_now = host.node.voting_weight();
+    if weight_now != host.last_weight {
+        host.last_weight = weight_now;
+        host.record_state_transition(format!(
+            "{{\"event\":\"weight\",\"weight\":{},\"era\":{},\"view\":{}}}",
+            weight_now
+                .map(|w| w.to_string())
+                .unwrap_or_else(|| "null".into()),
+            status.era,
+            status.view
+        ));
+    }
     if now.saturating_sub(host.last_status_note) >= 2000 {
         host.last_status_note = now;
         // `voting` is the E1 runner's rejoin-serving signal: the
@@ -2226,6 +2495,10 @@ fn timers(host: &mut Host, now: u64, rng: &mut Rng) {
             sidecar_drops = host.sidecar.drops(),
             "status"
         );
+        // The slot frontier onto the telemetry tape, on the same periodic
+        // cadence as the status note: every node states how far it got,
+        // not only the one that happens to lead.
+        host.record_frontier(&status);
     }
     if (status.state == STATE_RECOVERING
         || (host.reincarnated && host.node.voting_weight().is_none_or(|weight| weight == 0)))
@@ -2283,7 +2556,9 @@ fn pump_udp(host: &mut Host, now: u64, rng: &mut Rng) {
             // verb's proposal-time row only lives on the leader that
             // accepted the verb — a changed leader re-learns it here from
             // the member's own first datagram, whose fingerprint the
-            // transport already validated).
+            // transport already validated). The AOF standby never speaks
+            // until it is spoken to, so the first learn rides whatever it
+            // sent.
             if !host.learn_member_row(addr) {
                 tracing::warn!(source = %addr, len, "datagram from an unregistered endpoint dropped");
                 continue;
@@ -2336,6 +2611,16 @@ fn handle_packet(
                 .answered(replica, header.era, header.view, header.slot, tag);
         }
         host.on_leader_commit(replica, transport::vrr_header(payload), now, rng);
+        // The telemetry AOF stream: EVERY VRR datagram this node
+        // sees is one `Wire` envelope record — the datagram's VRR payload
+        // byte-identical to what the network carried — with the local
+        // nanosecond clock in the envelope header — appended while the
+        // lifecycle gate is active (weight 0 / boot phase). An append
+        // failure disables the stream for the process and logs once —
+        // telemetry must never poison the replication path.
+        if host.telemetry.is_some() {
+            host.record_telemetry(Record::wire(local_ns(), payload));
+        }
         // The reincarnation remap: a `Reincarnation(old, new)` announcement
         // arriving from the socket the learned map attributes to `old` IS
         // the restarted process's entry ticket. The row for the bumped id

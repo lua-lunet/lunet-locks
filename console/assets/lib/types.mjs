@@ -69,7 +69,7 @@
  */
 
 /**
-
+ * GET /cluster. `era`/`view` widen to `string` for the aof-console-bridge
  * data source, which replays one standby's committed stream and cannot see
  * live membership — it reports the "—" placeholder instead of a number
  * (see app.mjs's bridge branch and the header rendering in la-app.mjs).
@@ -203,6 +203,8 @@
  * The `#la-config` JSON blob baked into index.html.
  * @typedef {object} Config
  * @property {string} apiBase
+ * @property {"mock" | "bridge"} dataSource
+ * @property {string} bridgeBase
  * @property {number} refreshMs
  * @property {number} expiryDefaultOffsetMs
  * @property {number[]} toleranceOptionsSec

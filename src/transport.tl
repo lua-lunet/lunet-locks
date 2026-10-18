@@ -6,11 +6,6 @@ local PEER_APPLICATION = "\2"
 -- post-commit dissemination): the request is one tag byte, the response
 -- era+slot+members. See `snapshot.tl` for the payload shapes.
 local PEER_SNAPSHOT = "\3"
--- The witness sync point: the clean stop's fire-and-forget broadcast of
--- the node's committed frontier to the static witnesses (the ceremony's
--- step 1). The payload is the VRR header's identity triple: era u32,
--- view u32, slot u64, big-endian.
-local PEER_WITNESS_SYNC = "\4"
 local FORWARD_REQUEST = "\1"
 local FORWARD_RESPONSE = "\2"
 local FORWARD_NOT_LEADER = "\3"
@@ -47,10 +42,7 @@ end
 
 local function encode_peer(kind: string, fingerprint: string, payload: string): string
     assert(
-        kind == PEER_VRR
-            or kind == PEER_APPLICATION
-            or kind == PEER_SNAPSHOT
-            or kind == PEER_WITNESS_SYNC,
+        kind == PEER_VRR or kind == PEER_APPLICATION or kind == PEER_SNAPSHOT,
         "transport: invalid peer packet kind"
     )
     assert(valid_fingerprint(fingerprint), "transport: invalid membership fingerprint")
@@ -59,33 +51,6 @@ local function encode_peer(kind: string, fingerprint: string, payload: string): 
         "transport: peer payload exceeds UDP limit"
     )
     return PEER_MAGIC .. kind .. fingerprint .. payload
-end
-
--- The witness sync point's frame: the node's committed frontier (era,
--- view, slot) in the witness-sync envelope — the ceremony's step 1, fire
--- and forget, no reply ever awaited (the witnesses' series are the
--- backup certificate). The bytes come out by arithmetic, never bit
--- operations: the shifts Teal emits name bit32, which does not exist on
--- LuaJIT, and a ceremony that dies at its own encode is a ceremony that
--- never ran.
-local function four_bytes(value: integer): string
-    local high = math.floor(value / 16777216) % 256
-    local midhigh = math.floor(value / 65536) % 256
-    local midlow = math.floor(value / 256) % 256
-    local low = value % 256
-    return string.char(high, midhigh, midlow, low)
-end
-
-local function encode_witness_sync(
-    fingerprint: string, era: integer, view: integer, slot: integer
-): string
-    assert(valid_fingerprint(fingerprint), "transport: invalid membership fingerprint")
-    local slot_high = math.floor(slot / 4294967296)
-    local frontier = four_bytes(era)
-        .. four_bytes(view)
-        .. four_bytes(slot_high)
-        .. four_bytes(slot % 4294967296)
-    return PEER_MAGIC .. PEER_WITNESS_SYNC .. fingerprint .. frontier
 end
 
 local function decode_peer(packet: string): (boolean, string, string, string)
@@ -313,7 +278,6 @@ return {
     MEMBERSHIP_FINGERPRINT_HEX_BYTES = MEMBERSHIP_FINGERPRINT_HEX_BYTES,
     source_is_member = source_is_member,
     encode_peer = encode_peer,
-    encode_witness_sync = encode_witness_sync,
     decode_peer = decode_peer,
     encode_not_leader = encode_not_leader,
     decode_not_leader = decode_not_leader,

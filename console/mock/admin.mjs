@@ -231,8 +231,9 @@ const pub = (l) => {
 // `era` and `view` on every protocol line): a stable leader's heartbeat
 // cadence, one failover window (the detections, the election fire, the
 // NOMINATE traffic, the era fold), lease grants and forwards around it,
-// and the slot-frontier records the telemetry tape carries
-// (`/api/v1/telemetry/log`).
+// and the slot-frontier records the telemetry tape carries. The same
+// served shape the aof-console-bridge reads off real `--log-dir` rolling
+// files plus the tape's state-transition records (`/api/v1/telemetry/log`).
 const logSeries = (() => {
   const end = Date.now();
   const start = end - 120e3;

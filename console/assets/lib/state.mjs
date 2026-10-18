@@ -7,11 +7,24 @@ import { fmtClock } from "./util.mjs";
 /** @typedef {import("./types.mjs").SavedState} SavedState */
 /** @typedef {import("./types.mjs").StoreState} StoreState */
 
-// The API base: the nginx edge's /api/v1 (the witness's served cache
-// behind it in the live shape, the mock in development).
 export const config =
   /** @type {Config} */
   (JSON.parse(/** @type {HTMLScriptElement} */ (document.getElementById("la-config")).textContent));
+
+// Data-source switch: config carries `dataSource` ("mock" | "bridge",
+// default mock) and `bridgeBase` (the bridge's /api/v1 URL). A query param
+// overrides both, so the same static assets serve either backend:
+//   index.html                          → mock (development default)
+//   index.html?dataSource=bridge        → the aof-console-bridge
+//   index.html?dataSource=bridge&bridgeBase=http://127.0.0.1:8619/api/v1
+{
+  const params = new URLSearchParams(location.search);
+  const dataSource = params.get("dataSource");
+  if (dataSource === "bridge" || dataSource === "mock") config.dataSource = dataSource;
+  const bridgeBase = params.get("bridgeBase");
+  if (bridgeBase) config.bridgeBase = bridgeBase;
+}
+export const isBridge = config.dataSource === "bridge";
 
 const SAVED_KEY = "lock-admin";
 /** @type {SavedState} */

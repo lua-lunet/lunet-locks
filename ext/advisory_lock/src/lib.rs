@@ -8,6 +8,7 @@
 //! sides are written against, and its module doc is the normative
 //! division of labour.
 
+pub mod aof;
 /// The disk seam: the one contract every byte this crate reads or writes
 /// is named against, so the crate compiles identically over the local
 /// filesystem ([`disk::StdDisk`]) and over whatever industrial engine an

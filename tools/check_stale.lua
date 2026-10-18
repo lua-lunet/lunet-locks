@@ -6,7 +6,7 @@
 -- rule has exactly one implementation and this file adds no logic to it.
 --
 -- usage: tools/check_stale.lua cdylib | lease-node | lease-ladder |
---                        snapshot-tools | image IMAGE_NAME
+--                        standby-stack | snapshot-tools | image IMAGE_NAME
 -- Exit 0 = the artifact may be booted; nonzero = the refusal, on stderr,
 -- naming the artifact's identity, the tree's identity and the rebuild.
 
@@ -22,6 +22,8 @@ elseif which == "lease-node" then
     profile = stale.lease_node(root)
 elseif which == "lease-ladder" then
     profile = stale.lease_ladder(root)
+elseif which == "standby-stack" then
+    profile = stale.standby_stack(root)
 elseif which == "snapshot-tools" then
     profile = stale.snapshot_tools(root)
 elseif which == "image" then
@@ -34,7 +36,7 @@ elseif which == "image" then
 else
     io.stderr:write(
         "check_stale: usage: tools/check_stale.lua cdylib | lease-node |"
-            .. " lease-ladder | snapshot-tools | image IMAGE_NAME\n"
+            .. " lease-ladder | standby-stack | snapshot-tools | image IMAGE_NAME\n"
     )
     os.exit(2)
 end

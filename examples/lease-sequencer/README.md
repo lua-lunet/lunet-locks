@@ -65,8 +65,11 @@ request/response streams are all transparent, every heartbeat commit is
 a line carrying its slot, view and era, and the slot frontier rides the
 telemetry tape as well as the log.
 
-The console's telemetry panel reads this series over the admin API at
-`/api/v1/telemetry/log`; the loopback mock serves the same shape.
+The console's telemetry panel reads this series over the admin API: the
+`aof-console-bridge` (`--aof-dir` plus `--log-dir`) serves it at
+`/api/v1/telemetry/log`, folding the telemetry tape's slot-frontier
+records in with their envelope ns floored to ms; the loopback mock
+serves the same shape.
 
 **Loss window.** `NonBlocking` is drop-on-overflow: when a node writes
 faster than the worker drains, events are dropped, never backpressured
@@ -169,16 +172,87 @@ folds its admitting era and serves. Nothing about the file gates who may
 exist — the cross-environment boundary is a future PSK, never the
 descriptor.
 
-## The witness's tapes
+## The standby telemetry node
 
-The **witness** — the static, non-voting process outside the roster —
-carries the cluster's capture plane: every member forwards it every peer
-datagram, and it writes the `{epoch}.aof` wire tape through the vendored
-TigerBeetle store with the typed record envelope from
-`ext/lunet-locks-aof` (every record is `marker(1) | local-clock-ns(8) |
-payload`; the wire protocol itself is untouched) and lifts the committed
-lock transitions into the `ev-*.bin` lock-event series the console reads
-([the witness capture](../docs/src/telemetry-aof.md)).
+`check-standby.lua` runs the same six-node cluster with `dc1-node2` as the
+**standby telemetry node**: it enters at weight 0 through the join verb —
+first, so its learner fold is the clean one — is never promoted, and holds
+no vote. The `--aof-dir` option turns the node into the AOF host: its
+committed lock transitions enqueue to the async write-behind writer
+(dedicated thread, drop-on-overflow, `io_uring` on Linux / buffered
+`write_all` elsewhere, fsync only on the periodic `--aof-flush-ms` timer,
+at roll, and on shutdown) instead of the blocking journal, and the active
+file rolls at exactly 2 MiB (zero-padded, so every finalized file is one
+erasure block). The standby's lease driver still converses with the leader
+like every node's does — the round-trip traffic carries the era evidence
+that keeps the standby tracking the cluster while it applies the stream.
+
+## The telemetry AOF (the envelope series)
+
+Any node can carry a **telemetry AOF** — `--telemetry-aof-dir`, falling
+back to `--aof-dir` — a `{epoch}.aof` series written through the vendored
+TigerBeetle AOF with the typed record envelope from
+`ext/lunet-locks-aof`: every record is `marker(1) | local-clock-ns(8) |
+payload`, and the marker names the subsystem — `Wire` (the raw uVRR wire
+message, its serialization reused as-is), `TelemetryTimeoutDecision`,
+`TelemetryStateTransition`, or `TelemetryOutbound` (JSON). The wire
+protocol itself is untouched.
+
+The series follows the node's **voting weight** (the hard requirement):
+weight 0 — or the boot Recovering/Joining phase, where the weight is not
+yet known — keeps the AOF ON; weight > 0 turns it OFF; 1→0 re-arms it (a
+trace gap since the disarm is expected). While ON, the node writes its
+boot trace (the Recovering/Restarting/Joining decision and every outbound
+message), every VRR datagram it receives as a Wire record, and the
+timeout decisions; the same weight sequence on a voting node
+leaves just the boot trace. A background flush fsyncs every
+`--aof-flush-ms` (default 1000) and earlier whenever the vendored
+entry-window cap fills — and it STOPS when the gate disarms. A clean stop
+(SIGTERM/SIGINT) writes the teardown record LAST and flushes
+unconditionally; SIGKILL loses the last unflushed window. The active file
+rolls at `--telemetry-rollover-mib` (default 4) and the series keeps
+exactly the current file plus one closed old.
+
+Stop semantics (the uVRR termination obligations): SIGTERM/SIGINT is a
+clean stop — the node closes the wire, writes the `stopped` marker, drains
+the AOF sink to quiescence, writes the `flushed` marker, and the next boot
+continues under the same incarnation with no resurrection. SIGKILL is the
+crash shape: the running sentinel stays behind and the next boot
+reincarnates (identity bump, the `(old, new)` announcement) — the
+run-sheets' node kills use `kill -9` wherever crash semantics
+are being exercised.
+
+The leader timeout: the host tick loop runs a uniform random wait in
+`--leader-timeout-min-ms` / `--leader-timeout-max-ms` (defaults
+500 / 1000) per watched (config era, leader) key, re-armed on
+leader change, on the fresh-commit resume, and on each heartbeat Commit
+arriving from the current leader. When the deadline passes the host
+drives the §14.2 forced view: the `leader-timeout-detect` note (silence
+and armed deadline), `force_view(era, view + 1)`, the `timedout` toggle,
+and the output flush. The timing law is Raft's (Ongaro 2014):
+broadcastTime ≪ electionTimeout ≪ MTBF with the wait randomised in a
+generous interval — a cloud deploy at the 200 ms heartbeat sets
+2000–4000 ms; the local rig at 5 ms heartbeats runs the 500/1000
+defaults. One `TelemetryTimeoutDecision` record (previous wait, next
+wait) plus the tracing line per changed armed wait.
+
+The boot line and the boot trace name the compiled-in detector:
+`detector=sloppy-timeout`. See
+[failure detection and the timeouts](../../docs/src/failure-detection.md).
+
+The script also starts `lock-feed` against the standby's AOF directory and
+the console stack (static SPA + nginx edge with `/feed/` mapped to the
+feed), then asserts, headless (curl/grep only):
+
+1. committed events land in the standby's AOF files;
+2. the feed serves them (REST listing and file bytes);
+3. the console's data endpoint (`/feed/files` through the nginx edge,
+   basic-auth loopback) returns them;
+4. the cluster cadence is unaffected: the holder's renewal cadence is
+   ~250 ms and each non-holder polls at ~2x renewal, measured from the
+   voting nodes' logs while the standby's AOF writer and feed run.
+
+Every spawned process (nodes, feed, mock, nginx) is killed on exit.
 
 ## Running
 
@@ -227,7 +301,9 @@ as this repo does:
 
 - `src/main.rs` — the node binary: host loop (heartbeat, election,
   fenced-boot recovery drive, output drain, receive pump), the TCP client
-  NDJSON server, and the lease driver.
+  NDJSON server, and the lease driver. `--aof-dir` switches the node to the
+  standby telemetry mode: the committed-transition hook feeds the async AOF
+  writer instead of the blocking journal and the lease driver stays idle.
 - `src/transport.rs` — the peer envelope, the membership/v3 genesis
   fingerprint, the `Reincarnation(old, new)` addressing notice, and the
   forward/redirect application channel.

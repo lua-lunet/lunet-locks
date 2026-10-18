@@ -343,45 +343,39 @@ restart.
 
 ## Lock-event journal and console feed
 
-The witness lifts the committed lock transitions (hold, renew, release,
-break) from its wire tape into the lock-event series
-(`LKE1`/`LKM1`, rolling by byte threshold; no component deletes
-finalized files by itself — the witness's expiry-based maintenance tick
-is the one documented exception). The durable lift cursor boots the lift
-past the series' tail, so a witness restart never re-writes history.
+Each replica optionally maintains an append-only binary journal of committed
+lock transitions (hold, renew, release, break) under a per-replica directory.
+The
+journal is observability data: it never participates in replication or
+recovery, and a journal error disables journaling without affecting the
+service path. Files roll by byte threshold and are never deleted by any
+component.
 
-The `lock-feed` process serves the series directory over REST and
-WebSocket. The nginx reverse proxy maps `/feed/` to lock-feed with
-WebSocket upgrade support. The console SPA pulls rolled files via HTTP,
-tails the open file via WebSocket, persists events to IndexedDB keyed by
-`[ts, lockId, leaseId]` for idempotent replay, and applies a
-tombstone-ahead merge rule so releases that arrive before their
-acquisition produce a correct active-lock view regardless of ingestion
-order.
+The `lock-feed` process serves the journal directory over REST and WebSocket.
+The nginx reverse proxy maps `/feed/` to lock-feed with WebSocket upgrade
+support. The console SPA pulls rolled files via HTTP, tails the open file via
+WebSocket, persists events to IndexedDB keyed by `[ts, lockId, leaseId]` for
+idempotent replay, and applies a tombstone-ahead merge rule so releases that
+arrive before their acquisition produce a correct active-lock view regardless
+of ingestion order.
 
-See [the event journal reference](event-journal.md) for record and
-metafile byte layouts, file naming, resume-on-reopen semantics,
-corrupt-tail tolerance, and the full console catch-up model; and
-[the witness capture](telemetry-aof.md) for the tape/series pair.
+See [the event journal reference](event-journal.md) for record and metafile
+byte layouts, file naming, resume-on-reopen semantics, corrupt-tail
+tolerance, and the full console catch-up model.
 
-## Let it crash
+## The write-behind AOF mount
 
-Every write failure on every surface — the consensus members, the
-witness (the tape, the series, the lift cursor), the flight recorder,
-the Lua host — crashes the process: stop, log, crash. We do not soldier
-on. A process that stumbles on an IO error terminates loudly because
-the error IS the bug, and the bug is cheapest exactly where it happens;
-a UI that silently goes stale is the most expensive bug we can ship, and
-a dead process is the cheapest signal we can get. Recovery is not the
-process's job — the cluster re-joins in one round trip and the witness
-re-lifts from the tape — so a permanent disk failure means a
-crash-rejoin loop: reality telling us something, never a condition to
-hide. The rule is unconditional across sync and async: the clean
-shutdown's force flush panics on a bad write and never records
-`flushed`; the background writers' failures halt the main loop and the
-health endpoint reports bad. The periodic async WAL flush bounds crash
-catch-up (see [write-behind](write-behind.md)); it never softens this
-rule.
+A replica mounts the write-behind AOF writer in the journal's place: the
+server takes `--aof-dir PATH` (with the `--aof-flush-ms N` periodic fsync
+cadence, 0 fsyncing only at roll and shutdown), and the C ABI takes
+`lunet_lock_node_new_aof` with the same two parameters. The mounts are
+exclusive — a replica carries the blocking journal or the AOF writer, never
+both — and the AOF directory is required: an empty one is refused at
+construction, never silently demoted to journaling. The roll threshold is
+fixed at the 2 MiB erasure block. The state artefact (the WAL snapshot
+store) is unaffected: the two mounts differ only in where the
+committed-transition stream goes. See [write-behind](write-behind.md) for
+the writer's own contract.
 
 ## The console telemetry panel
 
@@ -391,15 +385,19 @@ the heartbeat cadence (`heartbeat-commit`, `commit-in`), the relay of a
 repeated send (`relay-out`, with the wait that fired it), the timeout
 events (`leader-timeout-detect` with its measured silence,
 `election-wait-fire` with its armed wait, `timeout-poll` with its opinion
-and relayed count), the NOMINATE traffic, and the lease grants. The panel
-reads the series over the admin API at `GET /api/v1/telemetry/log`
-([the OpenAPI contract](../console/openapi.yaml)), with optional
-`fromMs`/`toMs` window bounds. The charts are the ones the series
-carries: the per-node heartbeat arrival intervals (1 s candlestick
-buckets), the detection silences and election waits over time, and the
-per-node slot frontiers. A line that is not a JSON object carrying `ts`
-(the Lua host's stdout captured beside a node's own log) is counted
-`unparsed`, never served.
+and relayed count), the NOMINATE traffic, the lease grants — plus the
+telemetry tape's `slot-frontier` records. The panel reads the series over
+the admin API at `GET /api/v1/telemetry/log` ([the OpenAPI
+contract](../console/openapi.yaml)), with optional `fromMs`/`toMs` window
+bounds. The loopback mock and the `aof-console-bridge`
+(`--aof-dir` plus `--log-dir`) serve the same shape: the bridge reads the
+daily-rolling `<node>.<date>.log` appender files and folds the tape's
+state-transition records in with their envelope ns floored to ms. The
+charts are the ones the series carries: the per-node heartbeat arrival
+intervals (1 s candlestick buckets), the detection silences and election
+waits over time, and the per-node slot frontiers. A line that is not a
+JSON object carrying `ts` (the Lua host's stdout captured beside a node's
+own log) is counted `unparsed`, never served.
 
 ## The lock telemetry capture file: the write-behind series
 
@@ -512,3 +510,22 @@ retain only one outstanding request, and retry the exact same envelope. See
 membership-administration semantics and
 [uvrr-core](https://github.com/lua-lunet/uvrr-core) for all replication
 mechanics and safety proofs.
+
+## Let it crash
+
+Every write failure on every surface crashes the process: stop, log, crash.
+There is no disable-and-continue, no drop counter standing in for a lost
+event, no degraded mode that keeps serving. A synchronously refused write —
+the journal's append, the AOF writer's pump, the state store's snapshot —
+crashes the process. The clean shutdown's force flush panics on a bad write
+and never records `flushed`. An asynchronous writer whose write fails halts
+the main loop and the health endpoint reports bad.
+
+The reasoning: this cluster is diskless — the protocol state lives in quorum
+memory, and a restarting node reincarnates from the live nodes. A process
+that keeps running past a failed write serves state its operators cannot
+see; a silently stale console is the most expensive bug we can ship. A dead
+process is the cheapest signal we can get. There are no carve-outs: the
+flight recorder's write failures panic like every other surface — only its
+cap-and-sweep behaviour is its own, and that is a policy, not an error
+path.

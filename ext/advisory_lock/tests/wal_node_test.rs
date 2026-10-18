@@ -31,6 +31,18 @@ unsafe extern "C" {
         roll_bytes: u32,
         out: *mut *mut c_void,
     ) -> i32;
+    fn lunet_lock_node_new_aof(
+        members_len: usize,
+        members_data: *const u8,
+        own_len: usize,
+        own_data: *const u8,
+        state_len: usize,
+        state_data: *const u8,
+        aof_dir_len: usize,
+        aof_dir_data: *const u8,
+        flush_ms: u64,
+        out: *mut *mut c_void,
+    ) -> i32;
     fn lunet_lock_node_free(node: *mut c_void);
     fn lunet_lock_node_own_id(node: *mut c_void, out_id: *mut u32) -> i32;
     fn lunet_lock_node_request(node: *mut c_void, json_len: usize, json: *const u8) -> i32;
@@ -121,6 +133,34 @@ impl AbiNode {
                 &mut out,
             );
             assert_eq!(rc, 0, "the node constructs ({rc})");
+            let mut id = 0u32;
+            assert_eq!(lunet_lock_node_own_id(out, &mut id), 0);
+            AbiNode { handle: out, id }
+        }
+    }
+
+    /// The AOF-backed sibling: the same mount seat, the write-behind
+    /// writer in the journal's place.
+    fn new_aof(root: &Path, name: &str, aof_dir: &Path) -> AbiNode {
+        unsafe {
+            let state = root.join(format!("{name}.nonce"));
+            let state_text = state.to_str().expect("the scratch path is UTF-8");
+            let members = members();
+            let dir_text = aof_dir.to_str().expect("the scratch path is UTF-8");
+            let mut out: *mut c_void = std::ptr::null_mut();
+            let rc = lunet_lock_node_new_aof(
+                members.len(),
+                members.as_ptr(),
+                name.len(),
+                name.as_ptr(),
+                state_text.len(),
+                state_text.as_ptr(),
+                dir_text.len(),
+                dir_text.as_ptr(),
+                0,
+                &mut out,
+            );
+            assert_eq!(rc, 0, "the AOF node constructs ({rc})");
             let mut id = 0u32;
             assert_eq!(lunet_lock_node_own_id(out, &mut id), 0);
             AbiNode { handle: out, id }
@@ -447,6 +487,79 @@ fn the_stop_takes_the_load_it_owes_the_flush() {
     assert_eq!(
         reheld, held,
         "the stop-before-demand rewrote the artefact with the same table"
+    );
+}
+
+/// The AOF-backed mount, end to end: the creator refuses an empty AOF
+/// directory rather than falling back, a mounted node elects and serves
+/// through the real C ABI, and a clean stop leaves the AOF series on
+/// disk beside the same WAL state artefact the counters ride.
+#[test]
+fn the_aof_mount_serves_stops_and_leaves_the_series() {
+    let root = scratch("aof-mount");
+    let aof_dir = root.join("a.aof");
+    let mut buf = vec![0u8; DATAGRAM];
+
+    // The refusal: the AOF directory is required — an empty one is an
+    // INVALID call, never a silent journal fallback.
+    unsafe {
+        let members = members();
+        let state_text = root.join("x.nonce").to_str().unwrap().to_string();
+        let mut out: *mut c_void = std::ptr::null_mut();
+        let rc = lunet_lock_node_new_aof(
+            members.len(),
+            members.as_ptr(),
+            1,
+            b"a".as_ptr(),
+            state_text.len(),
+            state_text.as_ptr(),
+            0,
+            std::ptr::null(),
+            0,
+            &mut out,
+        );
+        assert_eq!(rc, -1, "an empty aof_dir is refused");
+        assert!(out.is_null(), "no handle escapes a refused mount");
+    }
+
+    // The mount: the same WAL state surface the blocking creator rides
+    // (the counters are present), and the AOF series directory created.
+    let mut rig = vec![
+        AbiNode::new_aof(&root, "a", &aof_dir),
+        AbiNode::new_aof(&root, "b", &aof_dir),
+        AbiNode::new_aof(&root, "c", &aof_dir),
+    ];
+    let _ = census_paths();
+    let status = rig[0].state_status();
+    assert_eq!(status.present, 1, "the WAL state store is mounted");
+
+    // The node remains a full node: it elects and serves locks.
+    let leader = elect(&mut rig, &mut buf);
+    let holder = "44444444-4444-4444-4444-444444444444";
+    let reply = take_lock(
+        &mut rig,
+        leader,
+        &set_json("00000000-0000-4000-8000-000000000004", 9004, 4, holder),
+        &mut buf,
+    );
+    assert!(
+        contains(&reply, GRANTED),
+        "the AOF-mounted node serves locks"
+    );
+
+    // The clean stop: the write-behind series is on disk.
+    let _ = census_paths();
+    for node in rig.iter() {
+        assert_eq!(node.stop(), 0, "the AOF node's stop is clean");
+    }
+    drop(rig);
+    let series: Vec<_> = fs::read_dir(&aof_dir)
+        .expect("the AOF series directory exists")
+        .filter_map(|entry| entry.ok())
+        .collect();
+    assert!(
+        !series.is_empty(),
+        "the clean stop leaves the write-behind series on disk"
     );
 }
 
