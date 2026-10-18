@@ -118,6 +118,79 @@ fn lifted_frontiers(lifted: &[RawTransition]) -> Vec<Frontier> {
 }
 
 #[test]
+fn the_restarted_witness_resumes_past_the_series_tail() {
+    let case = scratch("restart-cursor");
+    let dir = case.join("aof");
+
+    // The tape: slots 1-3, one file.
+    {
+        let mut aof = AofFile::open(&dir).expect("the first tape file opens");
+        tape_slot_work(&mut aof, 1);
+        tape_slot_work(&mut aof, 2);
+        tape_slot_work(&mut aof, 3);
+    }
+
+    // Life 1: the first tick lifts the whole tape, the cursor reaching
+    // the last transition's frontier.
+    let tick1 = replay_transitions(&dir);
+    assert_eq!(
+        lifted_slots(&tick1),
+        vec![1, 2, 3],
+        "the whole tape lifts on the first life's first tick"
+    );
+    let reached = lift_transitions(&tick1, None)
+        .last()
+        .map(|raw| raw.frontier);
+    assert_eq!(
+        reached,
+        Some(Frontier {
+            era: ERA,
+            view: VIEW,
+            slot: 3
+        }),
+        "the first life's cursor reaches slot 3"
+    );
+
+    // The first life stores the cursor durably on each successful
+    // append (the witness's append loop): the last store carries slot 3.
+    lease_sequencer::lift_cursor::store(&dir, &reached.expect("the cursor reached"))
+        .expect("the cursor stores");
+
+    // THE RESTART: a fresh process. The boot cursor is the durable
+    // cursor the first life stored — the frontier the series' tail
+    // carries, read from the frame file beside the series.
+    let boot_cursor = lease_sequencer::lift_cursor::load(&dir);
+    assert_eq!(
+        boot_cursor, reached,
+        "the restart boots at the frontier the first life reached"
+    );
+
+    // The stream advanced: slot 4 rides the tape.
+    {
+        let mut aof = AofFile::open(&dir).expect("the second tape file opens");
+        tape_slot_work(&mut aof, 4);
+    }
+
+    // The restarted lift: the whole tape replays again — the tape is
+    // intact — but the series already carries slots 1-3. Only the
+    // slot-4 event may be written; anything else is a duplicate in the
+    // recovery series the console's dedup hides.
+    let tick2 = replay_transitions(&dir);
+    assert_eq!(
+        lifted_slots(&tick2),
+        vec![1, 2, 3, 4],
+        "the restarted replay re-reads the whole tape"
+    );
+    let lifted = lift_transitions(&tick2, boot_cursor);
+    assert_eq!(
+        lifted_slots(&lifted),
+        vec![4],
+        "the restarted witness resumes past the series' tail: the slot-4 \
+         event alone is new"
+    );
+}
+
+#[test]
 fn the_lift_resumes_from_the_frontier_after_retention_rebases_the_tape() {
     let case = scratch("frontier-cursor");
     let dir = case.join("aof");
