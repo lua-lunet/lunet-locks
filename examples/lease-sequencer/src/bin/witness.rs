@@ -30,7 +30,7 @@
 //! receiver.
 
 use std::net::UdpSocket;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tbio::envelope::Record;
@@ -38,7 +38,7 @@ use tbio::envelope::Record;
 use lease_sequencer::bridge::{RawTransition, Server, replay_transitions};
 use lease_sequencer::telemetry::TelemetryLog;
 use lunet_advisory_lock::journal::{
-    Journal, JournalEvent, KIND_BREAK, KIND_HOLD, KIND_RELEASE, KIND_RENEW,
+    Journal, JournalEvent, KIND_BREAK, KIND_HOLD, KIND_RELEASE, KIND_RENEW, Meta,
 };
 use lunet_advisory_lock::locks::Transition;
 use lunet_advisory_lock::witness::{Frontier, SyncOutcome, WitnessWatermarks};
@@ -48,6 +48,7 @@ fn main() {
     let mut aof_dir: Option<PathBuf> = None;
     let mut flush_ms: u64 = 1000;
     let mut rollover_mib: u64 = 4;
+    let mut retention_mib: u64 = 64;
     let mut bind: Option<String> = None;
     let mut follow = false;
     let mut argv = std::env::args().skip(1);
@@ -80,6 +81,13 @@ fn main() {
             "--bind" => {
                 bind = Some(argv.next().unwrap_or_else(|| die("--bind needs ADDR:PORT")));
             }
+            "--retention-mib" => {
+                retention_mib = argv
+                    .next()
+                    .unwrap_or_else(|| die("--retention-mib needs a number"))
+                    .parse()
+                    .unwrap_or_else(|_| die("--retention-mib must be a number"));
+            }
             "--follow" => follow = true,
             "--help" | "-h" => {
                 print_usage();
@@ -103,7 +111,7 @@ fn main() {
         &dir,
         flush_ms,
         rollover_mib * 1024 * 1024,
-        u64::MAX / 2, // the retention prune is W5's; keep-everything at open
+        retention_mib * 1024 * 1024,
     )
     .unwrap_or_else(|e| die(&format!("cannot open the tape at {}: {e}", dir.display())));
 
@@ -217,6 +225,14 @@ fn main() {
             if let Err(error) = journal.flush() {
                 eprintln!("witness: the event series' flush failed ({error})");
             }
+            // The retention, on the maintenance cadence (never the
+            // receive path): the wire tape keeps its newest files within
+            // the byte budget (the active file never on the list), and
+            // the lock-event series drops the rolled files whose every
+            // lease has expired — the live set is small and the dead
+            // record is bulk.
+            sweep_tape(&dir, &tape, retention_mib * 1024 * 1024);
+            sweep_expired_events(&dir, now);
             last_flush = now;
         }
     }
@@ -332,6 +348,62 @@ fn classify(datagram: &[u8]) -> Kind {
             }
         }
         _ => Kind::Other,
+    }
+}
+
+/// The wire tape's retention: the newest files within the byte budget,
+/// the active file never on the list (the plan's own floor: the active
+/// plus one older).
+fn sweep_tape(dir: &Path, tape: &TelemetryLog, retention_bytes: u64) {
+    use tbio::retention::{AofSeriesFile, list_aof_files, retention_plan};
+    let active = tape.active_path();
+    let Ok(listed) = list_aof_files(dir) else {
+        return;
+    };
+    let files: Vec<AofSeriesFile> = listed
+        .into_iter()
+        .filter(|(path, _, _)| path != active)
+        .map(|(path, (epoch, seq), size)| AofSeriesFile {
+            epoch,
+            seq,
+            name: path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default(),
+            size,
+        })
+        .collect();
+    for name in retention_plan(&files, 0, retention_bytes) {
+        if let Err(error) = std::fs::remove_file(dir.join(&name)) {
+            eprintln!("witness: the tape's prune left {name} ({error})");
+        }
+    }
+}
+
+/// The lock-event series' lease horizon: a rolled file whose EVERY lease
+/// has expired is droppable — the metafile's expiry window is the bound,
+/// and the reader-valid-prefix rule plus the console's IndexedDB history
+/// tolerate the deletion. The live set is small; the dead record is bulk.
+fn sweep_expired_events(dir: &Path, now_ms: u64) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.starts_with("ev-") || !name.ends_with(".bin") {
+            continue;
+        }
+        let meta_path = entry.path().with_extension("meta");
+        let Ok(bytes) = std::fs::read(&meta_path) else {
+            continue;
+        };
+        let Some(meta) = Meta::decode(&bytes) else {
+            continue;
+        };
+        if now_ms > meta.expiry_max {
+            let _ = std::fs::remove_file(entry.path());
+            let _ = std::fs::remove_file(meta_path);
+        }
     }
 }
 
