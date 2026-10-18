@@ -36,6 +36,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tbio::envelope::Record;
 
 use lease_sequencer::bridge::{RawTransition, Server, lift_transitions, replay_transitions};
+use lease_sequencer::lift_cursor;
 use lease_sequencer::telemetry::TelemetryLog;
 use lunet_advisory_lock::journal::{
     Journal, JournalEvent, KIND_BREAK, KIND_HOLD, KIND_RELEASE, KIND_RENEW, Meta,
@@ -149,8 +150,18 @@ fn main() {
     // retention drops the oldest files and the replay window re-bases
     // underneath the lift each tick; whatever the window still carries
     // at or below the frontier is already in the series, and the lift
-    // resumes exactly past it.
-    let mut lifted: Option<Frontier> = None;
+    // resumes exactly past it. The cursor is durable — a frame file
+    // beside the series, stored on every successful append — so a
+    // restart boots past the series' own tail instead of re-lifting the
+    // whole surviving tape onto it. The LKE1 record cannot carry the
+    // frontier (61 fixed bytes), so the cursor file carries it.
+    let mut lifted: Option<Frontier> = match lift_cursor::load(&dir) {
+        Some(frontier) => {
+            eprintln!("witness: lift cursor resumes at {frontier:?}");
+            Some(frontier)
+        }
+        None => None,
+    };
 
     loop {
         let mut buf = [0u8; 65_536];
@@ -234,6 +245,14 @@ fn main() {
                 let event = transition_event(&transition, ts_ms);
                 if let Err(error) = journal.append(&event) {
                     eprintln!("witness: the event series refused an append ({error})");
+                    break;
+                }
+                // The durable cursor advances with the append: the
+                // store first, the seat second — a refused store leaves
+                // the cursor where it was, so the next tick retries and
+                // the boot cursor never claims work the series lacks.
+                if let Err(error) = lift_cursor::store(&dir, &frontier) {
+                    eprintln!("witness: the lift cursor refused its store ({error})");
                     break;
                 }
                 lifted = Some(frontier);
