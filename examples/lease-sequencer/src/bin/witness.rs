@@ -41,7 +41,7 @@ use lunet_advisory_lock::journal::{
     Journal, JournalEvent, KIND_BREAK, KIND_HOLD, KIND_RELEASE, KIND_RENEW,
 };
 use lunet_advisory_lock::locks::Transition;
-use lunet_advisory_lock::witness::{Frontier, WitnessWatermarks};
+use lunet_advisory_lock::witness::{Frontier, SyncOutcome, WitnessWatermarks};
 
 fn main() {
     let mut listen = String::new();
@@ -120,13 +120,39 @@ fn main() {
         let mut buf = [0u8; 65_536];
         match socket.recv_from(&mut buf) {
             Ok((size, _peer)) => {
-                // The wire tape: the datagram whole, byte-identical, and
-                // the buffered watermark observes the frontier its wire
-                // header carries.
                 let datagram = &buf[..size];
-                tape.record(Record::wire(local_ns(), datagram));
-                if let Some(frontier) = header_frontier(datagram) {
-                    watermarks.observe(frontier);
+                // The peer envelope the members forward: the magic, the
+                // kind byte, the fingerprint, then the payload. The
+                // kinds: 1 = a VRR datagram (taped whole, the buffered
+                // watermark observing the frontier its wire header
+                // carries); 4 = the stop's sync point (the ceremony's
+                // step 1 — the three rules apply, and rule 2 forces the
+                // flush of the batch in hand).
+                match classify(datagram) {
+                    Kind::Vrr { frontier } => {
+                        tape.record(Record::wire(local_ns(), datagram));
+                        if let Some(frontier) = frontier {
+                            watermarks.observe(frontier);
+                        }
+                    }
+                    Kind::SyncPoint { frontier } => {
+                        eprintln!("witness: sync point {frontier:?} received");
+                        match watermarks.sync_point(frontier) {
+                            SyncOutcome::Acked => {
+                                eprintln!("witness: sync point {frontier:?} acknowledged")
+                            }
+                            SyncOutcome::ForceFlush => {
+                                tape.force_flush(now_ms());
+                                for point in watermarks.flushed_through_buffer() {
+                                    eprintln!("witness: sync point {point:?} acknowledged");
+                                }
+                            }
+                            SyncOutcome::Held => {
+                                eprintln!("witness: sync point {frontier:?} held open")
+                            }
+                        }
+                    }
+                    Kind::Other => {}
                 }
             }
             Err(error)
@@ -221,24 +247,70 @@ fn transition_event(transition: &Transition, ts_ms: u64) -> JournalEvent {
 
 /// The datagram's wire header's identity: (era, view, slot). `None` for
 /// anything too short to carry one.
-fn header_frontier(datagram: &[u8]) -> Option<Frontier> {
-    if datagram.len() < 24 {
-        return None;
+/// The peer envelope the members speak: the magic (`\0` + the name + `\0`,
+/// 26 bytes), the kind byte, the 16-hex fingerprint, then the payload.
+/// The payload kinds this witness reads: 1 = a VRR datagram (the wire
+/// tape's record; its header is tag|era|view|slot, 20 bytes, big-endian),
+/// 4 = the stop's sync point (the payload is the frontier triple, 16
+/// bytes). Anything else is nothing: the members forward two kinds.
+const PEER_MAGIC: &[u8; 26] = b"\0LUNET_ADVISORY_LOCK_PEER\0";
+const PEER_HEADER_BYTES: usize = 26 + 1 + 16;
+
+enum Kind {
+    Vrr { frontier: Option<Frontier> },
+    SyncPoint { frontier: Frontier },
+    Other,
+}
+
+fn classify(datagram: &[u8]) -> Kind {
+    if datagram.len() < PEER_HEADER_BYTES || &datagram[..26] != PEER_MAGIC {
+        return Kind::Other;
     }
-    Some(Frontier {
-        era: u32::from_be_bytes([datagram[4], datagram[5], datagram[6], datagram[7]]),
-        view: u32::from_be_bytes([datagram[8], datagram[9], datagram[10], datagram[11]]),
-        slot: u64::from_be_bytes([
-            datagram[16],
-            datagram[17],
-            datagram[18],
-            datagram[19],
-            datagram[20],
-            datagram[21],
-            datagram[22],
-            datagram[23],
-        ]),
-    })
+    let payload = &datagram[PEER_HEADER_BYTES..];
+    match datagram[26] {
+        1 => {
+            if payload.len() < 20 {
+                return Kind::Other;
+            }
+            let era = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
+            let view = u32::from_be_bytes([payload[8], payload[9], payload[10], payload[11]]);
+            let slot = u64::from_be_bytes([
+                payload[12],
+                payload[13],
+                payload[14],
+                payload[15],
+                payload[16],
+                payload[17],
+                payload[18],
+                payload[19],
+            ]);
+            let frontier = Frontier { era, view, slot };
+            Kind::Vrr {
+                frontier: Some(frontier),
+            }
+        }
+        4 => {
+            if payload.len() < 16 {
+                return Kind::Other;
+            }
+            let era = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+            let view = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
+            let slot = u64::from_be_bytes([
+                payload[8],
+                payload[9],
+                payload[10],
+                payload[11],
+                payload[12],
+                payload[13],
+                payload[14],
+                payload[15],
+            ]);
+            Kind::SyncPoint {
+                frontier: Frontier { era, view, slot },
+            }
+        }
+        _ => Kind::Other,
+    }
 }
 
 fn now_ms() -> u64 {
