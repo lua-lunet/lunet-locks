@@ -158,7 +158,7 @@ pub struct LockView {
 }
 
 impl LockView {
-    fn to_json(&self, now_ms: u64) -> Value {
+    pub fn to_json(&self, now_ms: u64) -> Value {
         // The live-lease rule is the Service's own: expiry > now and a
         // real holder. The keeper record a break installs (nil holder,
         // expiry 0) renders free.

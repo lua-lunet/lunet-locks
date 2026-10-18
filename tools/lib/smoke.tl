@@ -281,12 +281,14 @@ function M.main(root: string, _argv: {string}): integer
         end
         -- The witness receiver is the smoke's own spawn: its binary is
         -- built by this lane or the witness stage has nothing to boot.
+        -- The replay tool rides the same build: the operator's recovery
+        -- reads the witness's series.
         if not shell.run(
             "cargo build --release --manifest-path "
                 .. shell.quote(fs.join(root, "examples/lease-sequencer/Cargo.toml"))
-                .. " --bin witness"
+                .. " --bin witness --bin witness-replay"
         ) then
-            fail("the witness binary's build failed")
+            fail("the witness binaries' build failed")
         end
         if not shell.run(shell.quote(cyan) .. " build --prune") then
             fail("cyan build failed")
@@ -889,7 +891,7 @@ function M.main(root: string, _argv: {string}): integer
         end
         -- The served cache: the witness IS the console's backend — the
         -- bridge's read-only server rides this very process and
-        -- directory.
+        -- directory. Its announcement is the process's stdout.
         local witness_out = fs.read_all(fs.join(work, "witness.out"))
         if not witness_out:find("serving the console", 1, true) then
             io.stderr:write(
@@ -897,6 +899,26 @@ function M.main(root: string, _argv: {string}): integer
             )
             io.stderr:write(witness_out)
             fail("the witness's console server never announced")
+        end
+        -- The operator's cold-start recovery: the witness series replayed
+        -- through the real state machine recovers the locks the stream
+        -- recorded — the ordered shutdown's certificate, read by the
+        -- driven tool, never by any startup path.
+        if not shell.run(
+            fs.join(root, "examples/lease-sequencer/target/release/witness-replay")
+                .. " --aof-dir "
+                .. shell.quote(fs.join(work, "witness/aof"))
+                .. " | tee "
+                .. shell.quote(fs.join(work, "witness-replay.out"))
+        ) then
+            fail("the witness replay failed")
+        end
+        local replay_out = fs.read_all(fs.join(work, "witness-replay.out"))
+        if not replay_out:find("/smoke/wal-persist", 1, true) then
+            io.stderr:write(
+                "lunet smoke: the replay's recovered table:\n" .. replay_out
+            )
+            fail("the replay did not recover the named lock the stream recorded")
         end
 
         started = true
