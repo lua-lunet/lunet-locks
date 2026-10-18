@@ -159,8 +159,10 @@ fn main() {
                 // step 1 — the three rules apply, and rule 2 forces the
                 // flush of the batch in hand).
                 match classify(datagram) {
-                    Kind::Vrr { frontier } => {
-                        tape.record(Record::wire(local_ns(), datagram));
+                    Kind::Vrr { frontier, payload } => {
+                        // The wire tape: the VRR payload whole — the
+                        // envelope is the transport's, never the stream's.
+                        tape.record(Record::wire(local_ns(), payload));
                         if let Some(frontier) = frontier {
                             watermarks.observe(frontier);
                         }
@@ -294,13 +296,22 @@ fn transition_event(transition: &Transition, ts_ms: u64) -> JournalEvent {
 const PEER_MAGIC: &[u8; 26] = b"\0LUNET_ADVISORY_LOCK_PEER\0";
 const PEER_HEADER_BYTES: usize = 26 + 1 + 16;
 
-enum Kind {
-    Vrr { frontier: Option<Frontier> },
-    SyncPoint { frontier: Frontier },
+enum Kind<'a> {
+    /// A VRR datagram: the frontier its wire header carries, and the raw
+    /// VRR payload the tape records — the envelope is the transport's,
+    /// never the stream's.
+    Vrr {
+        frontier: Option<Frontier>,
+        payload: &'a [u8],
+    },
+    /// The stop's sync point: the frontier triple, 16 bytes.
+    SyncPoint {
+        frontier: Frontier,
+    },
     Other,
 }
 
-fn classify(datagram: &[u8]) -> Kind {
+fn classify(datagram: &[u8]) -> Kind<'_> {
     if datagram.len() < PEER_HEADER_BYTES || &datagram[..26] != PEER_MAGIC {
         return Kind::Other;
     }
@@ -325,6 +336,7 @@ fn classify(datagram: &[u8]) -> Kind {
             let frontier = Frontier { era, view, slot };
             Kind::Vrr {
                 frontier: Some(frontier),
+                payload,
             }
         }
         4 => {
