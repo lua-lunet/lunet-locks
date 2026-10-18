@@ -88,12 +88,10 @@ pub(crate) fn sink_guard(door: &SinkDoor) -> MutexGuard<'_, Option<JournalSink>>
 }
 
 /// The stop path's durable-state write: drain the committed-transition
-/// sink to quiescence — every record the node enqueued is appended and
-/// fsynced (the AOF writer), or the journal file is fsynced (the blocking
+/// sink to quiescence — the journal file is fsynced (the blocking
 /// journal). A disabled sink (`None`) has nothing to drain.
 pub(crate) fn drain_sink(sink: &mut Option<JournalSink>) -> io::Result<()> {
     match sink {
-        Some(JournalSink::Aof(writer)) => writer.drain(),
         Some(JournalSink::Blocking(journal)) => journal.flush(),
         None => Ok(()),
     }

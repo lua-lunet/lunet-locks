@@ -191,8 +191,8 @@ capture copies aside every artifact class the run produced, per node:
   `<incarnation> <state>` markers (`n1.state`, `n1.nonce`);
 - the membership sidecars (`<state>.membership`) next to the markers;
 - the flight-recorder tapes (`flight-*.jsonl`, rolled files included);
-- the AOF telemetry trees (`--aof-dir` series, `*.aof` / `ev-*.bin` +
-  metafiles);
+- the witness's capture trees (the wire tape's `*.aof` / the series'
+  `ev-*.bin` + metafiles);
 - the regular logs (`*.log`, `*.nohup`, `*.out`, `*.err`) — the
   happens-before/happens-after evidence for shutdown correctness;
 - the anchors file (`anchors*`).

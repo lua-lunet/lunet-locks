@@ -214,8 +214,8 @@ paths:
         state-transition records (the slot-frontier records) with their
         envelope ns floored to ms. A line that is not a JSON object
         carrying `ts` (the Lua host's stdout captured beside a node's own
-        log) is counted `unparsed`, never served. Served by the loopback
-        mock and the aof-console-bridge with the same shape.
+        log) is counted `unparsed`, never served. The loopback mock
+        serves the same shape.
       parameters:
         - { name: fromMs, in: query, schema: { type: integer, format: int64 }, description: 'Start of window; the whole span when absent' }
         - { name: toMs, in: query, schema: { type: integer, format: int64 }, description: 'End of window; the whole span when absent' }

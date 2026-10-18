@@ -113,8 +113,6 @@ local record Options
     recovery_ms: integer
     event_journal_dir: string
     event_journal_roll_bytes: integer
-    aof_dir: string
-    aof_flush_ms: integer
     witnesses: {cluster_config.Witness}
 end
 
@@ -176,7 +174,7 @@ local function usage(): string
         .. "at least three entries) "
         .. "[--heartbeat-ms N] [--election-ms N] [--recovery-ms N] "
         .. "[--event-journal-dir PATH] [--event-journal-roll-bytes N] "
-        .. "[--aof-dir PATH] [--aof-flush-ms N] [--witnesses PATH]"
+        .. "[--witnesses PATH]"
 end
 
 local function positive(value: string, name: string): integer
@@ -208,8 +206,6 @@ local function parse_options(argv: {string}): Options
     local recovery_ms: integer = 2500
     local event_journal_dir: string = ""
     local event_journal_roll_bytes: integer = 8388608
-    local aof_dir: string = ""
-    local aof_flush_ms: integer = 0
     local witnesses_path: string = ""
     local index = 1
     while index <= #argv do
@@ -243,11 +239,6 @@ local function parse_options(argv: {string}): Options
             event_journal_roll_bytes = positive(
                 value, "server: --event-journal-roll-bytes"
             )
-        elseif flag == "--aof-dir" then
-            assert(aof_dir == "", "server: --aof-dir may appear once")
-            aof_dir = value
-        elseif flag == "--aof-flush-ms" then
-            aof_flush_ms = positive(value, "server: --aof-flush-ms")
         elseif flag == "--witnesses" then
             assert(witnesses_path == "", "server: --witnesses may appear once")
             witnesses_path = value
@@ -266,10 +257,6 @@ local function parse_options(argv: {string}): Options
     assert(
         election_ms >= heartbeat_ms,
         "server: election timeout must be at least heartbeat"
-    )
-    assert(
-        aof_dir == "" or event_journal_dir == "",
-        "server: --aof-dir and --event-journal-dir are exclusive mounts"
     )
     local witnesses: {cluster_config.Witness} = {}
     if witnesses_path ~= "" then
@@ -290,8 +277,6 @@ local function parse_options(argv: {string}): Options
         recovery_ms = recovery_ms,
         event_journal_dir = event_journal_dir,
         event_journal_roll_bytes = event_journal_roll_bytes,
-        aof_dir = aof_dir,
-        aof_flush_ms = aof_flush_ms,
         witnesses = witnesses,
     }
 end
@@ -378,24 +363,13 @@ local function main(options: Options)
     end
     assert(udp_host ~= "", "server: own member missing")
 
-    local node: advisory_lock.Node
-    if options.aof_dir ~= "" then
-        node = advisory_lock.new_aof(
-            options.nodes,
-            options.node,
-            options.state,
-            options.aof_dir,
-            options.aof_flush_ms
-        )
-    else
-        node = advisory_lock.new(
-            options.nodes,
-            options.node,
-            options.state,
-            options.event_journal_dir,
-            options.event_journal_roll_bytes
-        )
-    end
+    local node: advisory_lock.Node = advisory_lock.new(
+        options.nodes,
+        options.node,
+        options.state,
+        options.event_journal_dir,
+        options.event_journal_roll_bytes
+    )
     own_id = node:own_id()
     log_membership(membership_log)
     -- The v0.10.0 stop contract's drain point, wired to the reference
@@ -683,8 +657,8 @@ local function main(options: Options)
     -- The lazy write-behind: adopted membership facts persist on this
     -- routine tick, never on the message path. The sidecar is rewritten
     -- atomically (temporary file, rename) with no fsync -- the same
-    -- documented loss window the AOF writer carries, and nothing depends
-    -- on the file for safety.
+    -- documented loss window any deferred writer carries, and nothing
+    -- depends on the file for safety.
     local function write_behind_loop()
         while true do
             lunet.sleep(WRITE_BEHIND_MS)

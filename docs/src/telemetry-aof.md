@@ -1,156 +1,73 @@
-# The lock telemetry capture file: the write-behind series
+# The witness's capture: the wire tape and the lock-event series
 
-The lock telemetry capture file is the cluster's public telemetry: the
-console follows a non-voting telemetry node's own async write-behind log
-(the **AOF**, append-only file) instead of any replica's replication-path
-journal. The telemetry node is a zero-voting-weight member: it follows
-the replication stream, applies every committed lock transition, and
-defers its own disk writes so the cluster's latency cadence is untouched.
-The mechanism follows the TigerBeetle AOF write-behind pattern: bytes
-leave the hot path immediately, are never force-flushed there, and are
-fsync'd only on a periodic timer, a checkpoint, or shutdown. (This is the
-public, wire-visible plane; the per-node internal trace is the separate
-[Flight Recorder](flight-recorder.md).)
+The cluster's public telemetry and its recovery substrate live on the
+**witness**: a static, non-voting process outside the roster that the
+running cluster never depends on and the console is served from. The
+members push every VRR datagram to the witness out of band — one UDP
+sender on the hot path — and the witness does its own book work: it tapes
+the raw wire and lifts the lock events. (The per-node internal trace is
+the separate, build-flag [Flight Recorder](flight-recorder.md).)
 
-## The writer
+## The two series, one process, one directory
 
-The AOF writer (`ext/advisory_lock/src/aof.rs`) is a dedicated writer thread
-behind a bounded queue:
+The witness writes two series beside each other:
 
-- **Producers never wait on disk.** The adapter's committed-transition hook
-  enqueues the complete 61-byte `LKE1` record into the writer's queue and
-  returns. When the queue is full the event is **dropped** and the drop
-  counter increments — the same drop-on-overflow contract the tracing stack
-  follows. Nothing on the replication path blocks, and an AOF failure never
-  disables the node.
-- **Linux**: buffered appends are submitted through an `io_uring` ring (the
-  `io-uring` feature, default on for Linux targets). The writes are
-  page-cached buffered appends: no `O_DIRECT`, no `O_SYNC`, no fsync on the
-  append path. If the ring cannot be created on the running kernel the
-  writer falls back to plain buffered `write_all` and logs once.
-- **macOS and other non-Linux targets**: a plain dedicated writer thread
-  with buffered `write_all`.
-- **fsync policy**: none on the append path. The file is fsync'd on a
-  configurable periodic timer (the operator knob), on an explicit checkpoint
-  request, and on graceful shutdown.
-- **Loss window**: the last unflushed bytes may be lost on power loss. The
-  AOF is best-effort telemetry on its ordinary cadence; nothing on the
-  replication path waits on it. The one exception is the clean-shutdown
-  sync ceremony (the witness-as-state-holder ruling in
-  [decisions](decisions.md)): a sync point forces an early flush, and the
-  acknowledgement is the certificate the flushed marker vouches for. The
-  series is the shutdown certificate and the operator's backup; no startup
-  path reads it.
+- **The wire tape** (`{unix_epoch_seconds}.aof`, the vendored TigerBeetle
+  store `ext/lunet-locks-aof`): every VRR datagram the witness receives,
+  one envelope `Wire` record, byte-identical to what the network carried.
+  This is the recovery substrate — replayed through the real
+  `Service::execute` by the witness's own lift and by the driven
+  `witness-replay` tool (never automatic).
+- **The lock-event series** (`ev-*.bin` + the 40-byte `LKM1` metafiles,
+  the `LKE1` 61-byte record): the lift's output — the committed lock
+  transitions derived from the tape replay. This is what the console's
+  journal reads.
 
-The record bytes are exactly the lock-event journal format (the same
-`LKE1`/`LKM1` codecs) but written to a different file series: the AOF is
-the deferred durability target, not the journal.
+## The flush discipline
 
-## Rolling at one erasure block
+Bytes leave the receive path immediately; nothing on it waits on disk.
+Flushes fire on the periodic timer (`--flush-ms`), when a sync-point
+record forces the batch in hand (the clean-stop ceremony's
+acknowledgement is the certificate the flushed marker vouches for), and
+at shutdown. The timer cadence is the staleness bound the console's
+readers live under. Any write failure crashes the witness — the
+[let-it-crash policy](architecture.md); the tape is never defended by
+soldiering on.
 
-The active file rolls at exactly **2 MiB** (2 × 1024 × 1024 bytes). Because
-records are fixed 61 bytes and 61 does not divide 2 MiB, the writer
-zero-pads the tail before rolling, so **every finalized AOF file is exactly
-2 MiB** — write-position aligned to one erasure block. The zero padding
-fails record parsing (bad magic), so the fixed-size readers' stop-at-first-
-invalid-record rule terminates cleanly at the pad.
+## Rolling and retention
 
-File naming and the metafile match the lock-event journal conventions, so
-the same feed server reads both series:
+- The wire tape rolls at the vendored engine's epoch naming; the
+  operator's byte budget (`--retention-mib`) keeps the newest files
+  (the active file is never a deletion candidate; the floor is the
+  active file plus one older), swept on the maintenance tick only.
+- The lock-event series rolls at 8 MiB; finalized files whose every
+  lease has expired (the metafile's `expiry_max`) drop on the
+  maintenance tick — the one deletion exception, documented in
+  [event-journal](event-journal.md).
 
-- Open (still-appending): `ev-open-<ts_started_ms>.bin`.
-- Finalized: `ev-<op_min>-<op_max>-<expiry_min>-<expiry_max>.bin` with a
-  companion atomically-written 40-byte `.meta` file (tmp + fsync + rename +
-  directory sync).
+**Reader-valid-prefix rule.** Finalized files may be deleted freely, at
+any time, in any order: every prefix of the rolling series is a valid
+reader view. The feed server lists whatever files remain and the console
+merges idempotently (events are keyed `[ts, lockId, leaseId]` in
+IndexedDB with a tombstone-ahead release rule), so deleting old blocks
+only shrinks the history the console shows.
 
-At each roll the writer flushes the buffer, fsyncs the finalized file,
-renames it to its final name, and writes the metafile.
-
-**Reader-valid-prefix rule.** Finalized files may be deleted freely, at any
-time, in any order: every prefix of the rolling series is a valid reader
-view. The feed server lists whatever files remain and the console merges
-idempotently (events are keyed `[ts, lockId, leaseId]` in IndexedDB with a
-tombstone-ahead release rule), so deleting old blocks only shrinks the
-history the console shows. No component deletes finalized files by itself.
-
-On restart the writer finds the existing `ev-open-*.bin` file, scans its
-valid records to recompute the write position and metadata window, truncates
-any torn tail, and resumes appending.
-
-## Rotation at (re)start
-
-The capture series the non-voting telemetry nodes write through the
-vendored TigerBeetle store (`ext/lunet-locks-aof`, the
-`{unix_epoch_seconds}.aof` naming) ROTATES at every (re)start: a NEW
-active file opens under a fresh unix-epoch name and the pre-existing
-series is left in place for the ADMIN to prune — no startup sweep deletes rotated files on
-this path. The prior `{epoch}.aof` files are the between-restart history;
-during a run the in-run rollover keeps exactly the current file plus one
-closed old. The telemetry nodes stop and start cleanly, so an admin
-prunes old capture files between runs.
-
-## The telemetry node
-
-The telemetry node is a regular cluster member that joined at weight 0 (the
-`--aof-dir` option turns the embedded node into the AOF host). It participates
-in replication as any member does — it receives prepares, applies committed
-operations — but it holds no vote and writes its lock-event records to the
-AOF writer instead of the blocking journal. Its lease driver converses with
-the leader like every node's driver does: the round-trip traffic is what
-carries the era evidence that keeps the telemetry node tracking the cluster while
-it applies the stream. Its AOF directory is therefore a complete copy of the
-cluster's committed lock-transition stream, produced without taxing the
-quorum path.
+On restart the witness finds the existing active files, recomputes the
+write positions, truncates any torn tail, and resumes appending; the
+durable lift cursor (`lift-cursor.bin`) boots the lift past the series'
+tail, so a restart never re-writes the history the series already
+carries.
 
 ## Serving the console
 
-The `lock-feed` process serves the telemetry node's capture directory over REST and
-WebSocket exactly as it serves a journal directory (`/files`, `/files/:name`,
-`/health`, `/ws`). Its follower tails the series — inotify-driven on Linux,
-poll-driven elsewhere, with the poll loop retained as a safety net on both —
-so the console stays live while the writer rolls.
+The `lock-feed` process serves a lock-event series directory over REST
+and WebSocket (`/files`, `/files/:name`, `/health`, `/ws`). Its follower
+tails the series — inotify-driven on Linux, poll-driven elsewhere, with
+the poll loop retained as a safety net on both — so the console stays
+live while the writer rolls.
 
-The console edge (nginx) maps `/feed/` to lock-feed and serves the console
-SPA as static assets. The console UI never reads a cluster replica's journal
-files; it reads the telemetry node's deferred capture series through the feed.
-The three headless assertions the capture demo makes are that committed
-events land in the AOF files, that the feed serves them, and that the
-console's data endpoint (`/feed/files` through the edge) returns them.
-
-Cluster cadence is unaffected: the stability assertions (renew ~250 ms, poll
-~2× renewal) hold while the telemetry node's writer and the feed run.
-
-## The replay tape
-
-The capture series also feeds the replay story: `skaffold_aof_tape`
-streams a telemetry AOF directory as the `from,to,{json}` CSV tape — one
-line per record, in file order (epoch order = ns order) — and the trivial
-shell filter `... | grep "^66,99,"` reads any peer pair's raw jsonl
-stream. The filtered lines force-feed a node in the unit tests through
-the same playback engine the Flight Recorder's tape feeds
-([the Flight Recorder](flight-recorder.md)); its streamer
-(`skaffold_flight_tape`) renders the identical CSV shape over the
-internal recordings. The telemetry capture file is the stable-ish,
-prod, UI-facing plane; the Flight Recorder is the feature-flagged,
-debug-only plane whose internal format is unstable and whose deep read
-is same-commit-readable only. Each streamer's from/to derivation rules
-are printed in its `--help`.
-
-A wire row's `from` is the sender the recorder's own JSON log series
-names: with `--logs PATH` (the recorder's log files, repeatable) the
-tape joins each Commit wire frame's `(era, view, slot)` to the
-recorder's `commit-in` line carrying the same key and takes the line's
-`from` member — the observability contract's arrival line, logged by a
-standby for every Commit it accepts from its leader. A frame with no
-matching line keeps `?`, never a guessed id; the join claims Commit
-frames only.
-
-The `aof-trace-tool` twins export the same series' two clock-side
-measurements over `--logs`: the `hb-spacing` kind (the cadence between
-successive `heartbeat-commit` / `commit-in` lines per node, one stats
-row per node and side of the wire) and the `leader-lag` kind (one row
-per matched leader `heartbeat-commit` ↔ standby `commit-in` exchange,
-joined on the `(era, view, slot)` both lines carry, carrying
-`leader_ms` — the difference between the leader's send clock and the
-standby's record clock, the measurement that separates "the leader
-sent late" from "the standby recorded late").
+The console edge (nginx) maps `/feed/` to lock-feed, re-points `/api/v1/`
+at the witness's own served cache, and serves the console SPA as static
+assets. The console UI never reads a cluster replica's journal files; it
+reads the witness's series through the feed and the lock state from the
+witness's served cache.

@@ -22,13 +22,6 @@ ffi.cdef(
         size_t journal_dir_len, const uint8_t* journal_dir,
         uint32_t roll_bytes,
         void** out);
-    int32_t lunet_lock_node_new_aof(
-        size_t members_len, const uint8_t* members,
-        size_t own_len, const uint8_t* own,
-        size_t state_len, const uint8_t* state,
-        size_t aof_dir_len, const uint8_t* aof_dir,
-        uint64_t flush_ms,
-        void** out);
     void lunet_lock_node_free(void* node);
     int32_t lunet_lock_node_request(void* node, size_t json_len, const uint8_t* json);
     int32_t lunet_lock_node_reconfigure(
@@ -88,9 +81,6 @@ local errors: {integer: string} = {
 
 local record Native
     lunet_lock_node_new: function(
-        integer, any, integer, any, integer, any, integer, any, integer, {any}
-    ): number
-    lunet_lock_node_new_aof: function(
         integer, any, integer, any, integer, any, integer, any, integer, {any}
     ): number
     lunet_lock_node_free: function(any)
@@ -206,9 +196,6 @@ local record advisory_lock
     end
 
     new: function({cluster_config.ClusterNode}, string, string, string, integer): Node
-    new_aof: function(
-        {cluster_config.ClusterNode}, string, string, string, integer
-    ): Node
     version_properties: function(): {string: string}
 end
 
@@ -619,51 +606,6 @@ function M.new(
                     #journal_dir,
                     journal_dir,
                     journal_roll_bytes,
-                    out
-                )
-            ) or -127
-        ) as integer
-    )
-    return node_record(ffi.gc(out[0], native.lunet_lock_node_free))
-end
-
--- The AOF-backed mount: the committed transitions enqueue to the
--- write-behind AOF writer instead of the blocking journal. `aof_dir` is
--- required (the ABI refuses an empty directory rather than falling back to
--- the journal); `flush_ms` is the periodic fsync cadence, 0 fsyncing only
--- at roll and shutdown.
-function M.new_aof(
-    members: {cluster_config.ClusterNode},
-    own: string,
-    state_path: string,
-    aof_dir: string,
-    flush_ms: integer
-): Node
-    local packed = pack_members(members)
-    assert(own:find("\0", 1, true) == nil, "advisory_lock: own member contains NUL")
-    assert(
-        state_path ~= "" and state_path:find("\0", 1, true) == nil,
-        "advisory_lock: invalid state path"
-    )
-    assert(
-        aof_dir ~= "" and aof_dir:find("\0", 1, true) == nil,
-        "advisory_lock: invalid AOF directory"
-    )
-    assert(flush_ms >= 0, "advisory_lock: AOF flush ms must be non-negative")
-    local out = ffi.new("void*[1]") as {any}
-    check(
-        (
-            tonumber(
-                native.lunet_lock_node_new_aof(
-                    #packed,
-                    packed,
-                    #own,
-                    own,
-                    #state_path,
-                    state_path,
-                    #aof_dir,
-                    aof_dir,
-                    flush_ms,
                     out
                 )
             ) or -127

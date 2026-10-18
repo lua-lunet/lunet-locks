@@ -1063,7 +1063,7 @@ fn route(
             json!({
                 "status": "ok",
                 "nowMs": unix_millis(),
-                "source": "aof-console-bridge",
+                "source": "witness",
             })
             .to_string(),
         ),
