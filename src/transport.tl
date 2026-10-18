@@ -64,30 +64,27 @@ end
 -- The witness sync point's frame: the node's committed frontier (era,
 -- view, slot) in the witness-sync envelope — the ceremony's step 1, fire
 -- and forget, no reply ever awaited (the witnesses' series are the
--- backup certificate).
+-- backup certificate). The bytes come out by arithmetic, never bit
+-- operations: the shifts Teal emits name bit32, which does not exist on
+-- LuaJIT, and a ceremony that dies at its own encode is a ceremony that
+-- never ran.
+local function four_bytes(value: integer): string
+    local high = math.floor(value / 16777216) % 256
+    local midhigh = math.floor(value / 65536) % 256
+    local midlow = math.floor(value / 256) % 256
+    local low = value % 256
+    return string.char(high, midhigh, midlow, low)
+end
+
 local function encode_witness_sync(
     fingerprint: string, era: integer, view: integer, slot: integer
 ): string
     assert(valid_fingerprint(fingerprint), "transport: invalid membership fingerprint")
-    local frontier = string.char(
-        (era >> 24) & 0xFF,
-        (era >> 16) & 0xFF,
-        (era >> 8) & 0xFF,
-        era & 0xFF,
-        (view >> 24) & 0xFF,
-        (view >> 16) & 0xFF,
-        (view >> 8) & 0xFF,
-        view & 0xFF
-    ) .. string.char(
-        (slot >> 56) & 0xFF,
-        (slot >> 48) & 0xFF,
-        (slot >> 40) & 0xFF,
-        (slot >> 32) & 0xFF,
-        (slot >> 24) & 0xFF,
-        (slot >> 16) & 0xFF,
-        (slot >> 8) & 0xFF,
-        slot & 0xFF
-    )
+    local slot_high = math.floor(slot / 4294967296)
+    local frontier = four_bytes(era)
+        .. four_bytes(view)
+        .. four_bytes(slot_high)
+        .. four_bytes(slot % 4294967296)
     return PEER_MAGIC .. PEER_WITNESS_SYNC .. fingerprint .. frontier
 end
 

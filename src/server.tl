@@ -438,31 +438,6 @@ local function main(options: Options)
     local witness_era, witness_view, witness_slot = 0, 0, 0
 
     local function forward_witnesses(encoded: string)
-        if next(witness_endpoints) == nil then
-            return
-        end
-        if #encoded >= 62 then
-            local era = encoded:byte(43) * 16777216 + encoded:byte(
-                44
-            ) * 65536 + encoded:byte(45) * 256 + encoded:byte(46)
-            local view = encoded:byte(47) * 16777216 + encoded:byte(
-                48
-            ) * 65536 + encoded:byte(49) * 256 + encoded:byte(50)
-            local slot_hi = encoded:byte(55) * 16777216 + encoded:byte(
-                56
-            ) * 65536 + encoded:byte(57) * 256 + encoded:byte(58)
-            local slot_lo = encoded:byte(59) * 16777216 + encoded:byte(
-                60
-            ) * 65536 + encoded:byte(61) * 256 + encoded:byte(62)
-            local slot = slot_hi * 4294967296 + slot_lo
-            if
-                era > witness_era
-                or (era == witness_era and view > witness_view)
-                or (era == witness_era and view == witness_view and slot > witness_slot)
-            then
-                witness_era, witness_view, witness_slot = era, view, slot
-            end
-        end
         for _, witness_endpoint in ipairs(witness_endpoints) do
             local ok = pcall(send_endpoint, witness_endpoint, encoded)
             if not ok then
@@ -474,29 +449,25 @@ local function main(options: Options)
         end
     end
 
+    -- The node's committed frontier rides the drain: the highest
+    -- (era, view, slot) this node has ever put on the wire is the
+    -- frontier its stop's sync point names. The drain's outputs carry
+    -- the fields already parsed — no byte reading on the send path.
+    local function observe_frontier(era: integer, view: integer, slot: integer)
+        if
+            era > witness_era
+            or (era == witness_era and view > witness_view)
+            or (era == witness_era and view == witness_view and slot > witness_slot)
+        then
+            witness_era, witness_view, witness_slot = era, view, slot
+        end
+    end
+
     lunet.on_stop(
         function()
             log_membership(
                 "advisory-lock " .. options.node .. " stop: drain point reached"
             )
-            -- The ceremony's step 1: the sync point — this node's own
-            -- committed frontier, the highest it forwarded — broadcast to
-            -- every witness, fire and forget, BEFORE the message loop
-            -- stops. Every witness applies the same rule: flushed covers
-            -- the point — ack at once; in the buffer — force the flush
-            -- and ack; unseen — hold the point open, flush the moment
-            -- the stream covers it, ack then. No reply is awaited: the
-            -- witnesses' series are the backup certificate, and the
-            -- node's certificate is its own flush.
-            for _, witness_endpoint in ipairs(witness_endpoints) do
-                pcall(
-                    send_endpoint,
-                    witness_endpoint,
-                    transport.encode_witness_sync(
-                        fingerprint, witness_era, witness_view, witness_slot
-                    )
-                )
-            end
             node:stop()
             node:close()
             log_membership(
@@ -1072,6 +1043,9 @@ local function main(options: Options)
                 -- The core emits one unicast send per destination; route as
                 -- addressed (a self-addressed send is delivered like any other).
                 send_vrr(output.replica, output.bytes)
+                -- The node's committed frontier: the highest output's
+                -- identity is the stop's sync point.
+                observe_frontier(output.era, output.view, output.slot)
                 -- The heartbeat of a commit: the last Commit this node put
                 -- on the wire, kept per peer for the idle beat to
                 -- re-announce. The tag is the header's own first word
@@ -1763,6 +1737,28 @@ local function main(options: Options)
                         .. signal_name
                         .. " received"
                 )
+                -- The ceremony's step 1: the sync point — this node's own
+                -- committed frontier, the highest it ever forwarded —
+                -- broadcast to every witness, fire and forget, BEFORE the
+                -- runtime stops. The seat is here and not in the stop
+                -- hook: the hook runs inside the teardown, where the
+                -- runtime's sockets are already refusing; here the send
+                -- lands. Every witness applies the same rule: flushed
+                -- covers the point — ack at once; in the buffer — force
+                -- the flush and ack; unseen — hold the point open, flush
+                -- the moment the stream covers it, ack then. No reply is
+                -- awaited: the witnesses' series are the backup
+                -- certificate, and the node's certificate is its own
+                -- flush.
+                for _, witness_endpoint in ipairs(witness_endpoints) do
+                    pcall(
+                        send_endpoint,
+                        witness_endpoint,
+                        transport.encode_witness_sync(
+                            fingerprint, witness_era, witness_view, witness_slot
+                        )
+                    )
+                end
                 __lunet_exit_code = 0
                 lunet.stop()
             end
