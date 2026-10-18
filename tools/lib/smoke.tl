@@ -859,6 +859,14 @@ function M.main(root: string, _argv: {string}): integer
             io.stderr:write(witness_err)
             fail("the witness's tape never flushed")
         end
+        -- The ceremony's step 1 on the wire: the persistence stage's
+        -- clean stops broadcast the sync point; the witness answers by
+        -- the rules — the acknowledged line is the ack's log.
+        if not witness_err:find("sync point", 1, true) then
+            io.stderr:write("lunet smoke: the witness never saw a sync point:\n")
+            io.stderr:write(witness_err)
+            fail("the witness never saw a sync point")
+        end
         local witness_aof = fs.join(work, "witness/aof")
         local entries, _list_err = fs.list_dir(witness_aof)
         local tape_bytes = 0

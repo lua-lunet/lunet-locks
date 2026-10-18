@@ -403,11 +403,100 @@ local function main(options: Options)
     -- synchronous only, and the hosted node's graceful stop (wire close,
     -- `stopped` marker, sink drain, `flushed` marker) executes there. No
     -- Teal-side close machinery of our own runs outside this hook.
+    -- those bytes instead of opening a client transaction, so an idle
+    -- leader costs the journal no slots.
+    local last_commit: {integer: Commit} = {}
+    local commit_since_beat = false
+    -- Forward declarations: the discovery loop and the admin drive are
+    -- defined before the send helpers they route through.
+    local send_endpoint: function(string, string)
+    local flush: function({Output})
+    -- The static witnesses: host config, outside the roster, never
+    -- purged. Every datagram the node sends a peer, each witness's
+    -- endpoint receives the same bytes, fire and forget — a witness's
+    -- absence costs one datagram, never a wait, so the send is a UDP
+    -- write the protocol never hears about.
+    local witness_endpoints: {string} = {}
+    for _, witness in ipairs(options.witnesses) do
+        table.insert(witness_endpoints, witness.host .. ":" .. tostring(witness.port))
+        log_membership(
+            "advisory-lock witness "
+                .. witness.name
+                .. " at "
+                .. witness.host
+                .. ":"
+                .. tostring(witness.port)
+        )
+    end
+
+    -- The node's committed frontier rides the forwards: the highest
+    -- (era, view, slot) this node has ever forwarded is the frontier
+    -- its stop's sync point names. The forwarded frame's own frontier
+    -- sits after the peer envelope (the magic, the kind byte, the
+    -- fingerprint); its VRR header is tag|era|view|slot, 20 bytes,
+    -- big-endian.
+    local witness_era, witness_view, witness_slot = 0, 0, 0
+
+    local function forward_witnesses(encoded: string)
+        if next(witness_endpoints) == nil then
+            return
+        end
+        if #encoded >= 62 then
+            local era = encoded:byte(43) * 16777216 + encoded:byte(
+                44
+            ) * 65536 + encoded:byte(45) * 256 + encoded:byte(46)
+            local view = encoded:byte(47) * 16777216 + encoded:byte(
+                48
+            ) * 65536 + encoded:byte(49) * 256 + encoded:byte(50)
+            local slot_hi = encoded:byte(55) * 16777216 + encoded:byte(
+                56
+            ) * 65536 + encoded:byte(57) * 256 + encoded:byte(58)
+            local slot_lo = encoded:byte(59) * 16777216 + encoded:byte(
+                60
+            ) * 65536 + encoded:byte(61) * 256 + encoded:byte(62)
+            local slot = slot_hi * 4294967296 + slot_lo
+            if
+                era > witness_era
+                or (era == witness_era and view > witness_view)
+                or (era == witness_era and view == witness_view and slot > witness_slot)
+            then
+                witness_era, witness_view, witness_slot = era, view, slot
+            end
+        end
+        for _, witness_endpoint in ipairs(witness_endpoints) do
+            local ok = pcall(send_endpoint, witness_endpoint, encoded)
+            if not ok then
+                -- A witness's unreachability is never fatal: the stream
+                -- is fire and forget, and the witness's own gap is its
+                -- own affair.
+                log_membership("advisory-lock witness send failed; datagram dropped")
+            end
+        end
+    end
+
     lunet.on_stop(
         function()
             log_membership(
                 "advisory-lock " .. options.node .. " stop: drain point reached"
             )
+            -- The ceremony's step 1: the sync point — this node's own
+            -- committed frontier, the highest it forwarded — broadcast to
+            -- every witness, fire and forget, BEFORE the message loop
+            -- stops. Every witness applies the same rule: flushed covers
+            -- the point — ack at once; in the buffer — force the flush
+            -- and ack; unseen — hold the point open, flush the moment
+            -- the stream covers it, ack then. No reply is awaited: the
+            -- witnesses' series are the backup certificate, and the
+            -- node's certificate is its own flush.
+            for _, witness_endpoint in ipairs(witness_endpoints) do
+                pcall(
+                    send_endpoint,
+                    witness_endpoint,
+                    transport.encode_witness_sync(
+                        fingerprint, witness_era, witness_view, witness_slot
+                    )
+                )
+            end
             node:stop()
             node:close()
             log_membership(
@@ -430,15 +519,6 @@ local function main(options: Options)
     -- The heartbeat of a commit: the leader's LAST commit per peer, with
     -- the ballot that authorised it, and whether the last beat interval
     -- carried a Commit out of this node. The idle beat re-announces
-    -- those bytes instead of opening a client transaction, so an idle
-    -- leader costs the journal no slots.
-    local last_commit: {integer: Commit} = {}
-    local commit_since_beat = false
-    -- Forward declarations: the discovery loop and the admin drive are
-    -- defined before the send helpers they route through.
-    local send_endpoint: function(string, string)
-    local flush: function({Output})
-
     local guard = membership_guard.new(fingerprint)
     local listener_open = true
 
@@ -780,36 +860,6 @@ local function main(options: Options)
         local host, port = split_endpoint(endpoint)
         local ok, send_error = udp.send(peer, host, port, payload)
         assert(ok ~= nil, "server: UDP send failed: " .. (send_error or "unknown"))
-    end
-
-    -- The static witnesses: host config, outside the roster, never
-    -- purged. Every datagram the node sends a peer, each witness's
-    -- endpoint receives the same bytes, fire and forget — a witness's
-    -- absence costs one datagram, never a wait, so the send is a UDP
-    -- write the protocol never hears about.
-    local witness_endpoints: {string} = {}
-    for _, witness in ipairs(options.witnesses) do
-        table.insert(witness_endpoints, witness.host .. ":" .. tostring(witness.port))
-        log_membership(
-            "advisory-lock witness "
-                .. witness.name
-                .. " at "
-                .. witness.host
-                .. ":"
-                .. tostring(witness.port)
-        )
-    end
-
-    local function forward_witnesses(encoded: string)
-        for _, witness_endpoint in ipairs(witness_endpoints) do
-            local ok = pcall(send_endpoint, witness_endpoint, encoded)
-            if not ok then
-                -- A witness's unreachability is never fatal: the stream
-                -- is fire and forget, and the witness's own gap is its
-                -- own affair.
-                log_membership("advisory-lock witness send failed; datagram dropped")
-            end
-        end
     end
 
     local function send_vrr(replica: integer, payload: string)

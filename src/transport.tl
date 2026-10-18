@@ -6,6 +6,11 @@ local PEER_APPLICATION = "\2"
 -- post-commit dissemination): the request is one tag byte, the response
 -- era+slot+members. See `snapshot.tl` for the payload shapes.
 local PEER_SNAPSHOT = "\3"
+-- The witness sync point: the clean stop's fire-and-forget broadcast of
+-- the node's committed frontier to the static witnesses (the ceremony's
+-- step 1). The payload is the VRR header's identity triple: era u32,
+-- view u32, slot u64, big-endian.
+local PEER_WITNESS_SYNC = "\4"
 local FORWARD_REQUEST = "\1"
 local FORWARD_RESPONSE = "\2"
 local FORWARD_NOT_LEADER = "\3"
@@ -42,7 +47,10 @@ end
 
 local function encode_peer(kind: string, fingerprint: string, payload: string): string
     assert(
-        kind == PEER_VRR or kind == PEER_APPLICATION or kind == PEER_SNAPSHOT,
+        kind == PEER_VRR
+            or kind == PEER_APPLICATION
+            or kind == PEER_SNAPSHOT
+            or kind == PEER_WITNESS_SYNC,
         "transport: invalid peer packet kind"
     )
     assert(valid_fingerprint(fingerprint), "transport: invalid membership fingerprint")
@@ -51,6 +59,36 @@ local function encode_peer(kind: string, fingerprint: string, payload: string): 
         "transport: peer payload exceeds UDP limit"
     )
     return PEER_MAGIC .. kind .. fingerprint .. payload
+end
+
+-- The witness sync point's frame: the node's committed frontier (era,
+-- view, slot) in the witness-sync envelope — the ceremony's step 1, fire
+-- and forget, no reply ever awaited (the witnesses' series are the
+-- backup certificate).
+local function encode_witness_sync(
+    fingerprint: string, era: integer, view: integer, slot: integer
+): string
+    assert(valid_fingerprint(fingerprint), "transport: invalid membership fingerprint")
+    local frontier = string.char(
+        (era >> 24) & 0xFF,
+        (era >> 16) & 0xFF,
+        (era >> 8) & 0xFF,
+        era & 0xFF,
+        (view >> 24) & 0xFF,
+        (view >> 16) & 0xFF,
+        (view >> 8) & 0xFF,
+        view & 0xFF
+    ) .. string.char(
+        (slot >> 56) & 0xFF,
+        (slot >> 48) & 0xFF,
+        (slot >> 40) & 0xFF,
+        (slot >> 32) & 0xFF,
+        (slot >> 24) & 0xFF,
+        (slot >> 16) & 0xFF,
+        (slot >> 8) & 0xFF,
+        slot & 0xFF
+    )
+    return PEER_MAGIC .. PEER_WITNESS_SYNC .. fingerprint .. frontier
 end
 
 local function decode_peer(packet: string): (boolean, string, string, string)
@@ -278,6 +316,7 @@ return {
     MEMBERSHIP_FINGERPRINT_HEX_BYTES = MEMBERSHIP_FINGERPRINT_HEX_BYTES,
     source_is_member = source_is_member,
     encode_peer = encode_peer,
+    encode_witness_sync = encode_witness_sync,
     decode_peer = decode_peer,
     encode_not_leader = encode_not_leader,
     decode_not_leader = decode_not_leader,
