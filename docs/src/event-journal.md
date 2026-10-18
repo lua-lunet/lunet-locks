@@ -131,10 +131,19 @@ never block, poison, or fail the replication path:
 
 ### Never-delete policy
 
-No component in this system deletes journal files. Rolled `.bin` and `.meta`
-files accumulate indefinitely. Pruning is a sysadmin job, performed outside
-the service. The lock-feed server and the console SPA read files but never
-remove them.
+No component on a CLUSTER MEMBER deletes journal files. Rolled `.bin` and
+`.meta` files accumulate indefinitely on the members. Pruning is a sysadmin
+job, performed outside the service. The lock-feed server and the console SPA
+read files but never remove them.
+
+**The witness series is the exception.** The witness is not a member and
+never blocks anything: its own maintenance cadence reaps its series — the
+wire tape keeps its newest files within the byte budget (the active file
+and one older are the floor), and a rolled lock-event file whose every
+lease has expired is droppable (the metafile's expiry window is the bound;
+the live set is small and the dead record is bulk). The console's IndexedDB
+history is the UI's memory; the deletion of source files it already
+ingested costs it nothing.
 
 ## Serving to the console
 
