@@ -35,7 +35,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use tbio::envelope::Record;
 
-use lease_sequencer::bridge::{RawTransition, Server, replay_transitions};
+use lease_sequencer::bridge::{RawTransition, Server, lift_transitions, replay_transitions};
 use lease_sequencer::telemetry::TelemetryLog;
 use lunet_advisory_lock::journal::{
     Journal, JournalEvent, KIND_BREAK, KIND_HOLD, KIND_RELEASE, KIND_RENEW, Meta,
@@ -144,7 +144,13 @@ fn main() {
     // names; neither collides).
     let mut journal = Journal::open(&dir, 8 * 1024 * 1024)
         .unwrap_or_else(|e| die(&format!("cannot open the event series: {e}")));
-    let mut derived: usize = 0;
+    // The lift's cursor: the frontier reached — the last written
+    // transition's (era, view, slot) — never a count. The tape's
+    // retention drops the oldest files and the replay window re-bases
+    // underneath the lift each tick; whatever the window still carries
+    // at or below the frontier is already in the series, and the lift
+    // resumes exactly past it.
+    let mut lifted: Option<Frontier> = None;
 
     loop {
         let mut buf = [0u8; 65_536];
@@ -199,7 +205,12 @@ fn main() {
         // and the lift writes the newly derived lock events to the
         // series: the committed stream replayed through the real state
         // machine, the transitions' own shapes (the lease id, the holder
-        // bytes, the absolute expiry) encoded whole.
+        // bytes, the absolute expiry) encoded whole. The lift's cursor
+        // is the frontier reached — the last written transition's
+        // (era, view, slot) — so the retention's dropped tape head
+        // re-bases the replay window without moving the lift's seat:
+        // work already in the series is never re-written, new work is
+        // never skipped.
         let now = now_ms();
         tape.tick(now);
         if flush_ms > 0 && now.saturating_sub(last_flush) >= flush_ms {
@@ -213,16 +224,19 @@ fn main() {
                 watermarks.held().len()
             );
             let transitions = replay_transitions(&dir);
-            for raw in transitions.iter().skip(derived) {
+            for raw in lift_transitions(&transitions, lifted) {
                 let RawTransition {
-                    ts_ms, transition, ..
+                    ts_ms,
+                    frontier,
+                    transition,
+                    ..
                 } = raw;
-                let event = transition_event(transition, *ts_ms);
+                let event = transition_event(&transition, ts_ms);
                 if let Err(error) = journal.append(&event) {
                     eprintln!("witness: the event series refused an append ({error})");
                     break;
                 }
-                derived += 1;
+                lifted = Some(frontier);
             }
             if let Err(error) = journal.flush() {
                 eprintln!("witness: the event series' flush failed ({error})");
