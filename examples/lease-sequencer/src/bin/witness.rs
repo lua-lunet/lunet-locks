@@ -35,7 +35,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use tbio::envelope::Record;
 
-use lease_sequencer::bridge::{RawTransition, replay_transitions};
+use lease_sequencer::bridge::{RawTransition, Server, replay_transitions};
 use lease_sequencer::telemetry::TelemetryLog;
 use lunet_advisory_lock::journal::{
     Journal, JournalEvent, KIND_BREAK, KIND_HOLD, KIND_RELEASE, KIND_RENEW,
@@ -48,6 +48,8 @@ fn main() {
     let mut aof_dir: Option<PathBuf> = None;
     let mut flush_ms: u64 = 1000;
     let mut rollover_mib: u64 = 4;
+    let mut bind: Option<String> = None;
+    let mut follow = false;
     let mut argv = std::env::args().skip(1);
     while let Some(arg) = argv.next() {
         match arg.as_str() {
@@ -75,6 +77,10 @@ fn main() {
                     .parse()
                     .unwrap_or_else(|_| die("--rollover-mib must be a number"));
             }
+            "--bind" => {
+                bind = Some(argv.next().unwrap_or_else(|| die("--bind needs ADDR:PORT")));
+            }
+            "--follow" => follow = true,
             "--help" | "-h" => {
                 print_usage();
                 std::process::exit(0);
@@ -102,9 +108,25 @@ fn main() {
     .unwrap_or_else(|e| die(&format!("cannot open the tape at {}: {e}", dir.display())));
 
     println!(
-        "witness: receiving on udp {listen}, series {}, flush-ms {flush_ms}",
-        dir.display()
+        "witness: receiving on udp {listen}, series {}, flush-ms {}",
+        dir.display(),
+        flush_ms
     );
+    // The served cache: the witness IS the console's decoupled backend —
+    // the bridge's read-only OpenAPI server on this witness's own
+    // directory, the locks lifted off the tape here and served live
+    // (the --follow WS push rides the tape's own writes). The running
+    // nodes are decoupled from it: the console's reads never touch a
+    // member.
+    if let Some(bind) = &bind {
+        let server = Server::spawn(&dir, None, bind, follow)
+            .unwrap_or_else(|e| die(&format!("cannot serve on {bind}: {e}")));
+        println!(
+            "witness: serving the console on http://{} (series {}, follow {follow})",
+            server.port(),
+            dir.display()
+        );
+    }
 
     let mut watermarks = WitnessWatermarks::new();
     let mut last_flush = now_ms();

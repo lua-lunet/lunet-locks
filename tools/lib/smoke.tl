@@ -317,6 +317,9 @@ function M.main(root: string, _argv: {string}): integer
                 fs.join(work, "witness/aof"),
                 "--flush-ms",
                 "500",
+                "--bind",
+                "127.0.0.1:28301",
+                "--follow",
             },
             "witness",
             {
@@ -883,6 +886,17 @@ function M.main(root: string, _argv: {string}): integer
         end
         if not lifted_series then
             fail("the witness's lock-event series never landed: the lift wrote nothing")
+        end
+        -- The served cache: the witness IS the console's backend — the
+        -- bridge's read-only server rides this very process and
+        -- directory.
+        local witness_out = fs.read_all(fs.join(work, "witness.out"))
+        if not witness_out:find("serving the console", 1, true) then
+            io.stderr:write(
+                "lunet smoke: the witness's console server never announced:\n"
+            )
+            io.stderr:write(witness_out)
+            fail("the witness's console server never announced")
         end
 
         started = true
