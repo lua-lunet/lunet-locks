@@ -36,7 +36,7 @@ behind a bounded queue:
 - **Loss window**: the last unflushed bytes may be lost on power loss. The
   AOF is best-effort telemetry on its ordinary cadence; nothing on the
   replication path waits on it. The one exception is the clean-shutdown
-  sync ceremony (the witness-as-state-holder ruling in
+  sync ceremony (the UI-server-is-the-state-holder ruling in
   [decisions](decisions.md)): a sync point forces an early flush, and the
   acknowledgement is the certificate the flushed marker vouches for. The
   series is the shutdown certificate and the operator's backup; no startup

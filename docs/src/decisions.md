@@ -89,27 +89,28 @@ remains short for leader timeout.
 See [Failure detection and the timeouts](failure-detection.md) for the
 mechanisms this ruling governs.
 
-## Witnesses hold the durable stream; clean shutdown is a sync ceremony
+## The UI server holds the durable stream; clean shutdown is a sync ceremony
 
-A voting node never writes protocol state to its local disk. The cluster's
+A voting member never writes protocol state to its local disk. The cluster's
 store of record is quorum memory, and a restarting node recovers its state
-from the streams of its peers. Local disk on a voter carries the lifecycle
-marker, which fences, and observability, which vouches for nothing. The
-question that remains is where the state is durable when every voter is
-down, and the answer is the witnesses.
+from the streams of its peers. Local disk on a voting member carries the
+lifecycle marker, which fences, and observability, which vouches for
+nothing. The question that remains is where the state is durable when every
+voting member is down, and the answer is the UI server's series.
 
-**The ruling: the witness is the deployment's state holder.** Every
-deployment registers at least one witness per data centre. A witness is
+**The ruling: the UI server is the deployment's state holder.** Every
+deployment registers at least one UI server per data centre. A UI server is
 outside the roster, never votes, and receives the full phase-2 and commit
 stream from every leader in turn. Its append-only series is the durable
-copy of the stream: the witness records what it receives and tracks two
+copy of the stream: the UI server records what it receives and tracks two
 high-watermarks, the highest frontier it holds in its buffer and the
-highest frontier it has flushed. The series is no longer observability
-only; it is the copy a full-cluster cold start recovers from.
+highest frontier it has flushed. The series is more than observability: it
+is the shutdown certificate, the console's record, and the operator's
+backup.
 
-The witness's write cadence is unchanged by the role: deferred, batched,
+The UI server's write cadence is unchanged by the role: deferred, batched,
 force-flushed on a timer rather than on the replication path, so its I/O
-jitter stays off the voters. The one exception is the sync point, below,
+jitter stays off the voting members. The one exception is the sync point, below,
 which forces an early flush of a batch already in hand: a small amount of
 bookkeeping and an early flush, never a change to the streaming protocol.
 
@@ -119,13 +120,13 @@ A node shutting down cleanly owes itself one act before it may call
 itself flushed: its lock table durable under its own write-behind series.
 
 1. The node broadcasts a sync point, its own committed frontier, to all
-   nodes, fire and forget, so that every witness syncs. Every witness
+   nodes, fire and forget, so that every UI server syncs. Every UI server
    receiving the point applies the same rule: if its flushed watermark
    already covers the frontier it acknowledges immediately; if the
    frontier is in its buffer it forces the flush and acknowledges; if it
    has not yet seen the frontier it holds the point open, flushes the
    moment the stream covers it, and acknowledges then. No reply is
-   awaited: the witnesses' series are the backup certificate, and the
+   awaited: the UI servers' series are the backup certificate, and the
    node's certificate is its own flush.
 2. The node stops its message loop. No further protocol traffic is
    accepted, and anything arriving after this point is dropped.
@@ -145,7 +146,7 @@ itself flushed: its lock table durable under its own write-behind series.
 
 ### The startup side
 
-The witness series is never on the startup path. A starting node reads
+The UI server's series is never on the startup path. A starting node reads
 its boot fence, and the classification chooses the path:
 
 - **Clean** (the marker reads flushed): the node reads its own
@@ -160,17 +161,17 @@ its boot fence, and the classification chooses the path:
   family keeps for exactly this purpose. The live cluster's memory is
   the source of truth for a rejoining node; the tape is not.
 
-A full-cluster cold start re-forms the cluster empty. The witness series
-is the shutdown certificate and the console's record, and it is the
+A full-cluster cold start re-forms the cluster empty. The UI server's
+series is the shutdown certificate and the console's record, and it is the
 operator's backup: an ordered shutdown leaves the whole stream durable,
 the record exists for an operator-driven recovery, and no startup path
 replays it automatically.
 
-Witness retention is bounded by the lease horizon, not by the deployment's
-age. A witness retains its series indefinitely while it runs, rotates its
-files at its own reboot, and may drop files old enough that every lease
-they record has expired: the live set is small and the dead record is
-bulk.
+Retention on the UI server is bounded by the lease horizon, not by the
+deployment's age. The UI server retains its series indefinitely while it
+runs, rotates its files at its own reboot, and may drop files old enough
+that every lease they record has expired: the live set is small and the
+dead record is bulk.
 
 ## The system lease is a lease, not a fault detector
 
@@ -241,8 +242,9 @@ process's own intent. The artefact is a frame, not a running series: a
 dirty boot never reads it, so nothing is written to it during operation,
 and the serving path never touches the disk. The sweeper rides the
 leader's heartbeat cadence and removes expired locks from the table; no
-tombstones are written, because the frame holds the live set alone. The witness's two watermarks and the three
-sync-point rules are the AOF event loop's contract, tested red-green
+tombstones are written, because the frame holds the live set alone. The
+UI server's two watermarks and the three sync-point rules are the AOF
+event loop's contract, tested red-green
 around the loop: an ack for an already-flushed point, a forced flush for
 a buffered point, a held point that flushes and acks when the stream
 arrives. The end-to-end contract: a clean shutdown followed by a restart

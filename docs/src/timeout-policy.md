@@ -41,9 +41,9 @@ $ target/release/timeout-policy <state> <timeout>
 | stopping | do-nothing | do-nothing | do-nothing | do-nothing | do-nothing | do-nothing | do-nothing | do-nothing |
 | stopping-not-flushed | sorry | sorry | sorry | sorry | sorry | sorry | sorry | sorry |
 
-The matcher's rule, exhausted: a clock event on a non-agent (a witness, a
-node unknown to the others, a booted node, a crashed node, a stopping
-node) is not protocol and the opinion is `do-nothing`; an agent (a member
+The matcher's rule, exhausted: a clock event on a non-agent (the sink
+state, a node unknown to the others, a booted node, a crashed node, a
+stopping node) is not protocol and the opinion is `do-nothing`; an agent (a member
 seated in the cluster, a steady member) answers the flavour it met — the
 cluster wait resends the un-acknowledged traffic, the seated member's
 steady quiet with nothing outstanding is the heartbeat option, and the
@@ -68,11 +68,11 @@ from the hosts' own timer code — every cadence, deadline and forced
 transition in the adapter, the Rust example host and the Teal host — and
 asserted as a test
 (`ext/advisory_lock/tests/timeout_policy_audit_test.rs`). A pair no host
-acts on is not a row: the witness, the unknown node and the crashed node
-carry no clock-driven drive at all, a witness being a passive data sink,
-an unknown node having no addressing row, and a crashed node's clock
-belonging to whatever the next boot does about the marker. The adapter's
-status plane (`status`, `ext/advisory_lock/src/ffi.rs`) reports the
+acts on is not a row: the sink state, the unknown node and the crashed
+node carry no clock-driven drive at all, the sink state being a passive
+data sink, an unknown node having no addressing row, and a crashed node's
+clock belonging to whatever the next boot does about the marker. The
+adapter's status plane (`status`, `ext/advisory_lock/src/ffi.rs`) reports the
 node's replication state, leader, era, view and folded configuration
 era, and the hosts read it to choose the drive.
 

@@ -486,12 +486,13 @@ Durability is a stated property of the design. Under `Stability::Volatile`
 the core keeps protocol state in quorum memory, not local storage: a voting
 node never writes protocol state to its own disk. A restarting node
 reincarnates and recovers its state from the live nodes, whose memory
-holds the live locks and the inflight commands whole; the witness series
-is never on the startup path. The witness holds the durable copy of the
-stream as the deployment's state holder, and the clean-shutdown sync
-ceremony guarantees it is current at a clean halt: a node halts cleanly
-only once a witness has acknowledged that its frontier is flushed (the
-witness-as-state-holder ruling in [decisions](decisions.md)). An ordered
+holds the live locks and the inflight commands whole; the UI server's
+series is never on the startup path. The UI server holds the durable copy
+of the stream as the deployment's state holder, and the clean-shutdown
+sync ceremony flushes it current at a clean halt: the broadcast sync
+point drives the UI server's early flush, while the node's certificate is
+its own flush (the UI-server-is-the-state-holder ruling in
+[decisions](decisions.md)). An ordered
 full shutdown therefore leaves the whole stream durable as the certificate
 and the operator's backup, while a re-form after a full-cluster cold start
 begins empty, and an operator re-bootstrapping such a cluster must do so

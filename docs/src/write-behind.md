@@ -54,10 +54,10 @@ the shape follows:
 - A frame written once at shutdown has no queue, no cadence, no loss
   window. The serving path never touches the disk at all: the node's
   I/O jitter in operation is zero, not deferred.
-- The witnesses' append-only series remain the right tool in their
-  place: a continuous tape of the wire stream is what the console
-  follows and what the sync-point certificate rides. Incremental is
-  what a tape is for. A table at a point in time is what a frame is for.
+- The UI server's append-only series is the right tool in its place: a
+  continuous tape of the wire stream is what the console follows and
+  what the sync-point certificate rides. Incremental is what a tape is
+  for. A table at a point in time is what a frame is for.
 
 ## The artefact
 
@@ -100,9 +100,9 @@ The ceremony's order is fixed, and the flushed marker vouches for all of
 it:
 
 1. **Broadcast the sync point** to all nodes, fire and forget, so every
-   witness syncs its tape. Their acknowledgements are never awaited: the
-   witnesses' series are the backup certificate, and the node's
-   certificate is its own frame.
+   UI server syncs its tape. Acknowledgements are never awaited: the UI
+   servers' series are the backup certificate, and the node's certificate
+   is its own frame.
 2. **Stop the network loop.** No further protocol traffic is accepted;
    anything arriving after this point is dropped.
 3. **Write the frame**: the sync-start marker, the live-lock records,
@@ -130,8 +130,8 @@ path, exactly as the architecture document states it:
   The node reincarnates under a bumped identity and never reads the
   frame. The lock table comes back through the cluster, from the live
   nodes' memory.
-- **A full-cluster cold start** re-forms empty. The witnesses' series
-  remain the operator's backup: the record exists for an operator-driven
+- **A full-cluster cold start** re-forms empty. The UI server's series
+  is the operator's backup: the record exists for an operator-driven
   recovery, and no startup path replays it automatically.
 
 ## The nuances the design rests on
@@ -154,10 +154,10 @@ path, exactly as the architecture document states it:
   The single forced write sits where the operator chose to pay for it:
   inside the shutdown, where the flush and the marker rounds already
   live.
-- **The witnesses' cadence is untouched.** Their sync rules force one
+- **The UI server's cadence is untouched.** Its sync rules force one
   early flush per ceremony and nothing else; the broadcast is fire and
-  forget because the node's certificate is its own frame, not the
-  witnesses' replies.
+  forget because the node's certificate is its own frame, not the UI
+  server's reply.
 - **The cost is paid where it is cheap.** The serving path never touches
   the disk; the shutdown pays one framed write of a small live set; the
   startup reads it once. The gift of the design is that the costly work
@@ -165,5 +165,5 @@ path, exactly as the architecture document states it:
   survives the power cycle.
 
 See [the telemetry AOF](telemetry-aof.md) for the write-behind discipline
-the witnesses' tape follows, and [the decisions register](decisions.md)
-for the witness-as-state-holder ruling the ceremony cites.
+the UI server's tape follows, and [the decisions register](decisions.md)
+for the UI-server-is-the-state-holder ruling the ceremony cites.
