@@ -208,6 +208,10 @@ pub struct BridgeMetrics {
     pub first_ns: Option<u64>,
     /// Last record's ns stamp (full precision).
     pub last_ns: Option<u64>,
+    /// The highest era the decoded wire headers authorised.
+    pub max_era: Option<u32>,
+    /// The highest view the decoded wire headers authorised.
+    pub max_view: Option<u32>,
 }
 
 impl BridgeMetrics {
@@ -229,6 +233,8 @@ impl BridgeMetrics {
             "lockEvents": self.lock_events,
             "firstNs": self.first_ns,
             "lastNs": self.last_ns,
+            "maxEra": self.max_era,
+            "maxView": self.max_view,
         })
     }
 }
@@ -378,6 +384,14 @@ pub fn replay_series(dir: &Path) -> (Vec<LockEvent>, LockState, BridgeMetrics) {
                 .messages
                 .entry(tag_name(message.header.tag).to_string())
                 .or_insert(0) += 1;
+            let ballot = &message.header.view;
+            let (era, view) = (ballot.era.0, ballot.view.0);
+            if metrics.max_era.is_none_or(|seen| era > seen) {
+                metrics.max_era = Some(era);
+            }
+            if metrics.max_view.is_none_or(|seen| view > seen) {
+                metrics.max_view = Some(view);
+            }
 
             let Body::Prepare { entry, .. } = message.body else {
                 continue;
@@ -1002,6 +1016,17 @@ fn route(
             (200, json!({"events": events}).to_string())
         }
         "/api/v1/metrics" => (200, replay.metrics.to_json().to_string()),
+        "/api/v1/cluster" => (
+            200,
+            json!({
+                "era": replay.metrics.max_era,
+                "view": replay.metrics.max_view,
+                "leader": "—",
+                "nowMs": unix_millis(),
+                "nodes": [],
+            })
+            .to_string(),
+        ),
         "/api/v1/metrics/series" => (200, series_json(&replay, unix_millis()).to_string()),
         "/api/v1/telemetry/log" => (
             200,

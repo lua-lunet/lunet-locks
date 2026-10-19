@@ -302,6 +302,9 @@ local function up(root: string): integer
     local p = paths(root)
     local port = os.getenv("PORT") or "8480"
     local mockPort = os.getenv("MOCK_PORT") or "8481"
+    -- The UI server: the process hosting the console's /api/v1/ endpoints
+    -- (the aof-console-bridge). The voting members never host this API.
+    local apiPort = os.getenv("API_PORT") or "8619"
     local feedPort = os.getenv("FEED_PORT") or "8482"
     local feedDir = os.getenv("FEED_DIR") or ""
     os.execute('mkdir -p "' .. p.tmp .. '"')
@@ -313,6 +316,7 @@ local function up(root: string): integer
             ASSETS = p.assets,
             PORT = port,
             MOCK_PORT = mockPort,
+            API_PORT = apiPort,
             FEED_PORT = feedPort,
         }
     )

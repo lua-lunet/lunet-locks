@@ -36,11 +36,7 @@ reaches it: the C ABI's `lunet_lock_node_new_aof` and the server's
 place — the mounts exclusive, the AOF directory required, the roll
 threshold fixed at the 2 MiB erasure block. The example crate's standby
 mode (`--aof-dir`) constructs the same sink. The writer is compiled and
-tested by `make ext-test` and the WAL node tests. What the witness
-watermarks and the three sync-point rules (the decisions register) still
-gate is the deployment's durability posture: which members of a running
-cluster mount the writer as their committed-transition series is decided
-with the witness certificate in hand.
+tested by `make ext-test` and the WAL node tests.
 
 ## Why a frame and not a running series
 
