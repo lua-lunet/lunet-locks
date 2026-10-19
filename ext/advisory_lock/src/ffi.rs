@@ -302,15 +302,12 @@ use crate::marker_store::{GateStore, SinkDoor, drain_sink, sink_guard};
 #[macro_export]
 macro_rules! maybe_invariant {
     ($($arg:tt)*) => {
-        if cfg!(test) || cfg!(debug_assertions) {
-            panic!("maybe-invariant violation: {}", format_args!($($arg)*));
-        } else {
-            ::tracing::warn!(
-                ts = $crate::log_millis(),
-                event = "maybe-invariant",
-                $($arg)*
-            );
-        }
+        // The let-it-crash law: an invariant violation is a violation —
+        // the name is history. Every sighting crashes the process, in
+        // every build, in tests and in release alike. No trailing
+        // semicolon: the expansion is the diverging expression itself,
+        // so a let-else's tail can carry it.
+        panic!("maybe-invariant violation: {}", format_args!($($arg)*))
     };
 }
 
@@ -796,9 +793,10 @@ impl Node {
                 }
                 Err(payload) => {
                     // A panic unwound at the boundary: the default hook has
-                    // already printed it. Name the arrest with the payload
-                    // so the fault report carries it, then poison — an
-                    // unwound panic must never cross into C.
+                    // already printed it. Name the arrest with the payload,
+                    // then ABORT — the let-it-crash law: an unwound panic
+                    // never crosses into C and never leaves a live process
+                    // behind a broken invariant.
                     let message = payload
                         .downcast_ref::<String>()
                         .cloned()
@@ -806,12 +804,10 @@ impl Node {
                         .unwrap_or_else(|| "an unprintable panic".to_string());
                     self.record_fault(format!("panic: {message}"));
                     eprintln!(
-                        "lunet-advisory-lock: node self-arrested (panic); \
-                         every further entry reports SERVICE"
+                        "lunet-advisory-lock: a panic unwound at the boundary (panic: {message}); \
+                         the let-it-crash law aborts the process"
                     );
-                    self.poisoned = true;
-                    self.outputs.clear();
-                    return PANIC;
+                    std::process::abort();
                 }
             };
             for effect in effects {
@@ -1335,9 +1331,9 @@ impl Node {
                             if let Err(e) = journal.append(&event) {
                                 eprintln!(
                                     "lunet-advisory-lock: journal append failed ({e}); \
-                                     journaling disabled for this process"
+                                     the let-it-crash law aborts the process"
                                 );
-                                *sink = None;
+                                std::process::abort();
                             }
                         }
                         Some(JournalSink::Aof(writer)) => writer.enqueue(event),
@@ -2311,9 +2307,10 @@ impl Node {
             trace_line!("stop.refuse.drain-window");
             eprintln!(
                 "lunet-advisory-lock: the stop's view-record write failed ({error}); \
-                        the markers hold the halt's first round; {UNFLUSHED_RUNBOOK}"
+                        the markers hold the halt's first round; {UNFLUSHED_RUNBOOK}; \
+                        the let-it-crash law aborts the process"
             );
-            return SERVICE;
+            std::process::abort();
         }
         trace_line!("stop.drain-window.open");
         let draining = match halting.drain() {
@@ -2322,14 +2319,15 @@ impl Node {
                 trace_line!("stop.refuse.drain");
                 eprintln!(
                     "lunet-advisory-lock: the stop drain failed ({error}); \
-                        the marker stays at the first round; {UNFLUSHED_RUNBOOK}"
+                        the marker stays at the first round; {UNFLUSHED_RUNBOOK}; \
+                        the let-it-crash law aborts the process"
                 );
                 #[cfg(feature = "flight-recorder")]
                 self.flight_log(
                     "stop-drain",
                     serde_json::json!({ "what": "the stop drain failed", "error": error.to_string() }),
                 );
-                return SERVICE;
+                std::process::abort();
             }
         };
         trace_line!("stop.drain-window.close");
@@ -3203,7 +3201,23 @@ fn sync_dir(_disk: &dyn Disk, _dir: &Path) -> std::io::Result<()> {
 }
 
 fn guarded(run: impl FnOnce() -> i32) -> i32 {
-    catch_unwind(AssertUnwindSafe(run)).unwrap_or(PANIC)
+    // The let-it-crash law: a panic at the boundary aborts the process —
+    // never a PANIC code, never a poisoned node left running.
+    match catch_unwind(AssertUnwindSafe(run)) {
+        Ok(code) => code,
+        Err(payload) => {
+            let message = payload
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| payload.downcast_ref::<&str>().map(|text| text.to_string()))
+                .unwrap_or_else(|| "an unprintable panic".to_string());
+            eprintln!(
+                "lunet-advisory-lock: a panic unwound at the boundary (panic: {message}); \
+                 the let-it-crash law aborts the process"
+            );
+            std::process::abort();
+        }
+    }
 }
 
 /// Conservative worst-case size of the Prepare datagram a proposal of
@@ -3806,7 +3820,18 @@ pub unsafe extern "C" fn lunet_lock_node_new(
                 OK
             }
             Ok(Err(code)) => code,
-            Err(_) => PANIC,
+            Err(payload) => {
+                let message = payload
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| payload.downcast_ref::<&str>().map(|text| text.to_string()))
+                    .unwrap_or_else(|| "an unprintable panic".to_string());
+                eprintln!(
+                    "lunet-advisory-lock: a panic unwound at the boundary (panic: {message}); \
+                     the let-it-crash law aborts the process"
+                );
+                std::process::abort();
+            }
         }
     })
 }
@@ -3875,7 +3900,18 @@ pub unsafe extern "C" fn lunet_lock_node_new_aof(
                 OK
             }
             Ok(Err(code)) => code,
-            Err(_) => PANIC,
+            Err(payload) => {
+                let message = payload
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| payload.downcast_ref::<&str>().map(|text| text.to_string()))
+                    .unwrap_or_else(|| "an unprintable panic".to_string());
+                eprintln!(
+                    "lunet-advisory-lock: a panic unwound at the boundary (panic: {message}); \
+                     the let-it-crash law aborts the process"
+                );
+                std::process::abort();
+            }
         }
     })
 }
@@ -3885,7 +3921,19 @@ pub unsafe extern "C" fn lunet_lock_node_free(node: *mut c_void) {
     if !node.is_null() {
         let _ = catch_unwind(AssertUnwindSafe(|| unsafe {
             drop(Box::from_raw(node.cast::<Node>()));
-        }));
+        }))
+        .inspect_err(|payload| {
+            let message = payload
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| payload.downcast_ref::<&str>().map(|text| text.to_string()))
+                .unwrap_or_else(|| "an unprintable panic".to_string());
+            eprintln!(
+                "lunet-advisory-lock: a panic unwound freeing the node (panic: {message}); \
+                 the let-it-crash law aborts the process"
+            );
+            std::process::abort();
+        });
     }
 }
 

@@ -51,7 +51,6 @@ use crate::disk::{Disk, DiskFile, std_disk};
 use crate::journal::{self, JournalEvent, RECORD_SIZE};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -76,7 +75,8 @@ pub const ROLL_BYTES: u64 = 2 * 1024 * 1024;
 /// buffer only batches syscalls.
 const DEFAULT_FLUSH_BYTES: usize = 64 * 1024;
 
-/// Default bounded-queue capacity. Producers never block: overflow drops.
+/// Default bounded-queue capacity. Producers never block: an overflow
+/// crashes the process.
 const DEFAULT_QUEUE_CAP: usize = 4096;
 
 /// Default periodic-fsync interval (the operator knob; no protocol meaning).
@@ -92,7 +92,7 @@ pub struct AofConfig {
     pub flush_bytes: usize,
     /// Periodic fsync interval. `None` fsyncs only at roll and shutdown.
     pub flush_interval: Option<Duration>,
-    /// Bounded-queue capacity (drop-on-overflow above it).
+    /// Bounded-queue capacity (an overflow crashes the process above it).
     pub queue_cap: usize,
 }
 
@@ -441,7 +441,7 @@ enum Msg {
 
 /// The drain completion: `None` while the writer has not answered,
 /// `Some(Ok(()))` once the fsync landed, `Some(Err(reason))` when the
-/// writer is disabled after an I/O failure.
+/// write failed — the caller aborts on it under the let-it-crash law.
 struct DrainSignal {
     state: Mutex<Option<Result<(), String>>>,
     cvar: Condvar,
@@ -449,11 +449,10 @@ struct DrainSignal {
 
 struct Inner {
     tx: SyncSender<Msg>,
-    drops: Arc<AtomicU64>,
 }
 
 /// A handle to the AOF writer thread. Producers call [`AofWriter::enqueue`],
-/// which never blocks and never fails: overflow drops.
+/// which never blocks: an overflow crashes the process.
 ///
 /// The thread drains and fsyncs when the last handle drops.
 pub struct AofWriter {
@@ -462,8 +461,8 @@ pub struct AofWriter {
 
 impl AofWriter {
     /// Open (or resume) the AOF series at `dir` and start the writer
-    /// thread. An open error here disables telemetry for the process (the
-    /// caller logs and proceeds without a sink).
+    /// thread. An open error here aborts the process (the caller's open
+    /// path propagates the failure under the let-it-crash law).
     pub fn open(dir: &Path, config: AofConfig) -> io::Result<Self> {
         Self::open_on(std_disk(), dir, config)
     }
@@ -475,31 +474,37 @@ impl AofWriter {
     pub fn open_on(disk: Arc<dyn Disk>, dir: &Path, config: AofConfig) -> io::Result<Self> {
         let core = AofCore::open_on(disk, dir, config.flush_bytes)?;
         let (tx, rx) = sync_channel::<Msg>(config.queue_cap);
-        let drops = Arc::new(AtomicU64::new(0));
-        let thread_drops = Arc::clone(&drops);
         let interval = config.flush_interval;
         std::thread::Builder::new()
             .name("aof-writer".to_string())
-            .spawn(move || pump(rx, core, interval, thread_drops))
+            .spawn(move || pump(rx, core, interval))
             .map_err(io::Error::other)?;
         Ok(Self {
-            inner: Arc::new(Inner { tx, drops }),
+            inner: Arc::new(Inner { tx }),
         })
     }
 
-    /// Enqueue one complete event. Never blocks, never fails: a full or
-    /// disconnected queue drops the event and increments the drop counter.
+    /// Enqueue one complete event. Never blocks. A full queue is an
+    /// invariant violation — the let-it-crash law asserts and crashes:
+    /// the panic unwinds through the FFI boundary, which aborts the
+    /// process. A disconnected queue (the writer thread is gone, the
+    /// process already dying) panics the same way.
     pub fn enqueue(&self, event: JournalEvent) {
         match self.inner.tx.try_send(Msg::Event(event)) {
             Ok(()) => {}
-            Err(_) => {
-                self.inner.drops.fetch_add(1, Ordering::Relaxed);
+            Err(TrySendError::Full(_)) => {
+                panic!(
+                    "aof: the write-behind queue overflowed; the let-it-crash law asserts and crashes"
+                )
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                panic!("aof: the writer thread is gone; the let-it-crash law asserts and crashes")
             }
         }
     }
 
     /// Request an fsync (the checkpoint path). Best-effort: a full queue
-    /// drops the request.
+    /// drops the request — the fsync lands on the timer or the drain.
     pub fn checkpoint(&self) {
         let _ = self.inner.tx.try_send(Msg::Checkpoint);
     }
@@ -507,10 +512,9 @@ impl AofWriter {
     /// Block until every event enqueued before this call is durable: the
     /// queue is FIFO, so when the writer answers the drain request, all
     /// earlier events have been appended and fsynced. The graceful-stop
-    /// path writes its `flushed` marker only after this returns. A writer
-    /// disabled after an I/O failure reports the failure (the stop path
-    /// then leaves its marker at `stopped`); a writer whose thread is
-    /// gone (post-panic) is an error.
+    /// path writes its `flushed` marker only after this returns Ok — an
+    /// Err aborts the process (the caller's law), so the marker never
+    /// claims flushed over a failed write.
     pub fn drain(&self) -> io::Result<()> {
         let signal = Arc::new(DrainSignal {
             state: Mutex::new(None),
@@ -538,113 +542,90 @@ impl AofWriter {
             .expect("completed above")
             .map_err(io::Error::other)
     }
-
-    /// Events dropped by this writer so far (overflow, or post-failure).
-    pub fn drops(&self) -> u64 {
-        self.inner.drops.load(Ordering::Relaxed)
-    }
 }
 
-fn pump(rx: Receiver<Msg>, mut core: AofCore, interval: Option<Duration>, drops: Arc<AtomicU64>) {
+fn pump(rx: Receiver<Msg>, mut core: AofCore, interval: Option<Duration>) {
     // The buffered-write drain runs on its own short cadence: a continuous
     // event stream must not starve it (recv_timeout would then never
     // expire), and the fsync knob stays independent of the byte flow.
+    //
+    // The let-it-crash law: a write failure on this thread crashes the
+    // PROCESS (std::process::abort) — never a disable latch, never a
+    // drop counter, never a degraded mode. A dead process is the
+    // cheapest signal; a silently stale series the most expensive bug.
     let mut last_flush = Instant::now();
     let mut last_sync = Instant::now();
-    let mut failed = false;
     loop {
         match rx.recv_timeout(PUMP_TICK) {
             Ok(Msg::Event(event)) => {
-                if failed {
-                    // Telemetry disabled for the process; the event is lost.
-                    drops.fetch_add(1, Ordering::Relaxed);
-                } else if let Err(e) = core.append(&event) {
+                if let Err(e) = core.append(&event) {
                     eprintln!(
                         "lunet-advisory-lock: aof append failed ({e}); \
-                         telemetry disabled for this process"
+                         the let-it-crash law aborts the process"
                     );
-                    failed = true;
+                    std::process::abort();
                 }
             }
             Ok(Msg::Checkpoint) => {
-                if !failed {
-                    match core.checkpoint() {
-                        Ok(()) => {
-                            last_sync = Instant::now();
-                            last_flush = Instant::now();
-                        }
-                        Err(e) => {
-                            // The checkpoint request was dropped without
-                            // an answer. Survivable — telemetry carries
-                            // a documented loss window and the next
-                            // drain still reports — but never silent.
-                            crate::maybe_invariant!(
-                                "aof checkpoint request failed ({e}); the fsync was not taken"
-                            );
-                        }
-                    }
+                if let Err(e) = core.checkpoint() {
+                    eprintln!(
+                        "lunet-advisory-lock: aof checkpoint request failed ({e}); \
+                         the fsync was not taken; the let-it-crash law aborts the process"
+                    );
+                    std::process::abort();
                 }
+                last_sync = Instant::now();
+                last_flush = Instant::now();
             }
             Ok(Msg::Drain(signal)) => {
-                let outcome = if failed {
-                    Err("telemetry disabled after an earlier error".to_string())
-                } else {
-                    match core.checkpoint() {
-                        Ok(()) => {
-                            last_sync = Instant::now();
-                            last_flush = Instant::now();
-                            Ok(())
-                        }
-                        Err(e) => {
-                            eprintln!(
-                                "lunet-advisory-lock: aof drain flush failed ({e}); \
-                                 telemetry disabled for this process"
-                            );
-                            failed = true;
-                            Err(e.to_string())
-                        }
-                    }
-                };
+                let outcome = core.checkpoint();
+                if let Err(e) = &outcome {
+                    eprintln!(
+                        "lunet-advisory-lock: aof drain flush failed ({e}); \
+                         the let-it-crash law aborts the process"
+                    );
+                }
+                let failed = outcome.is_err();
                 let mut state = signal.state.lock().expect("drain state poisoned");
-                *state = Some(outcome);
+                *state = Some(outcome.map_err(|e| e.to_string()));
                 signal.cvar.notify_all();
+                if failed {
+                    // The stop's caller aborts on the reported failure too;
+                    // this thread does not outlive a failed write.
+                    std::process::abort();
+                }
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
         }
-        if failed {
-            continue;
-        }
         if last_flush.elapsed() >= PUMP_TICK {
-            if core.flush().is_err() {
+            if let Err(e) = core.flush() {
                 eprintln!(
-                    "lunet-advisory-lock: aof flush failed; telemetry disabled for this process"
+                    "lunet-advisory-lock: aof flush failed ({e}); \
+                     the let-it-crash law aborts the process"
                 );
-                failed = true;
-                continue;
+                std::process::abort();
             }
             last_flush = Instant::now();
         }
         if interval.is_some_and(|iv| last_sync.elapsed() >= iv) {
-            match core.checkpoint() {
-                Ok(()) => {
-                    last_sync = Instant::now();
-                    last_flush = Instant::now();
-                }
-                Err(e) => {
-                    // The window's fsync did not land. Survivable (the
-                    // loss window is documented), never silent.
-                    crate::maybe_invariant!(
-                        "aof periodic fsync failed ({e}); this window's fsync did not land"
-                    );
-                }
+            if let Err(e) = core.checkpoint() {
+                eprintln!(
+                    "lunet-advisory-lock: aof periodic fsync failed ({e}); \
+                     the let-it-crash law aborts the process"
+                );
+                std::process::abort();
             }
+            last_sync = Instant::now();
+            last_flush = Instant::now();
         }
     }
-    if failed {
-        eprintln!("lunet-advisory-lock: aof shutdown skipped (telemetry disabled after an error)");
-    } else if let Err(e) = core.shutdown() {
-        eprintln!("lunet-advisory-lock: aof shutdown flush failed ({e})");
+    if let Err(e) = core.shutdown() {
+        eprintln!(
+            "lunet-advisory-lock: aof shutdown flush failed ({e}); \
+             the let-it-crash law aborts the process"
+        );
+        std::process::abort();
     }
 }
 
@@ -884,7 +865,6 @@ mod tests {
             writer.enqueue(one.clone());
         }
         writer.drain().expect("the drain lands every queued record");
-        assert_eq!(writer.drops(), 0, "no record drops at this depth");
         let bytes = fs::read(open_file(&dir)).expect("the open file reads");
         assert_eq!(
             bytes.len(),
@@ -1089,14 +1069,13 @@ mod tests {
         assert_eq!(bytes.len(), expected.len() * RECORD_SIZE);
     }
 
-    /// The writer thread's bounded queue drops on overflow and counts the
-    /// drops: under a burst against a one-deep queue, every enqueue
-    /// either landed (the file, in enqueue order) or dropped (the
-    /// counter) — nothing else — and the drain still answers.
+    /// The writer thread's bounded queue asserts and crashes on overflow:
+    /// an enqueue onto a full queue panics — the let-it-crash law's
+    /// assert-and-crash (the unwind aborts the process at the FFI
+    /// boundary; here the test observes the panic directly).
     #[test]
-    fn writer_thread_enqueue_lands_bytes_and_drops_on_overflow() {
+    fn enqueue_panics_when_the_queue_overflows() {
         let dir = scratch("overflow");
-        const TOTAL: u64 = 20_000;
         let writer = AofWriter::open(
             &dir,
             AofConfig {
@@ -1106,34 +1085,14 @@ mod tests {
             },
         )
         .expect("the series opens");
-        let events: Vec<_> = (0..TOTAL)
-            .map(|index| event(KIND_HOLD, 5_000 + index, 40 + index, 9_000))
-            .collect();
-        for one in &events {
-            writer.enqueue(one.clone());
-        }
-        writer.drain().expect("the drain lands the survivors");
-        let dropped = writer.drops();
-        assert!(dropped > 0, "a one-deep queue overflows under the burst");
-        assert!(dropped < TOTAL, "the writer kept up at least once");
-        drop(writer);
-        let bytes = fs::read(open_file(&dir)).expect("the open file reads");
-        let landed = journal::parse_file(&bytes);
-        assert!(!landed.is_empty(), "the first events landed");
-        assert_eq!(
-            landed.len() as u64 + dropped,
-            TOTAL,
-            "every enqueue either landed or dropped"
-        );
+        // Fill the queue: the pump is slower than this loop.
+        writer.enqueue(event(KIND_HOLD, 5_000, 40, 9_000));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            writer.enqueue(event(KIND_HOLD, 5_001, 41, 9_000));
+        }));
         assert!(
-            landed.windows(2).all(|pair| pair[0].ts < pair[1].ts),
-            "the landed records ride in enqueue order"
-        );
-        assert!(
-            landed
-                .iter()
-                .all(|one| one.ts >= 5_000 && one.ts < 5_000 + TOTAL),
-            "the landed records came from the input"
+            result.is_err(),
+            "the overflow enqueue panics: the let-it-crash law's assert-and-crash"
         );
     }
 
@@ -1235,7 +1194,6 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(20));
         }
-        assert_eq!(writer.drops(), 0, "the stream fit the queue");
         drop(writer);
     }
 
@@ -1255,7 +1213,6 @@ mod tests {
             writer.enqueue(one.clone());
         }
         writer.drain().expect("the drain lands every queued record");
-        assert_eq!(writer.drops(), 0, "no record drops at this depth");
         drop(writer);
         let finalized = finalized_files(&dir);
         assert_eq!(finalized.len(), 1, "the writer rolled exactly once");
@@ -1329,5 +1286,149 @@ mod tests {
             "ev-1000-5000-5000-9000.bin",
             "the finalized file's name is the same window"
         );
+    }
+
+    /// The let-it-crash law's end-to-end proof: an AOF whose every write
+    /// is refused aborts the PROCESS. The child (this test binary,
+    /// env-gated) opens the writer over a failing engine handle and
+    /// enqueues one record; the pump's append fails; the process aborts.
+    /// The parent asserts the child died by SIGABRT, never a clean exit.
+    #[test]
+    fn an_append_failure_aborts_the_process() {
+        if std::env::var("AOF_ABORT_CHILD").is_ok() {
+            use crate::disk::{Disk, DiskFile, EngineFile};
+            use std::io::SeekFrom;
+
+            /// The engine whose every mutation is refused: the seam's own
+            /// injection point at the handle level.
+            struct FailingEngine;
+            impl EngineFile for FailingEngine {
+                fn read_exact(&mut self, _buf: &mut [u8]) -> io::Result<()> {
+                    Err(io::Error::other("refused"))
+                }
+                fn seek(&mut self, _from: SeekFrom) -> io::Result<u64> {
+                    Ok(0)
+                }
+                fn write_all(&mut self, _bytes: &[u8]) -> io::Result<()> {
+                    Err(io::Error::other("refused"))
+                }
+                fn flush(&mut self) -> io::Result<()> {
+                    Err(io::Error::other("refused"))
+                }
+                fn sync_all(&self) -> io::Result<()> {
+                    Err(io::Error::other("refused"))
+                }
+                fn set_len(&mut self, _len: u64) -> io::Result<()> {
+                    Err(io::Error::other("refused"))
+                }
+                fn file_len(&self) -> io::Result<u64> {
+                    Ok(0)
+                }
+                fn write_all_at(&mut self, _offset: u64, _bytes: &[u8]) -> io::Result<()> {
+                    Err(io::Error::other("refused"))
+                }
+            }
+
+            /// The disk that hands out the failing handle and does nothing
+            /// else the writer needs.
+            struct FailingDisk;
+            impl Disk for FailingDisk {
+                fn create_dir_all(&self, path: &Path) -> io::Result<()> {
+                    std::fs::create_dir_all(path)
+                }
+                fn remove_dir_all(&self, _path: &Path) -> io::Result<()> {
+                    unimplemented!("the child never deletes")
+                }
+                fn rename(&self, _from: &Path, _to: &Path) -> io::Result<()> {
+                    unimplemented!("the child never rolls")
+                }
+                fn remove_file(&self, _path: &Path) -> io::Result<()> {
+                    unimplemented!("the child never deletes")
+                }
+                fn read(&self, _path: &Path) -> io::Result<Vec<u8>> {
+                    unimplemented!("the child never reads a metafile")
+                }
+                fn read_to_string(&self, _path: &Path) -> io::Result<String> {
+                    unimplemented!("the child never reads a metafile")
+                }
+                fn exists(&self, _path: &Path) -> bool {
+                    false
+                }
+                fn file_len(&self, _path: &Path) -> io::Result<u64> {
+                    unimplemented!("the child never stats")
+                }
+                fn read_dir(&self, _path: &Path) -> io::Result<Vec<crate::disk::DiskDirEntry>> {
+                    // The fresh directory: the resume scan finds nothing.
+                    Ok(vec![])
+                }
+                fn sync_path(&self, _path: &Path) -> io::Result<()> {
+                    Ok(())
+                }
+                fn open_read(&self, _path: &Path) -> io::Result<DiskFile> {
+                    unimplemented!("the child never opens for read")
+                }
+                fn open_read_write(&self, _path: &Path) -> io::Result<DiskFile> {
+                    unimplemented!("the child never resumes")
+                }
+                fn open_read_append(&self, _path: &Path) -> io::Result<DiskFile> {
+                    unimplemented!("the child never appends")
+                }
+                fn open_or_create_write(&self, _path: &Path) -> io::Result<DiskFile> {
+                    unimplemented!("the child never writes metafiles")
+                }
+                fn open_or_create_append(&self, _path: &Path) -> io::Result<DiskFile> {
+                    unimplemented!("the child never appends")
+                }
+                fn create_new_write(&self, _path: &Path) -> io::Result<DiskFile> {
+                    unimplemented!("the child never rolls")
+                }
+                fn create_new_append(&self, _path: &Path) -> io::Result<DiskFile> {
+                    unimplemented!("the child never rolls")
+                }
+                fn create_new_read_write(&self, _path: &Path) -> io::Result<DiskFile> {
+                    Ok(DiskFile::from_engine(Box::new(FailingEngine)))
+                }
+            }
+
+            let writer = AofWriter::open_on(
+                std::sync::Arc::new(FailingDisk),
+                &scratch("abort-child"),
+                AofConfig {
+                    flush_bytes: RECORD_SIZE,
+                    flush_interval: None,
+                    queue_cap: 16,
+                },
+            )
+            .expect("the core opens: the fresh directory creates");
+            writer.enqueue(event(KIND_HOLD, 1_000, 7, 5_000));
+            // The pump takes the event within one PUMP_TICK and aborts.
+            loop {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+
+        let exe = std::env::current_exe().expect("the test binary resolves");
+        let output = std::process::Command::new(exe)
+            .args([
+                "aof::tests::an_append_failure_aborts_the_process",
+                "--exact",
+                "--nocapture",
+            ])
+            .env("AOF_ABORT_CHILD", "1")
+            .output()
+            .expect("the child spawns");
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            assert_eq!(
+                output.status.signal(),
+                Some(6),
+                "the child died by SIGABRT: the let-it-crash law aborts the process \
+                 on a refused write, never a clean exit (stderr: {})",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        #[cfg(not(unix))]
+        assert!(!output.status.success(), "the child died abnormally");
     }
 }

@@ -19,10 +19,10 @@ behind a bounded queue:
 
 - **Producers never wait on disk.** The adapter's committed-transition hook
   enqueues the complete 61-byte `LKE1` record into the writer's queue and
-  returns. When the queue is full the event is **dropped** and the drop
-  counter increments — the same drop-on-overflow contract the tracing stack
-  follows. Nothing on the replication path blocks, and an AOF failure never
-  disables the node.
+  returns. When the queue is full the process **crashes** — the
+  let-it-crash law asserts and crashes: a silently dropped event is the
+  most expensive bug, a dead process the cheapest signal. Nothing on the
+  replication path blocks, and there is no degraded mode to fall into.
 - **Linux**: buffered appends are submitted through an `io_uring` ring (the
   `io-uring` feature, default on for Linux targets). The writes are
   page-cached buffered appends: no `O_DIRECT`, no `O_SYNC`, no fsync on the

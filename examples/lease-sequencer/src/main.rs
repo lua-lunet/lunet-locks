@@ -1209,7 +1209,6 @@ impl Host {
                         out.slot,
                         out.bytes.len()
                     );
-                    continue;
                 };
                 // The leader's Commit datagrams carry no trailer: the
                 // datagram the network carries is the datagram the core

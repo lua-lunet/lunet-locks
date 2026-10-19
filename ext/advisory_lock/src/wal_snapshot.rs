@@ -870,7 +870,6 @@ impl WalSnapshotStore {
     pub fn note(&mut self, lock_id: u64) {
         if lock_id == 0 {
             crate::maybe_invariant!("wal snapshot: lock id 0 is not a lock");
-            return;
         }
         self.changed.insert(lock_id);
     }
@@ -1342,7 +1341,6 @@ impl StateStore for WalSnapshotStore {
         for (&lock_id, lease) in &snap.locks {
             if lock_id == 0 {
                 crate::maybe_invariant!("wal snapshot: lock id 0 is not a lock");
-                continue;
             }
             if lease.name.is_some() {
                 // The durable class: a live frame while the lease holds

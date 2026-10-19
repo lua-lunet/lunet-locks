@@ -1279,8 +1279,6 @@ mod tests {
         assert_eq!(resp.status, 200);
         assert_eq!(resp.body.len(), 2 * RECORD_SIZE);
 
-        // Only two events through a 64-slot queue: nothing dropped.
-        assert_eq!(writer.drops(), 0);
         drop(writer); // graceful shutdown: drains and fsyncs
         let _ = fs::remove_dir_all(&dir);
     }

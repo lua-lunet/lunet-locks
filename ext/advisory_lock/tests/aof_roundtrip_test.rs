@@ -100,7 +100,6 @@ fn append_drain_reopen_roundtrips_the_record_bytes() {
     // AND fsynced — reading the file back now, with the writer still
     // alive, proves the drain itself landed the bytes.
     writer.drain().expect("the drain lands every queued record");
-    assert_eq!(writer.drops(), 0, "no record drops at this depth");
     let open_path = open_file(&dir);
     let bytes = fs::read(&open_path).expect("the open file reads");
     assert_eq!(
@@ -197,7 +196,6 @@ fn the_window_rebuilds_and_the_roll_names_the_full_window() {
     reopened
         .drain()
         .expect("the drain lands every queued record");
-    assert_eq!(reopened.drops(), 0, "no record drops at this depth");
     drop(reopened);
 
     let finalized = finalized_file(&dir);

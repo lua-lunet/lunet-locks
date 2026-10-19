@@ -347,9 +347,9 @@ Each replica optionally maintains an append-only binary journal of committed
 lock transitions (hold, renew, release, break) under a per-replica directory.
 The
 journal is observability data: it never participates in replication or
-recovery, and a journal error disables journaling without affecting the
-service path. Files roll by byte threshold and are never deleted by any
-component.
+recovery, and it is never a degraded mode — a journal write failure crashes
+the process under the let-it-crash law (below). Files roll by byte threshold
+and are never deleted by any component.
 
 The `lock-feed` process serves the journal directory over REST and WebSocket.
 The nginx reverse proxy maps `/feed/` to lock-feed with WebSocket upgrade
@@ -518,8 +518,10 @@ There is no disable-and-continue, no drop counter standing in for a lost
 event, no degraded mode that keeps serving. A synchronously refused write —
 the journal's append, the AOF writer's pump, the state store's snapshot —
 crashes the process. The clean shutdown's force flush panics on a bad write
-and never records `flushed`. An asynchronous writer whose write fails halts
-the main loop and the health endpoint reports bad.
+and never records `flushed`. An asynchronous writer whose write fails aborts
+the process from its own thread — a live process behind a broken capture is
+the one thing this law forbids, and a dead process answers no health probe,
+which is the health reporting bad in its most honest form.
 
 The reasoning: this cluster is diskless — the protocol state lives in quorum
 memory, and a restarting node reincarnates from the live nodes. A process
