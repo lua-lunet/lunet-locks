@@ -7,7 +7,7 @@
 //! with the nodes' embedded CAS clients, reads the lock through a TCP
 //! client per node, walks the lifecycle scenario ladder, and ends with
 //! the oracle verdict: the three CAS chains identical, the client
-//! histories consistent, no maybe-invariant voice, the store discipline
+//! histories consistent, no invariant-violation voice, the store discipline
 //! held. Any failure stops the run; nothing is tolerated and nothing is
 //! left running.
 
@@ -676,10 +676,10 @@ impl Driver {
             .iter()
             .map(|(name, text)| (name.as_str(), text.clone()))
             .collect();
-        if let Err(error) = oracle::logs_without_maybe_violations(&log_refs) {
+        if let Err(error) = oracle::logs_without_invariant_violations(&log_refs) {
             failures.push(error);
         } else {
-            println!("bench oracle: no maybe-invariant voice");
+            println!("bench oracle: no invariant-violation voice");
         }
         for node in &self.nodes {
             let discipline = lock(&node.discipline);

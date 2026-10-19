@@ -7,7 +7,7 @@
 //! oracle decodes each node's journal, compares the chains on their
 //! semantic content (the apply timestamp is each node's own), checks
 //! every lease a client observed appears in the chain in order, and
-//! scans the node logs for the adapter's maybe-invariant voice. Any
+//! scans the node logs for the adapter's invariant-violation voice. Any
 //! violation is a run failure; there is no tolerance and no repair.
 
 use std::fs;
@@ -235,15 +235,17 @@ pub fn client_history_consistent(
     Ok(())
 }
 
-/// Check 3 — the maybe-invariant voice: the adapter's `maybe_invariant!`
-/// warns (release) or panics (debug) on a probationary-state violation.
-/// Any occurrence in any node log fails the run.
-pub fn logs_without_maybe_violations(logs: &[(&str, String)]) -> Result<(), String> {
+/// Check 3 — the invariant-violation voice: the adapter's `invariant!`
+/// asserts the invariant in every build; a sighting crashes the process,
+/// so a log line carrying one names a node that ran an older build or a
+/// rebuilt binary whose crash went unobserved. Any occurrence in any node
+/// log fails the run — the belt behind the crash.
+pub fn logs_without_invariant_violations(logs: &[(&str, String)]) -> Result<(), String> {
     for (name, text) in logs {
         for (line, content) in text.lines().enumerate() {
-            if content.contains("maybe-invariant violation") {
+            if content.contains("invariant violation") {
                 return Err(format!(
-                    "{name} log line {} carries a maybe-invariant violation: {content}",
+                    "{name} log line {} carries an invariant violation: {content}",
                     line + 1
                 ));
             }

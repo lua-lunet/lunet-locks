@@ -64,8 +64,8 @@ pub use recovery_flush::{FlushOutcome, RecoveryFlush};
 pub use ffi::{census_paths, census_push};
 
 /// The wall-clock millisecond every log line carries. `#[doc(hidden)]`
-/// because no embedder calls it: `maybe_invariant!` reaches it through
-/// `$crate`, and the crate's own sites call it directly.
+/// because no embedder calls it: the crate's own sites call it directly,
+/// and a log line's ts is the host's clock, nothing more.
 #[doc(hidden)]
 pub use ffi::log_millis;
 

@@ -868,9 +868,7 @@ impl WalSnapshotStore {
     /// [`WalSnapshotStore::submit`] carries the lock — a live record if
     /// the snapshot still holds it, a tombstone if it does not.
     pub fn note(&mut self, lock_id: u64) {
-        if lock_id == 0 {
-            crate::maybe_invariant!("wal snapshot: lock id 0 is not a lock");
-        }
+        crate::invariant!(lock_id != 0, "wal snapshot: lock id 0 is not a lock");
         self.changed.insert(lock_id);
     }
 
@@ -1339,9 +1337,7 @@ impl StateStore for WalSnapshotStore {
         let mut frames = Vec::with_capacity(snap.locks.len() * FAT_FRAME_SIZE);
 
         for (&lock_id, lease) in &snap.locks {
-            if lock_id == 0 {
-                crate::maybe_invariant!("wal snapshot: lock id 0 is not a lock");
-            }
+            crate::invariant!(lock_id != 0, "wal snapshot: lock id 0 is not a lock");
             if lease.name.is_some() {
                 // The durable class: a live frame while the lease holds
                 // (a nonzero expiry), the kept frame once it does not

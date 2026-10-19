@@ -266,48 +266,33 @@ use vrr::wire::{Pack, Tag, Unpack, UnpackError};
 
 use crate::marker_store::{GateStore, SinkDoor, drain_sink, sink_guard};
 
-/// An unexpected-but-not-provably-impossible condition — a "maybe" in the
-/// TigerBeetle model — reported where the path today logs nothing.
-///
-/// The two-tier convention this adapter follows:
-///
-/// - **Invariants** are conditions whose impossibility the surrounding code
-///   establishes (a reply cache hit must never re-execute the Service, ticks
-///   are nondecreasing, a reincarnated identity never reuses the old id, the
-///   output queue carries only kinds 1/2, a poisoned node executes nothing).
-///   They are `assert!`ed: a violation is a bug and the node stops. Through
-///   the Rust API (`Node`) the panic propagates to the embedder's process;
-///   through the C ABI the boundary's `catch_unwind` poisons the node and
-///   reports `PANIC` — an unwound panic must never cross into C. Either way
-///   the node never continues past a violated invariant, in tests AND
-///   release.
-/// - **Maybes** are conditions that are not provably impossible and are
-///   often adversary- or environment-adjacent (a datagram attributed to an
-///   unknown peer id, a send to an unaddressable replica, an ack for an
-///   unclaimed verb, a folded-era regression). In test/debug builds
-///   (`cfg!(test)` or `cfg!(debug_assertions)`) the macro panics, so the
-///   test suite and any smoke run surface it; in release it logs `warn!`
-///   with full context and continues — mirroring upstream's totality stance
-///   (`wire.rs`: "a decoder that aborts the host process on a hostile
-///   datagram is a denial-of-service vector"), which never lets hostile or
-///   merely unexpected input crash a release build.
+/// An invariant of the adapter: the condition either holds or the process
+/// dies. The let-it-crash law in one line — a violation crashes the
+/// process, in every build, in tests and in release alike; there is no
+/// warn-and-continue shape and never was a build profile where one was
+/// tolerable. Where the older two-tier convention split "invariants"
+/// (assert, every build) from "maybes" (a datagram attributed to an unknown
+/// peer id, a send to an unaddressable replica, a folded-era regression —
+/// panic in test/debug, log `warn!` and continue in release), the ruling
+/// folded the tiers: those conditions are invariants now, stated as
+/// positive checks. The sites name the check, the message names what
+/// failed, and a dead process is the cheapest signal there is.
 ///
 /// Upstream (`uvrr-core`) has no equivalent helper — its
 /// `src/invariant.rs` names drops through the `Diagnostic` observation and
 /// faults impossible local transitions, but neither asserts nor warns; the
 /// convention is proposed upstream and this macro is
 /// the reference implementation. It is exported so downstream embedders
-/// (e.g. the `lease-sequencer` example) report their host-side maybes under
-/// the same convention.
+/// (e.g. the `lease-sequencer` example) state their host-side invariants
+/// under the same convention.
 #[macro_export]
-macro_rules! maybe_invariant {
-    ($($arg:tt)*) => {
-        // The let-it-crash law: an invariant violation is a violation —
-        // the name is history. Every sighting crashes the process, in
-        // every build, in tests and in release alike. No trailing
-        // semicolon: the expansion is the diverging expression itself,
-        // so a let-else's tail can carry it.
-        panic!("maybe-invariant violation: {}", format_args!($($arg)*))
+macro_rules! invariant {
+    ($condition:expr, $($arg:tt)*) => {
+        assert!(
+            $condition,
+            "invariant violation: {}",
+            format_args!($($arg)*)
+        )
     };
 }
 
@@ -343,10 +328,10 @@ fn is_view_change_family(tag: Tag) -> bool {
 
 /// One lifecycle path line: the named census entry that a boot or stop path
 /// emits as it takes it. The observability contract's third clause — "the
-/// zero-cost `maybe!`/trace discipline logs every path the node takes
+/// zero-cost trace discipline logs every path the node takes
 /// through boot, drain, flush, and stop — a path that cannot show itself in
 /// the trace is a defect" — is carried here, alongside the
-/// [`maybe_invariant!`](crate::maybe_invariant) discipline it extends.
+/// [`invariant!`](crate::invariant) discipline it extends.
 ///
 /// The convention, stated once and applied everywhere:
 ///
@@ -368,7 +353,7 @@ fn is_view_change_family(tag: Tag) -> bool {
 ///   concurrent callers' lines apart. [`crate::census_paths`] is the reader
 ///   that drains it.
 ///
-/// Unlike [`maybe_invariant!`] this is not a convention for downstream
+/// Unlike [`invariant!`] this is not a convention for downstream
 /// hosts: it names this adapter's own boot and stop paths.
 #[macro_export]
 macro_rules! trace_line {
@@ -1113,23 +1098,12 @@ impl Node {
             self.last_leader = Some(leader);
         }
         let config_era = self.replica.progress().config().current().era.0;
-        if folded_era_regressed(self.last_config_era, config_era) {
-            #[cfg(feature = "flight-recorder")]
-            self.flight_log(
-                "maybe",
-                serde_json::json!({
-                    "where": "report",
-                    "what": "folded configuration era regressed",
-                    "previous": self.last_config_era,
-                    "current": config_era,
-                }),
-            );
-            maybe_invariant!(
-                "folded configuration era regressed (previous={}, current={})",
-                self.last_config_era.unwrap_or_default(),
-                config_era
-            );
-        }
+        invariant!(
+            !folded_era_regressed(self.last_config_era, config_era),
+            "folded configuration era regressed (previous={}, current={})",
+            self.last_config_era.unwrap_or_default(),
+            config_era
+        );
         self.last_config_era = Some(config_era);
     }
 
@@ -1876,31 +1850,19 @@ impl Node {
         }
         // A message attributed to an id outside the descriptor's
         // address space whose system half names no descriptor member is
-        // a maybe (an unknown peer id). A later life of a member
+        // an invariant violation. A later life of a member
         // (the crash counter advanced under the same system half — the
         // identity law's packing) is the reincarnation story's
         // legitimate caller and exempt.
-        if !self.known_ids.contains(&from)
-            && !self
-                .known_ids
-                .iter()
-                .any(|known| (known >> SYSTEM_HALF_SHIFT) == (from >> SYSTEM_HALF_SHIFT))
-        {
-            #[cfg(feature = "flight-recorder")]
-            self.flight_log(
-                "maybe",
-                serde_json::json!({
-                    "where": "receive",
-                    "what": "message from an unknown peer id",
-                    "from": from,
-                    "len": data.len(),
-                }),
-            );
-            maybe_invariant!(
-                "message from an unknown peer id (from={from}, len={})",
-                data.len()
-            );
-        }
+        invariant!(
+            self.known_ids.contains(&from)
+                || self
+                    .known_ids
+                    .iter()
+                    .any(|known| (known >> SYSTEM_HALF_SHIFT) == (from >> SYSTEM_HALF_SHIFT)),
+            "message from an unknown peer id (from={from}, len={})",
+            data.len()
+        );
         // W5: `Incomplete` means "more bytes could make this a message" and
         // `Malformed` means none could; over datagram transport there is no
         // reassembly, so both are a bad datagram from this host's view.

@@ -39,7 +39,7 @@ use lease_sequencer::embedded_client::{self, Action, Runner};
 use lease_sequencer::relay;
 use lunet_advisory_lock::{
     NOT_LEADER, Node, OK, POSITION_APPEND, RECONFIGURE_DECREMENT, RECONFIGURE_INCREMENT,
-    RECONFIGURE_JOIN, RECONFIGURE_LEAVE, RecoveryFlush, maybe_invariant,
+    RECONFIGURE_JOIN, RECONFIGURE_LEAVE, RecoveryFlush, invariant,
 };
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -1198,18 +1198,18 @@ impl Host {
                 if out.slot > self.frontier_slot {
                     self.frontier_slot = out.slot;
                 }
-                let Some(&addr) = self.peers.get(&out.to) else {
-                    maybe_invariant!(
-                        "cannot address replica (to={} kind={} era={} view={} slot={} len={}); \
-                         datagram dropped",
-                        out.to,
-                        out.kind,
-                        out.era,
-                        out.view,
-                        out.slot,
-                        out.bytes.len()
-                    );
-                };
+                invariant!(
+                    self.peers.contains_key(&out.to),
+                    "cannot address replica (to={} kind={} era={} view={} slot={} len={}); \
+                     datagram dropped",
+                    out.to,
+                    out.kind,
+                    out.era,
+                    out.view,
+                    out.slot,
+                    out.bytes.len()
+                );
+                let &addr = self.peers.get(&out.to).unwrap();
                 // The leader's Commit datagrams carry no trailer: the
                 // datagram the network carries is the datagram the core
                 // produced, so the exact-length wire contract (W3) is
