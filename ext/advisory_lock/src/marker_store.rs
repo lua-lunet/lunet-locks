@@ -606,3 +606,92 @@ impl LifecycleStore for GateStore {
         result
     }
 }
+
+#[cfg(all(test, not(target_os = "windows")))]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn scratch(name: &str) -> PathBuf {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.tmp/marker-store-test");
+        let dir = root.join(format!(
+            "{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        fs::create_dir_all(&dir).expect("the scratch dir creates");
+        dir
+    }
+
+    fn door() -> SinkDoor {
+        Arc::new(Mutex::new(None))
+    }
+
+    fn identity(system: u16, crash: u16) -> NodeId {
+        NodeId::new(
+            SystemId::new(system).unwrap(),
+            CrashCounter::new(crash).unwrap(),
+        )
+    }
+
+    #[test]
+    fn the_first_life_has_no_copies() {
+        let state = scratch("first-life").join("state");
+        let mut store = GateStore::new(&state, door(), 42, Arc::new(Mutex::new(Vec::new())));
+        assert_eq!(LifecycleStore::read_copies(&mut store).unwrap(), None);
+    }
+
+    #[test]
+    fn the_single_file_marker_projects_to_uniform_copies() {
+        let state = scratch("projection").join("state");
+        write_marker(&state, 42, 3, Marker::Stopping).unwrap();
+        let mut store = GateStore::new(&state, door(), 42, Arc::new(Mutex::new(Vec::new())));
+        let copies = LifecycleStore::read_copies(&mut store).unwrap().unwrap();
+        assert!(
+            copies.copies.iter().all(|copy| {
+                copy.identity == identity(42, 3) && copy.marker == Marker::Stopping
+            })
+        );
+    }
+
+    #[test]
+    fn the_projection_refuses_a_cross_system_descriptor() {
+        let state = scratch("cross-system").join("state");
+        write_marker(&state, 42, 3, Marker::Stopping).unwrap();
+        let mut store = GateStore::new(&state, door(), 9, Arc::new(Mutex::new(Vec::new())));
+        let error = LifecycleStore::read_copies(&mut store).unwrap_err();
+        assert!(error.to_string().contains("system 42"), "{error}");
+    }
+
+    #[test]
+    fn the_superblock_round_reads_the_quorum() {
+        let state = scratch("superblock-round").join("state");
+        let store = GateStore::new(&state, door(), 42, Arc::new(Mutex::new(Vec::new())));
+        store.emission_gate(identity(42, 1)).unwrap();
+        assert!(superblock_path(&state).exists());
+        let mut store = GateStore::new(&state, door(), 42, Arc::new(Mutex::new(Vec::new())));
+        let copies = LifecycleStore::read_copies(&mut store).unwrap().unwrap();
+        assert!(
+            copies
+                .copies
+                .iter()
+                .all(|copy| copy.identity == identity(42, 1))
+        );
+    }
+
+    #[test]
+    fn a_corrupt_superblock_panics_the_boot() {
+        let state = scratch("corrupt").join("state");
+        let store = GateStore::new(&state, door(), 42, Arc::new(Mutex::new(Vec::new())));
+        store.emission_gate(identity(42, 1)).unwrap();
+        let superblock = superblock_path(&state);
+        fs::write(&superblock, b"garbage that no quorum copy survives\n").unwrap();
+        let mut store = GateStore::new(&state, door(), 42, Arc::new(Mutex::new(Vec::new())));
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            LifecycleStore::read_copies(&mut store).unwrap();
+        }));
+        assert!(outcome.is_err(), "the boot-read safety law must panic");
+    }
+}

@@ -3,6 +3,7 @@ name = "lease-sequencer"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.96" # uvrr-core's floor; let-chains in src/main.rs are older news
+license = "Apache-2.0"
 
 # The test target: the integration tests link the pure modules
 # (timeouts, bridge, telemetry, embedded_client) through this thin lib
