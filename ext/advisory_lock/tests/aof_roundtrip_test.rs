@@ -1,10 +1,3 @@
-//! The AOF records' roundtrip at the disk boundary: append, the stop
-//! drain, and the reopen — the record bytes survive byte-exact, a torn
-//! tail truncates to the last complete record, and the metadata window
-//! rebuilds over the pre-restart records so the next roll names the full
-//! window. Real files in the repo's scratch tree, the writer thread and
-//! all.
-
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -14,9 +7,6 @@ use lunet_advisory_lock::journal::{
     self, JournalEvent, KIND_BREAK, KIND_HOLD, KIND_RELEASE, KIND_RENEW, RECORD_SIZE,
 };
 
-/// The writer's test knobs: no periodic fsync (the drain's own fsync is
-/// the durability proof) and a queue deep enough that every enqueue of a
-/// test lands (overflow drops would corrupt the counted assertions).
 fn config() -> AofConfig {
     AofConfig {
         flush_interval: None,
@@ -25,7 +15,6 @@ fn config() -> AofConfig {
     }
 }
 
-/// The scratch tree, inside the repo (`.tmp` is scratch).
 fn scratch(name: &str) -> PathBuf {
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.tmp/aof-roundtrip");
@@ -51,7 +40,6 @@ fn event(kind: u8, ts: u64, lock: u64, expiry: u64) -> JournalEvent {
     }
 }
 
-/// The one active (still-appending) file of the series.
 fn open_file(dir: &Path) -> PathBuf {
     let mut found = Vec::new();
     for entry in fs::read_dir(dir).expect("the series directory reads") {
@@ -65,7 +53,6 @@ fn open_file(dir: &Path) -> PathBuf {
     found.remove(0)
 }
 
-/// The one finalized (rolled) file of the series.
 fn finalized_file(dir: &Path) -> PathBuf {
     let mut found = Vec::new();
     for entry in fs::read_dir(dir).expect("the series directory reads") {

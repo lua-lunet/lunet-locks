@@ -18,7 +18,6 @@ nav = [
   { "Build and tests" = "build-and-tests.md" },
   { "The test scaffold" = "test-scaffold.md" },
   { "Decisions" = "decisions.md" },
-  { "VRR-2012 reading group summary" = "vrr-2012-reading-group-summary.md" },
   { "The timeout policy" = "timeout-policy.md" },
   { "Bench harness" = "bench-harness.md" },
   { "Contributing" = "contributing.md" },

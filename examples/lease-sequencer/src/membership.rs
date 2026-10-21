@@ -1,15 +1,3 @@
-//! The cluster membership snapshot affordances (`src/snapshot.tl`, mirrored
-//! byte for byte): the era-qualified request/response payloads, the era+slot
-//! total comparison, the weighted quorum over agreeing snapshots, the
-//! leader-side application of committed admin verbs, and the membership
-//! sidecar — the lazy write-behind copy of the adopted facts next to the
-//! incarnation marker.
-//!
-//! Snapshots are ADVISORY evidence, never a consensus mechanism: safety
-//! stays with the replicated configuration commands, a discovered
-//! configuration is adopted in memory and feeds the existing fenced-boot
-//! path, and nothing here bypasses a gate.
-
 use std::collections::HashSet;
 use std::fs;
 use std::io::Write;
@@ -18,16 +6,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{SyncSender, sync_channel};
 
-/// The request payload: one tag byte. The requester needs no state of its
-/// own; every responder answers from its current membership model.
 pub const SNAPSHOT_REQUEST: u8 = 1;
-/// The response payload tag: era + slot + members.
 pub const SNAPSHOT_RESPONSE: u8 = 2;
-/// The core bounds a configuration's membership at 16; a snapshot carries
-/// at most that.
 const MAX_MEMBERS: usize = 16;
-/// The bounded write-behind queue's capacity: producers never block, a
-/// full queue drops the fact and counts it.
 const QUEUE_CAP: usize = 64;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -44,11 +25,6 @@ pub struct Snapshot {
     pub members: Vec<SnapshotMember>,
 }
 
-/// An endpoint is literal `IPv4:port` — the same rule `config.tl` enforces
-/// for every addressing row.
-/// An endpoint is an IPv4 `dotted.dotted.dotted:port` or a bracketed IPv6
-/// `[addr]:port` literal — the bracket form is how the rig's IPv6-only
-/// benchmark nodes appear in descriptors and snapshots.
 fn valid_endpoint(endpoint: &str) -> bool {
     let Some((host, port)) = endpoint.rsplit_once(':') else {
         return false;
@@ -78,12 +54,7 @@ pub fn decode_request(payload: &[u8]) -> bool {
     payload == [SNAPSHOT_REQUEST]
 }
 
-/// The response is strictly shaped and small: era (u32), the choosing slot
-/// (u64), the member count (u16), then per member its id (u32), weight
-/// (u32), and length-delimited endpoint — members in canonical strictly
-/// ascending id order, one shape per membership.
 pub fn encode_response(snapshot: &Snapshot) -> Vec<u8> {
-    let _ = u32::MAX; // era is a u32 by construction; the assert was vacuous
     assert!(
         !snapshot.members.is_empty() && snapshot.members.len() <= MAX_MEMBERS,
         "snapshot: membership must carry 1..=16 members"
@@ -159,18 +130,10 @@ pub fn decode_response(payload: &[u8]) -> Option<Snapshot> {
     Some(Snapshot { era, slot, members })
 }
 
-/// The up-to-dateness comparison: era plus slot, lexicographic — every
-/// configuration knows the slot at which it was chosen (the genesis
-/// configuration is slot 0), so the pair is total. True when the first
-/// names a configuration the second does not cover yet; an equal or older
-/// snapshot is a no-op everywhere.
 pub fn newer(era: u32, slot: u64, own_era: u32, own_slot: u64) -> bool {
     era > own_era || (era == own_era && slot > own_slot)
 }
 
-/// The responder's weight inside a snapshot's membership, or `None` when
-/// the snapshot does not name it (inconsistent evidence; the response is
-/// dropped).
 pub fn member_weight(members: &[SnapshotMember], id: u32) -> Option<u64> {
     members
         .iter()
@@ -178,11 +141,6 @@ pub fn member_weight(members: &[SnapshotMember], id: u32) -> Option<u64> {
         .map(|member| u64::from(member.weight))
 }
 
-/// The weighted majority the deployment's configurations vote with
-/// (`WeightedMajority`): the threshold is half the total weight plus one,
-/// the sum runs over the agreeing responders, and a weight-0 learner's
-/// agreement is collected but contributes nothing — learners never satisfy
-/// a quorum.
 pub fn quorum_reached(members: &[SnapshotMember], responded: &HashSet<u32>) -> bool {
     let total: u64 = members.iter().map(|member| u64::from(member.weight)).sum();
     let threshold = total / 2 + 1;
@@ -194,13 +152,6 @@ pub fn quorum_reached(members: &[SnapshotMember], responded: &HashSet<u32>) -> b
     sum >= threshold
 }
 
-/// The boot membership model the descriptor gives a node: era 1 (the
-/// founding configuration the core folds, chosen at slot 0), the
-/// descriptor's GENESIS lines in line order at weight 1. A post-genesis
-/// descriptor line is an addressing row, not a membership fact: the node
-/// can talk to the member, and snapshots and dissemination teach whether
-/// it is still in the live configuration and at what weight. `nodes`
-/// carries `(id, host, port, genesis)` per line.
 pub fn descriptor_model(nodes: &[(u32, String, u16, bool)]) -> Vec<SnapshotMember> {
     let mut members: Vec<SnapshotMember> = nodes
         .iter()
@@ -215,9 +166,6 @@ pub fn descriptor_model(nodes: &[(u32, String, u16, bool)]) -> Vec<SnapshotMembe
     members
 }
 
-/// The membership model this process carries: era 0 over the descriptor
-/// (or over the parsed sidecar), advancing only forward — a newer (era,
-/// slot) is adopted in memory, an equal or older one is a no-op.
 pub struct Model {
     pub era: u32,
     pub slot: u64,
@@ -225,8 +173,6 @@ pub struct Model {
 }
 
 impl Model {
-    /// Adopt a newer (era, slot) snapshot wholesale. The caller adds the
-    /// addressing rows the adopted membership names.
     pub fn adopt(&mut self, snapshot: Snapshot) -> bool {
         if !newer(snapshot.era, snapshot.slot, self.era, self.slot) {
             return false;
@@ -237,10 +183,6 @@ impl Model {
         true
     }
 
-    /// The leader-side application of one committed admin verb: a join
-    /// appends the member at weight 0 (additive and idempotent), an
-    /// increment promotes it to a voter, a decrement returns it to weight
-    /// 0, a leave removes it. A refused change touches nothing.
     pub fn apply_change(&mut self, action: &str, id: u32, endpoint: &str) -> bool {
         let exists = self.members.iter().any(|member| member.id == id);
         let mut updated: Vec<SnapshotMember> = self
@@ -282,9 +224,6 @@ impl Model {
         true
     }
 
-    /// The next generation after this node's own committed verb: the
-    /// model's counter advances exactly once per reconfiguration commit it
-    /// drives, at the establishing operation's choosing slot.
     pub fn advance(&mut self, slot: u64) {
         self.era += 1;
         self.slot = slot;
@@ -299,19 +238,6 @@ impl Model {
     }
 }
 
-// ---------------------------------------------------------------------------
-// The membership sidecar
-// ---------------------------------------------------------------------------
-
-/// The sidecar's on-disk series, next to the incarnation marker (whose bump
-/// semantics are untouched): line 1 is the header
-/// `{"format":"membership-sidecar/v1","era":N,"slot":N}`, then one line per
-/// member `{"id":N,"weight":N,"endpoint":"host:port"}` in canonical
-/// ascending-id order. Written atomically (temporary file, rename) with no
-/// fsync — the same documented loss window the AOF writer carries, and
-/// nothing depends on the file for safety. A sidecar that does not parse is
-/// ignored entirely at boot: the model falls back to the descriptor and
-/// discovery re-learns.
 pub fn sidecar_path(state: &str) -> PathBuf {
     PathBuf::from(format!("{state}.membership"))
 }
@@ -390,10 +316,6 @@ pub fn decode_sidecar(text: &str) -> Option<Snapshot> {
     Some(Snapshot { era, slot, members })
 }
 
-/// A handle to the sidecar writer thread. Producers enqueue complete
-/// membership facts and never wait on disk: the queue is bounded, and an
-/// enqueue onto a full queue drops the fact and increments the drop
-/// counter — the same drop-on-overflow contract the AOF writer follows.
 pub struct SidecarWriter {
     tx: SyncSender<Snapshot>,
     drops: Arc<std::sync::atomic::AtomicU64>,
@@ -411,9 +333,6 @@ impl SidecarWriter {
         std::thread::Builder::new()
             .name("membership-sidecar".to_string())
             .spawn(move || {
-                // The writer thread drains its bounded queue and rewrites
-                // the sidecar atomically per accepted fact: temporary
-                // file, rename, no fsync — the documented loss window.
                 while let Ok(snapshot) = rx.recv() {
                     let text = encode_sidecar(&snapshot);
                     let temporary = path.with_extension("membership.new");
@@ -434,8 +353,6 @@ impl SidecarWriter {
         Ok(Self { tx, drops })
     }
 
-    /// Enqueue one membership fact. Never blocks, never fails: a full
-    /// queue drops the fact and increments the drop counter.
     pub fn enqueue(&self, snapshot: &Snapshot) {
         match self.tx.try_send(snapshot.clone()) {
             Ok(()) => {}
@@ -450,15 +367,11 @@ impl SidecarWriter {
     }
 }
 
-/// The boot-time read of the sidecar: strict, and a sidecar that does not
-/// parse falls back to the descriptor.
 pub fn load_sidecar(state: &str) -> Option<Snapshot> {
     let text = fs::read_to_string(sidecar_path(state)).ok()?;
     decode_sidecar(&text)
 }
 
-/// The discovery tally for one agreement key: the agreeing responders'
-/// ids and their summed weight.
 pub struct Tally {
     pub ids: HashSet<u32>,
     pub weight: u64,
@@ -472,9 +385,6 @@ impl Tally {
         }
     }
 
-    /// Records one responder's agreement: an unattributed weight (the
-    /// snapshot does not name the responder) and a repeat response are
-    /// dropped.
     pub fn record(&mut self, id: u32, weight: Option<u64>) {
         if weight.is_none() || self.ids.contains(&id) {
             return;
@@ -494,8 +404,6 @@ impl Default for Tally {
     }
 }
 
-/// The agreement key over a snapshot: era, choosing slot, and the member
-/// set. Snapshots that agree share the key.
 pub fn agreement_key(snapshot: &Snapshot) -> String {
     let mut key = format!("{}:{}", snapshot.era, snapshot.slot);
     for member in &snapshot.members {
@@ -506,6 +414,3 @@ pub fn agreement_key(snapshot: &Snapshot) -> String {
     }
     key
 }
-
-#[cfg(test)]
-mod tests {}

@@ -1,23 +1,10 @@
-//! The witness: the deployment's state holder.
-//!
-//! Every deployment registers at least one witness per data centre. A
-//! witness is outside the roster, never votes, and receives the full
-//! phase-2 and commit stream from every leader in turn. Its append-only
-//! series is the durable copy of the stream: the witness records what it
-//! receives and tracks two high-watermarks — the highest frontier it
-//! holds in its buffer and the highest frontier it has flushed (the
-//! witness ruling in `docs/src/decisions.md`). The series is no longer
-//! observability only; it is the copy a full-cluster cold start recovers
-//! from, on the operator's driven replay — never an automatic startup
-//! path.
-//!
-//! This module is the watermarks and the three sync-point rules, pure:
-//! the flush effect (the tape's fsync) is the driver's, so the rules are
-//! provable red-green with no disk, no thread, and no clock. The file
-//! tape and the wire mount ride separately.
+//! The witness: the deployment's state holder — the watermarks and the
+//! three sync-point rules, pure: the flush effect (the tape's fsync) is
+//! the driver's, so the rules are provable red-green with no disk, no
+//! thread, and no clock.
 
-/// The committed frontier a sync point names: the stream's progress
-/// identity, ordered by era, then view, then slot.
+/// The committed frontier a sync point names: ordered by era, then
+/// view, then slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Frontier {
     pub era: u32,
@@ -30,21 +17,17 @@ pub struct Frontier {
 pub enum SyncOutcome {
     /// The flushed watermark already covers the frontier: acknowledged.
     Acked,
-    /// The frontier is in the buffer: the witness forces the flush of
-    /// the batch already in hand (a small amount of bookkeeping and an
-    /// early flush, never a change to the streaming protocol), and the
-    /// point acknowledges with that flush.
+    /// The frontier is in the buffer: force the flush of the batch
+    /// already in hand and acknowledge with it.
     ForceFlush,
-    /// The frontier is beyond the buffer: the witness holds the point
-    /// open, flushes the moment the stream covers it, and acknowledges
-    /// then.
+    /// The frontier is beyond the buffer: hold the point open and
+    /// acknowledge when the stream covers it.
     Held,
 }
 
 /// The two high-watermarks and the held-open points. Every mutation is
-/// monotonic: a watermark never moves backwards, and a held point never
-/// unholds — the witness records what it receives and never forgets
-/// progress.
+/// monotonic: a watermark never moves backwards, a held point never
+/// unholds.
 #[derive(Debug, Default)]
 pub struct WitnessWatermarks {
     buffered: Option<Frontier>,
@@ -57,23 +40,20 @@ impl WitnessWatermarks {
         Self::default()
     }
 
-    /// The highest frontier held in the buffer (received, not yet flushed).
     pub fn buffered(&self) -> Option<Frontier> {
         self.buffered
     }
 
-    /// The highest frontier flushed.
     pub fn flushed(&self) -> Option<Frontier> {
         self.flushed
     }
 
-    /// The held-open sync points, in arrival order.
     pub fn held(&self) -> &[Frontier] {
         &self.held
     }
 
-    /// A stream record landed in the buffer. The buffered watermark
-    /// moves to the record's frontier; the flush effect is the driver's.
+    /// A stream record landed in the buffer; the buffered watermark
+    /// moves to its frontier.
     pub fn observe(&mut self, frontier: Frontier) {
         if self.buffered.is_none_or(|held| held < frontier) {
             self.buffered = Some(frontier);
@@ -92,19 +72,10 @@ impl WitnessWatermarks {
         self.resolve_held()
     }
 
-    /// The three sync-point rules, applied in order:
-    ///
-    /// 1. the flushed watermark already covers the frontier — acknowledge
-    ///    immediately;
-    /// 2. the frontier is in the buffer — force the flush and acknowledge
-    ///    with it;
-    /// 3. the frontier has not yet been seen — hold the point open,
-    ///    flush the moment the stream covers it, and acknowledge then.
-    ///
-    /// No reply is awaited on the wire: the witnesses' series are the
-    /// backup certificate. The outcome tells the driver which flush (if
-    /// any) the point owes; the acknowledgements are the driver's to
-    /// log.
+    /// The three sync-point rules, in order: covered by the flushed
+    /// watermark — acknowledge immediately; in the buffer — force the
+    /// flush and acknowledge with it; unseen — hold the point open and
+    /// acknowledge when the stream covers it.
     pub fn sync_point(&mut self, frontier: Frontier) -> SyncOutcome {
         if self.flushed.is_some_and(|flushed| flushed >= frontier) {
             return SyncOutcome::Acked;

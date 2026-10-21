@@ -1,9 +1,3 @@
-//! The harness driver binary: boots the node hosts in-process, wires
-//! every peer and client message through the cluster-wide trace AOF, and
-//! runs one scenario (stage1 | stage2 | stage3) with its asserted
-//! invariants. Every scenario step prints a `[pass]`/`[fail]` line;
-//! exit 0 only when all pass.
-
 use lease_sequencer::uds_harness::{
     Cluster, ClusterConfig, print_verdicts, stage1, stage2, stage3,
 };

@@ -107,35 +107,12 @@ The public telemetry plane is the **lock telemetry capture file**: the
 the vendored TigerBeetle store. The capture series rotates at every
 (re)start to a fresh unix-epoch-named file and leaves the prior files for
 admin pruning; during a run the rollover keeps exactly the current file
-plus one closed old. (The old "telemetry AOF" naming refers to this same
-file.) The per-node INTERNAL trace — everything the capture file never
-sees — is the separate [Flight
+plus one closed old. The per-node INTERNAL trace — everything the capture
+file never sees — is the separate [Flight
 Recorder](docs/src/flight-recorder.md), a debug-level feature-flagged
-build, not a prod artifact.
-
-## Two capture planes, one replay tape
-
-The run produces two kinds of capture files, and both stream as the same
-`from,to,{json}` replay tape — one CSV line per record, the first two
-fields the endpoints, the JSON starting after the second comma — so the
-trivial shell filter `... | grep "^${from},${to},"` works on either plain
-output and the filtered lines force-feed a unit test's node through the
-same playback engine (`examples/lease-sequencer/tests/scenario/mod.rs`).
-
-| | The lock telemetry capture file | The Flight Recorder |
-| --- | --- | --- |
-| What it holds | the public, wire-visible events (wire datagrams, timeout decisions, state transitions, outbound queue) | the node's private story: every drive outcome, fault, maybe, journal flush, and stop marker, plus the wire events byte-exact |
-| Where it runs | the separate non-voting telemetry nodes, off the critical path — no performance impact on the quorum | feature-flagged build (`flight-recorder`), never a prod release |
-| Format stability | stable-ish file formats for the UI | unstable internal format; captures hidden state that never goes on the wire |
-| Reader gate | none | the deep read requires reader commit == recording commit |
-
-The telemetry plane is the prod surface: always available, read by the
-console UI. The Flight Recorder is debug-only and same-commit-readable
-only: cross-commit, `skaffold_flight_tape` offers only the stable
-`from,to,jsonl` slice, while the deep read (`--deep`, or any kind beyond
-`wire`) is loudly refused — see [the Flight
-Recorder](docs/src/flight-recorder.md) for the from/to derivation rules
-each streamer prints in its `--help`.
+build, not a prod artifact. Both capture planes stream the same
+`from,to,{json}` replay tape; their split is [the Flight
+Recorder's](docs/src/flight-recorder.md) comparison table.
 
 `ext/lunet-locks-aof` vendors the AOF (append-only write-behind log) from
 [tigerbeetle/tigerbeetle](https://github.com/tigerbeetle/tigerbeetle)
@@ -144,10 +121,9 @@ safe Rust wrapper: the standby learner streams the leader's
 heartbeat/commit records into a hash-chained, checksum-validated
 `{unixepoch}.aof` series with an optional force knob (default OFF) and a
 10 MiB startup retention sweep. Upstream licence: Apache-2.0 — permissive,
-no copyleft obligation on the combined work (this corrects the item spec's
-AGPL-3.0 premise; the pinned release's `LICENSE` is Apache-2.0). For
-telemetry alone this is overkill — it is built for full disaster recovery
-of a database — and it is incubated here because downstream uvrr-core
-applications will want exactly this standby/DR shape. Full system
-description, attribution, and the licence facts:
-[`ext/lunet-locks-aof/AOF.md`](ext/lunet-locks-aof/AOF.md).
+no copyleft obligation on the combined work; the pinned release's
+`LICENSE` is Apache-2.0. For telemetry alone this is overkill — it is
+built for full disaster recovery of a database — and it is incubated here
+because downstream uvrr-core applications will want exactly this
+standby/DR shape. Full system description, attribution, and the licence
+facts: [`ext/lunet-locks-aof/AOF.md`](ext/lunet-locks-aof/AOF.md).

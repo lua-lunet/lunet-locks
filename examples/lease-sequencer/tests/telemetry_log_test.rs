@@ -1,10 +1,3 @@
-//! The console telemetry panel's data source: the observability
-//! contract's JSON log series (`docs/src/test-scaffold.md`) — the daily
-//! rolling `<node>.<date>.log` appender files plus the telemetry tape's
-//! slot-frontier records — served at `/api/v1/telemetry/log`. The
-//! endpoint's life sign is a NON-EMPTY series with named events: a
-//! permanently-empty panel is the failure this suite exists to prevent.
-
 use lease_sequencer::bridge::Server;
 use serde_json::Value;
 use std::io::{Read, Write};
@@ -14,7 +7,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tbio::AofFile;
 use tbio::envelope::{Marker, Record};
 
-/// The scratch tree, inside the repo (`.tmp` is scratch).
 fn scratch(name: &str) -> PathBuf {
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.tmp/telemetry-log");
@@ -29,7 +21,6 @@ fn scratch(name: &str) -> PathBuf {
     dir
 }
 
-/// One GET round against the bridge: `(status, body)`.
 fn http_get(port: u16, path: &str) -> (u16, String) {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("the bridge accepts");
     stream
@@ -51,11 +42,6 @@ fn http_get(port: u16, path: &str) -> (u16, String) {
     (status, body)
 }
 
-/// The fixture: one AOF series whose telemetry tape carries the
-/// slot-frontier record (and one timeout-decision record the endpoint
-/// does not serve), and a logs directory with two nodes' rolling logs in
-/// the real line shapes — including one non-JSON neighbor line (the Lua
-/// host's stdout captured beside the node's own log).
 fn write_fixture(aof_dir: &Path, log_dir: &Path) {
     std::fs::create_dir_all(aof_dir).expect("the aof fixture dir creates");
     std::fs::create_dir_all(log_dir).expect("the logs fixture dir creates");
@@ -121,11 +107,6 @@ fn write_fixture(aof_dir: &Path, log_dir: &Path) {
     .expect("n3's log writes");
 }
 
-/// The endpoint serves a non-empty series with the named events, every
-/// line carrying `ts` and `event`, every protocol line carrying both
-/// `era` and `view`, the tape's slot-frontier record folded in with its
-/// envelope ns floored to ms, the non-JSON neighbor counted not served,
-/// and the fromMs window trimming the series.
 #[test]
 fn telemetry_log_endpoint_serves_a_nonempty_series_with_named_events() {
     let case = scratch("panel-source");

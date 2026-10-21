@@ -126,41 +126,10 @@ current configuration and the configuration the operation would fold. When
 no legal pivot exists for that leader, the reconfiguration drives with no
 pivot and takes the stop-the-world fallback — a latency outcome, never an
 error. The era advances exactly at the establishing operation's commit;
-every refusal leaves the log untouched.
-
-The acknowledgment shapes are exact:
-
-- an accepted verb answers `{"action":...,"id":...,"accepted":true}`, and
-  only after the establishing commit has advanced the leader's era (the
-  leader polls its status, whose era comes from the core's folded
-  configuration);
-- a floor-crossing verb answers
-  `{"action":...,"id":...,"accepted":false,"reason":"voting-floor"}` — the
-  leader refused it at admission, before the adapter was driven; nothing
-  entered the log;
-- a core refusal (fold gate, transition-outstanding gate, poisoned replica)
-  answers `{"action":...,"id":...,"accepted":false}` — nothing entered the
-  log;
-- an establishing commit that did not land within the client deadline
-  answers `{"action":...,"id":...,"accepted":false,"reason":"deadline"}` —
-  the verb may still commit later, so the leader answers honestly and
-  duplicates of the same `message_id` replay that same first outcome from
-  the leader's dedup cache.
-
-Because the acknowledgment waits on the establishing commit, it can take
-longer than a lock operation; a stop-the-world era entry in particular
-awaits the ordinary fence.
-
-The operator's sequences follow the core's weight rules:
-
-- to add a member: `join` (the member enters at weight 0, a learner), then
-  `increment` (the learner becomes a voter);
-- to remove a member: `decrement` (the voter returns to weight 0), wait for
-  that era to commit, then `leave` — a leave of a member above weight 0 is
-  refused by the core's fold gate and reported as a rejected verb. A
-  `decrement` or `leave` that would leave fewer than three voters is
-  refused at the leader's admission with the `voting-floor` acknowledgment,
-  and again at the adapter's reconfigure gate.
+every refusal leaves the log untouched. See
+[the client protocol](client-protocol.md)
+for the verb wire shapes, the four acknowledgment shapes, and the operator's
+join/increment/decrement/leave sequences.
 
 Endpoint addressing moves with two of the verbs. A `join` adds the joining
 member's addressing row on every replica: the leader adds it before driving
@@ -212,11 +181,9 @@ client retries attach to that in-flight correlation rather than submit a new
 operation. The normal client deadline is 30 seconds; on expiry the service
 closes the TCP connection, and the client retries the *unchanged* envelope.
 
-A connection carries one outstanding request. A second, different command
-arriving on a connection that already holds one is refused by name
-(`{"error":"request_outstanding","message_id":…}`) and never queued behind it;
-the refused command never enters the replication log and never allocates a
-correlation entry. See [the client topology](client-topology.md) for the
+One outstanding request per connection, a second refused by name and never
+queued, is [the client protocol's](client-protocol.md) rule. See
+[the client topology](client-topology.md) for the
 uuid-to-socket nexus, the two-nodes-per-datacentre deployment in front of a
 cloud L4 load balancer, and the load-balancer failover behaviours that topology
 depends on.
@@ -310,21 +277,10 @@ that is not primary never executes the forwarded application command.
 A node whose configuration knowledge is stale — including one booting on
 the genesis descriptor while the live cluster has reconfigured — learns
 the live membership through era-qualified membership snapshots, the
-third LAL peer kind. They are advisory evidence and never a consensus
-mechanism: the model they feed is in-memory, feeds the ordinary
-fenced-boot path, and never bypasses a gate. The boot-time discovery
-loop requests a snapshot from every node the process remembers,
-escalates across any newer era (each escalation dropping the older-era
-responses), and adopts a configuration only at a weighted quorum of
-agreeing snapshots. When the leader's reconfiguration command commits,
-it disseminates the as-at-new-generation snapshot to the new membership;
-recipients check only up-to-dateness, era plus slot. Adopted facts
-persist lazily on a routine tick in a membership sidecar next to the
-identity marker.
-
-See [membership snapshots](membership-snapshots.md) for the wire shapes,
-the discovery and dissemination rules, the quorum arithmetic, and the
-sidecar format.
+third LAL peer kind. See [membership snapshots](membership-snapshots.md)
+for the advisory-evidence model, the wire shapes, the boot-time
+discovery and post-commit dissemination rules, the quorum arithmetic,
+and the sidecar format.
 
 ## Status surface
 
@@ -344,20 +300,11 @@ restart.
 ## Lock-event journal and console feed
 
 Each replica optionally maintains an append-only binary journal of committed
-lock transitions (hold, renew, release, break) under a per-replica directory.
-The
-journal is observability data: it never participates in replication or
-recovery, and it is never a degraded mode — a journal write failure crashes
-the process under the let-it-crash law (below). Files roll by byte threshold
-and are never deleted by any component.
-
-The `lock-feed` process serves the journal directory over REST and WebSocket.
-The nginx reverse proxy maps `/feed/` to lock-feed with WebSocket upgrade
-support. The console SPA pulls rolled files via HTTP, tails the open file via
-WebSocket, persists events to IndexedDB keyed by `[ts, lockId, leaseId]` for
-idempotent replay, and applies a tombstone-ahead merge rule so releases that
-arrive before their acquisition produce a correct active-lock view regardless
-of ingestion order.
+lock transitions (hold, renew, release, break) under a per-replica directory;
+the `lock-feed` process serves the journal directory over REST and WebSocket,
+and the console SPA follows it. The journal is observability data: it never
+participates in replication or recovery, and a journal write failure crashes
+the process under the let-it-crash law (below).
 
 See [the event journal reference](event-journal.md) for record and metafile
 byte layouts, file naming, resume-on-reopen semantics, corrupt-tail
@@ -404,14 +351,9 @@ own log) is counted `unparsed`, never served.
 A zero-voting-weight telemetry node can host the console's telemetry: it
 applies the replication stream like any member and writes its lock-event
 records to an async write-behind log (the lock telemetry capture file)
-instead of the blocking journal. The writer never blocks or forces on the
-append path — events enqueue to a dedicated writer thread with
-drop-on-overflow, files roll at exactly 2 MiB (erasure-block aligned),
-the series rotates to a fresh unix-epoch-named file at every (re)start
-with the prior files left for admin pruning, and fsync happens only on a
-periodic timer, a checkpoint, or shutdown. The console's feed and SPA
-serve off the telemetry node's own capture series, never off a cluster
-replica's journal files, and the cluster's latency cadence is unaffected.
+instead of the blocking journal. The console's feed and SPA serve off the
+telemetry node's own capture series, never off a cluster replica's journal
+files, and the cluster's latency cadence is unaffected.
 
 See [the lock telemetry capture file](telemetry-aof.md) for the writer
 design, the rotation, the rolling and reader-valid-prefix rules, and the
@@ -523,12 +465,3 @@ and never records `flushed`. An asynchronous writer whose write fails aborts
 the process from its own thread — a live process behind a broken capture is
 the one thing this law forbids, and a dead process answers no health probe,
 which is the health reporting bad in its most honest form.
-
-The reasoning: this cluster is diskless — the protocol state lives in quorum
-memory, and a restarting node reincarnates from the live nodes. A process
-that keeps running past a failed write serves state its operators cannot
-see; a silently stale console is the most expensive bug we can ship. A dead
-process is the cheapest signal we can get. There are no carve-outs: the
-flight recorder's write failures panic like every other surface — only its
-cap-and-sweep behaviour is its own, and that is a policy, not an error
-path.

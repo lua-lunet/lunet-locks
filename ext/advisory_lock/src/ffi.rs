@@ -1,229 +1,8 @@
 //! Host-side FFI adapter between the LuaJIT host and the uVRR core
+//! (`Replica<SegmentedLog, WeightedMajority>` under `Stability::Volatile`).
 //!
-//! Concrete core: `Replica<SegmentedLog, WeightedMajority>` running
-//! `Stability::Volatile` — nothing is persisted but the boot gate's
-//! markers, so a process that died while operating has no same-identity
-//! clean restart in this embedder: its restart is CRASHED. A graceful
-//! stop is the one same-identity restart (the boot gate's stopped
-//! quorum, below). The restart story is upstream's Crash-Stop-Self-Evict
-//! protocol (`src/replica/reincarnation.rs`): the durable markers carry
-//! the incarnation (the quorum-of-copies construction, `marker_store`),
-//! a crashed boot decides the bumped pair, the bumped node drives
-//! `Input::Reincarnate { old }` — the `Reincarnation(old, new)` entry
-//! ticket — and the stable leader computes `forced_steps` idempotently from
-//! the committed configuration, proposing each remaining era's batch
-//! through the ordinary reconfiguration pipeline, continued tick-driven,
-//! until the new identity sits at weight 1 in the old succession position
-//! and the old identity is evicted. The reincarnated node reopens over the
-//! deployment's genesis (the only true shared history a Volatile process
-//! has) and acquires nothing beyond its genesis — the §10 learner
-//! acquisition streams it the committed history through its boot fence —
-//! so it replays no lock state it did not commit, exactly like the joiner.
-//!
-//! Adapter policies the core deliberately does not own:
-//!
-//! - **Tick clock.** The adapter owns the tick clock: a monotonic
-//!   nondecreasing milliseconds-since-Unix-epoch value, clamped per node so
-//!   a clock regression never reaches the core. ABI functions take no `at`
-//!   parameter. Ticks come from the ms clock only; the durable state file
-//!   is the incarnation marker, not a tick source (the old nonce-as-tick
-//!   role is retired with the amnesia protocol it served).
-//! - **Identity.** Membership is the admin-assigned deployment descriptor:
-//!   the member buffer carries NUL-separated `<u32-id>:<name>` entries, in
-//!   the descriptor's line order. Each id is the member's live `NodeId`
-//!   (sparse, admin-assigned, never recycled), and the buffer order is the
-//!   genesis succession sequence (`primary(v) = order[v mod N]`). Member ids
-//!   are the ABI's peer addresses: `receive`'s `from`, send outputs' `to`,
-//!   and the leader outs all carry member ids; the host maps id -> endpoint
-//!   through the descriptor. `own` is matched by name. A post-genesis
-//!   (joined-later) entry carries a `:j` suffix: `<u32-id>:<name>:j`. Such
-//!   entries are outside the genesis order — the core's `provision` refuses
-//!   an `own` that is not a founding member — so a node whose `own` names a
-//!   `:j` entry boots as a JOINER: `Replica::join` over the deployment's
-//!   genesis (the entries `provision` installs, mirrored byte-for-byte, plus
-//!   the era table folded from them), fenced `Restarting`, addressed but
-//!   outside every configuration until a committed `Join` admits it. Upstream
-//!   has no fresh-node catch-up at this commit: the establishing operation's
-//!   fan-out reaches configuration members only and the `GetState` serving
-//!   gate serves configuration members only, so the joiner evaluates only
-//!   the era-1 traffic its genesis table covers and drops everything past it
-//!   by name — the same boundary upstream's own learner corpus states
-//!   (§10 acquisition, future work). The joiner fabricates nothing.
-//! - **Identity (the restart story).** The boot classification is the
-//!   engine's (`lifecycle::boot` over the superblock quorum store,
-//!   `vrr::lifecycle`): no marker ever written is the FIRST life — the
-//!   first latch anchors the genesis life (crash counter 1); a stopped
-//!   quorum is a CLEAN continue under the SAME identity
-//!   (`Replica::resume` behind the engine's `Vouched` token); no
-//!   stopped quorum is a CRASH — the identity is dead, the replacement
-//!   pair is decided at boot (`Crashed::pair`), and THE EMISSION GATE
-//!   lands the bump's one durable marker round — the next life at the
-//!   running sentinel — before the driver releases the first
-//!   announcement, unconditional, seated or not. The engine's session
-//!   is held so its typestate can latch the same round again once the
-//!   seated observation mints the witness (`Replica::rejoined`): the
-//!   same identity and state, idempotent on the marker.
-//!   Membership is the admin-assigned deployment descriptor: the member
-//!   buffer carries NUL-separated `<u32-id>:<name>` entries, in the
-//!   descriptor's line order. Each id is the member's provisioned
-//!   identity — the packed pair (system half, crash counter 1); the
-//!   marker's crash counter carries the life from there, so a crashed
-//!   boot's announced id is the strict next life of the same system.
-//!   The buffer order is the genesis succession sequence
-//!   (`primary(v) = order[v mod N]`). Member ids are the ABI's peer
-//!   addresses: `receive`'s `from`, send outputs' `to`, and the leader
-//!   outs carry the live packed ids; the host maps id -> endpoint
-//!   through the descriptor, and a later life of a member rides the
-//!   transport's remap. `own` is matched by name. A post-genesis
-//!   (joined-later) entry carries a `:j` suffix: `<u32-id>:<name>:j`. Such
-//!   entries are outside the genesis order — the core's `provision` refuses
-//!   an `own` that is not a founding member — so a node whose `own` names a
-//!   `:j` entry boots as a JOINER: `Replica::join` over the deployment's
-//!   genesis (the entries `provision` installs, mirrored byte-for-byte, plus
-//!   the era table folded from them), fenced `Restarting`, addressed but
-//!   outside every configuration until a committed `Join` admits it. Upstream
-//!   has no fresh-node catch-up at this commit: the establishing operation's
-//!   fan-out reaches configuration members only and the `GetState` serving
-//!   gate serves configuration members only, so the joiner evaluates only
-//!   the era-1 traffic its genesis table covers and drops everything past it
-//!   by name — the same boundary upstream's own learner corpus states
-//!   (§10 acquisition, future work). The joiner fabricates nothing.
-//!   A crashed boot reopens the
-//!   reincarnation way — a later life over the deployment's genesis
-//!   (`Replica::reincarnate` under the bumped identity; there is no
-//!   durable journal to carry forward) — and announces
-//!   `Input::Reincarnate { old }` on the host's fenced-boot drives
-//!   (`recover` — the §8 re-announce; the core self-gates: a member
-//!   already voting at weight ≥ 1 has nothing to announce). The boot
-//!   itself emits nothing: a reopened node answers only what it is
-//!   driven with, and the announcement is the first fenced-boot
-//!   drive's work.
-//!   `lunet_lock_node_own_id` reports the live identity so the host can
-//!   compare leaders against it after a bump.
-//! - **Termination (the stop story).** The ENGINE owns the stop
-//!   schedule: the Running session's
-//!   `begin_stop` writes the halt's first round (`Stopping` — it
-//!   vouches for nothing), the host drain forces the committed-
-//!   transition sink to quiescence strictly between the rounds, and
-//!   `finish_stop` writes the drain-proven second round (`Stopped` — a
-//!   stopped quorum at the next boot proves the clean stop). The host
-//!   obligations stay ours: the wire closes FIRST (the `stopped` flag
-//!   refuses every further inbound entry — `request`, `receive`,
-//!   `idle`, `leader_timeout`, `force_view`, `recover`, `reconfigure` —
-//!   before any marker write and before any task processing, making the
-//!   in-memory state final), and the durable write is the existing
-//!   sink drain. A node still inside the crashed path's unseated window
-//!   (its engine session not yet latched) cannot run the halt's rounds —
-//!   the stop closes the wire, drains the sink, and leaves the markers
-//!   at the emission gate's round (the new life's running sentinel); the
-//!   next boot re-classifies crashed and derives the strictly next
-//!   life. Marker storage: the lifecycle rides the
-//!   vendored Zig store's quorum-of-copies superblock construction
-//!   (four fixed sector-aligned Aegis-checksummed copies, hash-chained
-//!   sequence/parent, quorum write with forced I/O verified at the 3/4
-//!   threshold, quorum read resolving by highest sequence at the 2/4
-//!   threshold, through the AOF C ABI's marker exports and linked
-//!   statically so this cdylib stays self-contained); the single
-//!   fsynced flag file remains as the compatibility projection — written
-//!   after every quorum write, never a classification input. An
-//!   unreadable marker quorum refuses the boot
-//!   (`BootError::QuorumLost` shape): no projection fallback, no
-//!   guessed identity.
-//! - **Reconfiguration.** `lunet_lock_node_reconfigure` drives
-//!   `Input::Reconfigure { op, pivot }` (Join at weight 0 / Increment /
-//!   Decrement (voter to learner) / Leave at weight 0) on the current primary
-//!   through the ordinary
-//!   plan/publish pipeline. The host derives the non-stop overlap pivot with
-//!   the core's own `construct_pivot` (`config(e+1)` probed exactly the way
-//!   the planner probes it, at `accepted().next()`); a `None` result — or a
-//!   failed probe — drives the stop-the-world fallback with `pivot: None`,
-//!   which upstream defines as a latency outcome, never an error. The era
-//!   advances exactly at the establishing operation's commit; refusals never
-//!   enter the log. Error mapping: `NotPrimary` is the one actionable code
-//!   (NOT_LEADER, re-forward to the named primary); every other refusal
-//!   (transition-outstanding gates, fold and closed-intersection gates,
-//!   view-exhaustion) is internal and reports SERVICE.
-//! - **Operation identity.** `OperationId` is derived from the client
-//!   request's 16-byte message_id: `msb` = first 8 bytes, `lsb` = last 8,
-//!   both big-endian (the core's wire order). The operation payload IS the
-//!   client JSON bytes; `Service::decode` parses the ids out of it.
-//! - **Exactly-once (B2).** The core never deduplicates and never answers a
-//!   proposal. The adapter caches each executed reply by message_id and
-//!   replays the cached bytes for a duplicate request or a duplicated
-//!   committed operation, without re-executing the Service. A reply output
-//!   is queued only for an operation this node proposed (locally pending).
-//! - **Timers.** The tag has a single liveness input, `Input::Tick`; both
-//!   `node_idle` (heartbeat) and `node_leader_timeout` (election) drive it.
-//!   `ViewChangeKnobs::primary_timeout` is `PRIMARY_TIMEOUT_MS` below;
-//!   `view_change_budget` is `EVIDENCE_BUDGET` — the largest core-built
-//!   suffix or chunk this host puts on one datagram, sized to what a
-//!   default UDP socket actually delivers (see the constant's note).
-//! - **Peer payload gate.** The core carries operation payloads opaque and
-//!   validates none of them (B2), so the adapter re-checks every peer-carried
-//!   operation entry (Prepare / DoViewChange / StartView / NewState) with
-//!   `Service` before the message reaches the core — the same gate the old
-//!   adapter called `valid_message_payload`.
-//! - **Self-arrest reporting.** The core's never-repair contract makes a
-//!   fault sticky: a legality-gate breach, a journal refusal, or a boundary
-//!   panic self-arrests the node — poison is permanent and every further
-//!   entry reports SERVICE, by design (the node never continues past a
-//!   violated invariant). What the contract never allowed was SILENCE: the
-//!   first fault observation records its reason, says it once on stderr,
-//!   and exports it ([`NodeStatus`] and `lunet_lock_node_fault`) so the
-//!   runbook can tell a breached node from a wedged one without
-//!   restarting anything. The arrest itself is unchanged.
-//! - **Lock-event journal.** An optional append-only binary journal records
-//!   every committed lock transition (Hold/Renew/Release) to rolling files
-//!   under a per-replica directory. Enabled when `lunet_lock_node_new`
-//!   receives a non-empty `journal_dir`; disabled otherwise. Journal errors
-//!   log to stderr and disable journaling for the process; the node keeps
-//!   serving. See `journal.rs` for the record and metafile formats.
-//!
-//! `node_next` output contract (kinds): 1 = send (unicast to `to`; era, view
-//! and slot report the encoded message's wire header), 2 = reply (message_id
-//! and response bytes; to/era/view/slot are zero). Return 1 when an output
-//! was produced, 0 when the queue is empty, negative on error. When the next
-//! output's bytes exceed `capacity`, the call reports the needed size in
-//! `out_len`, returns TOO_LARGE and does NOT pop the queue.
-//!
-//! # ABI surface
-//!
-//! ```text
-//! lunet_lock_node_new(
-//!     members_len: usize, members_data: *const u8,
-//!     own_len: usize, own_data: *const u8,
-//!     state_len: usize, state_data: *const u8,
-//!     journal_dir_len: usize, journal_dir_data: *const u8,
-//!     roll_bytes: u32,
-//!     out: *mut *mut c_void,
-//! ) -> i32
-//! ```
-//!
-//! Empty `journal_dir` (len=0 or data points to empty string) disables the
-//! journal. `roll_bytes` is the byte threshold at which the current event
-//! file rolls to a final name with an atomic metafile. `members_data` holds
-//! NUL-separated `<u32-id>:<name>` entries in descriptor (genesis succession)
-//! order, with post-genesis entries suffixed `:j` (see Identity above);
-//! `own_data` is the local member's name.
-//!
-//! ```text
-//! lunet_lock_node_new_aof(
-//!     members_len: usize, members_data: *const u8,
-//!     own_len: usize, own_data: *const u8,
-//!     state_len: usize, state_data: *const u8,
-//!     aof_dir_len: usize, aof_dir_data: *const u8,
-//!     flush_ms: u64,
-//!     out: *mut *mut c_void,
-//! ) -> i32
-//! ```
-//!
-//! The AOF-backed creator: the committed-transition hook enqueues to the
-//! write-behind AOF writer instead of the blocking journal. `aof_dir` is
-//! required — an empty directory is an `INVALID` call, not a journal
-//! fallback. `flush_ms` is the periodic fsync cadence; 0 fsyncs only at
-//! roll and shutdown. The roll threshold is fixed at the 2 MiB erasure
-//! block and `members_data`/`own_data`/`state_data` follow the same
-//! grammar as `lunet_lock_node_new`.
+//! The boundary's law: a panic never crosses into C — every ABI entry catches
+//! a panic at the boundary and aborts the process (the let-it-crash law).
 
 use crate::aof::{AofConfig, AofWriter};
 use crate::disk::{Disk, StdDisk, std_disk};
@@ -267,24 +46,8 @@ use vrr::wire::{Pack, Tag, Unpack, UnpackError};
 use crate::marker_store::{GateStore, SinkDoor, drain_sink, sink_guard};
 
 /// An invariant of the adapter: the condition either holds or the process
-/// dies. The let-it-crash law in one line — a violation crashes the
-/// process, in every build, in tests and in release alike; there is no
-/// warn-and-continue shape and never was a build profile where one was
-/// tolerable. Where the older two-tier convention split "invariants"
-/// (assert, every build) from "maybes" (a datagram attributed to an unknown
-/// peer id, a send to an unaddressable replica, a folded-era regression —
-/// panic in test/debug, log `warn!` and continue in release), the ruling
-/// folded the tiers: those conditions are invariants now, stated as
-/// positive checks. The sites name the check, the message names what
-/// failed, and a dead process is the cheapest signal there is.
-///
-/// Upstream (`uvrr-core`) has no equivalent helper — its
-/// `src/invariant.rs` names drops through the `Diagnostic` observation and
-/// faults impossible local transitions, but neither asserts nor warns; the
-/// convention is proposed upstream and this macro is
-/// the reference implementation. It is exported so downstream embedders
-/// (e.g. the `lease-sequencer` example) state their host-side invariants
-/// under the same convention.
+/// dies — in every build, tests and release alike. Exported so downstream
+/// embedders state their host-side invariants under the same convention.
 #[macro_export]
 macro_rules! invariant {
     ($condition:expr, $($arg:tt)*) => {
@@ -296,24 +59,13 @@ macro_rules! invariant {
     };
 }
 
-/// The wall-clock millisecond every log line this crate emits carries:
-/// the same host clock the marker layer's `unix_millis` reads and the
-/// same one the embedding host stamps its own lines with, so the log's
-/// order is the host's order. A clock reading before the UNIX epoch
-/// carries no millisecond; the line then reads `0` and nothing else
-/// decides on it — no protocol path reads a log field.
+/// The wall-clock millisecond every log line this crate emits carries.
 #[doc(hidden)]
 #[must_use]
 pub fn log_millis() -> u64 {
     unix_millis().unwrap_or(0)
 }
 
-/// The view-change message family (`vrr::wire::Tag`): the NOMINATE
-/// computation's own traffic — the fence, the evidence, the selected
-/// history. Ordinary replication traffic stays at `trace` (it is the
-/// heartbeat's subject, and the host logs every heartbeat commit with
-/// its slot, view and era), so the whole fence is visible in the log at
-/// the default `RUST_LOG=info` without the replication flood.
 fn is_view_change_family(tag: Tag) -> bool {
     matches!(
         tag,
@@ -326,35 +78,8 @@ fn is_view_change_family(tag: Tag) -> bool {
     )
 }
 
-/// One lifecycle path line: the named census entry that a boot or stop path
-/// emits as it takes it. The observability contract's third clause — "the
-/// zero-cost trace discipline logs every path the node takes
-/// through boot, drain, flush, and stop — a path that cannot show itself in
-/// the trace is a defect" — is carried here, alongside the
-/// [`invariant!`](crate::invariant) discipline it extends.
-///
-/// The convention, stated once and applied everywhere:
-///
-/// - A path's name is its stable identity: `<subject>.<verb>[.<qualifier>]`,
-///   lowercase, hyphenated. `boot.crashed`, `marker.read.corrupt`,
-///   `stop.drain-window.open`. The name never changes shape when the code
-///   around it moves, because the proving test asserts on it.
-/// - EVERY path through boot and through stop names itself, refusals
-///   included, with its own line. A refusal that shares another refusal's
-///   line is a path that cannot show itself.
-/// - The line costs nothing when the tape is not wanted. The expansion is a
-///   `#[cfg]`-gated call on a `&'static str`: a release build carries no
-///   tape, no push, and no formatting — the call site compiles to nothing
-///   rather than formatting and discarding.
-/// - The census tape is THREAD-LOCAL, not per node: a boot that REFUSES
-///   hands back no [`Node`], so a node-scoped tape could not carry the
-///   refusal paths at all. Thread-local is the granularity that works for
-///   both the node-bearing and the node-refusing paths, and it keeps
-///   concurrent callers' lines apart. [`crate::census_paths`] is the reader
-///   that drains it.
-///
-/// Unlike [`invariant!`] this is not a convention for downstream
-/// hosts: it names this adapter's own boot and stop paths.
+/// One lifecycle path line on the calling thread's census tape
+/// ([`census_paths`]); the expansion is nothing in a release build.
 #[macro_export]
 macro_rules! trace_line {
     ($path:expr) => {{
@@ -363,10 +88,6 @@ macro_rules! trace_line {
     }};
 }
 
-// The lifecycle census tape: every named path line the calling thread
-// took, in order. Present in the test and dev profiles (the builds that
-// run the proving test and the cloud rigs); absent from a release build,
-// where `trace_line!` expands to nothing.
 #[cfg(any(test, debug_assertions))]
 std::thread_local! {
     static LIFECYCLE_CENSUS: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
@@ -397,21 +118,15 @@ pub const TOO_LARGE: i32 = -6;
 pub const SERVICE: i32 = -7;
 pub const NOT_LEADER: i32 = -8;
 pub const FAULTED: i32 = -9;
-/// The drain point's refusal code: the node has stopped and the wire is
-/// closed — every inbound entry (request, receive, ticks, admin drives)
-/// reports STOPPED and processes nothing.
+/// The drain point's refusal code: the node has stopped and the wire is closed.
 pub const STOPPED: i32 = -10;
 pub const PANIC: i32 = -127;
 
-/// The queued output's kinds (`NodeOutput.kind`): a unicast peer datagram
-/// or a client reply. The names the human surfaces spell for them ride
-/// `output_kind_name`.
+/// The queued output's kinds (`NodeOutput.kind`): a unicast peer datagram or a client reply.
 pub const OUTPUT_SEND: u32 = 1;
 pub const OUTPUT_REPLY: u32 = 2;
 
-/// The output kind's name, for every surface a human reads: `send`,
-/// `reply`, or `unknown(N)` for anything else — never a bare integer for
-/// a human to memorise.
+/// The output kind's name for human surfaces: `send`, `reply`, `unknown(N)`.
 pub fn output_kind_name(kind: u32) -> &'static str {
     match kind {
         OUTPUT_SEND => "send",
@@ -425,34 +140,20 @@ pub fn output_kind_name(kind: u32) -> &'static str {
 const MAX_DATAGRAM: usize = 65507;
 
 /// Ticks (milliseconds) of primary silence before a backup fences into the
-/// next view. Host policy; correctness never depends on it. The default
-/// every [`Node::open`] caller passes; a caller that pins its own policy
-/// passes its own value.
+/// next view. Host policy; the default every [`Node::open`] caller passes.
 pub const PRIMARY_TIMEOUT_MS: u64 = 5000;
 
-/// The host's evidence-and-transfer datagram budget (W5): the largest
-/// core-built suffix or chunk this host will put on one datagram. The
-/// core's own cap is `MAX_DATAGRAM` (one UDP datagram), but the wire path
-/// here is the LAL peer envelope over a host UDP socket, and a default
-/// socket's send buffer caps a single send well below that limit — on
-/// macOS the default is 9216 bytes, and a send past it fails with
-/// `EMSGSIZE` and the datagram silently never arrives. A view-change
-/// evidence or `StartView` suffix sized past that budget would then
-/// strand the very view change it carries: the designated primary waits
-/// forever on evidence that was sent and lost. 8192 leaves headroom for
-/// the envelope under every default UDP send buffer this stack runs on;
-/// the transfer machinery resumes whatever does not fit through the
-/// fetch cursor (§13.1 step 5), so correctness never depends on the
-/// number — only liveness does.
+/// The host's evidence-and-transfer datagram budget (W5): a default UDP send
+/// buffer (9216 bytes on macOS) rejects larger sends with `EMSGSIZE` and they
+/// silently never arrive; the transfer machinery resumes overflow through the
+/// fetch cursor, so correctness never depends on the number — only liveness.
 const EVIDENCE_BUDGET: usize = 8192;
 
-/// Leader/primary unknown (era outside the core's three-era retention
-/// window, or the void configuration): the value status and
-/// leader-for-view report in that case.
+/// Leader/primary unknown (era outside the core's retention window, or the void configuration).
 const LEADER_UNKNOWN: u32 = u32::MAX;
 
-/// The lawful packing's halves: the system identifier is the high
-/// sixteen bits of a packed `NodeId`, the crash counter the low sixteen.
+/// The packing's halves: the system identifier is the high sixteen bits of a
+/// packed `NodeId`, the crash counter the low sixteen.
 const SYSTEM_HALF_SHIFT: u32 = 16;
 
 struct Queued {
@@ -467,8 +168,6 @@ struct Queued {
 
 type Core = Replica<SegmentedLog, WeightedMajority>;
 
-/// The node construction's runtime policy: the view-change timeout the
-/// cluster plays by.
 struct Construction {
     primary_timeout: u64,
 }
@@ -479,124 +178,56 @@ pub struct Node {
     service: Service,
     /// message_id bytes -> cached response bytes, for duplicate replay (B2).
     replies: HashMap<[u8; 16], Vec<u8>>,
-    /// Operations proposed through this node's `request` entry and not yet
-    /// applied: `OperationId` -> message_id bytes. Only these get replies.
+    /// Proposed through `request` and not yet applied: the ids that get replies.
     pending: HashMap<OperationId, [u8; 16]>,
     last_tick: u64,
     poisoned: bool,
-    /// The sweeper's own request_num sequence (the keeper's client
-    /// numbering never collides with a client's).
+    /// The sweeper's own request_num sequence.
     sweep_seq: u64,
-    /// The recorded reason of the FIRST self-arrest observation (the
-    /// core's never-repair fault, or a boundary panic): `None` until the
-    /// node arrests. The sticky fault would otherwise repeat the
-    /// observation on every drive, so only the first is recorded and
-    /// said — loudly, on stderr, where the runbook reads.
+    /// The recorded reason of the first self-arrest observation.
     fault_note: Option<String>,
-    /// The superseded identity when this node booted a DIRTY restart: the
-    /// bumped node re-announces `Reincarnation(old, new)` on every
-    /// fenced-boot drive (§8). `None` for an incarnation-0 boot.
+    /// The superseded identity on a dirty restart: the fenced-boot drives
+    /// re-announce `Reincarnation(old, new)` until the node seats.
     reincarnate_from: Option<NodeId>,
-    /// The descriptor's member ids (the low band, `:j` entries included):
-    /// the address space `receive` accepts. A message attributed to a
-    /// low-band id outside this set is a maybe (an unknown peer id).
+    /// The descriptor's member ids: the address space `receive` accepts.
     known_ids: HashSet<u32>,
-    /// The last (era, view) reported for lifecycle `debug!` events.
     last_view: Option<(u32, u32)>,
-    /// The last leader reported for lifecycle `info!` events.
     last_leader: Option<u32>,
-    /// The last folded configuration era, for the folded-era-regression
-    /// maybe.
     last_config_era: Option<u32>,
-    /// The lock-event sink. `None` when journaling is disabled (empty
-    /// journal_dir at construction) or after a journal error.
-    ///
-    /// - `Blocking` writes the classic per-replica journal: blocking
-    ///   buffered appends on the apply path; an append error disables it.
-    /// - `Aof` enqueues to the async write-behind writer: producers never
-    ///   wait on disk, overflow drops (the writer's drop counter tracks
-    ///   it), and fsync happens only on the timer, at roll, at checkpoint,
-    ///   and at shutdown.
-    ///
-    /// The door is shared with the boot gate's store: the engine's halt
-    /// schedule forces it through `LifecycleStore::drain`, strictly
-    /// between the two marker rounds.
+    /// The lock-event sink: `None` when journaling is disabled or errored.
     sink: SinkDoor,
-    /// The durable incarnation-marker path: the boot gate's store rides
-    /// it; the single-file projection the operators read mirrors it.
+    /// The durable incarnation-marker path.
     state_path: PathBuf,
-    /// The seam the node's own disk work crosses — the drain window's
-    /// view-record write, above all. Dynamic, never generic: the C ABI
-    /// surface stays monomorph-free.
+    /// The node's disk seam; dynamic so the C ABI stays monomorph-free.
     disk: Arc<dyn Disk>,
-    /// The lock table's persistence contract: the eager flush the stop
-    /// path owes, and the lazy load the regular path never takes at boot.
-    /// Dynamic, never generic, for the same reason as the disk above —
-    /// and a `Box` rather than an `Arc`, because nothing here is shared:
-    /// the node owns its store outright, and `flush` takes `&mut self`
-    /// precisely so the eager path needs no interior mutability to
-    /// reach it.
+    /// The lock table's persistence seam (eager flush at stop, lazy load on demand).
     state_store: Box<dyn StateStore>,
-    /// Whether the boot gate's verdict was a CLEAN stop. The lazy-load
-    /// guard's second clause: a crashed boot distrusts the state file and
-    /// rebuilds from the replica stream (see
-    /// [`Node::load_state_on_demand`]).
+    /// Whether the boot gate's verdict was a CLEAN stop (the lazy-load guard).
     clean_boot: bool,
-    /// Whether the lazy load has already been taken this life. The guard's
-    /// third clause: the load happens at most once per node, so a table
-    /// that empties again later never re-reads a file the stream has
-    /// already overtaken.
+    /// Whether the lazy load has already been taken this life.
     state_loaded: bool,
-    /// The commit seam: a trigger fired at each applied commit, and nothing
-    /// more (see [`CommitHook`]). Dynamic, never generic, for the same reason
-    /// as the disk and the store above; `Arc<Mutex<_>>` rather than the
-    /// store's `Box`, because a hook is the one seam a consumer may want to
-    /// reach from beside the node as well as through it, and because
-    /// `on_commit` takes `&mut self` while the apply path holds `&mut self`
-    /// on everything else.
-    ///
-    /// The default is this crate's own no-op: the hook is a seam with no
-    /// in-tree consumer yet, so the production path pays one dispatch per
-    /// commit and nothing more.
+    /// The commit seam: a trigger fired at each applied commit.
     commit_hook: Arc<Mutex<dyn CommitHook>>,
-    /// The boot gate's latched session: the Running typestate whose
-    /// schedule the stop path drives. `None` while the crashed
-    /// classification's engine session is unlatched (the seated witness
-    /// has not minted) and after the halt consumed it.
+    /// The boot gate's latched session: the Running typestate the stop path drives.
     session: Option<Running<GateStore>>,
-    /// The crashed classification's engine session: held until the
-    /// engine's seated observation (`Replica::rejoined`) mints the
-    /// witness, then latched once — the same marker round the emission
-    /// gate already made durable at boot, idempotent.
+    /// The crashed classification's engine session, held for the seated witness's latch.
     deferred: Option<Crashed<GateStore>>,
-    /// The drain point's wire-closed flag: set BEFORE any marker write at
-    /// stop, and refusing every further inbound entry while set — the
-    /// mandatory obligation that makes the in-memory state final.
+    /// The drain point's wire-closed flag: set before any marker write at stop.
     stopped: bool,
-    /// The Flight Recorder's tape (the `flight-recorder` feature): the
-    /// per-node internal trace. `None` without the feature (the field
-    /// itself is compiled out) and whenever the env did not name a
-    /// flight directory — the prod path carries nothing.
+    /// The Flight Recorder's tape (`flight-recorder` feature); `None` without it.
     #[cfg(feature = "flight-recorder")]
     flight: Option<crate::flight::FlightRecorder>,
 }
 
-/// The committed-transition sink behind `Node`'s journal hook.
 pub(crate) enum JournalSink {
     Blocking(LockJournal),
     Aof(AofWriter),
 }
 
 impl Node {
-    /// The next monotonic tick from the adapter-owned ms clock (never
-    /// decreasing per node, even across a wall-clock regression). Ticks
-    /// come from the clock only — the durable state file is the incarnation
-    /// marker, not a tick source.
     fn tick(&mut self) -> Result<u64, i32> {
         let now = unix_millis()?;
         let next = self.last_tick.max(now);
-        // Invariant (asserted, always): ticks are nondecreasing — the clamp
-        // holds even across a wall-clock regression.
         assert!(
             next >= self.last_tick,
             "tick regression: last={} next={}",
@@ -607,11 +238,6 @@ impl Node {
         Ok(self.last_tick)
     }
 
-    /// One plan/publish/effects cycle, looping on the host acknowledgements
-    /// (`Input::Applied`) the effects require, until the core goes quiet.
-    /// Under `Stability::Volatile` every publish is `Published`; a `Parked`
-    /// outcome is an invariant/API mismatch, so the node is poisoned rather
-    /// than allowed to fabricate a `StabilityResult::Stable`.
     fn drive(&mut self, event: Input) -> i32 {
         let at = match self.tick() {
             Ok(at) => at,
@@ -620,10 +246,6 @@ impl Node {
         self.drive_at(at, event)
     }
 
-    /// A drive whose outer input's tick the caller already chose (fenced
-    /// boot nonce ticks); feedback inputs inside the loop still sample the
-    /// clock. The Flight Recorder wraps every drive's outcome (the
-    /// `flight-recorder` feature).
     fn drive_at(&mut self, at: u64, event: Input) -> i32 {
         #[cfg(feature = "flight-recorder")]
         self.flight_log("drive-in", Self::flight_input_summary(&event));
@@ -634,14 +256,6 @@ impl Node {
         code
     }
 
-    /// The engine session's latch settle: the engine's seated
-    /// observation (`Replica::rejoined` — `Normal` at voting weight)
-    /// mints the witness, and the engine latches the crashed
-    /// classification — `(new, Joining)` written 4x through the machine,
-    /// the same round the emission gate made durable at boot. Checked
-    /// after every drive. A failed latch write
-    /// keeps the session — the markers already hold the emission gate's
-    /// round, and the next drive retries.
     fn settle_deferred_latch(&mut self) {
         if self.poisoned || self.stopped {
             return;
@@ -679,21 +293,6 @@ impl Node {
         }
     }
 
-    /// One plan/publish/effects cycle, looping on the host acknowledgements
-    /// (`Input::Applied`) the effects require, until the core goes quiet.
-    /// Under `Stability::Volatile` every publish is `Published`; a `Parked`
-    /// outcome is an invariant/API mismatch, so the node is poisoned rather
-    /// than allowed to fabricate a `StabilityResult::Stable`.
-    ///
-    /// The feedback queue drains FIRST-IN-FIRST-OUT: the core's §11.1
-    /// acknowledgement refuses any `Input::Applied` report but the next
-    /// expected slot, and a publish whose effects apply several operations
-    /// (a gap-served chunk, a view-change install — the live shapes any
-    /// client stream produces) must report its completions in the slot
-    /// order the effects were emitted in. A last-in-first-out drain
-    /// reports the newest slot first, refuses against its own publish, and
-    /// abandons the drive after it — with the install already published
-    /// and the applied frontier stranded behind it.
     fn drive_at_inner(&mut self, at: u64, event: Input) -> i32 {
         if self.poisoned {
             return SERVICE;
@@ -708,18 +307,10 @@ impl Node {
                 return SERVICE;
             }
             let result = catch_unwind(AssertUnwindSafe(|| {
-                // Invariant (asserted, always): poison means poisoned — no
-                // post-poison execution. The loop-top guard reports SERVICE
-                // for a poisoned node (the host may poll it); the execution
-                // point itself must never be reached while poisoned.
                 assert!(!self.poisoned, "post-poison execution");
                 let planned = match self.replica.plan(&input, &self.replica.journal().view()) {
                     Ok(planned) => planned,
                     Err(PlanRefusal::Faulted(fault)) => {
-                        // The core's never-repair contract: the fault is
-                        // sticky and the node self-arrests. Record WHY —
-                        // this observation is the operator's only chance
-                        // to see the reason.
                         self.record_fault(format!("sticky fault: {fault:?}"));
                         return Err(FAULTED);
                     }
@@ -728,19 +319,12 @@ impl Node {
                 match self.replica.publish(planned) {
                     Ok(PublishOutcome::Published { effects, .. }) => Ok(effects),
                     Ok(PublishOutcome::Parked { revision, .. }) => {
-                        // Parked under Volatile: the durability handshake
-                        // the core expects does not exist in this host.
                         self.record_fault(format!(
                             "publish parked under Stability::Volatile (revision {revision})"
                         ));
                         Err(FAULTED)
                     }
                     Err(PublishRefusal::IllegalCandidate(fault)) => {
-                        // The closed legality gate (or the planner-declared
-                        // breach) refused the candidate: the core faulted the
-                        // node and the next drive observes it. The return
-                        // code is unchanged (SERVICE, as every publish
-                        // refusal reports); the reason is the fix.
                         self.record_fault(format!(
                             "the legality gate refused the candidate: {fault:?}"
                         ));
@@ -759,10 +343,6 @@ impl Node {
                 Ok(Ok(effects)) => effects,
                 Ok(Err(error)) => {
                     if error == FAULTED {
-                        // The self-arrest: poison is sticky and every
-                        // further entry reports SERVICE — but never
-                        // silently. Say the arrest once, with the
-                        // recorded reason when the core named one.
                         eprintln!(
                             "lunet-advisory-lock: node self-arrested ({}); \
                              every further entry reports SERVICE",
@@ -777,11 +357,6 @@ impl Node {
                     return error;
                 }
                 Err(payload) => {
-                    // A panic unwound at the boundary: the default hook has
-                    // already printed it. Name the arrest with the payload,
-                    // then ABORT — the let-it-crash law: an unwound panic
-                    // never crosses into C and never leaves a live process
-                    // behind a broken invariant.
                     let message = payload
                         .downcast_ref::<String>()
                         .cloned()
@@ -813,19 +388,6 @@ impl Node {
         OK
     }
 
-    /// The sweeper: expired leases leave the live table on the leader's
-    /// steady tick, never on a timer of its own. The tick already paces
-    /// the node's durability loop, and riding it on the leader only
-    /// keeps the sweep deterministic and centralised: the leader breaks
-    /// each expired lease as a committed operation, so the break rides
-    /// the replication log and every replica's table agrees — a local
-    /// mutation of one node's table would diverge the quorum state. The
-    /// break is the keeper's verb (the admin edge's authorisation, never
-    /// the state machine's), the post-break record's generation is
-    /// bumped and its holder is nil, and no tombstones are written: the
-    /// dead are simply absent from the next frame. Bounded per tick —
-    /// at most [`SWEEP_BUDGET`] breaks per sweep — so a backlog of dead
-    /// leases drains over ticks without stampeding the log.
     fn sweep_expired(&mut self) {
         const SWEEP_BUDGET: usize = 8;
         const SYSTEM_CLIENT: u64 = 0;
@@ -860,57 +422,14 @@ impl Node {
         }
     }
 
-    /// THE LAZY LOAD — the one place the lock table is read back, and
-    /// the mirror of the eager flush in [`Node::stop`].
-    ///
-    /// The law, verbatim: load is LAZY. The regular path never loads
-    /// eagerly at boot — there is no `load()` call in any constructor;
-    /// the table starts empty and state materialises only on demand.
-    /// The seat is the apply path's first committed entry
-    /// (`apply_effect`'s `Effect::Apply` arm, immediately before
-    /// `Service::execute`): the first moment the table is genuinely
-    /// demanded by the state machine, and therefore the first moment a
-    /// loaded table can be worth anything.
-    ///
-    /// The guard has three clauses, and all three must hold:
-    ///
-    /// 1. **Once.** `state_loaded` is set on the first demand whatever
-    ///    the outcome, so a table that empties again later never
-    ///    re-reads a file the replica stream has already overtaken.
-    /// 2. **Clean verdict.** A CRASHED boot (the marker gate's verdict)
-    ///    DISTRUSTS the state file: load returns nothing and the node
-    ///    rebuilds from the replica stream. Only a clean-stop file is
-    ///    loadable — the file the eager flush wrote in the drain window
-    ///    of a stop that went on to write its drain-proven `Stopped`
-    ///    round. A first life has no file and takes no load either; the
-    ///    clause reads "clean" precisely, and a first boot's empty table
-    ///    is what the stream fills.
-    /// 3. **Empty.** The table must hold nothing. Anything in it was
-    ///    materialised by the regular path (or by an earlier load), and
-    ///    a load now would overwrite live state.
-    ///
-    /// Clauses 2 and 3 are [`state::lazy_load`]'s, kept beside the trait
-    /// so the guard is stated once and can be driven without a node.
-    ///
-    /// Nothing here fails the node. A store that answers `Err` is a
-    /// store in trouble, so it is named on stderr and the node serves
-    /// from the empty table the stream fills — the fallback is exactly
-    /// what a missing file gives, so a broken fallback is not a worse
-    /// outcome than no fallback.
     fn load_state_on_demand(&mut self) {
         if self.state_loaded {
             return;
         }
-        // Clause 1: the load is taken at most once per life, and the
-        // decision is final whatever it was.
         self.state_loaded = true;
         let clean_boot = self.clean_boot;
         let table_empty = self.service.is_empty();
         if !clean_boot {
-            // The crashed verdict, said where the operator reads: this
-            // life will not read the state artefact whatever it
-            // carries — the table rebuilds from the replica stream.
-            // The release build's one log line for the law's clause 2.
             trace_line!("state.load-distrusted");
             eprintln!(
                 "lunet-advisory-lock: crashed boot: the state artefact is \
@@ -920,11 +439,6 @@ impl Node {
         match state::lazy_load(&*self.state_store, clean_boot, table_empty) {
             Ok(Some(snapshot)) => {
                 for lock_id in snapshot.locks.keys() {
-                    // The WAL store's mirrors start empty in this new
-                    // life; the loaded locks are noted so the first
-                    // tick re-submits the whole loaded set and the
-                    // mirrors catch up — the stop flush reconciles
-                    // against them.
                     self.state_store.note(*lock_id);
                 }
                 self.service.restore(snapshot);
@@ -939,9 +453,6 @@ impl Node {
                      the clean stop's state artefact"
                 );
             }
-            // Every refusal — a distrusted verdict, a populated table, an
-            // absent or rotten file — is `Ok(None)`, and the table the
-            // stream fills is exactly what a missing file gives.
             Ok(None) => {}
             Err(error) => {
                 trace_line!("state.load-refused");
@@ -953,14 +464,6 @@ impl Node {
         }
     }
 
-    /// The self-arrest bookkeeping: record the reason of the FIRST fault
-    /// observation and say it once, loudly. The core's never-repair
-    /// contract makes the fault sticky — every later drive repeats the
-    /// observation — so the first is the operator's only chance to see
-    /// WHY a node (and then, cascading, a cluster) stopped serving. The
-    /// note rides [`NodeStatus`] and the `lunet_lock_node_fault` ABI for
-    /// the runbook; the arrest itself is unchanged: poison is sticky and
-    /// every further entry reports SERVICE.
     fn record_fault(&mut self, note: String) {
         #[cfg(feature = "flight-recorder")]
         self.flight_log(
@@ -976,10 +479,6 @@ impl Node {
         }
     }
 
-    /// One Flight Recorder event (the `flight-recorder` feature): a no-op
-    /// with the recorder absent. Every call site is `#[cfg]`-gated, so
-    /// the flag-OFF build compiles nothing here — the prod path carries
-    /// zero recorder code.
     #[cfg(feature = "flight-recorder")]
     fn flight_log(&mut self, kind: &str, detail: serde_json::Value) {
         if let Some(recorder) = self.flight.as_mut() {
@@ -987,9 +486,6 @@ impl Node {
         }
     }
 
-    /// One inbound Flight Recorder event carrying the raw bytes (the
-    /// flight recording's `frame_hex`, byte-exact for the playback
-    /// engine). The call sites are `#[cfg]`-gated.
     #[cfg(feature = "flight-recorder")]
     fn flight_bytes_in(&mut self, kind: &str, from: u32, bytes: &[u8]) {
         self.flight_log(
@@ -1002,11 +498,6 @@ impl Node {
         );
     }
 
-    /// The Flight Recorder's summary of one core input (the
-    /// `flight-recorder` feature). Raw bytes ride the entry-level events
-    /// (`receive-in`, `request-in`); this names the internal inputs the
-    /// entries never see (the Applied feedback the drive loop feeds
-    /// itself, the boot's Reincarnate announcement).
     #[cfg(feature = "flight-recorder")]
     fn flight_input_summary(input: &Input) -> serde_json::Value {
         match input {
@@ -1053,11 +544,6 @@ impl Node {
         }
     }
 
-    /// The lifecycle/observability read after a quiet drive: the named
-    /// drop diagnostic (the core publishes every transition's drop outcome
-    /// and nobody read it before), the view-change `debug!`, the
-    /// leader-change `info!`, and the folded-era-regression maybe. One
-    /// seqlock read per drive, level-gated formatting.
     fn report(&mut self) {
         let diagnostic = self.replica.observer().read_diagnostic();
         if diagnostic != Diagnostic::None {
@@ -1122,11 +608,6 @@ impl Node {
                 let written = message.pack_into(&mut bytes).map_err(|_| VRR_MESSAGE)?;
                 bytes.truncate(written);
                 let header = message.header;
-                // The NOMINATE computation's outbound half: every fence,
-                // every piece of evidence and every selected history this
-                // node sends is a line, with the ballot and the slot it
-                // speaks at. Ordinary replication traffic stays at `trace`
-                // (the host logs each heartbeat commit).
                 if is_view_change_family(header.tag) {
                     info!(
                         ts = log_millis(),
@@ -1156,61 +637,22 @@ impl Node {
                 operation_id,
                 payload,
             } => {
-                // THE COMMIT HOOK — a trigger, fired once per applied
-                // commit, at the seat where the entry lands on the lock
-                // table: before the state machine is asked to execute, and
-                // before the lazy load materialises the table it will
-                // execute against. Every applied commit fires it, the
-                // cached-duplicate replay included, because a duplicate is
-                // still a commit the replica made.
-                //
-                // The machinery knows nothing about what a hook does. It
-                // carries no verdict back, so nothing here inspects an
-                // answer, branches on one, or can fail a commit because of
-                // one. The named consumers: the experimental harness, which
-                // kills a node at a named commit by whatever means it
-                // chooses (its own affair) so a crash-reload is exercised
-                // at a chosen point rather than after a timeout; and the
-                // industrial side, which rides the same trigger for
-                // amortized maintenance — a state-snapshot flush spread
-                // over new commits, TigerBeetle-style — and for logging.
-                // Production wiring is the no-op hook: see
-                // `default_commit_hook`.
                 commit_hook_guard(&self.commit_hook).on_commit(slot);
                 let message_id = operation_id_bytes(operation_id);
                 let (response, transition) = if let Some(cached) = self.replies.get(&message_id) {
-                    // Duplicate committed operation: replay the cached reply,
-                    // never re-execute (B2). No journal append for duplicates.
                     (cached.clone(), None)
                 } else {
-                    // Invariant (asserted, always): exactly-once reply
-                    // correlation — a Service executes exactly once per
-                    // message_id; the cached path above replays without
-                    // re-executing. If the cache were populated for this id
-                    // between the check and here, the duplicate would have
-                    // taken the cached path and this branch is a bug.
                     assert!(
                         !self.replies.contains_key(&message_id),
                         "exactly-once: a cached reply must never re-execute the Service \
                          (message_id={message_id:?})"
                     );
-                    // The committed entry carries only the operation identity
-                    // and the opaque payload; the client ids ride inside the
-                    // JSON and the execution time is the host's clock — the
-                    // old core's entry-carried fields have no equivalent.
                     let request = Service::decode(&payload).map_err(|_| SERVICE)?;
                     let (id, client_id, request_num) = request.ids();
                     if id.as_bytes() != &message_id {
                         return Err(SERVICE);
                     }
                     let execution_time = unix_millis()?;
-                    // THE LAZY LOAD. The law: load is LAZY — the regular
-                    // path never loads eagerly at boot, so this is the
-                    // only `load()` in the crate, and it is taken here:
-                    // the point the lock table is first demanded, one
-                    // committed entry before the state machine is asked
-                    // to execute against it. See
-                    // `Node::load_state_on_demand` for the guard.
                     self.load_state_on_demand();
                     let (bytes, transition) = self
                         .service
@@ -1219,17 +661,7 @@ impl Node {
                     self.replies.insert(message_id, bytes.clone());
                     (bytes, transition)
                 };
-                // Append a journal event for first-execution transitions
-                // only (never on cached duplicate replay). A blocking-journal
-                // error disables journaling for the process; the node keeps
-                // serving. The AOF sink enqueues and never fails: overflow
-                // drops into the writer's drop counter.
                 if let Some(transition) = transition {
-                    // The tick path's changed set: every committed lock
-                    // transition notes its lock, so the store's next tick
-                    // carries the lock's current value (a live record or
-                    // frame, a tombstone for a release). A store without a
-                    // tick path ignores the note.
                     self.state_store.note(transition.lock_id());
                     let ts = unix_millis().unwrap_or(0);
                     let event = match &transition {
@@ -1336,22 +768,11 @@ impl Node {
                 });
                 Ok(())
             }
-            Effect::Persist(_) => {
-                // Unreachable under Volatile (publish never releases Persist
-                // without parking); treated as an invariant breach.
-                Err(FAULTED)
-            }
-            Effect::AdminResponse { .. } => {
-                // Unreachable: the host never submits plans over the admin
-                // ingress, so no verdict can come back; treated as an
-                // invariant breach.
-                Err(FAULTED)
-            }
+            Effect::Persist(_) => Err(FAULTED),
+            Effect::AdminResponse { .. } => Err(FAULTED),
         }
     }
 
-    /// The current view's primary as a positional index, via the public
-    /// route: progress config -> era record -> configuration primary.
     fn primary_index(&self) -> u32 {
         let current = self.replica.progress().current();
         self.leader_for(current.era.0, current.view.0)
@@ -1369,9 +790,7 @@ impl Node {
 }
 
 /// One queued output for an embedded host (`Node::next_output`): a unicast
-/// peer datagram (`kind == 1`, deliver `bytes` to member id `to` over the
-/// host's own peer transport) or a client reply (`kind == 2`, `bytes`
-/// answers the request carrying `message_id`).
+/// peer datagram (`kind == 1`) or a client reply (`kind == 2`).
 pub struct NodeOutput {
     pub kind: u32,
     pub to: u32,
@@ -1382,14 +801,9 @@ pub struct NodeOutput {
     pub bytes: Vec<u8>,
 }
 
-/// One status snapshot for an embedded host (`Node::status`): the
-/// replication state (`0` normal, `1` view_change, `2` recovering,
-/// `3` replaying), the current view's primary as a member id (`u32::MAX`
-/// when unknown or void), the current view's era and view, the folded
-/// configuration table's current era — the two eras differ exactly while a
-/// committed reconfiguration's establishing era awaits the view that
-/// enters it — whether the node has self-arrested, and the recorded
-/// reason when it has.
+/// One status snapshot for an embedded host (`Node::status`): the replication
+/// state, the current view's primary, era, view and folded config era, and
+/// the self-arrest flag and its recorded reason.
 #[derive(Debug)]
 pub struct NodeStatus {
     pub state: u32,
@@ -1397,19 +811,13 @@ pub struct NodeStatus {
     pub era: u32,
     pub view: u32,
     pub config_era: u32,
-    /// Whether the node has self-arrested (the core's never-repair
-    /// fault, or a boundary panic): every further entry reports SERVICE.
+    /// Whether the node has self-arrested: every further entry reports SERVICE.
     pub poisoned: bool,
     /// The self-arrest's recorded reason, when the arrest named one.
     pub fault_note: Option<String>,
 }
 
-/// The replication state word's name, for every surface a human reads (a
-/// log line, a status note, a trace): `state=joining`, never `state=4`.
-/// The word and every comparison stay numeric; the name comes from the
-/// core's own const table (`vrr::progress::Status::name` — the snapshot
-/// word's numbering and its names are stated together there), and a word
-/// no status encodes renders `invalid`, never a bare integer.
+/// The replication state word's name for human surfaces (`state=normal`, never `state=0`).
 pub fn replication_state_name(word: u32) -> &'static str {
     match vrr::progress::Status::from_word(word) {
         Some(status) => status.name(),
@@ -1418,19 +826,15 @@ pub fn replication_state_name(word: u32) -> &'static str {
 }
 
 impl NodeStatus {
-    /// The status's replication state spelled for humans (`state=normal`,
-    /// never `state=0`).
+    /// The status's replication state spelled for humans.
     pub fn state_name(&self) -> &'static str {
         replication_state_name(self.state)
     }
 }
 
-/// The state store's counters, the C ABI's layout: one field set per
-/// stream plus the last completion's timestamp and a `present` flag.
-/// Natural C layout (u64 fields 8-aligned; the u32s pack into the tail
-/// the C compiler assigns identically both sides — the fields are
-/// declared in the same order in every consumer). The Teal mirror lives
-/// in `src/advisory_lock.tl`'s cdef.
+/// The state store's counters, the C ABI's layout: one field set per stream
+/// plus the last completion's timestamp and a `present` flag; mirrored in
+/// `src/advisory_lock.tl`'s cdef.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct StateStatusRaw {
@@ -1446,13 +850,9 @@ pub struct StateStatusRaw {
     pub present: u32,
 }
 
-/// This host ABI's binding layout, pinned at compile time on every build:
-/// the record is flat and deliberately so — the two streams' counters
-/// side by side, the timestamp, the `present` flag — and it is mirrored in
-/// the Teal host's cdef, where a LuaJIT `uint64_t` reads the same eight
-/// bytes at the same offset. The offsets are therefore the ABI's, not
-/// Rust's: asserted here so a field added, reordered or retyped on either
-/// side is a compile error, never a silently shifted read.
+/// The binding layout pinned at compile time on every build: a field added,
+/// reordered or retyped on either side (here or the Teal cdef) is a compile
+/// error, never a silently shifted read.
 const STATE_STATUS_RAW_LAYOUT: () = assert!(
     size_of::<StateStatusRaw>() == 80
         && offset_of!(StateStatusRaw, eph_completed_generations) == 0
@@ -1468,8 +868,6 @@ const STATE_STATUS_RAW_LAYOUT: () = assert!(
 );
 
 impl StateStatusRaw {
-    /// The raw record a `None` (a store without counters) answers with:
-    /// present = 0, everything zeroed.
     fn from(status: Option<&crate::state::StoreStatus>) -> Self {
         match status {
             None => Self::default(),
@@ -1489,32 +887,10 @@ impl StateStatusRaw {
     }
 }
 
-/// The default state store for a node state path: this crate's own
-/// [`FileStateStore`] over the very disk the node is being built on,
-/// exactly as every defaulting entry point defaults its disk. The
-/// plumbing is the disk's plumbing — the store is a parameter of the
-/// shared construction body, and every defaulting entry point builds the
-/// default here — while the full-shape constructor
-/// ([`Node::open_with_seams`]) takes the store itself: that is the
-/// embedder's public injection point, the same door the disk and the
-/// commit hook ride (`FileStateStore::new_on` remains the store's own
-/// standalone seam).
 fn default_state_store(disk: &Arc<dyn Disk>, state: &str) -> Box<dyn StateStore> {
     Box::new(FileStateStore::new_on(Arc::clone(disk), Path::new(state)))
 }
 
-/// The WAL snapshot store mounted beside the node's state path: the
-/// state path's name with a `.wal` suffix (the design doc's file rule),
-/// default capacity. The mounted store replaces the file store at the
-/// node's construction — nothing above the trait knows which store the
-/// node holds.
-///
-/// The mount site's cold-start fallback (R4): a refused construction —
-/// corrupt content at open above all — must NOT block the boot. The WAL
-/// is a fallback mechanism, never a safety mechanism, so a store that
-/// cannot open is said loudly (the crate's trace surface) and the node
-/// boots WITHOUT the artefact on the file store: the lock table
-/// rebuilds from the replica stream and the node remains correct.
 fn wal_state_store(state: &str) -> Box<dyn StateStore> {
     let mut os = PathBuf::from(state).into_os_string();
     os.push(".wal");
@@ -1549,22 +925,10 @@ fn wal_state_store(state: &str) -> Box<dyn StateStore> {
     }
 }
 
-/// The default commit hook: this crate's own no-op, behind the seam's own
-/// indirection. The plumbing is a parameter of the shared construction
-/// body, beside the disk's and the store's; the defaulting entry points
-/// build the default here, and [`Node::open_with_seams`] takes the hook
-/// itself — the embedder's public injection point, the same door the
-/// disk and the state store ride.
 fn default_commit_hook() -> Arc<Mutex<dyn CommitHook>> {
     Arc::new(Mutex::new(NoOpHook))
 }
 
-/// The commit hook's guard, with this crate's poison discipline — the same
-/// one the committed-transition sink takes in `sink_guard`. A hook that
-/// panicked did not un-apply the commit the machinery had already made, so
-/// the lock is recovered and the next commit's hook still runs: the
-/// machinery does not disarm a consumer's callback for the consumer's own
-/// bug.
 fn commit_hook_guard<'a, 'b>(
     hook: &'a Mutex<dyn CommitHook + 'b>,
 ) -> MutexGuard<'a, dyn CommitHook + 'b> {
@@ -1573,12 +937,9 @@ fn commit_hook_guard<'a, 'b>(
 
 impl Node {
     /// Safe constructor over the same grammar the C ABI takes: `members` is
-    /// the NUL-separated `<u32-id>:<name>` member buffer in descriptor
-    /// (genesis succession) order, post-genesis entries suffixed `:j`;
-    /// `own` is the local member's name; `state` is the durable
-    /// incarnation-marker path; `journal_dir` enables the lock-event
-    /// journal (an empty string disables it, matching the ABI's
-    /// empty-buffer rule) with `roll_bytes` as its roll threshold.
+    /// the NUL-separated `<u32-id>:<name>` buffer in genesis order (`:j` for
+    /// post-genesis joiners), `own` the local member's name, `state` the
+    /// marker path, `journal_dir` the optional journal dir (empty disables).
     pub fn open(
         members: &str,
         own: &str,
@@ -1606,40 +967,11 @@ impl Node {
     }
 
     /// The full-shape constructor: the embedding host's public injection
-    /// point. Same grammar as [`Node::open`] — `members`, `own`, `state`,
-    /// `journal_dir`, `roll_bytes`, `primary_timeout` — plus the four
-    /// things the machinery is written against, the four seams
-    /// (`docs/src/contract-seam.md`, the embedding API):
-    ///
-    /// * `disk` — every byte of disk access: the journals, the view
-    ///   record, the state file, everything the construction and the run
-    ///   touch.
-    /// * `state_store` — the lock table's persistence, under the
-    ///   persistence law (eager flush on the stop path, lazy load at the
-    ///   first demand).
-    /// * `commit_hook` — the trigger at each applied commit.
-    /// * `fence` — the boot fence, the boot gate's marker store
-    ///   ([`LifecycleStore`], re-exported from `spi`). `None` keeps the
-    ///   industrial default, the superblock quorum store over the state
-    ///   path; `Some(store)` mounts the embedder's own: the boot's
-    ///   classification reads it, the marker machine's rounds go through
-    ///   its `commit`, and the halt's drain rides its `drain` beside the
-    ///   event journal's own drain. What an embedder mounts is the
-    ///   `LifecycleStore` itself; the marker-round schedule and the
-    ///   projection mechanics stay the machinery's.
-    ///
-    /// The defaulting entry points stay exactly as they are —
-    /// [`Node::open`], [`Node::open_aof`],
-    /// [`Node::open_with_recovery_flush`], [`Node::open_bench`], and the
-    /// C ABI's `lunet_lock_node_new` hard-default all four seams and the
-    /// C ABI takes no new surface.
-    // The parameter list IS the mounting grammar, one caller-supplied
-    // fact per parameter: the descriptor buffers and the run's policy,
-    // then the four seams. It pays here for the same reason
-    // [`node_from_sink`]'s pays — the four seams and the six grammar
-    // facts are exactly what an embedder mounts, and folding them into
-    // carriers would hide the mounting grammar behind a shape the
-    // defaulting entry points do not take.
+    /// point. Same grammar as [`Node::open`] plus the four seams the
+    /// machinery is written against — `disk`, `state_store`, `commit_hook`,
+    /// `fence` (the boot gate's marker store; `None` is the default).
+    // The parameter list IS the mounting grammar, one caller-supplied fact
+    // per parameter; folding the seams into carriers would hide it.
     #[allow(clippy::too_many_arguments)]
     pub fn open_with_seams(
         members: &str,
@@ -1669,12 +1001,10 @@ impl Node {
         }))
         .unwrap_or(Err(PANIC))
     }
-    /// The AOF-backed constructor: the committed-transition hook enqueues
-    /// to the AOF write-behind writer instead of the blocking journal. Same
-    /// member/own/state grammar as [`Node::open`]; `aof_dir` is the AOF
-    /// series directory (created or resumed); `flush_ms` is the periodic
-    /// fsync knob (`None` fsyncs only at roll and shutdown). The roll
-    /// threshold is fixed at the 2 MiB erasure block.
+    /// The AOF-backed constructor: the committed-transition hook enqueues to
+    /// the AOF write-behind writer instead of the blocking journal. Same
+    /// member/own/state grammar as [`Node::open`]; `aof_dir` is required,
+    /// `flush_ms` the periodic fsync knob (`None` fsyncs at roll and shutdown).
     ///
     /// The C ABI takes this path through [`lunet_lock_node_new_aof`].
     pub fn open_aof(
@@ -1701,12 +1031,8 @@ impl Node {
     }
 
     /// The E2 experiment variant: same grammar as [`Node::open`], plus the
-    /// recovery-boundary flush variant and its scratch directory. At the
-    /// dirty-boot classification point the variant's forced flush executes
-    /// against `scratch_dir` (variant 0 — [`RecoveryFlush::Diskless`] —
-    /// writes nothing); the measured latency lands in the node's log as a
-    /// `recovery-boundary flush executed` event. The C ABI never takes this
-    /// path: the ABI's boot stays variant 0.
+    /// recovery-boundary flush variant and its scratch directory. The C ABI
+    /// never takes this path.
     pub fn open_with_recovery_flush(
         members: &str,
         own: &str,
@@ -1742,12 +1068,9 @@ impl Node {
         .unwrap_or(Err(PANIC))
     }
 
-    /// The bench-harness variant (`docs/src/bench-harness.md`, unix
-    /// only): the lifecycle marker store rides the harness driver's
-    /// control socket — every boot-read, commit, and drain is an RPC the
-    /// driver answers from memory under the scenario's signalled
-    /// discipline — while the blocking journal stays real (it is the
-    /// run's CAS-chain evidence). The C ABI never takes this path.
+    /// The bench-harness variant (unix only): the lifecycle marker store
+    /// rides the harness driver's control socket while the blocking journal
+    /// stays real (the run's CAS-chain evidence). The C ABI never takes this path.
     #[cfg(unix)]
     pub fn open_bench(
         members: &str,
@@ -1762,9 +1085,6 @@ impl Node {
             node_from_sink(
                 members.as_bytes(),
                 own.as_bytes(),
-                // The marker store is the driver's; the state path is
-                // never touched on this path. The grammar still wants a
-                // non-empty value.
                 b"bench",
                 journal,
                 None,
@@ -1773,10 +1093,6 @@ impl Node {
                     primary_timeout: PRIMARY_TIMEOUT_MS,
                 },
                 Arc::clone(&disk),
-                // The bench node's state path is the grammar's non-empty
-                // placeholder, so its state store is the default over that
-                // same placeholder — a bench stop writes and loads no
-                // state any more than it writes no marker there.
                 default_state_store(&disk, "bench"),
                 default_commit_hook(),
                 None,
@@ -1786,14 +1102,12 @@ impl Node {
     }
 
     /// Propose a client request (the lock-verb JSON). `0` on acceptance —
-    /// the correlated reply arrives later as a kind-2 `NodeOutput` keyed by
-    /// the request's message_id; the ABI's negative codes otherwise.
+    /// the correlated reply arrives later as a kind-2 `NodeOutput`.
     pub fn request(&mut self, json: &[u8]) -> i32 {
         trace!(len = json.len(), "node request entry");
         #[cfg(feature = "flight-recorder")]
         self.flight_bytes_in("request-in", 0, json);
         if self.stopped {
-            // The drain point closed the wire: no further task processing.
             return STOPPED;
         }
         if json.len() > MAX_DATAGRAM {
@@ -1804,8 +1118,6 @@ impl Node {
         };
         let (message_id, _, _) = request.ids();
         let message_id = *message_id.as_bytes();
-        // Duplicate suppression (B2): a request whose reply is already cached
-        // replays the cached bytes without re-proposing or re-executing.
         if let Some(cached) = self.replies.get(&message_id) {
             self.outputs.push_back(Queued {
                 kind: OUTPUT_REPLY,
@@ -1842,18 +1154,11 @@ impl Node {
         #[cfg(feature = "flight-recorder")]
         self.flight_bytes_in("receive-in", from, data);
         if self.stopped {
-            // The drain point closed the wire: no further inbound reads.
             return STOPPED;
         }
         if data.len() > MAX_DATAGRAM {
             return TOO_LARGE;
         }
-        // A message attributed to an id outside the descriptor's
-        // address space whose system half names no descriptor member is
-        // an invariant violation. A later life of a member
-        // (the crash counter advanced under the same system half — the
-        // identity law's packing) is the reincarnation story's
-        // legitimate caller and exempt.
         invariant!(
             self.known_ids.contains(&from)
                 || self
@@ -1863,9 +1168,6 @@ impl Node {
             "message from an unknown peer id (from={from}, len={})",
             data.len()
         );
-        // W5: `Incomplete` means "more bytes could make this a message" and
-        // `Malformed` means none could; over datagram transport there is no
-        // reassembly, so both are a bad datagram from this host's view.
         let message = match Message::unpack_from(data) {
             Ok(message) => message,
             Err(UnpackError::Incomplete { .. } | UnpackError::Malformed(_)) => {
@@ -1883,9 +1185,6 @@ impl Node {
                 return VRR_MESSAGE;
             }
         };
-        // The NOMINATE computation's inbound half, with the same ballot
-        // discipline as the outbound half: a fence this node heard, the
-        // evidence it holds, the history it was handed.
         if is_view_change_family(message.header.tag) {
             info!(
                 ts = log_millis(),
@@ -1908,9 +1207,6 @@ impl Node {
             tag = ?message.header.tag,
             "datagram in"
         );
-        // The peer payload gate: the host re-checks every peer-carried
-        // operation entry with `Service` before the message reaches the
-        // core.
         if !valid_message_payloads(&message) {
             warn!(
                 ts = log_millis(),
@@ -1934,31 +1230,25 @@ impl Node {
     pub fn idle(&mut self) -> i32 {
         trace!("node idle entry");
         if self.stopped {
-            // The drain point closed the wire: no further task processing.
             return STOPPED;
         }
         self.drive(Input::Tick)
     }
 
-    /// Election tick: same liveness input — tick-driven suspicion is the
-    /// tag's only view-change trigger (`ViewChangeKnobs::primary_timeout`).
+    /// Election tick: the same liveness input, tick-driven suspicion.
     pub fn leader_timeout(&mut self) -> i32 {
         trace!("node leader timeout entry");
         if self.stopped {
-            // The drain point closed the wire: no further task processing.
             return STOPPED;
         }
         self.drive(Input::Tick)
     }
 
-    /// Host-forced view change (§14.2): the leader timeout's
-    /// conclusion that the primary is dead. `era` must be the node's
-    /// current era and `view` must strictly advance the view number — the
-    /// core refuses anything sideways or backwards.
+    /// Host-forced view change (§14.2): `era` must be the node's current
+    /// era and `view` must strictly advance the view number.
     pub fn force_view(&mut self, era: u32, view: u32) -> i32 {
         trace!(era, view, "node force view entry");
         if self.stopped {
-            // The drain point closed the wire: no further task processing.
             return STOPPED;
         }
         self.drive(Input::AdminForceView {
@@ -1969,13 +1259,9 @@ impl Node {
         })
     }
 
-    /// One timeout toggle's event capture (`docs/src/failure-detection.md`):
-    /// the host's timeout plane records EVERY toggle of its
-    /// `timedout` state — the new state, the toggle's local-clock ts, and
-    /// the ts of the LAST toggle (kept in memory in the host's toggle) —
-    /// in BOTH the regular log (the `info!` here) AND the Flight Recorder
-    /// as one `timeout-toggle` event, alongside the other internal
-    /// events. A no-op on the replication path: capture only.
+    /// One timeout toggle's event capture (`docs/src/failure-detection.md`),
+    /// recorded in the regular log and the Flight Recorder. No-op on the
+    /// replication path.
     pub fn note_timeout_toggle(&mut self, timedout: bool, at_ms: u64, previous_ms: Option<u64>) {
         let snapshot = self.replica.observer().read();
         info!(
@@ -2001,21 +1287,14 @@ impl Node {
         );
     }
 
-    /// One fenced-boot drive. The core has no recovery protocol: a fenced
-    /// node starts clean, and the only protocol lever is `Input::Tick` —
-    /// the genesis primary self-promotes on it, and the primary's messages
-    /// adopt the fenced backups. A bumped node (a dirty restart) re-drives
-    /// its `Input::Reincarnate { old }` announcement first, on every fenced
-    /// drive, until it stops being fenced — upstream's §8 re-announce; the
-    /// core self-gates the announcement (a member already voting at
-    /// weight >= 1 has nothing to announce). The drive never fabricates
-    /// recovered state.
+    /// One fenced-boot drive: ticks the node, re-announcing a dirty
+    /// restart's `Input::Reincarnate { old }` first on every drive until
+    /// it stops being fenced (§8). Never fabricates recovered state.
     pub fn recover(&mut self) -> i32 {
         if self.poisoned {
             return SERVICE;
         }
         if self.stopped {
-            // The drain point closed the wire: no further task processing.
             return STOPPED;
         }
         if let Some(old) = self.reincarnate_from {
@@ -2042,11 +1321,9 @@ impl Node {
 
     /// Drive a reconfiguration operation on this node: `op` is one of the
     /// `RECONFIGURE_*` codes, `member` the target member id, `position` the
-    /// join succession position (`POSITION_APPEND` appends at the current
-    /// succession end).
+    /// join succession position (`POSITION_APPEND` appends at the end).
     pub fn reconfigure(&mut self, op: u32, member: u32, position: u32) -> i32 {
         if self.stopped {
-            // The drain point closed the wire: no further task processing.
             return STOPPED;
         }
         let position = if op == RECONFIGURE_JOIN && position == POSITION_APPEND {
@@ -2075,9 +1352,6 @@ impl Node {
             RECONFIGURE_LEAVE => SystemOperation::Leave(NodeId(member)),
             _ => return INVALID,
         };
-        // The deployment ruling (docs/src/decisions.md): a cluster never
-        // drops below three VOTING members. A departure (Leave) or a
-        // demotion (Decrement) that would is refused before it drives.
         if matches!(op, RECONFIGURE_DECREMENT | RECONFIGURE_LEAVE)
             && let Some((ids, weights)) = self.membership()
         {
@@ -2090,24 +1364,6 @@ impl Node {
                 return CONFIG;
             }
         }
-        // The host's pivot policy (W5 is sizing; this is its transition
-        // sibling): the non-stop overlap path is probed only for the
-        // weight-moves it has been proven through. A membership change
-        // — Join or Leave — drives the stop-the-world fallback with
-        // `pivot: None`, a latency outcome, never an error: the
-        // establishing era then completes through the ordinary fence the
-        // stop-the-world exemption arms (the same proven path every
-        // stop-the-world transition takes). The probed non-stop machine
-        // for a weight-0 departure is the one liveness hole the
-        // upstream-issue draft records: its solicited evidence races the
-        // proposer's own establishing commit, the answer that arrives
-        // first is dropped UnevaluableEra (the proposer's table has not
-        // folded the establishing era yet), the one-shot solicitation
-        // never re-fires, and with the machine armed the
-        // stop-the-world exemption does not gate the primary's baseline —
-        // the stream keeps the fence from arming and the transition sits
-        // half-committed forever. The stop-the-world path has no such
-        // window.
         let pivot = match op {
             RECONFIGURE_JOIN | RECONFIGURE_LEAVE => None,
             _ => self.derived_pivot(&system),
@@ -2115,58 +1371,15 @@ impl Node {
         self.drive(Input::Reconfigure { op: system, pivot })
     }
 
-    /// The graceful stop (the engine's halt schedule, driven through
-    /// the Running typestate):
-    ///
-    /// 1. **The wire closes first** — the mandatory drain point, and the
-    ///    host obligation the engine assumes: the `stopped` flag is set
-    ///    BEFORE any marker write, so every further inbound entry
-    ///    (`request`, `receive`, ticks, admin drives) refuses and
-    ///    processes nothing: the in-memory state becomes final and
-    ///    nothing arriving later can contradict it. The caller may still
-    ///    drain already-queued outputs (outbound flush is the desirable
-    ///    obligation and must never delay this one).
-    /// 2. **`begin_stop`** — the engine writes the halt's first round
-    ///    (`Stopping`, 4x): termination has begun, it vouches for
-    ///    nothing.
-    /// 3. **The drain** — the host's, through the engine's schedule: the
-    ///    committed-transition sink drains to quiescence (the AOF
-    ///    writer's queue appended and fsynced; the blocking journal
-    ///    fsynced), strictly between the two rounds.
-    /// 4. **The state flush** — the lock table's whole state, in the
-    ///    foreground, in the drain window: after the drain closes and
-    ///    before the `Stopped` round is written. The eager half of the
-    ///    state seam's law (see [`crate::state`]); a flush failure fails
-    ///    the stop the same way a drain failure does, named
-    ///    `stop.refuse.state-flush`.
-    /// 5. **`finish_stop`** — the engine writes the drain-proven second
-    ///    round (`Stopped`, 4x): the next boot's stopped quorum proves
-    ///    the clean stop.
-    ///
-    /// A node still inside the crashed path's unseated window (its
-    /// engine session not yet latched) has no Running session: the stop
-    /// closes the wire and drains the sink, and no marker round is
-    /// lawful — the markers hold the emission gate's round (the new
-    /// life's running sentinel), the next boot re-classifies crashed
-    /// and derives the strictly next life.
-    ///
-    /// Idempotent: a second stop reports OK without writing anything. A
-    /// failed round or drain reports SERVICE and the markers stand at
-    /// the last completed transition (a death past the first round reads
-    /// crashed — the purge's law: nothing vouches before the drain).
-    /// SIGKILL takes none of this path: the running sentinel stays
-    /// behind and the next boot classifies crashed.
-    ///
-    /// Every path below names itself on the lifecycle census tape
-    /// ([`trace_line!`]): the idempotent re-entry, the drain point, both
-    /// marker rounds, the drain window opening and closing, the state
-    /// flush, the unseated window's drain, and every refusal arm.
+    /// The graceful stop, in the contract's write order: the wire closes
+    /// first (every further inbound entry reports STOPPED), the sink drains,
+    /// the lock table flushes eagerly, then the two marker rounds write.
+    /// Idempotent; a failed round or drain reports SERVICE.
     pub fn stop(&mut self) -> i32 {
         if self.stopped {
             trace_line!("stop.idempotent");
             return OK;
         }
-        // The drain point: the wire closes BEFORE any marker write.
         self.stopped = true;
         trace_line!("stop.wire-closed");
         #[cfg(feature = "flight-recorder")]
@@ -2187,18 +1400,7 @@ impl Node {
             "stop: the wire is closed, the in-memory state is final"
         );
         let Some(session) = self.session.take() else {
-            // The deferred window: no latched identity, no marker round.
-            // The host still owes the durable sink drain.
             trace_line!("stop.unseated");
-            // No state flush on this arm, and the absence is the law's
-            // own shape rather than an omission: the unseated window
-            // writes no marker round at all, so it is not a clean stop —
-            // the markers hold the emission gate's round and the next
-            // boot re-classifies crashed, which distrusts the state file
-            // (see `load_state_on_demand`). A file written here could
-            // never be loaded by anybody; the honest thing is to write
-            // none, and the eager flush's seat stays the one place a
-            // loadable file is produced.
             #[cfg(feature = "flight-recorder")]
             self.flight_log(
                 "stop",
@@ -2254,12 +1456,6 @@ impl Node {
                 return SERVICE;
             }
         };
-        // The drain window's own durable write: the view record — the
-        // ballot the node held — strictly between the two rounds, so
-        // the next clean boot resumes at the view it stopped at. A
-        // failed write leaves the markers at the first round (the next
-        // boot reads crashed) and reports SERVICE, the same shape as a
-        // failed round.
         let snapshot = self.replica.observer().read();
         let record = ViewRecord {
             era: snapshot.era,
@@ -2293,26 +1489,7 @@ impl Node {
             }
         };
         trace_line!("stop.drain-window.close");
-        // THE STOP'S OWN FIRST DEMAND. A clean boot that never served a
-        // client op never took the lazy load — and the store's mirrors
-        // hold exactly what its artefact carries. The table this stop
-        // owes to the eager flush is the table the node would have
-        // served: the artefact's own state, not an empty one (an empty
-        // flush over the artefact would destroy the very state a clean
-        // stop exists to persist, and the reconciliation would call the
-        // divergence loudly). So the load is taken here — the same
-        // guard, the same once-only clause, the law's "first demand
-        // that finds the table empty" — and the loaded locks are noted,
-        // so the tick below re-submits them and the flush reconciles
-        // against a caught-up mirror.
         self.load_state_on_demand();
-        // THE TICK BEFORE THE FLUSH (R2). The flush reconciles each set
-        // against the engine's own mirror, so the table's current changes
-        // ride the tick path first — the same drain, submit, drain the
-        // steady tick runs, in the drain window, with nothing after it but
-        // the flush. A refusal here cannot be caught up by the flush (the
-        // mirror would stay behind and the reconciliation would refuse) —
-        // it is the failed stop itself, named `stop.refuse.state-tick`.
         if let Err(error) = self.state_tick_path() {
             trace_line!("stop.refuse.state-tick");
             eprintln!(
@@ -2323,17 +1500,6 @@ impl Node {
             return SERVICE;
         }
         trace_line!("state.tick");
-        // THE EAGER FLUSH. The law: flush is EAGER — on the shutdown path
-        // the whole lock-table state is written in the foreground before
-        // the stop completes. The seat in the schedule is the only one
-        // that can hold it: the drain window has just closed (so the sink
-        // is quiescent and the table will not move again — the wire
-        // closed at `stop.wire-closed`, before any marker write), and
-        // the drain-proven `Stopped` round has not yet been written, so a
-        // flush failure leaves the markers at `Stopping` and the next
-        // boot reads crashed — which distrusts the file this stop was
-        // writing. A clean stop therefore means state on disk; a stop
-        // that cannot flush is a FAILED stop, never a silent skip.
         if let Err(error) = self.state_store.flush(&self.service.snapshot()) {
             trace_line!("stop.refuse.state-flush");
             eprintln!(
@@ -2394,41 +1560,19 @@ impl Node {
         }
     }
 
-    /// THE TICK PATH, as the one ordered sequence every seat runs:
-    /// completions drained, the changed set submitted, completions
-    /// drained again. The steady tick (the ~1000 ms timer) and the stop
-    /// (the drain window, immediately before the eager flush) are the
-    /// same three steps in the same order — the stop's is load-bearing
-    /// because the flush reconciles against the mirror the submit moves,
-    /// so the sequence lives here once and cannot be reordered at one
-    /// seat only.
     fn state_tick_path(&mut self) -> std::io::Result<()> {
         self.state_store.pump()?;
         self.state_store.tick(&self.service.snapshot())?;
         self.state_store.pump()
     }
 
-    /// THE STEADY TICK — the ~1000 ms timer's one call. The changed
-    /// set (noted at every committed lock transition, and once per lock
-    /// a lazy load installs) rides the tick path: completions drained,
-    /// one generation submitted per stream, completions drained again.
-    /// Zero fsync — a crash mid-period is a dirty boot and the dirty
-    /// boot never reads the artefact.
-    ///
-    /// A capacity refusal is a counted refusal (`refusals`, per stream)
-    /// that leaves the serving state untouched: the changed set is kept
-    /// and the next tick retries. That answer is `OK` — the tick's
-    /// failure mode is the store's business, surfaced through
-    /// [`Node::state_status`], never the node's serving path. `STOPPED`
-    /// past the drain point (the wire is closed; the timer's last
-    /// beats change nothing).
+    /// The steady tick (~1000 ms timer): the changed set rides the tick
+    /// path with zero fsync. A capacity refusal is counted in the store's
+    /// `refusals` and left to the next tick; the answer is still `OK`.
     pub fn state_tick(&mut self) -> i32 {
         if self.stopped {
             return STOPPED;
         }
-        // The sweeper's seat: the leader's steady tick is the sweep's
-        // cadence, and the tick is over (no re-entrancy into the store's
-        // pump/submit sequence).
         self.sweep_expired();
         if let Err(error) = self.state_tick_path() {
             warn!(
@@ -2443,20 +1587,13 @@ impl Node {
         OK
     }
 
-    /// The store's per-stream counters, for the status surface: the
-    /// ephemeral and durable generations, records, refusals and
-    /// outstanding submissions, and the last completion's wall
-    /// timestamp. `None` when the mounted store carries no counters
-    /// (the file store).
+    /// The store's per-stream counters for the status surface; `None` when
+    /// the mounted store carries no counters (the file store).
     pub fn state_status(&self) -> Option<crate::state::StoreStatus> {
         self.state_store.state_status()
     }
 
-    /// This node's voting weight in the current folded configuration
-    /// (`None` when it is not a member of it): the E1 runner's
-    /// "voting and serving" signal — a reincarnated node is walked back to
-    /// weight 1 by the leader's forced reconfiguration sequence, and the
-    /// host reports the weight in its status notes.
+    /// This node's voting weight in the current folded configuration.
     pub fn voting_weight(&self) -> Option<u32> {
         let current = self.replica.progress().config().current();
         current
@@ -2468,9 +1605,6 @@ impl Node {
     /// Pop the next queued output, if any.
     pub fn next_output(&mut self) -> Option<NodeOutput> {
         let queued = self.outputs.pop_front()?;
-        // Invariant (asserted, always): the output queue carries only the
-        // send (1) and reply (2) kinds — any other kind is an adapter bug
-        // the host cannot interpret.
         assert!(
             queued.kind == OUTPUT_SEND || queued.kind == OUTPUT_REPLY,
             "output queue carries an unknown kind {}",
@@ -2565,19 +1699,10 @@ impl Node {
     }
 }
 
-/// Whether the folded configuration era moved backwards across two
-/// observations. The folded era advances exactly at a committed
-/// reconfiguration's establishing operation; it never regresses. A
-/// regression is a maybe (not provably impossible for a host juggling era
-/// snapshots, and survivable), not an assert.
 fn folded_era_regressed(previous: Option<u32>, current: u32) -> bool {
     matches!(previous, Some(previous) if current < previous)
 }
 
-/// Map a plan refusal onto the ABI error codes. `NotPrimary` is the one a
-/// caller can act on (re-forward to the named primary); the rest —
-/// the fault, the reconfiguration gates, the outstanding-transition
-/// bookkeeping — are internal states the host cannot repair in place.
 fn plan_error(rejection: PlanRefusal) -> i32 {
     debug!(?rejection, "plan refused");
     match rejection {
@@ -2587,8 +1712,6 @@ fn plan_error(rejection: PlanRefusal) -> i32 {
     }
 }
 
-/// `OperationId` from the request's 16-byte message_id: first 8 bytes are
-/// `msb`, last 8 `lsb`, both big-endian (the core's wire order).
 fn operation_id(message_id: [u8; 16]) -> OperationId {
     OperationId {
         msb: u64::from_be_bytes(message_id[..8].try_into().expect("8 bytes")),
@@ -2603,10 +1726,6 @@ fn operation_id_bytes(id: OperationId) -> [u8; 16] {
     bytes
 }
 
-/// The peer-carried payload gate: every operation entry in an incoming
-/// message must decode as a Service request whose message_id matches the
-/// operation identity the entry claims. The core carries payloads opaque
-/// (B2), so this host-side check is the only validation they get.
 fn valid_message_payloads(message: &Message) -> bool {
     fn valid_entry(entry: &vrr::journal::LogEntry) -> bool {
         match &entry.payload {
@@ -2633,35 +1752,23 @@ fn valid_message_payloads(message: &Message) -> bool {
     }
 }
 
-/// One parsed member-buffer entry: the admin-assigned id, the name, and
-/// whether the member joined after genesis (the `<id>:<name>:j` grammar).
-/// A `:j` entry is outside the genesis succession order; it registers the
-/// id->name mapping and, when it is `own`, selects the joiner boot.
 struct MemberEntry {
     id: u32,
     name: String,
     joined: bool,
 }
 
-/// The descriptor's provisioned-identity law: the id is the packed pair
-/// (system, crash counter 1) — a lawful identity whose system half is
-/// the sysadmin-assigned system identifier and whose crash half names
-/// the genesis life. The marker's crash counter carries the life from
-/// there.
 fn provisioned_identity(id: u32) -> bool {
     NodeId::from(id).system_id().is_some() && (id & 0xffff) == 1
 }
 
 /// Reconfiguration operation codes for `lunet_lock_node_reconfigure`.
-/// The departure route is `Decrement` to weight 0, then `Leave` (the core's
-/// one departure route); a weight-0 member cannot be decremented further.
 pub const RECONFIGURE_JOIN: u32 = 1;
 pub const RECONFIGURE_INCREMENT: u32 = 2;
 pub const RECONFIGURE_LEAVE: u32 = 3;
 pub const RECONFIGURE_DECREMENT: u32 = 4;
 
-/// `lunet_lock_node_reconfigure`'s Join position sentinel: append at the
-/// core's current succession end (resolved against the folded configuration).
+/// `lunet_lock_node_reconfigure`'s Join position sentinel: append at the succession end.
 pub const POSITION_APPEND: u32 = u32::MAX;
 
 fn parse_member_entry(entry: &[u8]) -> Option<MemberEntry> {
@@ -2680,17 +1787,6 @@ fn parse_member_entry(entry: &[u8]) -> Option<MemberEntry> {
     })
 }
 
-/// The later-life knowledge every non-first constructor reopens over (see
-/// the module's Identity note): the deployment's genesis, and nothing
-/// else. The journal and the era table hold exactly the entries
-/// `provision` installs — mirrored byte-for-byte so the joiner's slot-2
-/// entry equals the cluster's committed one — and the constructors
-/// (`join`, `resume`, `reincarnate`) fence the node to `Restarting`
-/// regardless. Nothing about a restart is pretended: the node holds the
-/// shared committed root and nothing else. The persisted record carries
-/// the genesis frontiers; the constructor reconstitutes the boot status
-/// (`Restarting`), so the record's own status is the Joining ruling's
-/// spelling and is overridden.
 fn joiner_parts(
     genesis_order: Vec<NodeId>,
 ) -> Result<(SegmentedLog, PersistedProgress, Arc<EraTable>), i32> {
@@ -2756,10 +1852,6 @@ fn unix_millis() -> Result<u64, i32> {
         .and_then(|duration| u64::try_from(duration.as_millis()).map_err(|_| SERVICE))
 }
 
-/// The marker file's on-disk line: `<system> <crash>
-/// <unflushed|stopped|flushed>` — the identity pair spelled as its halves
-/// (the projection's spelling of the engine marker,
-/// `marker_store::projection_word`).
 fn marker_line(system: u16, crash: u16, marker: Marker) -> String {
     format!(
         "{system} {crash} {}\n",
@@ -2767,15 +1859,6 @@ fn marker_line(system: u16, crash: u16, marker: Marker) -> String {
     )
 }
 
-/// The clean restart's view record: the view ballot the stop contract
-/// writes into its drain window, strictly between the halt's two marker
-/// rounds. The clean classification reads it back; the node resumes at
-/// the view it stopped at instead of re-fencing at the genesis view —
-/// a stale Prepare from below its own view then drops by name. The journal is not carried (the
-/// adapter's durable shape: a reopened node holds the deployment's
-/// genesis and catches up through the stream — its frontiers stay the
-/// genesis ones the journal covers), so only the ballot is restored:
-/// the one field the stream cannot hand back before the first answer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ViewRecord {
     pub era: u32,
@@ -2783,12 +1866,10 @@ pub(crate) struct ViewRecord {
 }
 
 impl ViewRecord {
-    /// The record's on-disk line: the two fields, space-separated.
     fn line(&self) -> String {
         format!("{} {}\n", self.era, self.view)
     }
 
-    /// Parses the record's line. Anything else is unreadable.
     pub(crate) fn parse(text: &str) -> Option<ViewRecord> {
         let line = text.trim();
         let mut fields = line.split(' ');
@@ -2801,15 +1882,12 @@ impl ViewRecord {
     }
 }
 
-/// The view record's path for a state path.
 fn view_record_path(state: &Path) -> PathBuf {
     let mut os = state.as_os_str().to_os_string();
     os.push(".view");
     PathBuf::from(os)
 }
 
-/// Writes the view record durably (fsync+rename+dir-sync, the marker
-/// projection's crash-consistency idiom).
 pub(crate) fn write_view_record(
     disk: &dyn Disk,
     path: &Path,
@@ -2837,12 +1915,6 @@ pub(crate) fn write_view_record(
     result
 }
 
-/// Reads the view record. `None` when the file does not exist (no stop
-/// ever wrote one); any existing-but-unreadable record is an error.
-///
-/// The single-file projection's reader, over the default disk: its only
-/// caller is the marker store, whose own disk path rides the vendored
-/// store's own boundary, so no disk is threaded in here.
 pub(crate) fn read_view_record(path: &Path) -> std::io::Result<Option<ViewRecord>> {
     let path = view_record_path(path);
     if !StdDisk.exists(&path) {
@@ -2857,13 +1929,6 @@ pub(crate) fn read_view_record(path: &Path) -> std::io::Result<Option<ViewRecord
     })
 }
 
-/// Parses the marker line. Anything else is an unreadable marker: the boot
-/// refuses rather than guessing an identity. The file's words are the
-/// identity pair's halves (a zero half is refused — no identity) and the
-/// engine's markers: `unflushed` is the running sentinel (`Joining` — an
-/// operating or freshly-latched process), `stopped` is the halt's first
-/// round (`Stopping` — it vouches for nothing), `flushed` is the
-/// drain-proven second round (`Stopped`).
 pub(crate) fn parse_marker(text: &str) -> Option<(u16, u16, Marker)> {
     let line = text.trim();
     let (system_text, rest) = line.split_once(' ')?;
@@ -2882,24 +1947,11 @@ pub(crate) fn parse_marker(text: &str) -> Option<(u16, u16, Marker)> {
     Some((system, crash, marker))
 }
 
-/// The marker's single-file projection, read over the default disk: the
-/// marker store is this reader's only caller, and it rides the vendored
-/// store's own boundary for its durable path.
 pub(crate) fn read_marker(path: &Path) -> std::io::Result<(u16, u16, Marker)> {
     parse_marker(&StdDisk.read_to_string(path)?)
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid marker"))
 }
 
-/// One durable marker write: fsync+rename+dir-sync (POSIX crash
-/// consistency — persist the new directory entry, not just the file's
-/// data; Windows no-ops the directory sync, see `sync_dir`).
-///
-/// The single-file write is the COMPATIBILITY PROJECTION — written only
-/// after the authoritative quorum write succeeded (see `marker_store`),
-/// never a classification input once the copies exist.
-/// The marker's single-file projection write, over the default disk: the
-/// marker store is this writer's only caller, and it rides the vendored
-/// store's own boundary for its durable path.
 pub(crate) fn write_marker(
     path: &Path,
     system: u16,
@@ -2928,85 +1980,17 @@ pub(crate) fn write_marker(
     result
 }
 
-/// The boot gate's decision record: the session whose type fixes the
-/// schedule, the identity the boot decided, and the tokens the replica
-/// constructors require.
 #[derive(Debug)]
 struct BootDecision {
-    /// The latched session (a First or Clean classification): the
-    /// Running typestate the stop path drives. `None` on the crashed
-    /// path, whose engine session is held for the seated witness's
-    /// latch.
     session: Option<Running<GateStore>>,
-    /// The crashed classification's engine session: the engine's
-    /// typestate latches it only once the seated observation mints the
-    /// witness (landing the same marker round the emission gate already
-    /// made durable at boot). `None` on the latched paths.
     deferred: Option<Crashed<GateStore>>,
-    /// The identity the boot decided — the packed pair: the genesis
-    /// pair for a first boot, the quorum-resolved pair for a clean
-    /// continue, the bumped pair for a crashed boot.
     identity: NodeId,
-    /// The clean start's proof token (`Replica::resume` requires it).
     vouched: Option<Vouched>,
-    /// The crashed classification's replacement pair
-    /// (`Replica::reincarnate` requires it; the pair is the commitment
-    /// the wire announcement carries).
     pair: Option<Bumped>,
-    /// The E2 experiment variant's flush outcome at the recovery
-    /// boundary. The C ABI's boot never configures a variant.
     flush: Option<FlushOutcome>,
-    /// The clean classification's view record: the view the stop's
-    /// drain-window write carried, the ballot the resume continues at.
-    /// `None` on the other classifications (a first life and a
-    /// reincarnation open at the genesis view) and when no stop ever
-    /// wrote one (the genesis-view fallback).
     restored: Option<ViewRecord>,
 }
 
-/// The boot gate (`vrr::lifecycle::boot` over the superblock quorum
-/// store): the engine reads the durable
-/// markers, classifies the start, and hands back the session whose type
-/// fixes the write schedule. The verdicts:
-///
-/// * No marker ever written — the FIRST life: the first latch anchors
-///   the genesis life (crash counter 1), so a later crash reads as a
-///   crash.
-/// * A stopped quorum — the CLEAN start: the drain was proven. One
-///   latch round (the running sentinel) and the same-identity resume
-///   behind the `Vouched` token.
-/// * No stopped quorum — a CRASH: the identity is dead. The replacement
-///   pair is decided here and THE EMISSION GATE lands the bump's one
-///   durable marker round — the next life at the running sentinel —
-///   before the driver releases the first announcement, unconditional,
-///   seated or not. The engine's session is held so its typestate can
-///   latch the same round again once the seated observation mints the
-///   witness (the same identity and state: idempotent on the marker).
-/// * An old-format marker (INCOMPATIBLE) or any other unreadable
-///   marker shape (rotted beyond the read quorum, a fork, any store
-///   refusal) — the boot REFUSES. A host that cannot classify from
-///   durable state is unsafe and must not start; old-format markers
-///   are never converted; there is no projection fallback and no
-///   guessed identity.
-///
-/// The crashed classification is the recovery boundary (the experiment
-/// design's §4): when a variant is configured, its forced flush executes
-/// right here — at the classification point, before the reincarnated
-/// node rejoins serving — against the caller-provided scratch directory.
-/// Variant 0 (diskless) writes nothing. The flush carries fake data only
-/// and is never read back; its measured latency is returned so the boot
-/// can report it. A flush failure refuses the boot: the boundary is
-/// load-bearing for the measurement, so a failure here means the disk is
-/// not usable.
-///
-/// The adapter's identity law rides the marker pair: the crash counter's
-/// next life must stay spellable through the packing's sixteen-bit
-/// counter half, so the boot refuses there exactly as the engine's
-/// checked bump refuses at exhaustion.
-///
-/// Every path below names itself on the lifecycle census tape
-/// ([`trace_line!`]), classification and refusal alike, and the proving
-/// test asserts each name against a fixture that reaches it.
 fn boot_gate(
     disk: &dyn Disk,
     store: GateStore,
@@ -3041,8 +2025,6 @@ fn boot_gate(
         }
         Ok(BootOutcome::First(first)) => {
             trace_line!("boot.first");
-            // The genesis pair: the descriptor's system half, the first
-            // life's counter.
             let genesis = NodeId::new(
                 system,
                 CrashCounter::new(1).expect("the genesis life's counter is non-zero"),
@@ -3102,12 +2084,6 @@ fn boot_gate(
                     return Err(refuse(format!("the replacement pair refused: {refusal:?}")));
                 }
             };
-            // THE EMISSION GATE: the crash bump's one durable marker
-            // round — the next life at the running sentinel — completes
-            // here, before the driver releases the first announcement,
-            // unconditionally (seated or not). The argument is the
-            // bumped pair itself. A failed round refuses the boot: the
-            // node is never half-announced.
             crashed.store().emission_gate(pair.new).map_err(|error| {
                 trace_line!("boot.refuse.emission-gate");
                 refuse(format!("the crash bump's marker write failed: {error}"))
@@ -3145,13 +2121,9 @@ pub(crate) fn sync_parent(disk: &dyn Disk, path: &Path) -> std::io::Result<()> {
 }
 
 // Fsyncing the containing directory after create/rename is a POSIX crash-
-// consistency idiom (persist the new directory entry, not just the file's
-// data). Windows has no equivalent: opening a directory fails with
-// ERROR_ACCESS_DENIED (std does not set FILE_FLAG_BACKUP_SEMANTICS), and NTFS
-// does not require or support an explicit directory fsync for this guarantee
-// the way POSIX filesystems do. Other Rust crates with the same durability
-// pattern (e.g. `atomicwrites`) no-op this step on Windows for the same
-// reason; do the same here rather than fail every nonce write on Windows.
+// consistency idiom. Windows cannot open a directory (std does not set
+// FILE_FLAG_BACKUP_SEMANTICS) and NTFS needs no directory fsync for the
+// guarantee, so the step no-ops there (cf. `atomicwrites`).
 #[cfg(unix)]
 fn sync_dir(disk: &dyn Disk, dir: &Path) -> std::io::Result<()> {
     disk.sync_path(dir)
@@ -3163,8 +2135,7 @@ fn sync_dir(_disk: &dyn Disk, _dir: &Path) -> std::io::Result<()> {
 }
 
 fn guarded(run: impl FnOnce() -> i32) -> i32 {
-    // The let-it-crash law: a panic at the boundary aborts the process —
-    // never a PANIC code, never a poisoned node left running.
+    // The let-it-crash law: a panic at the boundary aborts the process.
     match catch_unwind(AssertUnwindSafe(run)) {
         Ok(code) => code,
         Err(payload) => {
@@ -3182,17 +2153,11 @@ fn guarded(run: impl FnOnce() -> i32) -> i32 {
     }
 }
 
-/// Conservative worst-case size of the Prepare datagram a proposal of
-/// `payload_len` bytes produces: 20-byte header + 1-byte body discriminant +
-/// entry (8 slot + 4 era + 1 payload discriminant + 16 operation id + 4
-/// opaque length prefix + payload) + 8 piggybacked committed slot. Exact per
-/// the wire module's fixed-width big-endian layout (W3/W4); stated as a
-/// margin over the payload so admission can refuse before proposing.
+/// Conservative worst-case size of the Prepare datagram a `payload_len`-byte
+/// proposal produces, per the wire module's fixed-width layout; admission
+/// refuses before proposing.
 const PREPARE_OVERHEAD: usize = 20 + 1 + 8 + 4 + 1 + 16 + 4 + 8;
 
-/// The blocking journal's open, shared by every node-construction path
-/// that takes one: a failure logs and disables journaling for the
-/// process; the replication path is never poisoned by observability.
 fn open_journal(
     disk: Arc<dyn Disk>,
     journal_dir: Option<&str>,
@@ -3212,16 +2177,8 @@ fn open_journal(
     })
 }
 
-/// The construction body shared by the C ABI's `lunet_lock_node_new` and
-/// the embedded host's `Node::open`: parse the member buffer, classify the
-/// boot from the durable incarnation marker, and build the replica. Each
-/// failure returns its ABI code.
-///
-/// The parameter list is the construction grammar's, one caller-supplied
-/// fact per parameter — the same shape and the same pay as
-/// [`node_from_sink`]'s, which this forwards to. The fence is the last
-/// parameter: `None` is every defaulting caller's answer, and the
-/// full-shape constructor's fence door forwards through here.
+// The parameter list IS the construction grammar, one caller-supplied fact
+// per parameter; folding the seams into a carrier would hide it.
 #[allow(clippy::too_many_arguments)]
 fn node_from_parts(
     members_data: &[u8],
@@ -3251,15 +2208,8 @@ fn node_from_parts(
     )
 }
 
-/// The AOF-backed variant: the committed-transition hook enqueues to the
-/// async write-behind writer instead of the blocking journal. Same node
-/// construction; the C ABI never takes this path.
-// The parameter list IS the node construction grammar, one caller-supplied
-// fact per parameter: the descriptor buffers, the AOF series and its flush
-// interval, the disk, the state store and the commit hook. It pays here for
-// the same reason [`node_from_sink`]'s pays — folding them into a carrier
-// struct would rewrite the construction grammar's shape at every call site,
-// and the seams are the only things this file may move.
+// The parameter list IS the construction grammar, one caller-supplied fact
+// per parameter; folding the seams into a carrier would hide it.
 #[allow(clippy::too_many_arguments)]
 fn node_from_aof(
     members_data: &[u8],
@@ -3302,16 +2252,8 @@ fn node_from_aof(
     )
 }
 
-// The parameter list IS the node construction grammar, one caller-supplied
-// fact per parameter: the three descriptor buffers, the event sink, the
-// recovery boundary, the bench control socket, the runtime policy, the
-// disk the whole construction crosses, the state store the lock table
-// is flushed to and loaded from, the commit hook fired at each applied
-// commit, and the boot fence the gate's marker rounds ride (`None` is
-// the industrial default). It pays here because folding them
-// into a carrier struct would rewrite five call sites' signatures — a
-// change to the construction grammar's shape that has nothing to do with
-// the seams, and the seams are the only things this row may move.
+// The parameter list IS the construction grammar, one caller-supplied fact
+// per parameter; folding the seams into a carrier would hide it.
 #[allow(clippy::too_many_arguments)]
 fn node_from_sink(
     members_data: &[u8],
@@ -3326,17 +2268,10 @@ fn node_from_sink(
     commit_hook: Arc<Mutex<dyn CommitHook>>,
     fence: Option<Box<dyn LifecycleStore<Error = io::Error> + Send + Sync>>,
 ) -> Result<Node, i32> {
-    // The descriptor's grammar refusals: one named path, every branch of
-    // it — the grammar is a single shape, so a violation is a single
-    // observation on the census tape.
     let refused_descriptor = || {
         trace_line!("boot.refuse.descriptor");
         CONFIG
     };
-    // Member entries are "<u32-id>:<name>"; a post-genesis (joined)
-    // entry is "<u32-id>:<name>:j". The plain-entry order is the
-    // descriptor's genesis succession sequence and each id is the
-    // member's live NodeId.
     let Some(members) = members_data
         .split(|byte| *byte == 0)
         .map(parse_member_entry)
@@ -3371,12 +2306,6 @@ fn node_from_sink(
     if unique_ids.len() != members.len() || unique_names.len() != members.len() {
         return Err(refused_descriptor());
     }
-    // The admin-assigned identity law: the descriptor's genesis (plain)
-    // ids in buffer order are both the live NodeIds of the founding
-    // membership and the genesis succession sequence. Every id is the
-    // member's PROVISIONED identity — the packed pair (system, crash
-    // counter 1) — so the system half is what the descriptor assigns and
-    // the marker's crash counter carries the life.
     let genesis_order: Vec<NodeId> = members
         .iter()
         .filter(|member| !member.joined)
@@ -3393,23 +2322,8 @@ fn node_from_sink(
         primary_timeout: construction.primary_timeout,
         view_change_budget: EVIDENCE_BUDGET,
     };
-    // The boot gate: the engine reads the durable markers, classifies
-    // the start, and hands back the session whose type fixes the write
-    // schedule (see the `marker_store` bridge note and `boot_gate`). The
-    // crashed classification is the recovery boundary: a configured E2
-    // variant's forced flush executes there, against the caller-provided
-    // scratch directory. The fence door is the first shape: a mounted
-    // fence — the embedding constructor's `Some(store)` — is the boot's
-    // classification input and the marker machine's write path, whole.
-    // The bench harness substitutes the store itself: `store_ctl` names
-    // the driver's control socket and every marker call rides it
-    // (`docs/src/bench-harness.md`); the durable path is unchanged when
-    // no control socket is given and no fence is mounted.
     let state_path = PathBuf::from(state);
     let sink: SinkDoor = Arc::new(Mutex::new(journal));
-    // The boot gate's marker-round schedule: every machine commit and the
-    // drain between the halt's rounds, in write order. The store owns the
-    // record.
     let marker_log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     #[cfg(unix)]
     let store = match (fence, store_ctl) {
@@ -3456,19 +2370,10 @@ fn node_from_sink(
             .map(|(variant, dir)| (variant, dir.as_path())),
     )?;
     let own_id = decision.identity;
-    // The dirty boot's write half of the law's third clause: every boot
-    // that is not a clean resume forgets the state artefact — the store
-    // drops its artefact's bookkeeping (the WAL engine's mirrors are
-    // seeded from the open scan) so the tick path rebuilds them from
-    // the replica stream's own commits. A stale mirror would fail a
-    // correct stop; a forgotten one reconciles by construction.
     let not_a_clean_boot = decision.vouched.is_none();
     if not_a_clean_boot {
         state_store.forget();
     }
-    // The life's number for the run's logs: the decided pair's crash
-    // counter (the pair is lawful — the boot gate's decision is
-    // asserted below).
     let counter = own_id.crash_counter().map_or(0, CrashCounter::get);
     let incarnation = u64::from(counter);
     if let Some(outcome) = decision.flush {
@@ -3482,28 +2387,7 @@ fn node_from_sink(
             "recovery-boundary flush executed"
         );
     }
-    // The live identity is the pair the boot gate decided: the genesis
-    // pair at the first life, the quorum-resolved pair on a clean
-    // continue, the bumped pair on a crashed boot — whose emission gate
-    // already landed the next life's round before this point.
-    // The superseded identity on the CRASHED path: the bumped node
-    // re-announces `Reincarnation(old, new)` on every fenced-boot drive
-    // and, while it is below voting weight, on the host's §8 re-announce
-    // cadence. The old identity is the one the node LAST OPERATED AS —
-    // the marker pair the boot classified (the replacement pair's old
-    // life), not the descriptor id: from the second bump on, the
-    // descriptor id was already evicted by the previous life's forced
-    // walk, so announcing it would name a non-member, the transport's
-    // remap could never chain (the previous life's id is the row the
-    // peers still attribute the socket to), and the leader-side
-    // `from == new` gate would refuse the announcement forever. A clean
-    // resume or a first life carries no pair and announces nothing: the
-    // pair is the crashed path's commitment.
     let reincarnate_from = decision.pair.as_ref().map(|pair| pair.old);
-    // Invariant (asserted, always): the announced identity is lawful and
-    // names the descriptor's system half; on the crashed path it is the
-    // replacement pair's new identity — the strict next life of the
-    // superseded one.
     assert!(
         own_id.is_lawful()
             && own_id.system_id() == Some(system)
@@ -3538,23 +2422,11 @@ fn node_from_sink(
         .iter()
         .map(|member| member.id)
         .collect::<HashSet<_>>();
-    // The constructor the classification chose. Every later life reopens
-    // over the deployment's genesis — the honest Volatile shape (there
-    // is no durable journal to carry forward) — fenced until the stream
-    // proves currency; only the FIRST life of a founding member
-    // provisions the genesis itself.
-    // Every later life reopens over the deployment's genesis; the era
-    // table that genesis folds cannot be built for a descriptor the
-    // grammar already accepted.
     let refused_genesis = || {
         trace_line!("boot.refuse.genesis");
         CONFIG
     };
     let replica = if let Some(pair) = decision.pair {
-        // The crashed classification: `Replica::reincarnate` behind the
-        // engine's `Bumped` pair. The durable bump defers — the marker
-        // machine latches the new identity only once the engine's seated
-        // observation mints the witness.
         let (journal, persisted, config) =
             joiner_parts(genesis_order).map_err(|_| refused_genesis())?;
         trace_line!("boot.reincarnate");
@@ -3569,16 +2441,6 @@ fn node_from_sink(
             knobs,
         )
     } else if let Some(vouched) = decision.vouched {
-        // The clean classification: `Replica::resume` behind the
-        // engine's `Vouched` token — the only same-identity constructor.
-        // The view record the stop's drain window wrote restores the
-        // stopped view; without one the node re-fences at the genesis
-        // view (the record is absent only when no stop ever wrote one).
-        // The restored era must be one the deployment's genesis era
-        // table covers — the adapter carries no durable journal, so a
-        // post-reconfiguration era is not reconstructible and the boot
-        // refuses rather than resuming over a table that cannot name
-        // the view.
         let (journal, mut persisted, config) =
             joiner_parts(genesis_order).map_err(|_| refused_genesis())?;
         if let Some(record) = decision.restored {
@@ -3612,8 +2474,6 @@ fn node_from_sink(
             knobs,
         )
     } else if own_member.joined {
-        // A post-genesis member's first life: `Replica::join` over the
-        // deployment's genesis, fenced until the stream proves currency.
         let (journal, persisted, config) =
             joiner_parts(genesis_order).map_err(|_| refused_genesis())?;
         trace_line!("boot.join");
@@ -3627,7 +2487,6 @@ fn node_from_sink(
             knobs,
         )
     } else {
-        // The first life of a founding member: the genesis provision.
         trace_line!("boot.provision");
         Replica::provision(
             own_id,
@@ -3661,11 +2520,6 @@ fn node_from_sink(
         state_path: state_path.clone(),
         disk: Arc::clone(&disk),
         state_store,
-        // Only a clean stop's boot may load the state file (see
-        // `Node::load_state_on_demand`): the boot gate decided `vouched`
-        // — the drain-proven clean classification, and the only one whose
-        // stop went on to write the `Stopped` round the eager flush
-        // precedes.
         clean_boot: decision.vouched.is_some(),
         state_loaded: false,
         commit_hook,
@@ -3675,31 +2529,13 @@ fn node_from_sink(
         #[cfg(feature = "flight-recorder")]
         flight: crate::flight::FlightRecorder::open_from_env_on(&disk, own_id.0),
     };
-    // The bumped node's entry ticket (§4) rides the fenced-boot drive
-    // (`recover`): the announcement is emitted on the host's first
-    // fenced-boot drive, never at the boot itself — a reopened node
-    // answers only what it is driven with, and the §8 re-announce
-    // cadence carries the pair until the node seats. The boot gate's
-    // classification is complete: the crash bump's durable round is
-    // already landed (the emission gate), so the drive's announcement
-    // vouches for a durable identity from the first wire emission.
     Ok(node)
 }
 
-/// The read-only information console: this build's own identity facts,
-/// as the Maven `version.properties` text (the release tag naming the
-/// build or `unknown`, the commit, the dirty flag, the feature shape),
-/// NUL-terminated into `out_data` with its length (excluding the NUL)
-/// in `out_len`. The pull-style contract of `lunet_lock_node_fault`:
-/// when the text does not fit `capacity` the call reports TOO_LARGE and
-/// writes the needed size.
-///
-/// The call takes NO node handle — that is the whole of its safety
-/// argument. Nothing reachable from here reaches a [`Node`], so the
-/// console is read-only by construction: there is no path through it
-/// that writes protocol state or mutates the store. Every
-/// value is stamped at build time, so the answer is the same on every
-/// call and on every host that loaded this cdylib.
+/// The read-only information console: this build's own identity facts as the
+/// Maven `version.properties` text, NUL-terminated into `out_data` with its
+/// length in `out_len`; TOO_LARGE with the needed size when it does not fit.
+/// Takes no node handle — read-only by construction.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lunet_lock_version_properties(
     out_data: *mut u8,
@@ -3725,6 +2561,10 @@ pub unsafe extern "C" fn lunet_lock_version_properties(
     })
 }
 
+/// Create a node: `members_data` is the NUL-separated `<u32-id>:<name>` buffer
+/// in genesis order (`:j` for post-genesis joiners), `own_data` the local
+/// member's name, `state_data` the durable marker path, `journal_dir_data` the
+/// optional journal dir (empty disables); on success writes the handle to `*out`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lunet_lock_node_new(
     members_len: usize,
@@ -3798,11 +2638,9 @@ pub unsafe extern "C" fn lunet_lock_node_new(
     })
 }
 
-/// The AOF-backed creator: the committed-transition hook enqueues to the
-/// write-behind AOF writer instead of the blocking journal. Same grammar
-/// as [`lunet_lock_node_new`] with `journal_dir`/`roll_bytes` replaced by
-/// the required `aof_dir` and the `flush_ms` cadence (0 fsyncs only at
-/// roll and shutdown).
+/// The AOF-backed creator: same grammar as [`lunet_lock_node_new`] with
+/// `journal_dir`/`roll_bytes` replaced by the required `aof_dir` and the
+/// `flush_ms` cadence (0 fsyncs only at roll and shutdown).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lunet_lock_node_new_aof(
     members_len: usize,
@@ -3878,6 +2716,7 @@ pub unsafe extern "C" fn lunet_lock_node_new_aof(
     })
 }
 
+/// Free a node handle; NULL is a no-op.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lunet_lock_node_free(node: *mut c_void) {
     if !node.is_null() {
@@ -3899,11 +2738,8 @@ pub unsafe extern "C" fn lunet_lock_node_free(node: *mut c_void) {
     }
 }
 
-/// The node's live identity: the descriptor id at incarnation 0, the
-/// bumped high-band id after a dirty restart. The host compares leaders
-/// against it (`status.leader == own_id`) — after a bump the descriptor
-/// row still names the superseded id, so the live value is the only honest
-/// self-check.
+/// The node's live identity: the descriptor id at incarnation 0, the bumped
+/// high-band id after a dirty restart.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lunet_lock_node_own_id(node: *mut c_void, out_id: *mut u32) -> i32 {
     guarded(|| {
@@ -3916,6 +2752,7 @@ pub unsafe extern "C" fn lunet_lock_node_own_id(node: *mut c_void, out_id: *mut 
     })
 }
 
+/// Route to [`Node::request`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lunet_lock_node_request(
     node: *mut c_void,
@@ -3934,15 +2771,6 @@ pub unsafe extern "C" fn lunet_lock_node_request(
 }
 
 impl Node {
-    /// The non-stop overlap pivot for a reconfiguration, derived the
-    /// upstream way: the host builds it with the core's own `construct_pivot`
-    /// against the current configuration and the configuration the
-    /// establishing operation folds at the slot it would occupy — the same
-    /// slot the planner's gate 5 probes. `None` (no legal pivot for this
-    /// leader, or the fold probe failed) drives the stop-the-world
-    /// fallback, which upstream defines as a latency outcome, never an
-    /// error; the core's `validate_pivot` gate still judges whatever the
-    /// host passes.
     fn derived_pivot(&self, op: &SystemOperation) -> Option<Pivot> {
         let next_slot = self.replica.progress().accepted().next()?;
         let next_table = self
@@ -3961,6 +2789,7 @@ impl Node {
     }
 }
 
+/// Route to [`Node::reconfigure`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lunet_lock_node_reconfigure(
     node: *mut c_void,
@@ -3976,6 +2805,7 @@ pub unsafe extern "C" fn lunet_lock_node_reconfigure(
     })
 }
 
+/// Route to [`Node::receive`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lunet_lock_node_receive(
     node: *mut c_void,
@@ -3994,11 +2824,9 @@ pub unsafe extern "C" fn lunet_lock_node_receive(
     })
 }
 
+/// Heartbeat tick: route to [`Node::idle`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lunet_lock_node_idle(node: *mut c_void) -> i32 {
-    // Heartbeat tick. The tag has a single liveness input, Input::Tick;
-    // there is no separate idle input. The routed method carries the
-    // drain point's STOPPED gate: a drive here must not bypass it.
     guarded(|| unsafe {
         node.cast::<Node>()
             .as_mut()
@@ -4006,12 +2834,9 @@ pub unsafe extern "C" fn lunet_lock_node_idle(node: *mut c_void) -> i32 {
     })
 }
 
+/// Election tick: route to [`Node::leader_timeout`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lunet_lock_node_leader_timeout(node: *mut c_void) -> i32 {
-    // Election tick: same Input::Tick — tick-driven suspicion is the tag's
-    // only view-change trigger (ViewChangeKnobs::primary_timeout). The
-    // routed method carries the drain point's STOPPED gate: a drive here
-    // must not bypass it.
     guarded(|| unsafe {
         node.cast::<Node>()
             .as_mut()
@@ -4019,10 +2844,8 @@ pub unsafe extern "C" fn lunet_lock_node_leader_timeout(node: *mut c_void) -> i3
     })
 }
 
-/// §14.2 host-forced view change: the leader timeout's conclusion
-/// that the primary is dead (`era` the node's current era, `view` strictly
-/// ahead). Returns [`OK`], [`SERVICE`] (poisoned), or [`CONFIG`]-class
-/// refusals for a target that does not advance.
+/// §14.2 host-forced view change: [`OK`], [`SERVICE`] (poisoned), or
+/// [`CONFIG`]-class refusals for a target that does not advance.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lunet_lock_node_force_view(node: *mut c_void, era: u32, view: u32) -> i32 {
     guarded(|| unsafe {
@@ -4032,29 +2855,24 @@ pub unsafe extern "C" fn lunet_lock_node_force_view(node: *mut c_void, era: u32,
     })
 }
 
+/// Route to [`Node::recover`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lunet_lock_node_recover(node: *mut c_void) -> i32 {
     guarded(|| unsafe { node.cast::<Node>().as_mut().map_or(INVALID, Node::recover) })
 }
 
-/// The graceful stop (the uVRR termination obligations, host-side): the
-/// wire closes BEFORE any marker write — every further inbound entry
-/// reports STOPPED and processes nothing — then the `stopped` marker, the
-/// sink drain to quiescence, and the `flushed` marker, in the contract's
-/// §2 write order. Synchronous on the caller's thread: no thread spawn,
-/// no callback, no yield — the stop-contract invariants. Idempotent.
+/// The graceful stop (the termination obligations, host-side): the wire closes
+/// before any marker write, then the `stopped` marker, the sink drain, and the
+/// `flushed` marker, in the contract's write order. Synchronous; idempotent.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lunet_lock_node_stop(node: *mut c_void) -> i32 {
     guarded(|| unsafe { node.cast::<Node>().as_mut().map_or(INVALID, Node::stop) })
 }
 
-/// The steady tick (the ~1000 ms libuv timer's entry): the changed set —
-/// noted at every committed lock transition and once per lock a lazy
-/// load installs — rides the tick path, completions drained either side.
-/// A steady-tick refusal (capacity) is counted in the store's per-stream
-/// `refusals` and leaves the serving state untouched: the answer is
-/// still [`OK`], readable through [`lunet_lock_node_state_status`].
-/// `STOPPED` past the drain point.
+/// The steady tick (the ~1000 ms timer's entry): a capacity refusal is
+/// counted in the store's per-stream `refusals` and leaves the serving
+/// state untouched (the answer is still [`OK`]); `STOPPED` past the drain
+/// point.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lunet_lock_node_state_tick(node: *mut c_void) -> i32 {
     guarded(|| unsafe {
@@ -4065,12 +2883,8 @@ pub unsafe extern "C" fn lunet_lock_node_state_tick(node: *mut c_void) -> i32 {
 }
 
 /// The state store's per-stream counters, the C ABI's mirror of
-/// `state::StoreStatus`: one field set per stream (completed generations,
-/// completed records, refusals, in flight), the last completion's wall
-/// nanosecond timestamp, and a `present` flag — 1 when the mounted store
-/// reports counters (the WAL snapshot store), 0 when it does not (the
-/// file store), in which case every other field reads zero. Pull-style:
-/// the caller owns the struct, the call never drives the node.
+/// `state::StoreStatus`: `present` is 1 when the mounted store reports
+/// counters (the WAL snapshot store), 0 when it does not. Pull-style.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lunet_lock_node_state_status(
     node: *mut c_void,
@@ -4083,9 +2897,6 @@ pub unsafe extern "C" fn lunet_lock_node_state_status(
         let node = unsafe { &*node.cast::<Node>() };
         let status = node.state_status();
         unsafe {
-            // The binding pin, demanded at the one site that writes the
-            // record: a layout drift in the struct, or in the Teal cdef
-            // mirroring it, is a compile error on every build.
             const _: () = STATE_STATUS_RAW_LAYOUT;
             *out_status = StateStatusRaw::from(status.as_ref());
         }
@@ -4093,6 +2904,7 @@ pub unsafe extern "C" fn lunet_lock_node_state_status(
     })
 }
 
+/// The status snapshot's four words: state, leader, era, view.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lunet_lock_node_status(
     node: *mut c_void,
@@ -4122,6 +2934,7 @@ pub unsafe extern "C" fn lunet_lock_node_status(
     })
 }
 
+/// The leader for `(era, view)`; [`LEADER_UNKNOWN`] when unknown.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lunet_lock_node_leader_for_view(
     node: *mut c_void,
@@ -4139,16 +2952,10 @@ pub unsafe extern "C" fn lunet_lock_node_leader_for_view(
     })
 }
 
-/// The self-arrest report: a node that has self-arrested (the core's
-/// never-repair fault, or a boundary panic) no longer serves — every
-/// further entry reports SERVICE — and the runbook needs the reason
-/// without restarting anything. Writes the recorded reason as a
-/// NUL-terminated string into `out_data` and its length (excluding the
-/// NUL) into `out_len`; a node that has not arrested reports OK with
-/// `out_len` 0. When the note does not fit `capacity`, the call reports
-/// TOO_LARGE and writes the needed size — the mirror of
-/// `lunet_lock_node_next`'s contract. The call never drives the node:
-/// observation only, valid on a poisoned node by design.
+/// The self-arrest report: the recorded reason, NUL-terminated into
+/// `out_data` with its length in `out_len`; OK with `out_len` 0 on a node
+/// that has not arrested; TOO_LARGE with the needed size when it does not
+/// fit. Observation only, valid on a poisoned node.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lunet_lock_node_fault(
     node: *mut c_void,
@@ -4179,6 +2986,10 @@ pub unsafe extern "C" fn lunet_lock_node_fault(
     })
 }
 
+/// Pop the next queued output: `out_kind` 1 = send (unicast to `to`) or
+/// 2 = reply (`message_id`-keyed). Returns 1 when an output was produced, 0
+/// when the queue is empty, negative on error; when the bytes exceed
+/// `capacity`, reports the needed size in `out_len` and does NOT pop.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lunet_lock_node_next(
     node: *mut c_void,

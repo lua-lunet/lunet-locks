@@ -142,11 +142,10 @@ descriptor. It is rewritten atomically (temporary file, rename) with no
 fsync: the last write may be lost on power loss — the same documented
 loss window the AOF writer carries, and nothing depends on the file for
 safety. A sidecar that does not parse is ignored entirely at boot: the
-model falls back to the descriptor and discovery re-learns. The membership sidecar sits beside the durable identity marker; its
-authoritative storage is the quorum-of-copies superblock beside the state
-file (four Aegis-checksummed copies, quorum write with forced I/O,
-highest-sequence read quorum), and the fsync+rename+dir-sync single file
-stays beside it as the compatibility projection.
+model falls back to the descriptor and discovery re-learns. The sidecar
+sits beside the durable identity marker, whose authoritative storage —
+the quorum-of-copies superblock and the single-file compatibility
+projection — [architecture](architecture.md) specifies.
 
 ## Boundaries
 

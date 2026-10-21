@@ -1,15 +1,3 @@
-//! The AOF console bridge: the standby's TigerBeetle-format AOF series
-//! served as the vanilla JS console's admin surface.
-//!
-//! ```text
-//! aof-console-bridge --aof-dir PATH [--log-dir PATH] [--bind ADDR:PORT] [--follow]
-//! ```
-//!
-//! Read-only on the series: the standby owns writes. The decode path
-//! reuses the existing surfaces end to end — the typed envelope reader,
-//! the core's wire parser, and the advisory-lock Service's decode/execute
-//! state machine (see `lease_sequencer::bridge` for the contract).
-
 use lease_sequencer::bridge::Server;
 use std::path::PathBuf;
 

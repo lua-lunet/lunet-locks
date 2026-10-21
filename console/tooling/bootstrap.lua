@@ -1,7 +1,3 @@
--- Resolve the repo-local rocks tree (../.rocks, LuaJIT 5.1 ABI) without a
--- pre-sourced LUA_PATH, activate the Teal loader, and make sibling modules
--- requirable from any cwd. Returns the directory containing this file.
-
 local here = arg[0]:match("^(.*)/[^/]*$") or "."
 local rocks = here .. "/../../.rocks"
 

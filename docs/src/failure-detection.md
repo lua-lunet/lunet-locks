@@ -40,19 +40,6 @@ The detection latch is one detection per (era, leader) while the node is
 cluster viewchange timeout takes the polling, whose drive is the
 retransmit of the attempt already armed.
 
-The timing law is Raft's (Ongaro, "In Search of an Understandable
-Consensus Algorithm", 2014 §4.2.3): broadcastTime ≪ electionTimeout ≪
-MTBF, with the election timeout RANDOMISED in a generous fixed interval
-— the canonical 150–300 ms against a 0.5–20 ms broadcast, 10–20× the
-broadcast time. The randomisation IS the liveness mechanism (a
-synchronised fleet must never time out in lockstep and stampede the
-election); the generosity IS the stability mechanism (a fixed timeout
-measurably causes split votes and election stalls). The evidence on
-the deployment hardware: UDP loopback RTT 0.042 ms and fsync p50 0.023 ms —
-three orders of magnitude below the observed heartbeat-arrival jitter
-(12–23 ms against a 5 ms heartbeat, event-loop tick quantisation) — so
-a generous randomised wait covers the noise floor by construction.
-
 The profile table:
 
 | profile | heartbeat | leader timeout (uniform random) | rationale |
@@ -91,9 +78,6 @@ positive vote, it toggles its timeout behaviour to `timedout = true`:
 
 When the leader finally emerges and a commit arrives, the toggle flips
 to `timedout = false` and the next tick of the detector timer resumes.
-A node that re-elected the same leader may be pleasantly surprised —
-the partition healed and the SAME leader returned; that is all good,
-and its detector restarts clean for it.
 
 The failover gap is skipped the same way: the gap between the old
 leader's last commit and the new leader's first commit is not a
@@ -162,16 +146,11 @@ announcement and the proof of life in one datagram. A leader whose last
 interval carried no Commit of its own sends the commit it last released,
 byte for byte, to every peer it released it to; nothing else goes out.
 
-Both hosts take it that way. The Rust host keeps the released datagrams
-in the relay ledger (`examples/lease-sequencer/src/relay.rs`) and the
-leader's idle beat re-announces the newest commit per peer from it; the
-Teal host keeps the same frontier per peer as `flush` sends
-(`src/server.tl`) and its `heartbeat_loop` re-announces it while no
-Commit has gone out in the last interval. Neither opens a client
-transaction, so an idle leader's beats advance no journal slot at all: a
-run with an idle leader and N beats advances the replication journal
-zero times, which `examples/lease-sequencer/tests/relay_test.rs` counts
-in the journal's own entries.
+Neither host's idle beat opens a client transaction, so an idle leader's
+beats advance no journal slot at all: a run with an idle leader and N beats
+advances the replication journal zero times, which
+`examples/lease-sequencer/tests/relay_test.rs` counts in the journal's own
+entries.
 
 What it buys is idle-alive evidence. A backup's suspicion gate reads only
 same-view `Prepare` and `Commit` from the legitimate primary, so a quiet

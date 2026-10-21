@@ -216,8 +216,8 @@ and carries nothing else.
      header's byte-exact agreement plus the frame checksum.
 - **Load is lazy, clean-boot-only**: the boot fence (marker `stopped` →
   `flushed`) gates it as everywhere else; a dirty boot reads nothing and
-  rebuilds from the replica stream — the "resync-from-commit" of issue
-  #30. A loaded snapshot installs into an empty table, once, and never
+  rebuilds from the replica stream. A loaded snapshot installs into an
+  empty table, once, and never
   overwrites live state. The dirty boot forgets the artefact on the
   write side too (`StateStore::forget`): the store drops its artefact's
   bookkeeping — the WAL engine's mirrors are seeded from the open scan,

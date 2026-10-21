@@ -1,8 +1,3 @@
-//! The harness node host binary: boots ONE uVRR + lock node with the
-//! same service wiring the `lease-sequencer` host drives, listening on a
-//! request UDS and writing every output to the driver path the caller
-//! gives. Transport substitution only — the payloads are the rig's.
-
 use lease_sequencer::uds_harness::{NodeHost, NodeOptions};
 use std::path::PathBuf;
 

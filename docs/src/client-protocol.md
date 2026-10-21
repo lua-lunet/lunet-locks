@@ -151,8 +151,7 @@ The reply has `op: "break"` and reports what happened:
   The lock was already free, with no record to break and no journal event.
 
 Break is operator-trusted at exactly the same level as the membership verbs
-and the lock verbs: the TCP client channel has no separate authentication,
-and any client that can acquire locks can break one. The state machine
+and the lock verbs. The state machine
 accepts `break` as a valid, documented command; authorization for break is
 owned entirely by the admin edge that drives the channel, not by the state
 machine. This is the deployment's stated trust model, not a gap.

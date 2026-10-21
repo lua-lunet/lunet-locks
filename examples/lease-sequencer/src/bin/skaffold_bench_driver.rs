@@ -1,16 +1,3 @@
-//! The bench harness driver (`docs/src/bench-harness.md`).
-//!
-//! One process owns the run: it writes the three-node descriptor, binds
-//! each node identity's store socket, spawns the node processes (real
-//! UDP between them, real TCP client ports), serves every marker-store
-//! call from memory under the signalled discipline, loads the cluster
-//! with the nodes' embedded CAS clients, reads the lock through a TCP
-//! client per node, walks the lifecycle scenario ladder, and ends with
-//! the oracle verdict: the three CAS chains identical, the client
-//! histories consistent, no invariant-violation voice, the store discipline
-//! held. Any failure stops the run; nothing is tolerated and nothing is
-//! left running.
-
 use lease_sequencer::bench_oracle as oracle;
 use lease_sequencer::bench_store::{NodeDiscipline, serve_socket};
 use std::io::{Read, Write};
@@ -22,13 +9,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-/// The lock the embedded clients chase (the rig's `EMBEDDED_LOCK_ID`):
-/// the CAS chain the poller observes.
 const BENCH_LOCK_ID: u64 = 0x0DDBA12;
-/// The poller client ids (disjoint from the embedded clients' base).
 const POLLER_CLIENT_BASE: u64 = 900_000;
-/// The descriptor id of a live identity: the same system half at the
-/// genesis life — (system half << 16) | 1.
 fn descriptor_id(live: u32) -> u32 {
     ((live >> 16) << 16) | 1
 }
@@ -94,8 +76,6 @@ fn parse_options() -> Options {
     options
 }
 
-/// One spawned node life. Dropping it SIGKILLs the process (the
-/// no-dangle backstop; the scenario's own stops are deliberate).
 struct NodeProc {
     child: Child,
 }
@@ -108,8 +88,6 @@ impl NodeProc {
 
 impl Drop for NodeProc {
     fn drop(&mut self) {
-        // The in-process kill: no shell, no leaked stderr on the
-        // deliberate stops it backstops.
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -128,7 +106,6 @@ struct Node {
     proc: Option<NodeProc>,
 }
 
-/// One blocking TCP NDJSON exchange: connect, one line out, one line in.
 fn tcp_call(addr: &str, line: &str, timeout: Duration) -> Result<String, String> {
     let stream = TcpStream::connect(addr).map_err(|error| format!("connect {addr}: {error}"))?;
     stream
@@ -164,14 +141,10 @@ fn tcp_call(addr: &str, line: &str, timeout: Duration) -> Result<String, String>
     String::from_utf8(bytes).map_err(|error| error.to_string())
 }
 
-/// A node's rolling log file: `<name>.<date>.log` (the daily rotation
-/// puts the date between stem and suffix).
 fn is_node_log(file: &str, node: &str) -> bool {
     file.starts_with(&format!("{node}.")) && file.ends_with(".log")
 }
 
-/// One poller's observation log: every granted lease it read through a
-/// node's service, as (holder, lease_id) pairs.
 type ClientHistory = Arc<Mutex<Vec<([u8; 16], u64)>>>;
 
 struct Poller {
@@ -181,9 +154,6 @@ struct Poller {
 }
 
 impl Poller {
-    /// One GET round against the node's client port; a granted lease is
-    /// recorded as (holder, lease_id). Errors and non-leader replies
-    /// record nothing — the observation is the granted leases only.
     fn step(&mut self, addr: &str) {
         self.request_num += 1;
         let message_id = uuid::Uuid::new_v4();
@@ -247,10 +217,6 @@ impl Driver {
         })
     }
 
-    /// The last few lines of a node's stderr, bounded: the evidence a
-    /// failed wait prints (a node that died on boot — the stale-binary
-    /// class, a bad option, a refused socket — says why here, and a
-    /// bare timeout would bury it in the run directory).
     fn err_tail(&self, index: usize, lines: usize) -> String {
         let node = &self.nodes[index];
         let Ok(text) =
@@ -267,8 +233,6 @@ impl Driver {
         }
     }
 
-    /// Every live node's stderr tail, one line each — the wait-failure
-    /// evidence block.
     fn err_tails(&self) -> String {
         (0..self.nodes.len())
             .filter(|index| self.nodes[*index].proc.is_some())
@@ -277,10 +241,6 @@ impl Driver {
             .join("\n")
     }
 
-    /// The poll-loop wait every step rides: the predicate inside the
-    /// budget, the store violation as the instant abort. A timeout
-    /// carries the live nodes' stderr tails — the cause of a dead wait
-    /// (a node that never booted) is in them, not in the clock.
     fn wait_for(
         &self,
         what: &str,
@@ -306,9 +266,6 @@ impl Driver {
         ))
     }
 
-    /// The current leader's node index, from the newest `leader` note
-    /// across the node logs (the descriptor id is the id's low band).
-    /// The rolling files are `<name>.<date>.log` under the run dir.
     fn leader_index(&self) -> Option<usize> {
         let mut newest: Option<(u64, u32)> = None;
         for node in &self.nodes {
@@ -352,14 +309,11 @@ impl Driver {
     }
 
     fn serving(&self) -> bool {
-        (0..self.nodes.len()).any(|index| {
-            self.nodes[index].proc.is_some() && self.get_lease_observation(index).is_some()
-        })
+        (0..self.nodes.len())
+            .any(|index| self.nodes[index].proc.is_some() && self.serving_probe(index).is_some())
     }
 
-    /// One GET through the driver's own exchange (not the poller): the
-    /// serving probe and the failover measurement.
-    fn get_lease_observation(&self, index: usize) -> Option<()> {
+    fn serving_probe(&self, index: usize) -> Option<()> {
         let message_id = uuid::Uuid::new_v4();
         let line = format!(
             "{{\"op\":\"get\",\"message_id\":\"{message_id}\",\"client_id\":{POLLER_CLIENT_BASE},\"request_num\":1,\"lock_id\":{BENCH_LOCK_ID}}}"
@@ -375,12 +329,6 @@ impl Driver {
         let Some(proc) = &node.proc else {
             return Err(format!("{} has no live process to signal", node.name));
         };
-        // The deliberate lifecycle signals (TERM, USR1, USR2): std has no
-        // signal API, so this is a direct `execvp` of the `kill` system
-        // utility — no shell, typed arguments, checked exit status. The
-        // repo's "no shell orchestration" rule targets shell scripts;
-        // this is not one. The in-process kill backstop (`NodeProc::drop`)
-        // is the std call it correctly is.
         let status = Command::new("kill")
             .arg(signal)
             .arg(proc.pid().to_string())
@@ -397,8 +345,6 @@ impl Driver {
         let deadline = Instant::now() + budget;
         let name = self.nodes[index].name.clone();
         loop {
-            // try_wait reaps: a zombie reads alive to kill -0, so the
-            // child's own status is the only truthful exit check.
             match self.nodes[index]
                 .proc
                 .as_mut()
@@ -459,8 +405,6 @@ impl Driver {
             .arg("--viewchange-timeout-max-ms")
             .arg("400")
             .env("LUNET_FLIGHT_RECORDER_DIR", &node.flight)
-            // The rolling log's env filter (the runners' discipline):
-            // the operator's RUST_LOG wins, else info.
             .env(
                 "RUST_LOG",
                 std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()),
@@ -521,9 +465,7 @@ impl Driver {
         self.wait_for(what, Duration::from_secs(30), Driver::serving)
     }
 
-    /// The scenario ladder (the doc's §The scenario ladder).
     fn ladder(&mut self) -> Result<(), String> {
-        // 1. Settle: three nodes boot, elect, serve.
         self.wait_serving("settle: the cluster serves")?;
         let leader = self
             .wait_for(
@@ -534,7 +476,6 @@ impl Driver {
             .map(|_| self.leader_index().expect("the wait just landed"))?;
         println!("bench: settled; leader {}", self.nodes[leader].name);
 
-        // 2. Clean swap: a non-leader SIGTERMs out and respawns.
         let index = self.non_leader_index()?;
         self.clean_stop(index)?;
         println!("bench: clean stop of {}", self.nodes[index].name);
@@ -543,7 +484,6 @@ impl Driver {
         self.wait_serving("the cluster serves after the clean swap")?;
         println!("bench: clean swap of {} resumed", self.nodes[index].name);
 
-        // 3. Crash swap: a non-leader is SIGKILLed and respawns.
         let index = self.non_leader_index()?;
         self.crash(index)?;
         println!("bench: crash of {}", self.nodes[index].name);
@@ -555,7 +495,6 @@ impl Driver {
             self.nodes[index].name
         );
 
-        // 4. Leader crash: the leader timeout drives the takeover.
         let leader = self
             .wait_for(
                 "a leader before the leader crash",
@@ -575,7 +514,6 @@ impl Driver {
             self.nodes[leader].name
         );
 
-        // 5. Dirty cycle: a node takes a SIGUSR2 mid-load.
         let index = self.non_leader_index()?;
         self.cycle(index, "-USR2")?;
         self.wait_running(index, "the SIGUSR2 dirty cycle re-boots")?;
@@ -590,10 +528,6 @@ impl Driver {
             if self.nodes[index].proc.is_none() {
                 continue;
             }
-            // Only a latched-and-serving identity takes a fresh clean-stop
-            // signal: a node already mid-stop from a failed ladder step
-            // keeps its single expectation (no double-signal noise), and
-            // the process drop below backstops whatever survives.
             let serving = lock(&self.nodes[index].discipline).is_running();
             if serving {
                 lock(&self.nodes[index].discipline).signal_clean_stop();
@@ -605,7 +539,6 @@ impl Driver {
         }
     }
 
-    /// The oracle: the run's verdict, printed per check.
     fn oracle(&self) -> Result<(), String> {
         let mut failures: Vec<String> = Vec::new();
         let mut chains = Vec::new();
@@ -629,17 +562,6 @@ impl Driver {
                     refs.first().map(|(_, chain)| chain.len()).unwrap_or(0)
                 );
             }
-            // The client-history reference is the longest chain: a node
-            // that was down for part of the ladder legitimately holds
-            // fewer transitions, and the fullest chain is the most
-            // complete record of what clients could have observed. The
-            // coupling is deliberate: this check's verdict is meaningful
-            // only when `chains_agree` above passed — on a
-            // content-diverged world the longest chain is still a
-            // wrong-world record, and the client check may pass or fail
-            // against it for the wrong reasons. `chains_agree` fails the
-            // run independently; the two failures are reported together
-            // and either one is conclusive.
             let reference = &chains
                 .iter()
                 .max_by_key(|(_, chain)| chain.len())

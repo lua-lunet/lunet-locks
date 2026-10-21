@@ -1,66 +1,8 @@
 //! The routed lifecycle marker: the engine's `LifecycleStore` over the
-//! superblock copies.
-//!
-//! This module is the host's durable
-//! mechanics: the vendored Zig store's quorum-of-copies construction,
-//! reached through the AOF C ABI's marker exports (`ext/lunet-locks-aof`),
-//! plus the single-file compatibility projection.
-//!
-//! The bridge to the engine's machine: the durable marker is the
-//! `NodeIdentity` pair (system identifier, crash counter) — it vouches for
-//! the life — and the engine's lifecycle input is the packed pair itself,
-//! read at this boot-gate boundary. The packed u32 is what goes on the
-//! wire; this module spells the pair on every write and reads it back on
-//! every boot.
-//!
-//! - **Read** (`read_copies`) — the working quorum's verdict: the
-//!   highest-sequence valid copies at the `.open` threshold (2/4). THE
-//!   BOOT-READ SAFETY LAW: every block read validates its checksum
-//!   before any classification logic, and a checksum failure on ANY copy
-//!   is a loud log and a PANIC — the Zig store refuses with the distinct
-//!   `CORRUPT` code (the FFI boundary cannot panic across the ABI) and
-//!   this adapter panics on it: the boot never hangs, never clears,
-//!   never repairs, never falls back — deleting the marker file is the
-//!   recovery path. A tear is the spread writes being inconsistent
-//!   across the copies (checksum-valid copies at differing states), and
-//!   it resolves by the stated thresholds with the non-unanimity logged
-//!   in full at the moment of resolution (in the Zig store, which
-//!   resolves). The on-disk states map onto the engine's markers:
-//!   `flushed` is the drain-proven `Stopped` (a controlled ending),
-//!   `stopped` is `Stopping` (the halt has begun — it vouches for
-//!   nothing), and `unflushed` is the running sentinel (`Joining` — an
-//!   operating or freshly-latched process). An existing copies file that
-//!   cannot be read to a verdict is an error — the boot refuses, it
-//!   never falls back to the projection. When the copies never existed
-//!   (no superblock file), the single file is the boot input: the legacy
-//!   migration path, whose first routed write seeds the copies.
-//! - **Write** (`commit`) — the engine's decided rewrite: the quorum
-//!   write of `(identity, state)` — four fixed sector-aligned
-//!   Aegis-checksummed copies, hash-chained sequence/parent, forced I/O
-//!   (the fsync lands before the write reports success), verified
-//!   against the `.verify` threshold (3/4) — then the single-file
-//!   projection mirrors the state (fsync+rename+dir-sync, unchanged).
-//!   The projection is written only after the quorum write succeeded;
-//!   it is never a classification input once the copies exist.
-//! - **Drain** (`drain`) — the committed-transition sink forced to
-//!   quiescence: every record the node enqueued is appended and fsynced
-//!   (the AOF writer) or the journal file is fsynced (the blocking
-//!   journal). The driver calls it strictly between the two halt rounds.
-//!
-//! The sink rides a shared door (`SinkDoor`): the Node appends through
-//! it during operation; the halt's drain forces it through the engine's
-//! schedule.
-//!
-//! # On-disk layout
-//!
-//! The superblock copies live in a sibling file, `<state>.superblock`.
-//! The single `<system> <crash> <unflushed|stopped|flushed>` text file
-//! (the identity pair spelled as its halves, then the state word) is the
-//! projection legacy rigs and operators read, and the boot input only
-//! while the copies predate this routing.
-//!
-//! Windows keeps the single-file discipline: the vendored AOF
-//! build is unix-only, and no Windows asset is packaged.
+//! superblock copies, plus the single-file compatibility projection. THE
+//! BOOT-READ SAFETY LAW: a checksum failure on ANY copy is a loud log and
+//! a PANIC — never cleared, never repaired, never fallen back; deleting
+//! the marker file is the recovery path.
 use std::io;
 #[cfg(unix)]
 use std::io::{BufRead, BufReader, Write};
@@ -100,12 +42,8 @@ pub(crate) fn drain_sink(sink: &mut Option<JournalSink>) -> io::Result<()> {
 }
 
 /// THE BOOT-READ SAFETY LAW's panic: a readable marker copy failed its
-/// checksum. The Zig store already logged the copy in full (which slot,
-/// which checksum, which sequence); this adapter panics on the distinct
-/// refusal code — the loudest error that exits the boot — and the boot
-/// never clears, repairs, or falls back from a bad block. Deleting the
-/// marker file is the recovery path (the host re-seeds from the
-/// compatibility projection).
+/// checksum — never cleared, never repaired, never fallen back; delete
+/// the marker file to re-seed from the compatibility projection.
 fn boot_read_checksum_panic(superblock: &Path, what: &str) -> ! {
     panic!(
         "BOOT-READ SAFETY LAW: {what} of {} found a bad marker checksum \
@@ -116,10 +54,8 @@ fn boot_read_checksum_panic(superblock: &Path, what: &str) -> ! {
     )
 }
 
-/// The engine marker's on-disk Zig state: `Stopping` is the halt's first
-/// round (it vouches for nothing), `Stopped` is the drain-proven second
-/// round, and the latches (`Restarting`, `Joining`) are the running
-/// sentinel the next boot reads as an operating process.
+/// The engine marker's on-disk Zig state (`Stopping` → `Stopped`,
+/// `Stopped` → `Flushed`, the latches → `Unflushed`).
 #[cfg(not(target_os = "windows"))]
 fn zig_state(marker: Marker) -> tbio::marker::MarkerState {
     use tbio::marker::MarkerState;
@@ -154,9 +90,7 @@ fn engine_marker(state: tbio::marker::MarkerState) -> Marker {
     }
 }
 
-/// Four uniform copies: the store's read resolved one verdict (the Zig
-/// quorum machinery's own minimum-progress discipline), and the engine's
-/// cohort classification over a uniform set reads exactly that verdict.
+/// Four uniform copies: the store's read resolved one verdict.
 fn uniform(identity: NodeId, marker: Marker) -> SuperblockCopies {
     SuperblockCopies {
         copies: [CopyState { identity, marker }; 4],
@@ -182,9 +116,8 @@ fn marker_word(marker: Marker) -> &'static str {
     }
 }
 
-/// The engine marker a bench read reply names: the driver's answer is
-/// already in the collapsed engine vocabulary — the sentinels read as
-/// `Joining`, exactly as the disk path's `engine_marker` collapses them.
+/// The engine marker a bench read reply names (the sentinels read as
+/// `Joining`).
 #[cfg(unix)]
 fn word_marker(word: &str) -> Option<Marker> {
     match word {
@@ -199,9 +132,7 @@ fn word_marker(word: &str) -> Option<Marker> {
 /// harness driver's unix socket, one request one reply.
 #[cfg(unix)]
 struct MemBackend {
-    /// The driver's socket: the write half and the read half behind one
-    /// lock, so the store's RPCs (the engine's scheduled calls and the
-    /// emission gate's round) share the one wire discipline.
+    /// The driver's socket, one wire discipline behind one lock.
     socket: std::sync::Mutex<(UnixStream, BufReader<UnixStream>)>,
 }
 
@@ -248,11 +179,9 @@ impl MemBackend {
     }
 }
 
-/// The store backend: the real application's durable mechanics (`Disk` —
-/// the quorum plus the projection), or the bench harness's force-feed
-/// (`Mem` — every engine call rides the driver's socket and the driver
-/// answers from memory, enforcing the signalled discipline; unix-only,
-/// like the bench).
+/// The store backend: the real application's durable mechanics (`Disk`),
+/// the bench harness's force-feed (`Mem`), or the embedder's mounted
+/// fence (`Mounted`).
 #[cfg(unix)]
 enum Backend {
     Disk { state: PathBuf },
@@ -260,8 +189,7 @@ enum Backend {
     Mounted(MountedFence),
 }
 
-/// The durable-only backend: non-unix builds carry no bench, and the
-/// mounted fence is in both builds.
+/// The durable-only backend: non-unix builds carry no bench.
 #[cfg(not(unix))]
 enum Backend {
     Disk { state: PathBuf },
@@ -269,30 +197,21 @@ enum Backend {
 }
 
 /// The mounted fence, in both builds: the embedder's own
-/// [`LifecycleStore`], handed to [`GateStore::over`] by the embedding
-/// constructor and riding the boot gate's every marker call. The mutex is
-/// the `&mut` the trait's contract names: the boot gate reaches the fence
-/// through a shared reference (`Clean::store`/`Crashed::store` hand back
-/// `&S`), and the machine's write path stays the trait's own `commit`.
-/// `Send + Sync` because the fence is the fourth seam: the node carries
-/// it the way it carries its `Disk`, `StateStore` and `CommitHook` —
-/// including across the thread boundary a host spawns (`Send`), and the
-/// seam family's own sharing bar (`Sync`).
+/// [`LifecycleStore`], handed to [`GateStore::over`]. The mutex is the
+/// `&mut` the trait's contract names; `Send + Sync` because the node
+/// carries it the way it carries its other seams.
 type MountedFence = Mutex<Box<dyn LifecycleStore<Error = io::Error> + Send + Sync>>;
 
-/// Locks the mounted fence. A poisoned lock (a panic while held) is
-/// unlocked: the same discipline the sink door takes — the fence's
-/// durable state is the embedder's own machine's, not an invariant of
-/// this adapter's.
+/// Locks the mounted fence. A poisoned lock is unlocked: the fence's
+/// durable state is the embedder's own machine's.
 fn fence_guard(
     fence: &MountedFence,
 ) -> MutexGuard<'_, Box<dyn LifecycleStore<Error = io::Error> + Send + Sync>> {
     fence.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// The engine marker's name, spelled as the engine's own vocabulary
-/// (`docs/uvrr-io-obligations.md`, the boot-gate chapter): the word the
-/// marker-round schedule records — never the on-disk projection's word.
+/// The engine marker's name, spelled as the engine's own vocabulary —
+/// the word the marker-round schedule records.
 fn machine_word(marker: Marker) -> &'static str {
     match marker {
         Marker::Stopping => "Stopping",
@@ -303,20 +222,10 @@ fn machine_word(marker: Marker) -> &'static str {
 }
 
 /// The host's durable mechanics for the boot gate: the superblock quorum
-/// store plus the single-file projection, wired to the committed-
-/// transition sink for the halt's drain — or the bench harness's
+/// store plus the single-file projection — or the bench harness's
 /// in-memory driver store, or the embedding constructor's mounted fence
-/// ([`GateStore::over`]), the embedder's own [`LifecycleStore`]. The
-/// system identifier is the
-/// descriptor's own member's system half — the projection read is
-/// checked against it. The `ops` log records every marker round the
-/// boot-gate machine wrote (`commit:<Marker>@<packed identity>`) and the
-/// drain the halt schedule forces between its rounds (`drain`), in write
-/// order. The boot's
-/// classification branches and the store's read verdicts are NOT on this
-/// tape: they name themselves on the lifecycle census tape instead
-/// (`crate::trace_line!`), which is where a REFUSED boot can be seen at
-/// all — a refusal hands back no node, so it has no per-node tape.
+/// ([`GateStore::over`]). The `ops` log records every marker round the
+/// machine wrote and the drain the halt forces, in write order.
 pub(crate) struct GateStore {
     backend: Backend,
     sink: SinkDoor,
@@ -342,13 +251,7 @@ impl GateStore {
     }
 
     /// The mounted fence: the embedder's own boot-gate store, handed up
-    /// by the embedding constructor ([`Node::open_with_seams`]'s fence
-    /// parameter — the fence door). The marker machine's rounds ride the
-    /// mounted store's `commit`, the halt's drain rides its `drain`
-    /// beside the node's own sink drain, and the boot's read rides its
-    /// `read_copies`. The system identifier carries nothing here — the
-    /// mounted store owns its own durable mechanics, and the projection
-    /// cross-system check is the disk backend's, not the trait's.
+    /// by the embedding constructor.
     pub(crate) fn over(
         fence: Box<dyn LifecycleStore<Error = io::Error> + Send + Sync>,
         sink: SinkDoor,
@@ -362,12 +265,9 @@ impl GateStore {
         }
     }
 
-    /// The bench-harness store: no durable marker I/O at all — every
-    /// engine call (`read_copies`, `commit`, `drain`) is an RPC to the
+    /// The bench-harness store: every engine call is an RPC to the
     /// harness driver, which holds the identity's state in memory and
-    /// fails the run on an unsignalled or out-of-order call
-    /// (`docs/src/bench-harness.md`). The connect failure refuses the
-    /// boot exactly as a durable read failure does.
+    /// fails the run on an unsignalled or out-of-order call.
     #[cfg(unix)]
     pub(crate) fn mem(
         ctl: &Path,
@@ -384,11 +284,8 @@ impl GateStore {
 
     /// The emission gate's one durable round: the crash bump's marker
     /// write — the next life at the running sentinel — fsync-complete
-    /// before the driver releases the first announcement. Unconditional:
-    /// the round lands seated or not. The argument is the bumped pair
-    /// itself; an identity with a zero half is no identity and refuses
-    /// here. The round is the adapter's own write, not the engine's;
-    /// the `boot.emission-gate` census line is where it shows itself.
+    /// before the driver releases the first announcement. A zero half is
+    /// no identity and refuses here.
     pub(crate) fn emission_gate(&self, identity: NodeId) -> io::Result<()> {
         match &self.backend {
             Backend::Disk { state } => {
@@ -426,11 +323,6 @@ impl GateStore {
                 }))?;
                 MemBackend::ack(&reply)
             }
-            // The mounted fence's round is the trait's own write shape:
-            // the machine's uniform 4x `(identity, Joining)` copies
-            // through the mounted `commit` — the same round the deferred
-            // latch re-writes idempotently once the seated observation
-            // mints its witness.
             Backend::Mounted(fence) => {
                 fence_guard(fence).commit(&uniform(identity, Marker::Joining))
             }
@@ -438,12 +330,8 @@ impl GateStore {
     }
 
     /// The clean classification's view record (the stop's drain-window
-    /// write): the view the node stopped at. `None` when no stop ever
-    /// wrote one. The mem backend carries none (the bench driver holds
-    /// the state in memory and answers its own discipline), and the
-    /// mounted fence carries none either: the embedder's fence owns its
-    /// own durable mechanics, and a boot over it resumes fenced at the
-    /// genesis view exactly as a boot without a record does.
+    /// write); `None` when no stop ever wrote one, or when the backend is
+    /// the mem or mounted fence.
     #[cfg(unix)]
     pub(crate) fn view_record(&self) -> io::Result<Option<ViewRecord>> {
         match &self.backend {
@@ -462,17 +350,14 @@ impl GateStore {
 }
 
 /// The durable read: the working quorum's verdict, or the compatibility
-/// projection's while the copies predate this routing. The marker's
-/// `NodeIdentity` pair vouches for the life; the engine's lifecycle
-/// input is the packed pair.
+/// projection's while the copies predate this routing.
 #[cfg(not(target_os = "windows"))]
 fn read_copies_disk(state: &Path, system: u16) -> io::Result<Option<SuperblockCopies>> {
     let superblock = superblock_path(state);
     if !superblock.exists() {
         // The copies never existed: the single file is the boot input
-        // (the legacy migration — the first routed write seeds the
-        // copies from the file's own state). Neither storage present
-        // is the first life, which has no durable identity yet.
+        // (the legacy migration); neither storage present is the first
+        // life, which has no durable identity yet.
         if !state.exists() {
             crate::trace_line!("marker.read.absent");
             return Ok(None);
@@ -499,14 +384,8 @@ fn read_copies_disk(state: &Path, system: u16) -> io::Result<Option<SuperblockCo
         crate::trace_line!("marker.read.projection");
         return Ok(Some(uniform(identity, marker)));
     }
-    // The copies exist: they are the authoritative read. THE
-    // BOOT-READ SAFETY LAW: a bad checksum on ANY copy is a loud log
-    // and a PANIC (the adapter panics on the Zig store's distinct
-    // refusal code) — never cleared, never repaired, never fallen
-    // back, never "unclear". An old-format marker (INCOMPATIBLE) is
-    // invalid, never converted. Any other unreadable shape (no quorum,
-    // a fork, any refusal) is an error — the boot refuses rather than
-    // guessing an identity or falling back to the projection.
+    // An old-format marker (INCOMPATIBLE) is invalid, never converted;
+    // any other unreadable shape is an error — the boot refuses.
     let classified = marker::classify(&superblock).map_err(|code| {
         if code == marker::CORRUPT {
             crate::trace_line!("marker.read.corrupt");
@@ -556,9 +435,7 @@ fn read_copies_disk(state: &Path, system: u16) -> io::Result<Option<SuperblockCo
     Ok(Some(uniform(identity, marker)))
 }
 
-/// The durable write: the quorum write, then the projection mirror. The
-/// pair the engine decided is spelled as it stands — the identity's own
-/// halves, no re-derivation.
+/// The durable write: the quorum write, then the projection mirror.
 #[cfg(not(target_os = "windows"))]
 fn commit_disk(state: &Path, copy: CopyState) -> io::Result<()> {
     let identity = marker::NodeIdentity::from_packed(copy.identity.0).ok_or_else(|| {
@@ -574,8 +451,7 @@ fn commit_disk(state: &Path, copy: CopyState) -> io::Result<()> {
         }
         io::Error::other(format!("the marker quorum write failed (FFI code {code})"))
     })?;
-    // The compatibility projection: the single-file write, only AFTER
-    // the quorum write succeeded.
+    // The compatibility projection: only AFTER the quorum write succeeded.
     write_marker(
         state,
         identity.system_identifier(),
@@ -676,8 +552,7 @@ impl LifecycleStore for GateStore {
     }
 
     fn commit(&mut self, copies: &SuperblockCopies) -> Result<(), Self::Error> {
-        // Invariant (asserted, always): the engine's rewrites are uniform
-        // 4x — a non-uniform set has no representation on this store.
+        // Invariant (asserted, always): the engine's rewrites are uniform 4x.
         let copy = copies.copies[0];
         assert!(
             copies.copies.iter().all(|one| *one == copy),
@@ -710,11 +585,8 @@ impl LifecycleStore for GateStore {
     }
 
     fn drain(&mut self) -> Result<(), Self::Error> {
-        // The sink drain is the node's own obligation — every record the
-        // event journal holds, forced — and the mounted fence's `drain`
-        // rides the same halt seat beside it: the machine's
-        // `Marker::Stopped` round is written only over a proven drain, so
-        // the fence's durable state is forced here with the journal's.
+        // The sink drain is the node's own obligation; the mounted
+        // fence's `drain` rides the same halt seat beside it.
         let result =
             drain_sink(&mut sink_guard(&self.sink)).and_then(|()| match &mut self.backend {
                 Backend::Mounted(fence) => fence_guard(fence).drain(),

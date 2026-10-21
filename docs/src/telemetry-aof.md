@@ -130,10 +130,7 @@ stream. The filtered lines force-feed a node in the unit tests through
 the same playback engine the Flight Recorder's tape feeds
 ([the Flight Recorder](flight-recorder.md)); its streamer
 (`skaffold_flight_tape`) renders the identical CSV shape over the
-internal recordings. The telemetry capture file is the stable-ish,
-prod, UI-facing plane; the Flight Recorder is the feature-flagged,
-debug-only plane whose internal format is unstable and whose deep read
-is same-commit-readable only. Each streamer's from/to derivation rules
+internal recordings. Each streamer's from/to derivation rules
 are printed in its `--help`.
 
 A wire row's `from` is the sender the recorder's own JSON log series

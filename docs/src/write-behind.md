@@ -17,47 +17,19 @@ clean halt.
 
 The **WAL snapshot store** — the lock table's periodic async snapshot over
 the tbio-core engine — is the C ABI's mounted store: the node constructor
-mounts it beside the state path (the state path's name with a `.wal`
-suffix), and nothing above the `StateStore` trait knows which store the
-node holds. The node's ~1000 ms tick loop drives it — completions drained,
-one generation submitted per stream, completions drained again — and the
-clean-shutdown stop pumps, ticks, pumps, then takes the eager flush. Zero
-fsync in the steady state: a crash mid-period is a dirty boot, and the
-dirty boot never reads the artefact. A refused construction never blocks
-the boot — the store is a fallback mechanism, never a safety mechanism, so
-the node boots on the file store and says so loudly; the lock table
-rebuilds from the replica stream. The shapes are proven by the WAL node
-tests (clean-restart persistence, dirty-boot refusal) beside the state
-seam's tests.
+mounts it beside the state path, and nothing above the `StateStore` trait
+knows which store the node holds. The node's ~1000 ms tick loop drives it
+and the clean-shutdown stop takes the eager flush.
+[wal-snapshot](wal-snapshot.md) is the store's own page; a refused
+construction never blocks the boot — the store is a fallback mechanism,
+never a safety mechanism, so the node boots on the file store and says so
+loudly while the lock table rebuilds from the replica stream.
 
-The write-behind AOF writer is built and defended, and the host surface
-reaches it: the C ABI's `lunet_lock_node_new_aof` and the server's
-`--aof-dir` (with `--aof-flush-ms`) mount the writer in the journal's
-place — the mounts exclusive, the AOF directory required, the roll
-threshold fixed at the 2 MiB erasure block. The example crate's standby
-mode (`--aof-dir`) constructs the same sink. The writer is compiled and
-tested by `make ext-test` and the WAL node tests.
-
-## Why a frame and not a running series
-
-The contract that settles the shape is the boot fence's: **a dirty boot
-never trusts the local series**. A node that crashed reincarnates and
-recovers its locks from the live peers, whose memory holds the live locks
-and the inflight commands whole. The local artefact is therefore read on
-exactly one path, the clean boot, and everything else is cost. From that
-the shape follows:
-
-- A running append series written during operation buys nothing: its
-  records would exist to shrink a shutdown dump that is already tiny,
-  and a running series must be lossless, so its queue can backpressure
-  the serving path, the one thing the serving path must never do.
-- A frame written once at shutdown has no queue, no cadence, no loss
-  window. The serving path never touches the disk at all: the node's
-  I/O jitter in operation is zero, not deferred.
-- The UI server's append-only series is the right tool in its place: a
-  continuous tape of the wire stream is what the console follows and
-  what the sync-point certificate rides. Incremental is what a tape is
-  for. A table at a point in time is what a frame is for.
+The write-behind AOF writer's mount surface — the C ABI's
+`lunet_lock_node_new_aof` and the server's `--aof-dir` (with
+`--aof-flush-ms`) — is [architecture](architecture.md)'s; the example
+crate's standby mode (`--aof-dir`) constructs the same sink. The writer is
+compiled and tested by `make ext-test` and the WAL node tests.
 
 ## The artefact
 
@@ -97,72 +69,28 @@ is cheap because there is little live state to write.
 ## The clean-shutdown ceremony
 
 The ceremony's order is fixed, and the flushed marker vouches for all of
-it:
-
-1. **Broadcast the sync point** to all nodes, fire and forget, so every
-   UI server syncs its tape. Acknowledgements are never awaited: the UI
-   servers' series are the backup certificate, and the node's certificate
-   is its own frame.
-2. **Stop the network loop.** No further protocol traffic is accepted;
-   anything arriving after this point is dropped.
-3. **Write the frame**: the sync-start marker, the live-lock records,
-   the end marker, forced and renamed by the artefact's discipline. The
-   frame write and the superblock marker rounds are independent work and
-   proceed concurrently.
-4. **When all of it is done, the node halts.** The flushed marker round
-   is written last and vouches for the frame beneath it. A halt that did
-   not finish the frame does not write flushed; the restart classifies
-   dirty and reincarnates, and the frame is never read.
+it ([the ruling](decisions.md)): broadcast the sync point fire-and-forget,
+stop the network loop, then write the frame — the sync-start marker, the
+live-lock records, the end marker, forced and renamed by the artefact's
+discipline, in parallel with the superblock marker rounds — and halt, the
+flushed marker round written last. A halt that did not finish the frame
+does not write flushed; the restart classifies dirty and reincarnates,
+and the frame is never read.
 
 ## Startup
 
 The boot fence classifies the start, and the classification chooses the
-path, exactly as the architecture document states it:
-
-- **Clean** (the marker reads flushed): the node reads its frame,
-  validates it whole (the start and end markers agree, every record's
-  checksum holds, the life pair matches the marker's), rebuilds the lock
-  table from it, and carries on: it rejoins the cluster for the protocol
-  state, which comes from the live peers as ever. The frame restores the
-  locks; the peers restore the protocol. Neither crosses into the
-  other's lane.
-- **Dirty**: the running sentinel means the last life did not finish.
-  The node reincarnates under a bumped identity and never reads the
-  frame. The lock table comes back through the cluster, from the live
-  nodes' memory.
-- **A full-cluster cold start** re-forms empty. The UI server's series
-  is the operator's backup: the record exists for an operator-driven
-  recovery, and no startup path replays it automatically.
-
-## The nuances the design rests on
-
-- **The artefact is per-life in effect**: it is written by one identity
-  at one clean halt and read back only on the clean boot of the
-  deployment it was written in. The boot fence's identity law is
-  unchanged: a dirty marker disqualifies the frame along with the
-  identity.
-- **A clean boot with a bad frame is a contradiction the operator must
-  see.** Checksum every record, demand the end marker, refuse on any
-  disagreement, never repair in place. The refusal path is the
-  operator's.
-- **The sweep runs on the ordinary heartbeat cadence, before any flush
-  it protects.** The ceremony writes what is live at that moment; a
-  lease that expired one tick ago is released, not persisted.
-- **No lazy per-acquisition flush.** Under the boot fence's contract the
-  frame is read only on a clean boot, so incremental forcing in normal
-  operation pays for a read that never happens on the path that pays.
-  The single forced write sits where the operator chose to pay for it:
-  inside the shutdown, where the flush and the marker rounds already
-  live.
-- **The UI server's cadence is untouched.** Its sync rules force one
-  early flush per ceremony and nothing else; the broadcast is fire and
-  forget because the node's certificate is its own frame, not the UI
-  server's reply.
-- **The cost is paid where it is cheap.** The serving path never touches
-  the disk; the shutdown pays one framed write of a small live set; the
-  startup reads it once. The gift of the design is that the costly work
-  sits in the clean shutdown, and this mechanism is the reason the gift
-  survives the power cycle.
+path ([the ruling](decisions.md)). **Clean** (the marker reads flushed):
+the node reads its frame, validates it whole — the start and end markers
+agree, every record's checksum holds, the life pair matches the marker's —
+rebuilds the lock table from it, and rejoins the cluster for the protocol
+state, which comes from the live peers as ever. A clean boot with a bad
+frame is a contradiction the operator must see: refuse on any
+disagreement, never repair in place; the refusal path is the operator's.
+**Dirty**: the node reincarnates under a bumped identity and never reads
+the frame; the lock table comes back from the live nodes' memory. The
+frame restores the locks; the peers restore the protocol. Neither crosses
+into the other's lane.
 
 See [the telemetry AOF](telemetry-aof.md) for the write-behind discipline
 the UI server's tape follows, and [the decisions register](decisions.md)

@@ -139,12 +139,6 @@ alarm. Age is a conservative superset of cargo's own mtime fingerprint:
 anything cargo would rebuild, age calls stale, and a source file that
 has not moved since the build is the only way age passes.
 
-The two legs are not redundant. A commit moves no file inside a crate,
-so an artifact can be the newest file on disk and still have been built
-from an older commit — the age leg passes and only identity catches it.
-An edit to a source file always post-dates the build that preceded it,
-so the age leg catches what the stamp cannot see.
-
 ### The dirty tree
 
 A build stamped `dirty=true` names its commit but not its content, so
@@ -201,13 +195,6 @@ compare. The gate targets (`make bench`) build the artifact they boot
 in the same recipe, immediately before booting it, so there is no
 window for a stale artifact to stand in.
 
-### Docker discipline
-
-The docker ladders run on colima aarch64 from a clean image: no
-buildkit, no volume mounts, no cross-arch emulation. The image build
-and the ladder run are separate steps; the image is rebuilt from the
-pinned runtime when the tree moves.
-
 ## The observability contract
 
 Every shutdown and startup path is proven, not assumed: the
@@ -239,15 +226,12 @@ the tokens that site must still carry. The three relay drives are pinned
 twice over: the audit forbids each of them the shape it would take to
 manufacture protocol (`no_relay_drive_mints_anything` — the idle beat may
 not open a client transaction, the viewchange poll may not force a view,
-a correlation deadline may not retire an op whose traffic is in flight),
-and `examples/lease-sequencer/tests/relay_test.rs` proves the relay
-itself against real nodes: the resend multiset byte for byte with nothing
-re-proposed, the heartbeat's frontier re-announced across any number of
-beats with the replication journal standing still, and the armed
-view-change attempt re-asked at one unchanged ballot across ten timeouts.
+a correlation deadline may not retire an op whose traffic is in flight).
 The `Sorry{runbook}` verdicts
 (`StoppingNotFlushed`: free disk space and retry the flush, or a hard
-kill) are surfaced to the operator wherever `stop` fails.
+kill) are surfaced to the operator wherever `stop` fails. See
+[the timeout policy](timeout-policy.md) for the matcher's table, the
+host-drive census, and the relay proofs.
 
 ## The suite layout
 

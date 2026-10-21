@@ -1,14 +1,3 @@
-//! The three-AOF timeline aligner: reads one or more telemetry
-//! AOF directories through the typed envelope reader, classifies every
-//! record (Wire / TelemetryTimeoutDecision / TelemetryStateTransition /
-//! TelemetryOutbound), merges the traces by their local nanosecond clocks,
-//! and prints an aligned timeline excerpt. Unknown markers are rejected
-//! loudly — the reader never guesses.
-//!
-//! ```text
-//! aof-timeline <dir>... [--limit N] [--stats]
-//! ```
-
 use std::path::{Path, PathBuf};
 use tbio::envelope::{Marker, Record};
 
@@ -95,8 +84,6 @@ fn main() {
     }
 }
 
-/// The 20-byte VRR wire header's summary for a Wire record's payload:
-/// `tag(4 BE) era(4) view(4) slot(8)`, then the payload length.
 fn wire_summary(payload: &[u8]) -> String {
     if payload.len() < 20 {
         return format!("wire({} bytes, short)", payload.len());
@@ -111,9 +98,6 @@ fn wire_summary(payload: &[u8]) -> String {
     )
 }
 
-/// All records of one node's `.aof` series, oldest file first, decoded
-/// through the typed reader over the vendored checksum-validating
-/// iterator. An undecodable entry is stated, never guessed.
 fn read_series(dir: &Path) -> Vec<Record> {
     let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
         .unwrap_or_else(|e| die(&format!("cannot read {}: {e}", dir.display())))
@@ -125,6 +109,9 @@ fn read_series(dir: &Path) -> Vec<Record> {
     files.sort();
     let mut records = Vec::new();
     for file in files {
+        // SAFETY: the FFI reads only through the returned iterator and
+        // needs a byte-encoded path to an existing file; `file` is an
+        // `.aof` entry just listed from `dir`.
         let mut it = unsafe { tbio::ffi::RawIter::open(file.as_os_str().as_encoded_bytes()) }
             .unwrap_or_else(|e| die(&format!("cannot open {}: code {e}", file.display())));
         while let Ok(Some(entry)) = it.next_entry() {

@@ -1,57 +1,17 @@
-//! The host's relay: the ledger of un-acknowledged traffic and the
-//! flavoured-timeout opinions drawn from it (`docs/src/timeout-policy.md`).
-//!
-//! The core releases a message once and never re-releases it: a repeated
-//! send is a relay of what the core already put on the wire, never a
-//! message the host composes (upstream `uvrr-core/docs/architecture.md`,
-//! "Liveness: the resend, the heartbeat, and the retransmit"). This module
-//! is that host half, and nothing else:
-//!
-//! - [`Ledger`] remembers every datagram this node released that the
-//!   protocol gives a response to, and drops the ones a response answered.
-//!   The relay is a transport replay of those exact bytes to the same
-//!   peers; the ledger never mints a message.
-//! - [`cluster_timeout`] and [`poll_opinion`] ask the matcher
-//!   (`vrr::timeout::matcher`) what a node may do when a wait expires,
-//!   and the host obeys the answer. No host constant restates a
-//!   protocol opinion.
-//!
-//! Two waits draw on the ledger. The cluster wait (the quorum response a
-//! seated member awaits) relays everything it has not received a response
-//! on: phase 1's `Prepare` and phase 2's `Commit` from a leader, and a
-//! view change's `StartViewChange` fence votes and `DoViewChange`
-//! evidence from any member. The steady quiet of a leader with nothing
-//! outstanding takes the heartbeat option, which is the leader's LAST
-//! COMMIT re-announced — the frontier announcement and the proof of life
-//! in one, and no new slot.
-
 use vrr::timeout::{Opinion, State, Timeout, matcher};
 use vrr::wire::Tag;
 
-/// One datagram the core released, kept for the relay: the peer it was
-/// addressed to, the ballot that authorised it, the slot its header
-/// carries, the tag, and the exact bytes the network carried. The relay
-/// re-sends these and nothing else, so a relayed datagram is
-/// byte-identical to the datagram it repeats.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Datagram {
-    /// The member the datagram was addressed to.
     pub to: u32,
-    /// The era the header was authorised at.
     pub era: u32,
-    /// The view the header was authorised at.
     pub view: u32,
-    /// The slot the header speaks at.
     pub slot: u64,
-    /// The header's tag, decoded through the core's own table.
     pub tag: Tag,
-    /// The datagram, exactly as the core released it.
     pub bytes: Vec<u8>,
 }
 
 impl Datagram {
-    /// The relay's own name for one datagram, for a failure message: the
-    /// peer, the ballot and the slot, never a bare count.
     #[must_use]
     pub fn describe(&self) -> String {
         format!(
@@ -65,14 +25,6 @@ impl Datagram {
     }
 }
 
-/// The tags whose repeats the relay carries, and the evidence each one is
-/// answered by. The four classes are exactly the ones the resend policy
-/// names: phase 1 (`Prepare`), phase 2 (`Commit`), the ordinary fence
-/// (`StartViewChange`) and the primary's evidence request
-/// (`DoViewChange`). Everything else the core releases is either already
-/// final (a `StartView` the cluster has installed) or answered by the
-/// core's own re-release, and relaying it would put a stale ballot on
-/// the wire for no gain.
 fn relayable(tag: Tag) -> bool {
     matches!(
         tag,
@@ -80,25 +32,6 @@ fn relayable(tag: Tag) -> bool {
     )
 }
 
-/// Whether one inbound datagram is the response that retires a ledger
-/// entry. The evidence is the protocol's own, never an inference from
-/// silence:
-///
-/// - a `Prepare` is answered by its recipient's `PrepareOk` at the same
-///   slot or later (a replica acknowledges a slot only once it holds
-///   every slot before it);
-/// - a `Commit` carries no acknowledgement of its own, and the
-///   recipient's `PrepareOk` at a LATER slot is the proof it applied
-///   through this one;
-/// - a `StartViewChange` fence vote is answered by the recipient's own
-///   fence vote, which the receiver counts once however often it
-///   repeats;
-/// - `DoViewChange` evidence is answered by the designated primary
-///   installing a view of this era, which retires the attempt whatever
-///   became of the evidence itself.
-///
-/// A response from a different peer, or at a ballot the entry was not
-/// authorised at, answers nothing.
 fn answers(entry: &Datagram, from: u32, era: u32, view: u32, slot: u64, tag: Tag) -> bool {
     if entry.to != from || entry.era != era {
         return false;
@@ -112,25 +45,13 @@ fn answers(entry: &Datagram, from: u32, era: u32, view: u32, slot: u64, tag: Tag
     }
 }
 
-/// The ledger of un-acknowledged traffic: every relayable datagram this
-/// node released and no response has retired, bounded so a long partition
-/// cannot grow it without limit. The bound drops the OLDEST entries —
-/// the relay covers the recent window, and a datagram nobody answered
-/// after that many successors is traffic the cluster has moved past.
 pub struct Ledger {
     unacked: Vec<Datagram>,
-    /// The leader's last commit, kept whether or not a response has
-    /// retired it: the heartbeat re-announces the frontier, and a
-    /// frontier every replica already holds is still the frontier. One
-    /// ballot's worth of peers, replaced whole on each new commit.
     last_commit: Vec<Datagram>,
     bound: usize,
-    /// How many entries the bound has dropped, for the operator's line.
     dropped: u64,
 }
 
-/// The default bound: a window far wider than any quorum response the
-/// host's own timeouts allow, so a healthy cluster never reaches it.
 const DEFAULT_BOUND: usize = 256;
 
 impl Default for Ledger {
@@ -140,13 +61,11 @@ impl Default for Ledger {
 }
 
 impl Ledger {
-    /// An empty ledger with the default bound.
     #[must_use]
     pub fn new() -> Self {
         Self::with_bound(DEFAULT_BOUND)
     }
 
-    /// An empty ledger that keeps at most `bound` entries.
     #[must_use]
     pub fn with_bound(bound: usize) -> Self {
         Self {
@@ -157,11 +76,6 @@ impl Ledger {
         }
     }
 
-    /// Remember one datagram the node released. A tag outside the four
-    /// relayable classes is not the relay's business and is not kept. A
-    /// repeat of a datagram already standing (the core released the same
-    /// peer, ballot, slot and tag again) replaces it rather than
-    /// doubling it, so one outstanding request is one relay.
     pub fn record(&mut self, datagram: Datagram) {
         if !relayable(datagram.tag) {
             return;
@@ -186,9 +100,6 @@ impl Ledger {
         self.unacked.push(datagram);
     }
 
-    /// The leader's frontier: the newest commit released per peer. A
-    /// commit at a newer ballot replaces the whole frontier — the
-    /// previous ballot's commit is history, not this leader's frontier.
     fn remember_commit(&mut self, datagram: Datagram) {
         if let Some(standing) = self.last_commit.first()
             && (standing.era, standing.view) != (datagram.era, datagram.view)
@@ -205,7 +116,6 @@ impl Ledger {
         }
     }
 
-    /// One inbound datagram arrived: retire every entry its tag answers.
     pub fn answered(&mut self, from: u32, era: u32, view: u32, slot: u64, tag: Tag) {
         if !relayable(tag) && !matches!(tag, Tag::PrepareOk | Tag::StartView) {
             return;
@@ -214,11 +124,6 @@ impl Ledger {
             .retain(|entry| !answers(entry, from, era, view, slot, tag));
     }
 
-    /// The relay set for the ballot this node is in: every un-answered
-    /// datagram authorised at exactly `(era, view)`, in send order. An
-    /// entry from an earlier ballot is dead — the attempt it belonged to
-    /// is over, and a receiver would discard the repeat — so it is never
-    /// relayed.
     #[must_use]
     pub fn relay(&self, era: u32, view: u32) -> Vec<Datagram> {
         self.unacked
@@ -228,11 +133,6 @@ impl Ledger {
             .collect()
     }
 
-    /// The leader's last commit, the datagrams the heartbeat re-announces:
-    /// the newest commit this node released per peer, and only at the
-    /// ballot asked for. Empty when this node has released no commit at
-    /// this ballot, and a leader with nothing to re-announce beats with
-    /// nothing.
     #[must_use]
     pub fn last_commit(&self, era: u32, view: u32) -> Vec<Datagram> {
         self.last_commit
@@ -242,39 +142,25 @@ impl Ledger {
             .collect()
     }
 
-    /// How many datagrams are standing un-answered.
     #[must_use]
     pub fn unacknowledged(&self) -> usize {
         self.unacked.len()
     }
 
-    /// How many entries the bound has dropped since boot.
     #[must_use]
     pub fn dropped(&self) -> u64 {
         self.dropped
     }
 }
 
-/// The replication state a host's own status word is, in the matcher's
-/// vocabulary. A seated member of the current view — settled or inside a
-/// view change — is an agent the cluster wait and the steady quiet are
-/// protocol for; a node walking the boot machine's own path is not, and a
-/// clock event on it is not protocol (`docs/src/timeout-policy.md`).
 #[must_use]
 pub fn matcher_state(replication_state: u32) -> State {
     match replication_state {
-        // `normal` and `view_change`: seated in the cluster, the view
-        // settled or in the attempt's limbo.
         0 | 1 => State::InTheCluster,
-        // `recovering`, `replaying` and `joining`: the boot machine owns
-        // its own progress.
         _ => State::Booted,
     }
 }
 
-/// What a due cluster wait may do, decided by the matcher and nothing
-/// else: the relay of the un-acknowledged traffic, or nothing at all
-/// because the node's condition is not protocol for that wait.
 #[must_use]
 pub fn cluster_timeout(
     replication_state: u32,
@@ -291,20 +177,11 @@ pub fn cluster_timeout(
     ledger.relay(era, view)
 }
 
-/// What a due viewchange poll may do. The poll's own wait is the cluster
-/// wait — the quorum response the armed attempt awaits — and the
-/// matcher's answer for it on a seated member is the retransmit of that
-/// attempt. The same opinion answers `(steady, cluster)`, so a node that
-/// names either seated state gets the retransmit; nothing else does.
 #[must_use]
 pub fn poll_opinion(replication_state: u32) -> Opinion {
     matcher(matcher_state(replication_state), Timeout::Cluster)
 }
 
-/// What the leader's steady quiet may do: the heartbeat option, the
-/// leader's last commit re-announced. `None` when this node does not
-/// lead, when it leads with a view change in the air, or when it has
-/// committed nothing at this ballot to re-announce.
 #[must_use]
 pub fn heartbeat(last_commit: Vec<Datagram>) -> Option<Vec<Datagram>> {
     if last_commit.is_empty() {
@@ -431,7 +308,6 @@ mod tests {
         ledger.record(commit(3, 10));
         ledger.record(commit(2, 11));
         ledger.record(prepare(2, 12));
-        // The frontier every replica already holds is still the frontier.
         ledger.answered(2, 4, 42, 11, Tag::PrepareOk);
         ledger.answered(3, 4, 42, 10, Tag::PrepareOk);
         let beat = heartbeat(ledger.last_commit(4, 42)).expect("a commit stands");

@@ -1,38 +1,3 @@
-//! The experiment load client: continuous SET/BUMP/GET traffic at the
-//! configured lease cadence (the design's §1.2) with per-operation
-//! round-trip timing (§7) and client-side stats.
-//!
-//! Round trips are measured on the client's monotonic clock: one reading
-//! immediately before the request line is written and one immediately
-//! after the response line is read, one sample per operation. Expiry is
-//! interpreted against the leader's timeline through the echoed execution
-//! tick (`executed_at`) each reply carries: the client computes the lease's
-//! remaining window as `expiry - executed_at` and schedules its renewal or
-//! next poll from that, never assuming synchronized clocks.
-//!
-//! Stats: one JSON line per window (window percentiles plus cumulative
-//! percentiles, so the last line is always the summary) and, on a clean
-//! exit, a final JSON object. `by_op` counts granted outcomes: a GET is
-//! ok when it completes without error, a SET/BUMP (the acquire race or
-//! the same-holder renewal) only when the leader grants it — the
-//! leader's `granted:false` refusal is a completed round trip counted
-//! as an error, never as an ack, so the client's counters never claim
-//! renewals the committed lease state cannot account for. The bounded
-//! reporting interval is the proof-of-life discipline: the clients
-//! show what they see without taxing the cluster.
-//!
-//! The lease cadence knobs mirror the design's numbers: `--lease-ms 100
-//! --renew-fraction 0.8` runs the design's cadence exactly; the committed
-//! demo's aggressive timing (500 ms lease, renewal at half the window) is
-//! the default.
-//!
-//! The client gate boots every worker OFF: a (re)started client is silent
-//! until the first SIGUSR2 (start) and returns to OFF on SIGUSR1
-//! (silence). Silence also forgets holdership and resets the lease-id /
-//! request-num bookkeeping, so a restarted worker re-enters as a
-//! NON-holder — its first action is a GET probe, never a blind BUMP or
-//! SET renewal. Transitions are logged on the client's stdout stream.
-
 use lease_sequencer::client_gate::{self, Mode};
 use lease_sequencer::embedded_client::{Config, Contender, Signals, reply_granted};
 use serde_json::{Value, json};
@@ -56,11 +21,6 @@ struct Options {
     model: Model,
 }
 
-/// The load model. Polite (the default) is the experiment's cadence: one
-/// contender, no getters, and the not-holder probe thinned by a 1000 ms
-/// floor, so a live three-client chase is low-volume metadata. Aggressive
-/// is the parked stress shape (probe right past the leader-echoed
-/// expiry, chase workers) behind the explicit opt-in.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Model {
     Polite,
@@ -140,9 +100,6 @@ fn parse_options() -> Options {
         );
         std::process::exit(2);
     }
-    // Polite is the experiment's cadence: one contender, no getters, and
-    // the foreign-incumbent probe thinned past the leader-echoed expiry.
-    // An explicit --getters overrides; aggressive keeps every worker.
     if options.model == Model::Polite && options.getters == 1 {
         options.getters = 0;
     }
@@ -155,11 +112,6 @@ fn wall_ms() -> u64 {
         .expect("clock before epoch")
         .as_millis() as u64
 }
-
-// The process-level SIGUSR1 (silence) / SIGUSR2 (start) flags and their
-// gate plumbing live in the shared embedded-client module: the same
-// signal gate, the same transition log lines, the same chase machinery
-// the sequencer host's embedded clients run (src/embedded_client.rs).
 
 struct Rng(u64);
 
@@ -178,8 +130,6 @@ impl Rng {
     }
 }
 
-/// One timed operation: the round trip in microseconds from the client's
-/// monotonic clock.
 struct Sample {
     op: &'static str,
     ok: bool,
@@ -251,8 +201,6 @@ fn summarize(stats: &Stats) -> Value {
     })
 }
 
-/// One NDJSON connection to a node's client port, with reconnect across the
-/// server list (a killed node's port drops; the load continues at quorum).
 struct Link {
     servers: Vec<String>,
     stream: BufReader<TcpStream>,
@@ -281,9 +229,6 @@ impl Link {
         }
     }
 
-    /// One request line out, one reply line back, both timed on the
-    /// monotonic clock (§7). A dropped connection or a timed-out op counts
-    /// as an error sample and reconnects.
     fn round_trip(&mut self, request: &str, op: &'static str) -> (Sample, Option<Value>) {
         let start = Instant::now();
         let write = self
@@ -322,19 +267,7 @@ impl Link {
         }
         let rt = start.elapsed().as_micros() as u64;
         let reply: Option<Value> = serde_json::from_str(line.trim_end()).ok();
-        // The sample's ok is the GRANTED outcome, not the completed
-        // round trip: a SET (the acquire race or the same-holder
-        // renewal) is ok only when the leader granted it — the refusal
-        // (`granted:false`, the incumbent's lease echoed, no error
-        // field) is a completed round trip but never an acked
-        // operation, so the committed lease state and the client's
-        // by_op counters agree.
         let ok = reply.as_ref().is_some_and(|reply| reply_granted(reply, op));
-        // The addressed node forwards a lock verb to the leader on the
-        // peer application channel; the committed reply (or a leader-side
-        // mid-flight refusal, which rotates the connection) is the only
-        // line on the socket. Rotation still follows the leader when the
-        // client names a server list.
         let not_leader = reply.as_ref().is_some_and(|reply| {
             reply.get("error").and_then(|error| error.as_str()) == Some("not_leader")
         });
@@ -354,12 +287,6 @@ impl Link {
     }
 }
 
-/// The contender loop: hold the lock under a lease (SET), renew it one
-/// window ahead of the leader-echoed deadline (the same-holder
-/// regrant EXTENDS the lease), poll as GET while a live incumbent stands, and race to SET
-/// when the lock is free or expired — the design's §1.2 cadence, driven
-/// through the shared decision machinery (the same module the sequencer
-/// host's embedded clients run in-process).
 fn contender(options: &Options, shared: &Arc<Mutex<Vec<Sample>>>, index: usize, signals: &Signals) {
     let mut contender = Contender::new(
         Config {
@@ -394,9 +321,6 @@ fn contender(options: &Options, shared: &Arc<Mutex<Vec<Sample>>>, index: usize, 
         let (sample, reply) = link.round_trip(&action.request, action.op);
         shared.lock().unwrap().push(sample);
         if let Some(race) = contender.absorb(wall_ms(), &action, reply.as_ref()) {
-            // The inline SET race only fires while the gate is still ON:
-            // a signal mid-round-trip must never let the follow-up out
-            // (the one-op residual otherwise rides past the silence).
             signals.apply(contender.gate());
             if contender.mode() == Mode::On {
                 let (sample, reply) = link.round_trip(&race.request, race.op);
@@ -407,8 +331,6 @@ fn contender(options: &Options, shared: &Arc<Mutex<Vec<Sample>>>, index: usize, 
     }
 }
 
-/// The getter loop: fixed-interval GET probes at the configured rate,
-/// behind the same client gate — booted silent, started on SIGUSR2.
 fn getter(options: &Options, shared: &Arc<Mutex<Vec<Sample>>>, index: usize, signals: &Signals) {
     let interval = if options.high_rate { 50 } else { 250 };
     let mut rng = Rng::new(wall_ms() ^ (index as u64 + 1) ^ (std::process::id() as u64));

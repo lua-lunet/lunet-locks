@@ -78,7 +78,7 @@
   maximised local cargo cache on the rig's own disk.
 - Cloud binaries MUST have `maybe!` on and the flight recorder
   enabled; see `testing-on-cloud.md`.
-- The gateway to the cloud: clean commit + sanity build (above). See
+- The gateway to the cloud: clean commit + sanity build (above).
 
 ## The release flow
 

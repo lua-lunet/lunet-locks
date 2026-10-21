@@ -1,20 +1,3 @@
-//! The state seam at the disk boundary: the eager flush's bytes and the
-//! lazy load's guard.
-//!
-//! Three claims, each against the real `FileStateStore` over the real
-//! `StdDisk` — no fake of the trait under test, because a fake proves
-//! only that the fake agrees with itself:
-//!
-//! (a) a flushed table roundtrips byte-exactly: the loaded snapshot is
-//!     the flushed one, and applied to a fresh `Service` it reproduces
-//!     the same table.
-//! (b) a corrupted file loads as `Ok(None)`, never as an error — state
-//!     is a fallback and a fallback that blocks the boot is an outage.
-//! (c) the crashed verdict skips the load entirely: a perfectly readable
-//!     file goes unread, and only a clean verdict loads it.
-//!
-//! Real files in the repo's scratch tree (`.tmp` is scratch).
-
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -30,9 +13,6 @@ use lunet_advisory_lock::state::{FileStateStore, StateStore, lazy_load};
 use lunet_advisory_lock::{Node, PRIMARY_TIMEOUT_MS, SERVICE, census_paths};
 use uuid::Uuid;
 
-/// The store whose flush refuses — the failing leg of the FAILED-stop
-/// law. Everything else delegates to the real file store, so the test's
-/// only variable is the refusal itself.
 struct FailingFlushStore {
     inner: FileStateStore,
 }
@@ -50,13 +30,8 @@ impl StateStore for FailingFlushStore {
     }
 }
 
-/// The framed file's layout, restated here so the test's damages address
-/// the right bytes: version byte | length (u32 BE) | payload | checksum
-/// (u32 BE). `FileStateStore::frame`/`unframe` are the layout's single
-/// source; `HEADER_BYTES` is where the payload starts.
 const HEADER_BYTES: usize = 1 + 4;
 
-/// The scratch tree, inside the repo (`.tmp` is scratch).
 fn scratch(name: &str) -> PathBuf {
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.tmp/state-store");
@@ -71,15 +46,10 @@ fn scratch(name: &str) -> PathBuf {
     dir
 }
 
-/// A node state path inside `dir`. The store's file is this path plus
-/// `.state`; the marker projection and the `.view` record sit beside it
-/// and are not this seam's business.
 fn state_path(dir: &Path) -> PathBuf {
     dir.join("node.marker")
 }
 
-/// A stored record: `lock_id` varies the holder so the table's records
-/// are distinguishable one from another in the loaded bytes.
 fn lease(lock_id: u64, lease_id: u64, expiry: u64) -> Lease {
     Lease {
         lease_id,
@@ -95,11 +65,6 @@ fn lease(lock_id: u64, lease_id: u64, expiry: u64) -> Lease {
     }
 }
 
-/// A table with three records — one of each shape the lock service
-/// stores: a live hold, a renewed hold (counters non-zero), and the
-/// expired keeper record (`expiry: 0`, nil holder) a break leaves
-/// behind. Every record is non-empty state, so an empty table is
-/// distinguishable from a loaded one.
 fn table() -> StateSnapshot {
     StateSnapshot {
         locks: [
@@ -130,8 +95,6 @@ fn get_request(lock_id: u64) -> Request {
     }
 }
 
-/// One `Service::execute` against a live `Service`, at a fixed execution
-/// tick: the state machine's reply bytes for one Get.
 fn get_reply(service: &mut Service, lock_id: u64, at: u64) -> Vec<u8> {
     let request = get_request(lock_id);
     let payload = serde_json::to_vec(&request).expect("the request encodes");
@@ -142,8 +105,6 @@ fn get_reply(service: &mut Service, lock_id: u64, at: u64) -> Vec<u8> {
         .0
 }
 
-/// A `Service` holding exactly `snapshot`'s table, through the real
-/// decode/execute path and the real restore the lazy-load seam takes.
 fn service_holding(snapshot: &StateSnapshot) -> Service {
     let mut service = Service::default();
     assert!(service.is_empty(), "a fresh table is empty");
@@ -151,8 +112,6 @@ fn service_holding(snapshot: &StateSnapshot) -> Service {
     service
 }
 
-/// (a) The flush/load roundtrip: the bytes survive, the loaded table is
-/// the flushed one, and it answers identically.
 #[test]
 fn flush_then_load_roundtrips_the_table() {
     let dir = scratch("roundtrip");
@@ -225,10 +184,6 @@ fn flush_then_load_roundtrips_the_table() {
     );
 }
 
-/// (b) A rotted file loads as nothing. Every kind of damage the framing
-/// can suffer is tried: a flipped payload byte, a flipped checksum, a
-/// truncated tail, a length prefix that disagrees with the bytes
-/// present, a version byte this build does not know, and an empty file.
 #[test]
 fn corrupted_file_loads_as_none_not_an_error() {
     let dir = scratch("corrupt");
@@ -280,12 +235,6 @@ fn corrupted_file_loads_as_none_not_an_error() {
     );
 }
 
-/// The seam's defaulted answers, as the file store inherits them: a
-/// store without a tick path records nothing, submits nothing, drains
-/// nothing, reports no counters, and forgets nothing — the five
-/// defaults are the no-ops the file-store half of the law stands on,
-/// and a flush the store never made leaves the load exactly where it
-/// started.
 #[test]
 fn the_defaulted_seam_answers_are_the_no_ops() {
     let dir = scratch("defaults");
@@ -311,11 +260,6 @@ fn the_defaulted_seam_answers_are_the_no_ops() {
     );
 }
 
-/// (c) The lazy-load guard. A crashed boot's verdict reads nothing — not
-/// even a perfectly good file — and only a clean verdict loads. Driven
-/// through `lazy_load`, the seam's own guard, against the real store
-/// over a real file: the guard is the thing under test, so the test
-/// names the guard.
 #[test]
 fn a_crashed_verdict_skips_the_load() {
     let dir = scratch("verdict");
@@ -358,13 +302,6 @@ fn a_crashed_verdict_skips_the_load() {
     );
 }
 
-/// The eager flush, driven through the real `Node` stop path: the flush
-/// is in the halt schedule at the one seat the law allows it, and the
-/// file it leaves behind is loadable.
-///
-/// The census tape is the stop path's own naming of every path it took
-/// (see the `trace_line!` convention), so the schedule this asserts is
-/// the schedule the node actually walked — not a reconstruction of it.
 #[test]
 fn the_stop_flushes_eagerly_inside_the_halt_schedule() {
     let dir = scratch("stop-flush");
@@ -411,10 +348,6 @@ fn the_stop_flushes_eagerly_inside_the_halt_schedule() {
     );
 }
 
-/// The crashed verdict, driven through the real `Node` open path: a node
-/// that dies without stopping re-classifies as crashed, and that verdict
-/// is the one the lazy-load guard refuses. The file from the dead life's
-/// stop is still sitting there — the guard is what leaves it unread.
 #[test]
 fn a_crashed_boot_is_the_verdict_the_load_guard_refuses() {
     let dir = scratch("crashed-verdict");
@@ -467,11 +400,6 @@ fn a_crashed_boot_is_the_verdict_the_load_guard_refuses() {
     );
 }
 
-/// A stop that cannot flush is a FAILED stop — the law's central claim,
-/// driven through the real `Node` stop path with a store whose flush
-/// refuses. The stop reports the failure instead of skipping it, the
-/// markers never reach the drain-proven `Stopped` round (so the next boot
-/// reads crashed), and no torn half-state file is left behind.
 #[test]
 fn a_stop_that_cannot_flush_is_a_failed_stop() {
     let dir = scratch("flush-refused");
@@ -558,12 +486,6 @@ fn a_stop_that_cannot_flush_is_a_failed_stop() {
     );
 }
 
-/// The one-byte label's validation: a single lowercase letter matches
-/// the documented pattern (`^[a-z0-9](?:[-a-z0-9]{0,30}[a-z0-9])?$`) and
-/// must decode — a slice-arithmetic panic on the one-byte form would
-/// crash every request carrying one, silently at the client edge. The
-/// regression guards the boundary the labels ride (the WAL frame's tag
-/// bytes carry them).
 #[test]
 fn a_one_byte_label_decodes() {
     let request = r#"{"op":"set","message_id":"b0000000-0000-4000-8000-000000000001","client_id":6,"request_num":1,"lock_id":9306,"labels":["x"],"lease":{"lease_id":6,"holder":"33333333-3333-3333-3333-333333333333","lease_ms":30000}}"#;
@@ -577,8 +499,6 @@ fn a_one_byte_label_decodes() {
     }
 }
 
-/// A three-member descriptor: distinct provisioned identities, the
-/// genesis succession order, NUL-separated, no trailing NUL.
 fn members() -> String {
     [1u32, 2, 3]
         .iter()

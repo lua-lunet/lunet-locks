@@ -1,14 +1,3 @@
-//! The disk seam's error honesty: a fault-injecting Disk whose selected
-//! operations return `Err`, driven through the crate's real consumers, so
-//! what is pinned is the error crossing the boundary — no unwrap, no
-//! panic, no silent swallow, the error text reaching the caller.
-//!
-//! `disk_impl_externally_test.rs` proves a foreign Disk mounts;
-//! `engine_file_externally_test.rs` proves a foreign handle mounts. This
-//! file proves the third thing the seam sells (the durability contract's
-//! own words: an implementation "must report failure the way the
-//! underlying operation does"): the failures propagate.
-
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -17,8 +6,6 @@ use lunet_advisory_lock::spi::{
     Disk, DiskDirEntry, DiskFile, FileStateStore, StateSnapshot, StateStore, StdDisk,
 };
 
-/// The operations a test can poison. One enum so the fault matrix is
-/// nameable and the injection point is one match.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Fault {
     CreateNewWrite,
@@ -28,9 +15,6 @@ enum Fault {
     Read,
 }
 
-/// A foreign Disk that delegates everything to StdDisk except the one
-/// faulted operation, which always refuses — with its own error text, so
-/// the tests can assert the TEXT survived the boundary.
 struct FaultDisk {
     inner: StdDisk,
     fault: Mutex<Option<Fault>>,
@@ -131,7 +115,6 @@ impl Disk for FaultDisk {
     }
 }
 
-/// The scratch tree, inside the repo.
 fn scratch(name: &str) -> PathBuf {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../.tmp")
@@ -141,14 +124,10 @@ fn scratch(name: &str) -> PathBuf {
     dir
 }
 
-/// The empty-table snapshot the flush paths are driven with.
 fn empty_table() -> StateSnapshot {
     serde_json::from_str(r#"{"locks":{},"generations":{}}"#).expect("an empty table")
 }
 
-/// A faulting create_new_write surfaces through FileStateStore::flush: the
-/// error text crosses the boundary whole, and no state file is left
-/// behind — the staged write never started.
 #[test]
 fn a_faulting_stage_refuses_the_flush_and_leaves_nothing() {
     let dir = scratch("stage");
@@ -183,9 +162,6 @@ fn a_faulting_stage_refuses_the_flush_and_leaves_nothing() {
     );
 }
 
-/// A faulting rename surfaces through FileStateStore::flush, AND the
-/// staged temp file is removed on the way out — the failure cleans up
-/// after itself instead of littering the state directory.
 #[test]
 fn a_faulting_rename_refuses_the_flush_and_removes_the_staging_file() {
     let dir = scratch("rename");
@@ -218,10 +194,6 @@ fn a_faulting_rename_refuses_the_flush_and_removes_the_staging_file() {
     );
 }
 
-/// A faulting sync_path — the parent-directory fsync — surfaces through
-/// flush: the data may be renamed into place, but the flush refuses,
-/// because a directory entry the medium has not confirmed is not a
-/// durable state file.
 #[test]
 fn a_faulting_parent_sync_refuses_the_flush() {
     let dir = scratch("sync");
@@ -243,9 +215,6 @@ fn a_faulting_parent_sync_refuses_the_flush() {
     // state_store_test). Here the pin is the refusal alone.
 }
 
-/// A faulting read_dir surfaces through the store's load path as an Err —
-/// an unreadable directory is a store in trouble, never a silent
-/// "no state", which is the one lie the lazy-load contract cannot carry.
 #[test]
 fn a_faulting_read_dir_is_an_error_not_a_silent_no_state() {
     let dir = scratch("readdir");
@@ -269,11 +238,6 @@ fn a_faulting_read_dir_is_an_error_not_a_silent_no_state() {
     );
 }
 
-/// A faulting read surfaces through load as an Err: a state file that
-/// cannot be READ is a store in trouble — the fallback that blocks the
-/// boot must stay named, and the crate's caller (Node's
-/// load_state_on_demand) is the documented place that converts it to the
-/// empty-table fallback.
 #[test]
 fn a_faulting_read_is_an_error_named_whole() {
     let dir = scratch("read");

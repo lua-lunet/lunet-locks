@@ -1,43 +1,7 @@
-//! The AOF console bridge: the vanilla JS console reads the trace.
-//!
-//! One binary surface, read-only on the standby's AOF series:
-//!
-//! 1. Read every `.aof` file of the series (epoch order) through the
-//!    vendored checksum-validating iterator and decode each entry through
-//!    the typed envelope layer (`Record::decode`).
-//! 2. For Wire (marker 1) payloads — the raw uVRR wire messages,
-//!    byte-identical to what the network carried — decode through the
-//!    core's `Message::unpack_from` (the parser `Node::receive` itself
-//!    runs). A Prepare whose entry payload decodes through
-//!    `lunet_advisory_lock::locks::Service` is committed lock work; the
-//!    payload replays through the real `Service::execute` state machine
-//!    (the exact path the adapter's `Effect::Apply` arm runs at commit),
-//!    yielding the same `Transition` the standby's AOF sink journaled:
-//!    acquire / renew / release / break — plus the granted=false deny a
-//!    losing competitor committed.
-//! 3. Serve the console's OpenAPI shapes over loopback HTTP:
-//!    `/api/v1/health`, `/locks` (state replayed from the committed
-//!    stream), `/events` (the append-only log derived from the committed
-//!    work), `/metrics` (every message kind counted), the telemetry
-//!    panel's `/telemetry/log` (the observability contract's JSON log
-//!    series — the `--log-dir` rolling `.log` files plus the telemetry
-//!    tape's slot-frontier records), and a live WebSocket push at
-//!    `/api/v1/live` while `--follow` re-scans the series as it grows.
-//!
-//! # Time at the boundary
-//!
-//! The envelope header carries the writing node's nanosecond clock. The
-//! console speaks epoch milliseconds. The conversion is one-way integer
-//! floor division `ms = ns / 1_000_000` at the boundary (the same
-//! truncation direction the journal's ms stamps take); the bridge never
-//! widens a millisecond back to nanoseconds, and `/metrics` reports the
-//! raw `firstNs`/`lastNs` stamps so a post-mortem keeps full precision.
-//!
-//! # Read-only
-//!
-//! The bridge opens every file through the Zig iterator's read-only open;
-//! it never takes the writer's exclusive lock and never writes, renames,
-//! or deletes — the standby owns the series.
+//! The AOF console bridge: the standby's AOF series replayed through the
+//! real `Service` state machine and served as the console's HTTP surface.
+//! The replay reads read-only — it never writes, renames, or takes the
+//! writer's lock; the standby owns the series.
 
 use lunet_advisory_lock::locks::{Response, Service, Transition};
 use serde_json::{Value, json};
@@ -54,9 +18,6 @@ use vrr::journal::Payload;
 use vrr::message::{Body, Message};
 use vrr::wire::{Tag, Unpack};
 
-/// The wire alphabet's kind names, in tag order — the /metrics message
-/// table's keys. Total over the core's tags: a message kind is counted,
-/// never dropped.
 pub const TAG_NAMES: [&str; 14] = [
     "Prepare",
     "PrepareOk",
@@ -93,34 +54,20 @@ fn tag_name(tag: Tag) -> &'static str {
     }
 }
 
-/// The ns → ms boundary conversion: one-way integer floor division. The
-/// console speaks epoch milliseconds; full precision stays in the envelope
-/// header and is reported raw in /metrics.
 pub fn ns_to_ms(ns: u64) -> u64 {
     ns / 1_000_000
 }
 
-/// One derived lock event — the openapi `Event` shape plus the raw ns
-/// stamp.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LockEvent {
-    /// The console's event kind: acquire | renew | release | break | deny
-    /// (expire is reserved: expiry is not committed work).
     pub kind: String,
-    /// The record's envelope ns clock (full precision, the source of truth).
     pub ns: u64,
-    /// `ns` floored to epoch milliseconds — what the console renders.
     pub ts_ms: u64,
     pub lock_id: u64,
-    /// The lock's display name (sticky, from the replayed state).
     pub name: String,
-    /// The acting holder, as a uuid string; the console's holder.
     pub holder: String,
-    /// The console's actor field.
     pub actor: String,
-    /// The human detail line.
     pub detail: String,
-    /// The append-only sequence, 1-based over the derived event log.
     pub seq: u64,
 }
 
@@ -140,7 +87,6 @@ impl LockEvent {
     }
 }
 
-/// One replayed lock — the console's openapi `Lock` shape fields.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LockView {
     pub id: u64,
@@ -159,9 +105,6 @@ pub struct LockView {
 
 impl LockView {
     fn to_json(&self, now_ms: u64) -> Value {
-        // The live-lease rule is the Service's own: expiry > now and a
-        // real holder. The keeper record a break installs (nil holder,
-        // expiry 0) renders free.
         let held = self.holder.is_some()
             && self.holder.as_deref() != Some("00000000-0000-0000-0000-000000000000")
             && self.expires_at_ms.is_some_and(|expiry| expiry > now_ms);
@@ -183,34 +126,21 @@ impl LockView {
     }
 }
 
-/// The replayed lock table, keyed by lock id.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LockState {
     pub locks: BTreeMap<u64, LockView>,
 }
 
-/// Per-series counters: every record and message kind counted.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BridgeMetrics {
-    /// Envelope records decoded (unknown-marker entries excluded).
     pub records: u64,
-    /// Entries the readers refused (unknown marker, bad wire payload) —
-    /// stated, never guessed.
     pub undecodable: u64,
-    /// Per-marker record counts (wire / timeout_decision /
-    /// state_transition / outbound).
     pub markers: BTreeMap<String, u64>,
-    /// Per-wire-message-kind counts (every tag, not just lock work).
     pub messages: BTreeMap<String, u64>,
-    /// Per-lock-event-kind counts (acquire/renew/release/break/deny/get).
     pub lock_events: BTreeMap<String, u64>,
-    /// First record's ns stamp (full precision).
     pub first_ns: Option<u64>,
-    /// Last record's ns stamp (full precision).
     pub last_ns: Option<u64>,
-    /// The highest era the decoded wire headers authorised.
     pub max_era: Option<u32>,
-    /// The highest view the decoded wire headers authorised.
     pub max_view: Option<u32>,
 }
 
@@ -239,8 +169,6 @@ impl BridgeMetrics {
     }
 }
 
-/// The replay snapshot: the derived event log (ns order), the lock state,
-/// the counters, and the telemetry panel's log series.
 #[derive(Debug, Clone, Default)]
 pub struct Replay {
     pub events: Vec<LockEvent>,
@@ -249,27 +177,13 @@ pub struct Replay {
     pub log: TelemetryLog,
 }
 
-/// The console telemetry panel's data source: the observability
-/// contract's JSON log series (`docs/src/test-scaffold.md`) — every
-/// JSON-object line of the `--log-dir` rolling `.log` files (the named
-/// protocol events, each carrying `ts`), plus the telemetry tape's
-/// state-transition JSON records (the slot-frontier records, `ts`
-/// injected from the envelope ns floored to ms), in ts order.
 #[derive(Debug, Clone, Default)]
 pub struct TelemetryLog {
-    /// The ts-ordered JSON lines — every line an object carrying `ts`
-    /// and `event`.
     pub lines: Vec<Value>,
-    /// Lines that did not parse as a JSON object carrying a `ts` (the
-    /// Lua host's stdout captured beside the node's own log) — stated,
-    /// never served.
     pub unparsed: u64,
 }
 
 impl TelemetryLog {
-    /// The `/api/v1/telemetry/log` body: the lines in the `[from_ms,
-    /// to_ms]` window (the whole span when absent), the unparsed-neighbor
-    /// count, and the served window's own bounds.
     pub fn to_json(&self, from_ms: Option<u64>, to_ms: Option<u64>) -> Value {
         let lines: Vec<&Value> = self
             .lines
@@ -292,7 +206,6 @@ impl TelemetryLog {
     }
 }
 
-/// One decoded committed op: everything the replay needs.
 struct CommittedOp {
     ns: u64,
     message_id: Uuid,
@@ -301,14 +214,10 @@ struct CommittedOp {
     payload: Vec<u8>,
     kind: String,
     lock_id: u64,
-    /// The Set's offered holder, when the op is a Set.
     offered: Option<Uuid>,
-    /// The Set's offered lease_ms (the requested duration), when the op
-    /// is a Set.
     lease_ms: Option<u64>,
 }
 
-/// The request's wire kind name, from its decoded envelope.
 fn request_kind(request: &lunet_advisory_lock::locks::Request) -> &'static str {
     match request {
         lunet_advisory_lock::locks::Request::Get { .. } => "get",
@@ -327,7 +236,6 @@ fn request_lock_id(request: &lunet_advisory_lock::locks::Request) -> u64 {
     }
 }
 
-/// The Set request's holder uuid, when the payload is a Set.
 fn set_holder(request: &lunet_advisory_lock::locks::Request) -> Option<Uuid> {
     match request {
         lunet_advisory_lock::locks::Request::Set { lease, .. } => Some(lease.holder),
@@ -335,8 +243,6 @@ fn set_holder(request: &lunet_advisory_lock::locks::Request) -> Option<Uuid> {
     }
 }
 
-/// The Set request's offered lease_ms (the requested duration), when
-/// present.
 fn set_lease_ms(request: &lunet_advisory_lock::locks::Request) -> Option<u64> {
     match request {
         lunet_advisory_lock::locks::Request::Set { lease, .. } => Some(lease.lease_ms),
@@ -344,16 +250,10 @@ fn set_lease_ms(request: &lunet_advisory_lock::locks::Request) -> Option<u64> {
     }
 }
 
-/// Replay one series directory: every `.aof` file in epoch order, every
-/// record decoded, every committed lock op executed through the real
-/// Service state machine. Read-only on disk; deterministic across runs.
 pub fn replay_series(dir: &Path) -> (Vec<LockEvent>, LockState, BridgeMetrics) {
     let mut metrics = BridgeMetrics::default();
     let mut committed: Vec<CommittedOp> = Vec::new();
 
-    // Pass 1: decode every record; classify Wire payloads and collect the
-    // committed lock work (Prepare entries whose payload passes the same
-    // `Service::decode` gate the adapter applies at commit).
     for file in series_files(dir) {
         for record in read_file_records(&file, &mut metrics) {
             metrics.records += 1;
@@ -371,8 +271,6 @@ pub fn replay_series(dir: &Path) -> (Vec<LockEvent>, LockState, BridgeMetrics) {
                 continue;
             }
 
-            // The wire message: the core's own parser, the one
-            // `Node::receive` runs on every datagram.
             let message = match Message::unpack_from(&record.payload) {
                 Ok(message) => message,
                 Err(_) => {
@@ -404,9 +302,6 @@ pub fn replay_series(dir: &Path) -> (Vec<LockEvent>, LockState, BridgeMetrics) {
                 continue;
             };
 
-            // The committed-payload gate: the same `Service::decode` the
-            // adapter's `valid_message_payloads` applies inbound and its
-            // `Effect::Apply` arm applies at commit.
             let Ok(request) = Service::decode(payload) else {
                 continue;
             };
@@ -428,19 +323,12 @@ pub fn replay_series(dir: &Path) -> (Vec<LockEvent>, LockState, BridgeMetrics) {
         }
     }
 
-    // Pass 2: replay the committed stream in slot order (record order) —
-    // slot order IS record order within the standby's trace, since the
-    // standby appends each datagram at its local ns receipt and commits
-    // follow the Prepare stream it records.
     committed.sort_by_key(|op| op.ns);
 
     let mut service = Service::default();
     let mut events: Vec<LockEvent> = Vec::new();
     let mut seq: u64 = 0;
-    // The replay mirror: the executed replies' own shapes — the Service's
-    // stored lease rides every Set/Get/Break reply, and a released lock's
-    // absence IS the free state. Names/labels stick from the stored lease.
-    let mut current: BTreeMap<u64, lunet_advisory_lock::locks::Lease> = BTreeMap::new();
+    let mut leases: BTreeMap<u64, lunet_advisory_lock::locks::Lease> = BTreeMap::new();
     let mut names: BTreeMap<u64, String> = BTreeMap::new();
     let mut labels_seen: BTreeMap<u64, Vec<String>> = BTreeMap::new();
     let mut holder_changes: BTreeMap<u64, u64> = BTreeMap::new();
@@ -449,8 +337,6 @@ pub fn replay_series(dir: &Path) -> (Vec<LockEvent>, LockState, BridgeMetrics) {
 
     for op in committed {
         let now_ms = ns_to_ms(op.ns);
-        // The executed reply: the same serde shapes the state machine
-        // returns at commit — the reply IS the observation surface.
         let executed = service.execute(
             op.message_id,
             op.client_id,
@@ -464,9 +350,6 @@ pub fn replay_series(dir: &Path) -> (Vec<LockEvent>, LockState, BridgeMetrics) {
         };
         let reply: Option<Response> = serde_json::from_slice(&bytes).ok();
 
-        // Fold the reply into the state mirror: the stored lease rides
-        // every Set/Get/Break reply; a released lock's absence IS the
-        // free state. Names/labels stick from the stored lease.
         match &reply {
             Some(Response::Set {
                 granted: true,
@@ -478,10 +361,10 @@ pub fn replay_series(dir: &Path) -> (Vec<LockEvent>, LockState, BridgeMetrics) {
                 lease: Some(lease),
                 ..
             }) => {
-                current.insert(op.lock_id, lease.clone());
+                leases.insert(op.lock_id, lease.clone());
             }
             Some(Response::Release { released: true, .. }) => {
-                current.remove(&op.lock_id);
+                leases.remove(&op.lock_id);
             }
             _ => {}
         }
@@ -501,8 +384,6 @@ pub fn replay_series(dir: &Path) -> (Vec<LockEvent>, LockState, BridgeMetrics) {
 
         match transition {
             Some(transition) => {
-                // Holder-changing Hold transitions bump the counter; a
-                // Renew never does.
                 if matches!(transition, Transition::Hold { .. }) {
                     *holder_changes.entry(op.lock_id).or_insert(0) += 1;
                     last_holder_change.insert(op.lock_id, now_ms);
@@ -518,8 +399,6 @@ pub fn replay_series(dir: &Path) -> (Vec<LockEvent>, LockState, BridgeMetrics) {
             }
             None => {
                 if op.kind == "set" {
-                    // A Set that decoded and executed but granted nothing:
-                    // a denied acquire is committed lock work too.
                     let held_by = reply_lease(&reply)
                         .map(|lease| lease.holder.to_string())
                         .unwrap_or_else(|| "—".to_string());
@@ -546,25 +425,19 @@ pub fn replay_series(dir: &Path) -> (Vec<LockEvent>, LockState, BridgeMetrics) {
                     *metrics.lock_events.entry("deny".to_string()).or_insert(0) += 1;
                     events.push(event);
                 } else {
-                    // Get (and any other non-transitioning op): counted,
-                    // never an event.
                     *metrics.lock_events.entry(op.kind.clone()).or_insert(0) += 1;
                 }
             }
         }
     }
 
-    // The replayed state: derived from the transitions and replies above —
-    // the final Service table is private, so the bridge folds the observed
-    // replies into its own mirror (the deterministic replay makes this
-    // equivalent: same inputs, same state machine, same outcomes).
     let mut locks = BTreeMap::new();
-    let mut lock_ids: Vec<u64> = current.keys().copied().collect();
+    let mut lock_ids: Vec<u64> = leases.keys().copied().collect();
     lock_ids.extend(names.keys().copied());
     lock_ids.sort_unstable();
     lock_ids.dedup();
     for lock_id in lock_ids {
-        let lease = current.get(&lock_id);
+        let lease = leases.get(&lock_id);
         let name = names
             .get(&lock_id)
             .cloned()
@@ -592,7 +465,6 @@ pub fn replay_series(dir: &Path) -> (Vec<LockEvent>, LockState, BridgeMetrics) {
     (events, state, metrics)
 }
 
-/// The reply's stored lease, from the executed response's serde shape.
 fn reply_lease(reply: &Option<Response>) -> Option<lunet_advisory_lock::locks::Lease> {
     match reply {
         Some(Response::Set { lease, .. }) | Some(Response::Get { lease, .. }) => lease.clone(),
@@ -657,7 +529,6 @@ fn event_from_transition(transition: &Transition, ns: u64, seq: u64, name: &str)
     }
 }
 
-/// The `.aof` series files of one directory, oldest first. Read-only.
 fn series_files(dir: &Path) -> Vec<PathBuf> {
     retention::list_aof_files(dir)
         .unwrap_or_default()
@@ -666,15 +537,6 @@ fn series_files(dir: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Read the telemetry panel's log series. The log half: every `*.log`
-/// file of `log_dir` (the daily-rolling `<node>.<date>.log` appender
-/// files, file order), every line one JSON object carrying `ts` — a line
-/// that is not one (the Lua host's stdout captured beside the node's own
-/// log) is counted `unparsed`, never served. The tape half: every
-/// telemetry state-transition record's JSON payload of the AOF series —
-/// the slot-frontier records — with `ts` injected from the envelope ns
-/// floored to ms when the payload carries none. Read-only on both halves;
-/// the writers own the files.
 fn read_telemetry_log(log_dir: Option<&Path>, aof_dir: &Path) -> TelemetryLog {
     let mut log = TelemetryLog::default();
 
@@ -715,8 +577,6 @@ fn read_telemetry_log(log_dir: Option<&Path>, aof_dir: &Path) -> TelemetryLog {
         }
     }
 
-    // The tape half: the state-transition records' JSON payloads (the
-    // slot-frontier records), ts injected from the envelope ns.
     let mut scan = BridgeMetrics::default();
     for file in series_files(aof_dir) {
         for record in read_file_records(&file, &mut scan) {
@@ -742,11 +602,11 @@ fn read_telemetry_log(log_dir: Option<&Path>, aof_dir: &Path) -> TelemetryLog {
     log
 }
 
-/// Every envelope record of one AOF file through the checksum-validating
-/// iterator and the typed envelope decoder. Unknown markers and torn
-/// entries are counted undecodable — stated, never guessed.
 fn read_file_records(path: &Path, metrics: &mut BridgeMetrics) -> Vec<Record> {
     let mut records = Vec::new();
+    // SAFETY: the FFI reads only through the returned iterator and needs a
+    // byte-encoded path to an existing file; `path` is an `.aof` entry just
+    // listed from the series directory.
     let Ok(mut iterator) =
         (unsafe { tbio::ffi::RawIter::open(path.as_os_str().as_encoded_bytes()) })
     else {
@@ -778,24 +638,12 @@ fn operation_id_bytes(id: vrr::ids::OperationId) -> [u8; 16] {
     bytes
 }
 
-// ---------------------------------------------------------------------------
-// The HTTP + WebSocket server
-// ---------------------------------------------------------------------------
-
-/// The bridge server: one thread per connection, a shared replay snapshot
-/// refreshed on demand (and re-scanned by the follow thread when `follow`
-/// is on).
 pub struct Server {
     listener: TcpListener,
     running: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Server {
-    /// Spawn the server bound to `bind` (host:port; port 0 picks a free
-    /// ephemeral port). `log_dir` names the telemetry panel's JSON log
-    /// series directory (the rolling `.log` appender files). With
-    /// `follow`, a background thread re-scans the series and pushes new
-    /// events to the live sockets.
     pub fn spawn(
         dir: &Path,
         log_dir: Option<&Path>,
@@ -812,8 +660,6 @@ impl Server {
             running: Arc::clone(&running),
         };
 
-        // The accept loop. Parked threads die with the process (the
-        // binary's main returns); tests only need the sockets drained.
         let listener = server.listener.try_clone()?;
         let snapshot_loop = Arc::clone(&snapshot);
         let live_loop = Arc::clone(&live);
@@ -833,8 +679,6 @@ impl Server {
         });
 
         if follow {
-            // The follow thread: re-scan the series; new events push to
-            // every live socket.
             let dir = dir.to_path_buf();
             let log_dir = log_dir.map(Path::to_path_buf);
             let snapshot_follow = Arc::clone(&snapshot);
@@ -845,9 +689,6 @@ impl Server {
                     std::thread::sleep(Duration::from_millis(200));
                     let fresh = replay_snapshot(&dir, log_dir.as_deref());
                     let mut guard = snapshot_follow.lock().unwrap();
-                    // New events: everything past the previous snapshot's
-                    // length (the replay is deterministic and append-only,
-                    // so a longer event list means new committed work).
                     let new_events: Vec<LockEvent> = fresh
                         .events
                         .iter()
@@ -873,22 +714,16 @@ impl Server {
         Ok(server)
     }
 
-    /// The bound port (for tests and operators).
     pub fn port(&self) -> u16 {
         self.listener.local_addr().unwrap().port()
     }
 
-    /// Stop the follow thread and accept loop (best-effort; parked
-    /// threads exit with the process).
     pub fn shutdown(&self) {
         self.running
             .store(false, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
-/// A fresh full replay of one series directory, with the telemetry
-/// panel's log series (`log_dir`'s rolling files plus the tape's
-/// state-transition records).
 fn replay_snapshot(dir: &Path, log_dir: Option<&Path>) -> Replay {
     let (events, state, metrics) = replay_series(dir);
     let log = read_telemetry_log(log_dir, dir);
@@ -900,20 +735,11 @@ fn replay_snapshot(dir: &Path, log_dir: Option<&Path>) -> Replay {
     }
 }
 
-/// One connection's HTTP lifecycle. The full request head is drained
-/// before anything is answered: TCP delivers a request in as many
-/// segments as the client made writes, and a socket closed with request
-/// bytes still unread is reset by the kernel (BSD and Linux alike), so
-/// the client would lose the response instead of reading it through a
-/// clean FIN. WebSocket upgrades park the socket in the live set;
-/// everything else answers from the snapshot and half-closes.
 fn handle_connection(
     mut stream: TcpStream,
     snapshot: Arc<Mutex<Replay>>,
     live: Arc<Mutex<Vec<TcpStream>>>,
 ) {
-    // The request head's bound: the console's GET requests are one line
-    // of headers; anything larger is refused rather than buffered.
     const MAX_HEAD_BYTES: usize = 64 * 1024;
     let mut head: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 8192];
@@ -941,7 +767,6 @@ fn handle_connection(
         None => (path, None),
     };
 
-    // WebSocket upgrade on /api/v1/live.
     if path == "/api/v1/live" && request.contains("Upgrade: websocket") {
         let Some(key) = request
             .lines()
@@ -972,12 +797,9 @@ fn handle_connection(
     );
     let _ = stream.write_all(response.as_bytes());
     let _ = stream.flush();
-    // The graceful close: the response is sent, then the write side
-    // shuts down so the client reads the body through an orderly FIN.
     let _ = stream.shutdown(Shutdown::Write);
 }
 
-/// The route table: the console's OpenAPI surface, read-only.
 fn route(
     method: &str,
     path: &str,
@@ -1070,7 +892,6 @@ fn unix_millis() -> u64 {
         .as_millis() as u64
 }
 
-/// One query parameter's u64 value (the `/telemetry/log` window bounds).
 fn query_ms(query: Option<&str>, key: &str) -> Option<u64> {
     query?.split('&').find_map(|pair| {
         let (name, value) = pair.split_once('=')?;
@@ -1078,10 +899,6 @@ fn query_ms(query: Option<&str>, key: &str) -> Option<u64> {
     })
 }
 
-/// The openapi `/metrics/series` shape, derived from the event log: the
-/// per-kind counts per bucket, and the held gauge replayed from the lease
-/// intervals the events carry (an acquire opens one, a renew extends it, a
-/// release/break closes it, expiry closes it at its stamp).
 fn series_json(replay: &Replay, now_ms: u64) -> Value {
     const DEFAULT_BUCKET_MS: u64 = 5000;
     let from = replay
@@ -1105,8 +922,7 @@ fn series_json(replay: &Replay, now_ms: u64) -> Value {
         }));
         ts += bucket_ms;
     }
-    // The held gauge: replay the lease intervals in ts order.
-    let mut active: Vec<(u64, u64)> = Vec::new(); // (holder taken_at, expiry)
+    let mut active: Vec<(u64, u64)> = Vec::new();
     for event in &replay.events {
         fn bucket(
             ts_ms: u64,
@@ -1163,7 +979,6 @@ fn series_json(replay: &Replay, now_ms: u64) -> Value {
             }
             _ => {}
         }
-        // Held samples: last write wins per bucket.
         for (taken_at, expiry) in &active {
             let sample_ts = event.ts_ms;
             if *taken_at <= sample_ts
@@ -1177,12 +992,10 @@ fn series_json(replay: &Replay, now_ms: u64) -> Value {
     json!({"bucketMs": bucket_ms, "buckets": buckets})
 }
 
-/// The RFC 6455 accept-key derivation: SHA-1 of key + GUID, base64.
 fn ws_accept_key(key: &str) -> String {
     sha1_base64(format!("{key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11").as_bytes())
 }
 
-/// One unmasked server text frame.
 fn ws_text_frame(payload: &[u8]) -> Vec<u8> {
     let mut frame = vec![0x81];
     if payload.len() < 126 {
@@ -1195,8 +1008,6 @@ fn ws_text_frame(payload: &[u8]) -> Vec<u8> {
     frame
 }
 
-// SHA-1 (FIPS 180-1), the WebSocket handshake's only crypto — a spec-
-// mandated obfuscation of the accept key, not a security boundary.
 fn sha1_base64(data: &[u8]) -> String {
     let mut h: [u32; 5] = [0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0];
     let mut message = data.to_vec();
@@ -1246,7 +1057,6 @@ fn sha1_base64(data: &[u8]) -> String {
     base64(&digest)
 }
 
-/// Base64 (RFC 4648, standard alphabet, padded).
 fn base64(data: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);

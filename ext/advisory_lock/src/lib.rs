@@ -4,16 +4,10 @@
 //! [`spi::StateStore`] and [`spi::CommitHook`] — with the boot fence's
 //! [`spi::LifecycleStore`] re-exported beside them as the fourth mounting
 //! point. Nothing else crosses the boundary between the protocol and
-//! whatever environment it runs in. [`spi`] is the one named surface both
-//! sides are written against, and its module doc is the normative
-//! division of labour.
+//! whatever environment it runs in; [`spi`] is the one named surface both
+//! sides are written against.
 
 pub mod aof;
-/// The disk seam: the one contract every byte this crate reads or writes
-/// is named against, so the crate compiles identically over the local
-/// filesystem ([`disk::StdDisk`]) and over whatever industrial engine an
-/// embedder mounts behind [`disk::Disk`] instead. Nothing above the seam
-/// knows which one it holds.
 pub mod disk;
 mod ffi;
 #[cfg(feature = "flight-recorder")]
@@ -23,30 +17,8 @@ pub mod journal;
 pub mod locks;
 mod marker_store;
 pub mod recovery_flush;
-/// The contract seam: the three traits the machinery is written against —
-/// [`spi::Disk`], [`spi::StateStore`] and [`spi::CommitHook`] — re-exported
-/// under one name. This module IS the boundary between the experimental
-/// harness upstream runs the machinery in and the industrial deployment
-/// this repository runs it in, and its doc comment states that division
-/// normatively.
 pub mod spi;
-/// The state seam: the lock table's persistence contract, one trait
-/// ([`state::StateStore`]). Flush is EAGER — on the shutdown path the
-/// whole lock-table state is written in the foreground before the stop
-/// completes, and a stop that cannot flush is a failed stop, never a
-/// silent skip. Load is LAZY — the regular path never loads eagerly at
-/// boot; the table starts empty and state materialises only on demand, at
-/// the apply path's first committed entry. A crashed boot (the marker
-/// gate's verdict) distrusts the state file and rebuilds from the replica
-/// stream: only a clean-stop file is loadable.
 pub mod state;
-/// The WAL lock snapshot store: a [`state::StateStore`] over the WAL C
-/// ABI (`wal_open` … `wal_close`, the vendored Zig engine's surface), for
-/// the node's lock table to survive a clean stop and restart without
-/// replaying anything. Flush is EAGER (the shutdown generation, one
-/// fsync); load is LAZY and answers every content refusal with
-/// `Ok(None)`; the tick path (`note`/`submit`/`pump`/`event_fd`) writes
-/// page-cached generations with zero fsync, on the calling thread only.
 #[cfg(not(target_os = "windows"))]
 pub mod wal_snapshot;
 pub mod witness;

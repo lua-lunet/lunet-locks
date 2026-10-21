@@ -1,7 +1,3 @@
-//! `header_slot_role` admits. The widths the sums below state: header 20
-//! (tag 4 + era 4 + view 4 + slot 8, W1), body discriminant 1, NodeId 4,
-//! Era 4, View 4, Slot 8, OperationId 16, opaque length prefix 4.
-
 use vrr::configuration::SystemOperation;
 use vrr::ids::{Ballot, Era, NodeId, OperationId, Slot, View};
 use vrr::invariant::header_slot_role;
@@ -14,8 +10,6 @@ const DISC: usize = 1;
 const NODE: usize = 4;
 const SLOT: usize = 8;
 
-/// One System-operation entry at slot 8, era 3: 8 slot + 4 era + 1
-/// payload discriminant + the operation's own width.
 fn system_entry(op: &SystemOperation) -> LogEntry {
     LogEntry {
         slot: Slot(8),
@@ -52,8 +46,6 @@ fn frame(message: &Message) -> Vec<u8> {
     buf
 }
 
-/// The boundary roundtrip: pack, unpack, every field survives, and the
-/// frame's header slot is one its tag's table admits.
 fn roundtrips(message: Message) -> Vec<u8> {
     let bytes = frame(&message);
     let decoded = Message::unpack_from(&bytes).expect("the frame unpacks");

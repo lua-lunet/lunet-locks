@@ -1,19 +1,3 @@
-//! The AOF tape streamer: one telemetry AOF directory in,
-//! the `from,to,{jsonl}` replay tape out — one CSV line per record, in
-//! file order (epoch order = ns order), through the vendored AOF's C
-//! ABI iterator (the same FFI the host uses; never the python tool).
-//!
-//! ```text
-//! skaffold_aof_tape --dir PATH [--recorder N] [--from N] [--to N]
-//!                   [--from-any] [--to-any] [--kinds KINDS] [--logs PATH]
-//!                   [--out PATH]
-//! ```
-//!
-//! The acceptance shape: the plain output feeds a shell filter
-//! directly — `skaffold_aof_tape --dir D --recorder 99 --logs L
-//! | grep "^66,99,"` reads the leader-66 → node-99 stream as raw jsonl
-//! lines (the sender named by the recorder's own commit-in log lines).
-
 use lease_sequencer::tape::{Kind, TapeOptions, stream_dir};
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
@@ -155,7 +139,6 @@ fn main() {
     }
 }
 
-/// The --kinds union: comma/space joined, `all` expands to every kind.
 fn parse_kinds(text: &str) -> Vec<Kind> {
     let mut kinds = Vec::new();
     for token in text.split([',', ' ', '\t']) {

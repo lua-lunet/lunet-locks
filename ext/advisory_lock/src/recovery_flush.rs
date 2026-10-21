@@ -1,31 +1,8 @@
-//! The E2 recovery-boundary flush variants (the experiment design's §4).
-//!
-//! At the recovery boundary — the dirty-boot/reincarnation classification
-//! point in the adapter — a variant may execute a forced flush against a
-//! caller-provided scratch directory before the reincarnated node rejoins
-//! serving:
-//!
-//! - **Variant 0 — diskless (the default).** Nothing is written. Quorum
-//!   memory is the only protocol state.
-//! - **Variant 1 — naive single write (the latency baseline).** One 4 KiB
-//!   block write followed by `fsync`. Per FAST'18 (Alagappan et al.), even
-//!   this single write plus `fsync` is not fault-safe against real disk
-//!   faults; it is the latency baseline, never a safety claim.
-//! - **Variant 2 — double-ring write.** The TigerBeetle-style double write:
-//!   one 4 KiB block to the first ring carrying a 64-byte checksum header
-//!   plus one 64-byte data line, then the header+checksum copy — with NO
-//!   payload — to the second ring. The two zones are fixed, 4 KiB-sector
-//!   aligned, and spaced [`RING_SPACING_BYTES`] apart in the same data file,
-//!   so the two copies of the checksum sit in different erasure blocks.
-//!
-//! BOTH flush variants carry fake data only and NEVER read back: the
-//! variants measure write-and-flush latency only and never reconstruct
-//! state from what was written. The unit tests below do inspect the bytes —
-//! that is geometry verification, not a read-back path; no runtime code
-//! ever reads these files.
-//!
-//! The flush outcome reports the measured latency (flush start to write
-//! completion, `fsync` included) and the bytes written.
+//! The E2 recovery-boundary flush variants: diskless (the default), one
+//! 4 KiB block write + fsync (the latency baseline), or the TigerBeetle-style
+//! double-ring write whose two checksum copies sit in different erasure
+//! blocks. Both flush variants carry fake data only and NEVER read back:
+//! they measure write-and-flush latency, never reconstruct state.
 
 use crate::disk::{Disk, std_disk};
 use std::io;
@@ -45,7 +22,6 @@ pub enum RecoveryFlush {
 }
 
 impl RecoveryFlush {
-    /// Parses the variant's command-line spelling.
     pub fn parse(text: &str) -> Option<Self> {
         match text {
             "diskless" => Some(Self::Diskless),
@@ -55,7 +31,6 @@ impl RecoveryFlush {
         }
     }
 
-    /// The variant's label as it appears in logs and results.
     pub fn label(&self) -> &'static str {
         match self {
             Self::Diskless => "diskless",
@@ -87,10 +62,8 @@ pub struct FlushOutcome {
     pub latency: Duration,
 }
 
-/// The 64-byte ring header: magic, the FNV-1a checksum over the data line,
-/// the flush sequence (the boot's packed identity drives it), and the payload
-/// length (64 on ring one; ring two carries the identical header — the
-/// checksum copy — with the payload region absent).
+/// The 64-byte ring header: magic, the FNV-1a checksum over the data
+/// line, the flush sequence, the payload length.
 fn ring_header(checksum: u64, sequence: u64, data_len: u64) -> [u8; HEADER_BYTES] {
     let mut header = [0u8; HEADER_BYTES];
     header[..8].copy_from_slice(RING_MAGIC);
@@ -124,17 +97,14 @@ fn fake_line(seed: u64) -> [u8; DATA_LINE_BYTES] {
     line
 }
 
-/// Executes the selected variant's flush against `dir` over the default
-/// disk (created on demand) and reports the measured latency. Variant 0
-/// writes nothing and reports a zero latency. A flush failure here is a
-/// boot failure at the recovery boundary: the caller refuses the boot
-/// rather than rejoin unmeasured.
+/// Executes the selected variant's flush against `dir` and reports the
+/// measured latency; variant 0 writes nothing. A flush failure is a boot
+/// failure at the recovery boundary.
 pub fn execute(dir: &Path, variant: RecoveryFlush, sequence: u64) -> io::Result<FlushOutcome> {
     execute_on(&*std_disk(), dir, variant, sequence)
 }
 
-/// [`execute`] against a named disk — the same two block writes and the
-/// same fsync, over whatever [`Disk`] the caller holds.
+/// [`execute`] against a named [`Disk`].
 pub fn execute_on(
     disk: &dyn Disk,
     dir: &Path,
@@ -217,10 +187,6 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    /// The scratch path, inside the repo (`.tmp` is scratch). The path
-    /// is only built here: `execute` creates the tree on demand, so the
-    /// diskless variant's nothing-written proof can assert the tree's
-    /// absence.
     fn scratch(name: &str) -> PathBuf {
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.tmp/recovery-flush-unit");
@@ -233,9 +199,6 @@ mod tests {
         dir
     }
 
-    /// Every variant's command-line spelling parses to its variant, and
-    /// the label spells the same word back; an unknown spelling is no
-    /// variant.
     #[test]
     fn variant_labels_round_trip_through_parse() {
         for (text, variant) in [
@@ -251,9 +214,6 @@ mod tests {
         assert_eq!(RecoveryFlush::parse("DOUBLE-RING"), None);
     }
 
-    /// Variant 0 is diskless: nothing is written, the reported bytes are
-    /// zero, the measured latency is zero, and the scratch tree is never
-    /// even created.
     #[test]
     fn variant_0_writes_nothing() {
         let dir = scratch("variant-0");
@@ -267,11 +227,6 @@ mod tests {
         );
     }
 
-    /// Variant 1 writes exactly one 4 KiB block — the file's whole
-    /// length — and a second boot over the same scratch overwrites the
-    /// block in place: the baseline stays exactly one block across
-    /// boots. (The fsync itself is not observable from a test; the
-    /// geometry is what the tests verify, never a read-back path.)
     #[test]
     fn variant_1_writes_exactly_one_4k_block_and_fsyncs() {
         let dir = scratch("variant-1");
@@ -286,7 +241,6 @@ mod tests {
         );
         let bytes = fs::read(&path).expect("the block reads");
         assert_eq!(bytes, fake_block(9), "the block is the seed's fake data");
-        // The second boot: overwrite in place, the file never grows.
         let outcome =
             execute(&dir, RecoveryFlush::SingleBlock, 10).expect("the second flush executes");
         assert_eq!(outcome.bytes_written, BLOCK_BYTES as u64);
@@ -303,11 +257,6 @@ mod tests {
         );
     }
 
-    /// Variant 2 writes both rings with the documented geometry: the
-    /// checksum header plus the 64-byte data line at the file's start,
-    /// the identical header copy with NO payload at ring two, spaced
-    /// [`RING_SPACING_BYTES`] apart — different erasure blocks for the
-    /// two checksum copies.
     #[test]
     fn variant_2_writes_both_rings_with_the_documented_geometry() {
         let dir = scratch("variant-2");
@@ -321,8 +270,6 @@ mod tests {
             RING_SPACING_BYTES as usize + BLOCK_BYTES,
             "ring two sits RING_SPACING_BYTES past ring one"
         );
-        // Ring one: magic, the FNV-1a checksum over the data line, the
-        // flush sequence, the payload length — then the 64-byte line.
         assert_eq!(&bytes[..8], &RING_MAGIC[..], "the ring magic");
         let line = &bytes[HEADER_BYTES..HEADER_BYTES + DATA_LINE_BYTES];
         assert_eq!(
@@ -340,8 +287,6 @@ mod tests {
             DATA_LINE_BYTES as u64,
             "ring one carries the payload length"
         );
-        // Ring two: the identical header copy, and the payload region
-        // absent — the rest of the block stays zero.
         let ring_two = &bytes[RING_SPACING_BYTES as usize..];
         assert_eq!(
             &ring_two[..HEADER_BYTES],

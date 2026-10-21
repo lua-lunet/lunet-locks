@@ -1,26 +1,3 @@
-//! The UDS harness: the lease-sequencer host's service wiring — the
-//! embedded `lunet_advisory_lock::Node`, the leader timeout (the
-//! host's only failure-detection mechanism), the leader's heartbeat
-//! Commit fan-out, the election wait, the recovery drive, and the
-//! polite contender machinery (`embedded_client`/`client_gate`
-//! discipline) — with ONLY the transport swapped. Every payload rides
-//! unix domain stream frames through the harness driver instead of UDP
-//! datagrams and TCP client lines; the bytes the core produces and
-//! consumes are the same the rig's hosts produce and consume.
-//!
-//! The driver is the cluster's only switch fabric. It appends every
-//! message to the cluster-wide trace AOF (`from,to,payload-json`, one
-//! line per message, append+flush) BEFORE forwarding it down the
-//! destination node's channel, so `grep "^node44,node55" trace.aof` reads
-//! the whole conversation. Client→server and server↔server traffic all
-//! cross the driver; a node never addresses another node directly.
-//!
-//! Wire shapes mirrored byte-for-byte from the rig host (`src/main.rs`):
-//! the 20-byte VRR header, the `{"error":"not_leader"}` client reply,
-//! the FORWARD_REQUEST/RESPONSE/NOT_LEADER application payloads, and
-//! the heartbeat GET noise (client_id `0x0BEEF000 + node id`, lock
-//! `0x0DDBA11`).
-
 use crate::client_gate::{self, Mode};
 use crate::embedded_client::{Action, Config as ContenderConfig, Contender};
 use crate::timeouts::{self, Rng};
@@ -37,27 +14,19 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
-/// The adapter's output kinds (`ext/advisory_lock/src/ffi.rs`).
 const OUTPUT_SEND: u32 = 1;
 const OUTPUT_REPLY: u32 = 2;
-/// The replication states the harness distinguishes.
 const STATE_NORMAL: u32 = 0;
 const STATE_RECOVERING: u32 = 2;
-/// Upstream `src/wire.rs` Tag::Commit (main.rs's `is_commit`).
 const VRR_COMMIT_TAG: u32 = 4;
-/// The sequencer's sentinel lock (main.rs `LOCK_ID`): the heartbeat GET
-/// noise floor rides this lock, never a polite client's.
 pub const HEARTBEAT_LOCK_ID: u64 = 0x0DDBA11;
-/// The heartbeat client id base (main.rs `heartbeat_client_id`).
 pub const HEARTBEAT_CLIENT_BASE: u64 = 0x0BEEF000;
 
-// Frame channels. One body shape everywhere: [peer u32 BE][chan u8][rest].
 pub const CHAN_IDENT: u8 = 0;
 pub const CHAN_VRR: u8 = 1;
 pub const CHAN_APP: u8 = 2;
 pub const CHAN_CLIENT: u8 = 3;
 pub const CHAN_CLIENT_OP: u8 = 4;
-/// The application-channel payloads (main.rs's PEER_APPLICATION alphabet).
 pub const FORWARD_REQUEST: u8 = 0x01;
 pub const FORWARD_RESPONSE: u8 = 0x02;
 pub const FORWARD_NOT_LEADER: u8 = 0x03;
@@ -73,8 +42,6 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// The wire-header decode: tag(4) | era(4) | view(4) | slot(8), all
-/// big-endian, 20 bytes total (W1).
 fn header_fields(front: &[u8]) -> Option<(u32, u32, u32, u64)> {
     if front.len() < 20 {
         return None;
@@ -87,15 +54,6 @@ fn header_fields(front: &[u8]) -> Option<(u32, u32, u32, u64)> {
     ))
 }
 
-/// One message's trace JSON: the third CSV field. VRR datagrams carry
-/// their header fields plus the full wire bytes (the wire-as-carried
-/// evidence); application frames decode the forward kind and the
-/// embedded op; client ops are their own JSON. Every node-to-node
-/// protocol line carries `received_at_ms`: the driver's wall-ms at the
-/// frame's receive — the switch fabric's own clock. The trace's
-/// continuity evidence is therefore the standby-side record, never the
-/// sender's claim; the leader's own log owns the send side, and the two
-/// clocks together separate a late send from a late record.
 fn payload_json(chan: u8, rest: &[u8], received_at_ms: u64) -> String {
     match chan {
         CHAN_VRR => match header_fields(rest) {
@@ -139,13 +97,6 @@ fn payload_json(chan: u8, rest: &[u8], received_at_ms: u64) -> String {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Frame I/O: 4-byte big-endian length + payload, over unix stream sockets.
-// ---------------------------------------------------------------------------
-
-/// One stream's nonblocking write buffer: frames enqueue as bytes and
-/// drain as the socket takes them; partial writes resume by position, so
-/// the driver's own hop never waits on a busy peer.
 struct OutBuf {
     bytes: Vec<u8>,
     pos: usize,
@@ -171,7 +122,6 @@ impl OutBuf {
         Ok(())
     }
 
-    /// Push whatever the socket accepts; `Ok((written, pending))`.
     fn flush(&mut self, stream: &mut UnixStream) -> (usize, bool) {
         let mut written = 0;
         while self.pos < self.bytes.len() {
@@ -197,7 +147,6 @@ impl OutBuf {
     }
 }
 
-/// One stream's read buffer; pops complete frames as bytes arrive.
 struct FrameBuf {
     buf: Vec<u8>,
 }
@@ -207,8 +156,6 @@ impl FrameBuf {
         Self { buf: Vec::new() }
     }
 
-    /// Drains the socket (nonblocking) and returns the complete frames.
-    /// `Err` on a closed or broken stream.
     fn poll(&mut self, stream: &mut UnixStream) -> std::io::Result<Vec<Vec<u8>>> {
         let mut chunk = [0u8; 16384];
         let mut frames = Vec::new();
@@ -245,7 +192,6 @@ impl FrameBuf {
     }
 }
 
-/// `[peer u32][chan u8][rest]` encode/decode.
 fn frame_body(peer: u32, chan: u8, rest: &[u8]) -> Vec<u8> {
     let mut body = Vec::with_capacity(5 + rest.len());
     body.extend_from_slice(&peer.to_be_bytes());
@@ -266,7 +212,6 @@ fn frame_rest(payload: &[u8]) -> &[u8] {
     &payload[5..]
 }
 
-/// The `message_id` UUID of one lock-verb JSON line.
 fn message_id_of(text: &str) -> Option<[u8; 16]> {
     let value: Value = serde_json::from_str(text).ok()?;
     let text = value.get("message_id")?.as_str()?;
@@ -285,20 +230,11 @@ fn uuid_bytes(text: &str) -> Option<[u8; 16]> {
     Some(bytes)
 }
 
-// ---------------------------------------------------------------------------
-// The harness node host: one uVRR + lock node on UDS.
-// ---------------------------------------------------------------------------
-
 pub struct NodeOptions {
     pub name: String,
-    /// The full genesis membership, `[(id, name)]` in descriptor order.
     pub members: Vec<(u32, String)>,
     pub state: PathBuf,
-    /// The request channel: the node LISTENS here; the driver connects and
-    /// writes `[from][chan][payload]` frames.
     pub request_path: PathBuf,
-    /// The reply channel: the node CONNECTS here (the driver's listener)
-    /// and writes `[to][chan][payload]` frames.
     pub driver_path: PathBuf,
     pub log_path: Option<PathBuf>,
     pub heartbeat_ms: u64,
@@ -326,28 +262,18 @@ impl Default for NodeOptions {
     }
 }
 
-/// One harness node: the same host wiring the rig's `lease-sequencer`
-/// binary drives (heartbeat timer, election timer, leader-timeout
-/// detection and the §14.2 forced view, the fenced-boot recovery drive,
-/// the output drain), with the UDP/TCP socket internals replaced by the
-/// two UDS channels.
 pub struct NodeHost {
     node: Node,
     own_id: u32,
     own_name: String,
     listener: UnixListener,
-    /// The driver's request→node stream.
     request: Option<(UnixStream, FrameBuf)>,
-    /// The node→driver stream (the caller-given reply path) with its
-    /// nonblocking write buffer.
     driver: Option<(UnixStream, OutBuf)>,
     driver_path: PathBuf,
     log: Option<File>,
     heartbeat_ms: u64,
     recovery_ms: u64,
-    /// The leader timeout — the host's only failure-detection mechanism.
     leader_timeout: timeouts::LeaderTimeout,
-    /// The host's RNG, seeding every randomised wait.
     rng: Rng,
     last_heartbeat: u64,
     leader_since: u64,
@@ -432,9 +358,6 @@ impl NodeHost {
         }
     }
 
-    /// One pump slice: accept the request stream, drain both channels,
-    /// run the timers, drain the core's outputs. `now` is the host's
-    /// wall-ms clock reading.
     pub fn step(&mut self, now: u64) {
         self.accept_request();
         self.ensure_driver();
@@ -443,20 +366,9 @@ impl NodeHost {
         self.flush_outputs(now);
     }
 
-    /// The forever loop the binary runs; `stop` breaks it cleanly. The
-    /// break is the drain point: the node stop (wire closed, `stopped`
-    /// marker, sink drained, `flushed` marker) runs after it, so the next
-    /// boot continues under the same incarnation. SIGKILL skips all of
-    /// it: the running sentinel stays behind and the next boot
-    /// reincarnates.
     pub fn run(&mut self, stop: &Arc<AtomicBool>) {
         while !stop.load(Ordering::Relaxed) {
             self.step(millis());
-            // The step quantum: sub-millisecond, so a forwarded client op
-            // (home node -> driver relay -> leader -> consensus -> reply)
-            // clears its ~5 sleeping-thread hops inside the 10 ms RTT
-            // bucket even when the host is loaded. The rig binary keeps
-            // its own cadence; this is the harness's in-process fabric.
             std::thread::sleep(Duration::from_micros(500));
         }
         self.note("stop: clean exit");
@@ -520,9 +432,6 @@ impl NodeHost {
     fn handle_request(&mut self, from: u32, chan: u8, rest: &[u8], now: u64) {
         match chan {
             CHAN_VRR => {
-                // Nothing rides behind the core's message bytes: the
-                // Commit from the current leader is the heartbeat
-                // evidence `on_leader_commit` consumes.
                 self.on_leader_commit(from, rest, now);
                 if self.node.status().leader == from {
                     self.leader_since = now;
@@ -531,10 +440,6 @@ impl NodeHost {
                 self.flush_outputs(now);
             }
             CHAN_APP if !rest.is_empty() => match rest[0] {
-                // FORWARD_REQUEST addressed to this node: execute as the
-                // leader, or answer the 0x03 notch back through the driver
-                // (the driver plays the forwarding follower's client
-                // socket and correlates the refusal to the contender).
                 FORWARD_REQUEST if rest.len() > 17 => {
                     let json = String::from_utf8_lossy(&rest[17..]).into_owned();
                     let rc = self.node.request(json.as_bytes());
@@ -546,11 +451,6 @@ impl NodeHost {
                 _ => {}
             },
             CHAN_CLIENT => {
-                // One client op: the same lock-verb line the TCP client
-                // port accepts. Propose locally; a non-leader forwards to
-                // the leader over the application channel; no leader known
-                // answers the exact `{"error":"not_leader"}` bytes via the
-                // 0x03 notch.
                 let rc = self.node.request(rest);
                 self.flush_outputs(now);
                 if rc == OK {
@@ -577,10 +477,6 @@ impl NodeHost {
         }
     }
 
-    /// The 0x03 FORWARD_NOT_LEADER notch: op byte + message_id(16) +
-    /// era(4) + view(4), addressed to the driver (which correlates the
-    /// refusal to the contender and synthesizes the exact
-    /// `{"error":"not_leader"}` client reply).
     fn send_not_leader_notch(&mut self, mid: &[u8], now: u64) {
         let status = self.node.status();
         let mut notch = vec![FORWARD_NOT_LEADER];
@@ -591,15 +487,10 @@ impl NodeHost {
         self.flush_outputs(now);
     }
 
-    /// The election wait the tick loop runs: the armed uniform random in
-    /// `[min, max]`, re-armed on a leader change
-    /// (`rearm_election_wait`), stable otherwise.
     fn election_wait(&self) -> u64 {
         self.election_wait_armed
     }
 
-    /// Re-arms the election wait on a leader change: one uniform random
-    /// in `[min, max]`, logged when the armed wait changed.
     fn rearm_election_wait(&mut self, _now: u64) {
         let (min_ms, max_ms) = (self.leader_timeout.min_ms(), self.leader_timeout.max_ms());
         let wait = timeouts::random_wait_ms(min_ms, max_ms, self.rng.unit());
@@ -613,12 +504,6 @@ impl NodeHost {
         }
     }
 
-    /// The detection step: the leader timeout's deadline. The
-    /// watched (config era, leader) key arms a uniform random deadline
-    /// at its birth; every Commit arriving from the current leader
-    /// re-arms it (`on_leader_commit`); a due deadline drives the §14.2
-    /// host-forced view, the detection note recording the silence and
-    /// the armed deadline.
     fn leader_timeout_step(&mut self, now: u64) {
         let status = self.node.status();
         if status.config_era != status.era {
@@ -635,11 +520,6 @@ impl NodeHost {
             return;
         }
         let silence = now.saturating_sub(self.leader_timeout.last_evidence_ms());
-        // The harness's fence floor: the switch fabric is the test thread,
-        // so a scheduling stall of that thread manufactures wire silence
-        // while no node failed. A silence shorter than the configured
-        // minimum never drives the §14.2 forced view — the fence stays
-        // available for genuine, sustained leader loss beyond the floor.
         let fence_floor_ms = self.leader_timeout.min_ms().max(self.heartbeat_ms);
         let latched = self.detected_key == Some(watched) && status.state == STATE_NORMAL;
         if latched || silence < fence_floor_ms {
@@ -663,9 +543,6 @@ impl NodeHost {
         self.flush_outputs(now);
     }
 
-    /// One Commit arrived from `from` — the heartbeat evidence (the
-    /// Commit tag at the header's head is the evidence): re-arms the
-    /// leader deadline.
     fn on_leader_commit(&mut self, from: u32, rest: &[u8], now: u64) {
         if rest.len() < 21
             || u32::from_be_bytes(rest[0..4].try_into().expect("4 bytes")) != VRR_COMMIT_TAG
@@ -676,12 +553,6 @@ impl NodeHost {
         self.leader_timeout.rearm(now, self.rng.unit());
     }
 
-    /// The leader's idle heartbeat (main.rs `heartbeat_op`): when otherwise
-    /// idle — no Commit left this node in the last interval — propose a
-    /// read-only GET on the sentinel lock, whose commit fan-out emits the
-    /// heartbeat Commit every follower's leader timeout re-arms on. The op
-    /// rides the driver as a client op (client_id `0x0BEEF000 + node id`)
-    /// so the noise floor is fully traced.
     fn heartbeat_op(&mut self, now: u64) {
         let status = self.node.status();
         if status.state != STATE_NORMAL
@@ -710,8 +581,6 @@ impl NodeHost {
                 "leader leader={} era={} view={}",
                 status.leader, status.era, status.view
             ));
-            // The host re-arms the election wait on a leader
-            // change.
             self.rearm_election_wait(now);
         }
         if now.saturating_sub(self.last_heartbeat) >= self.heartbeat_ms {
@@ -752,9 +621,6 @@ impl NodeHost {
         }
     }
 
-    /// Drain the core's outputs: SEND datagrams ride the driver channel
-    /// keyed by the destination member; REPLY bytes ride the client
-    /// channel keyed by message id.
     fn flush_outputs(&mut self, now: u64) {
         while let Some(out) = self.node.next_output() {
             if out.kind == OUTPUT_SEND {
@@ -790,34 +656,15 @@ impl NodeHost {
     }
 }
 
-// ---------------------------------------------------------------------------
-// The driver: the cluster's switch fabric + the polite contenders.
-// ---------------------------------------------------------------------------
-
 #[derive(Clone)]
 pub struct ClusterConfig {
     pub run_dir: PathBuf,
-    /// The full genesis membership in descriptor order (ids the cluster
-    /// THINKS it has — stage 2 boots a subset).
     pub members: Vec<(u32, String)>,
-    /// The ids that actually run.
     pub boot: Vec<u32>,
-    /// The polite contenders: (client name, home node id). A client name
-    /// starting with `probe` is a RAW client: it issues hand-built verbs
-    /// only (stage 1) and never chases.
     pub clients: Vec<(String, u32)>,
-    /// `Some(bin)` spawns one `skaffold_uds_node` process per boot id;
-    /// `None` runs the hosts on in-process threads.
     pub node_bin: Option<PathBuf>,
     pub heartbeat_ms: u64,
     pub election_ms: u64,
-    /// The minimum leader-silence the in-process cluster tolerates before
-    /// any follower acts on it — the fence floor and the election wait's
-    /// lower clamp. The harness's switch fabric is the test thread; a
-    /// scheduler stall of that thread is wire silence to every follower
-    /// while no node actually failed, so the floor must exceed the stall a
-    /// loaded host produces (a 422 ms frame gap alone churned the
-    /// view 1→16 and starved the takeover). Defaults to 3000 ms.
     pub leader_timeout_min_ms: u64,
     pub leader_timeout_max_ms: u64,
     pub lock_id: u64,
@@ -873,7 +720,6 @@ struct ClientState {
 
 struct NodeSlot {
     request_path: PathBuf,
-    /// The driver→node stream (blocks-free: frames buffer, then drain).
     request: Option<(UnixStream, OutBuf)>,
     out: Option<(UnixStream, FrameBuf)>,
     child: Option<Child>,
@@ -882,23 +728,14 @@ struct NodeSlot {
 pub struct Cluster {
     pub config: ClusterConfig,
     trace: File,
-    /// The in-memory mirror of the trace file: the analyzers read this.
     pub lines: Vec<String>,
     nodes: HashMap<u32, NodeSlot>,
-    /// The descriptor's id -> name map: the trace's node actors spell
-    /// the descriptor name (`node44`), whatever the live id is.
     names: HashMap<u32, String>,
-    /// The in-process node host threads; joined at drop so the stop
-    /// sequence (markers, drain, flushed) completes before the next
-    /// scenario starts instead of racing it on the same disk.
     threads: Vec<std::thread::JoinHandle<()>>,
     listener: UnixListener,
-    /// Accepted out-conns awaiting their IDENT frame.
     incoming: Vec<(UnixStream, FrameBuf)>,
     clients: HashMap<String, ClientState>,
     stops: Vec<Arc<AtomicBool>>,
-    /// Client-op round trips over the 10 ms bucket (the pause windows
-    /// excluded by the scenario layer).
     pub rtt_violations: Vec<String>,
     pub max_driver_hop_us: u128,
     pub max_hop_detail: String,
@@ -915,7 +752,6 @@ impl Cluster {
         self.lines.push(line);
     }
 
-    /// The node actor's trace tag: the descriptor name for a member id.
     fn node_tag(&self, id: u32) -> String {
         self.names
             .get(&id)
@@ -1062,8 +898,6 @@ impl Cluster {
         })
     }
 
-    /// One driver slice: accept node out-conns, drain their frames (trace
-    /// + forward), tick the contenders. `now` is the wall-ms reading.
     pub fn poll(&mut self, now: u64) {
         self.accept_out();
         self.connect_all_requests();
@@ -1161,8 +995,6 @@ impl Cluster {
         }
     }
 
-    /// One node-emitted frame: trace it (the append+flush BEFORE the
-    /// forward), then route it. `from` is the emitting node's id.
     fn handle_node_frame(&mut self, from: u32, peer: u32, chan: u8, rest: &[u8], now: u64) {
         let started = std::time::Instant::now();
         match chan {
@@ -1171,14 +1003,9 @@ impl Cluster {
                 let from_name = self.node_tag(from);
                 let to_name = self.node_tag(peer);
                 self.record(&from_name, &to_name, &payload);
-                // A FORWARD_NOT_LEADER notch (peer 0) is the refusal route:
-                // the driver plays the forwarding follower's client socket
-                // and synthesizes the exact `{"error":"not_leader"}` bytes
-                // the real TCP conn writes.
                 if chan == CHAN_APP && !rest.is_empty() && rest[0] == FORWARD_NOT_LEADER {
                     self.deliver_not_leader(from, rest, now);
                 } else {
-                    // Forward down the destination's request channel.
                     let body = frame_body(from, chan, rest);
                     if let Some(slot) = self.nodes.get_mut(&peer) {
                         if let Some((stream, out)) = slot.request.as_mut() {
@@ -1195,14 +1022,10 @@ impl Cluster {
                 }
             }
             CHAN_CLIENT => {
-                // One client reply: correlate by message id.
                 let text = String::from_utf8_lossy(rest).into_owned();
                 self.deliver_client_reply(from, &text, now);
             }
             CHAN_CLIENT_OP => {
-                // The node issued its own client op (the heartbeat GET
-                // noise floor): trace it, then loop it back down the
-                // node's request channel.
                 let text = String::from_utf8_lossy(rest).into_owned();
                 let cid = serde_json::from_str::<Value>(&text)
                     .ok()
@@ -1230,8 +1053,6 @@ impl Cluster {
         }
     }
 
-    /// A 0x03 notch from node `from`: correlate the refused op to its
-    /// contender and answer the exact not_leader bytes.
     fn deliver_not_leader(&mut self, from: u32, rest: &[u8], now: u64) {
         if rest.len() < 17 {
             return;
@@ -1287,8 +1108,6 @@ impl Cluster {
         found
     }
 
-    /// One committed reply: trace, correlate, feed the contender (which
-    /// may immediately issue its follow-up — the free-probe SET race).
     fn deliver_client_reply(&mut self, from: u32, text: &str, now: u64) {
         let reply: Value = serde_json::from_str(text).unwrap_or(Value::Null);
         let mid = reply
@@ -1296,8 +1115,6 @@ impl Cluster {
             .and_then(|v| v.as_str())
             .and_then(uuid_bytes);
         let Some(mid) = mid else {
-            // No message id: the node's own uncorrelated reply (never
-            // expected — every op carries one).
             self.record(
                 &self.node_tag(from),
                 "driver",
@@ -1336,8 +1153,6 @@ impl Cluster {
         }
     }
 
-    /// Issue one contender action: trace the line, send the frame down the
-    /// home node's request channel, arm the pending correlation.
     fn issue_action(&mut self, client: &str, action: Action, now: u64) {
         let (node, text, mid, op, body) = {
             let Some(state) = self.clients.get_mut(client) else {
@@ -1365,8 +1180,6 @@ impl Cluster {
         }
     }
 
-    /// A hand-built verb for the raw clients (stage 1: the harness speaks
-    /// ANYTHING we tell it).
     pub fn raw_issue(&mut self, client: &str, json_text: &str) -> Result<(), String> {
         let now = millis();
         let (node, mid, body) = {
@@ -1417,9 +1230,6 @@ impl Cluster {
                         client_gate::stop(gate, now);
                     }
                 }
-                // One op in flight at a time (the wire loop discipline):
-                // an overdue pending is abandoned into the backoff, and a
-                // new action is decided only while idle.
                 let overdue = state.pending.as_ref().is_some_and(|(_, _, issued)| {
                     now.saturating_sub(*issued) >= self.config.op_deadline_ms
                 });
@@ -1440,8 +1250,6 @@ impl Cluster {
         }
     }
 
-    /// Start (SIGUSR2-equivalent) / pause (SIGUSR1-equivalent gate
-    /// silence) one contender. The marker lands in the trace.
     pub fn client_start(&mut self, client: &str) {
         self.marker("start", &format!(",\"client\":\"{client}\""));
         if let Some(state) = self.clients.get_mut(client) {
@@ -1457,7 +1265,6 @@ impl Cluster {
                 client_gate::stop(contender.gate(), millis());
             }
         }
-        // Silence abandons the in-flight op (the gate discipline).
         for state in self.clients.values_mut() {
             if state.name == client {
                 state.pending = None;
@@ -1465,7 +1272,6 @@ impl Cluster {
         }
     }
 
-    /// The contender's holder identity (its lease's holder string).
     pub fn client_holder(&self, client: &str) -> Option<String> {
         self.clients
             .get(client)
@@ -1480,9 +1286,6 @@ impl Cluster {
             .unwrap_or(&[])
     }
 
-    /// Wait until `predicate` holds over the trace lines (the poll loop
-    /// drives the cluster while it waits). Returns false on the deadline;
-    /// the caller names the hung message.
     pub fn wait_until(&mut self, timeout_ms: u64, predicate: impl Fn(&[String]) -> bool) -> bool {
         let deadline = millis() + timeout_ms;
         loop {
@@ -1527,12 +1330,6 @@ impl Drop for Cluster {
         for stop in &self.stops {
             stop.store(true, Ordering::Relaxed);
         }
-        // The break is the drain point: every in-process host thread runs
-        // its node stop (wire closed, `stopped` marker, drain, `flushed`
-        // marker) inside `run`; joining here keeps that sequence inside
-        // THIS cluster's teardown, so the next scenario never races it on
-        // the same disk. The spawned binaries get the crash shape instead:
-        // SIGKILL skips the whole sequence by design.
         for handle in self.threads.drain(..) {
             let _ = handle.join();
         }
@@ -1545,12 +1342,6 @@ impl Drop for Cluster {
     }
 }
 
-// ---------------------------------------------------------------------------
-// The scenario layer: the stages, their asserted invariants, and the
-// `[pass]`/`[fail]` verdicts the driver prints.
-// ---------------------------------------------------------------------------
-
-/// One scenario assertion's outcome.
 pub struct Verdict {
     pub name: String,
     pub pass: bool,
@@ -1565,7 +1356,6 @@ fn verdict(name: &str, pass: bool, detail: String) -> Verdict {
     }
 }
 
-/// Print the verdicts; true when every one passed.
 pub fn print_verdicts(verdicts: &[Verdict]) -> bool {
     let mut all = true;
     for v in verdicts {
@@ -1580,7 +1370,6 @@ pub fn print_verdicts(verdicts: &[Verdict]) -> bool {
     all
 }
 
-/// One parsed trace line: `from,to,payload-json`.
 pub struct TraceLine<'a> {
     pub from: &'a str,
     pub to: &'a str,
@@ -1595,7 +1384,6 @@ pub fn parse_line(line: &str) -> Option<TraceLine<'_>> {
     Some(TraceLine { from, to, json })
 }
 
-/// Granted-SET lines: `to` receives `{"op":"set",...,"granted":true,...}`.
 fn grants(lines: &[String], to: &str) -> Vec<(u64, String)> {
     lines
         .iter()
@@ -1616,7 +1404,6 @@ fn grants(lines: &[String], to: &str) -> Vec<(u64, String)> {
         .collect()
 }
 
-/// The GET replies one client received (the poll cadence's evidence).
 fn get_replies(lines: &[String], to: &str) -> Vec<u64> {
     lines
         .iter()
@@ -1627,8 +1414,6 @@ fn get_replies(lines: &[String], to: &str) -> Vec<u64> {
         .collect()
 }
 
-/// View-change fence tags in the trace (5 StartViewChange, 6 DoViewChange,
-/// 7 StartView): zero after settle is the no-silence-storm invariant.
 fn view_change_count(lines: &[String]) -> usize {
     lines
         .iter()
@@ -1638,10 +1423,6 @@ fn view_change_count(lines: &[String]) -> usize {
         .count()
 }
 
-/// The leader stayed stable across the window: every Commit (tag 4)
-/// carries one view, and it does not rise above the first Commit's
-/// view of the window. Any view increase marks a leader change — the
-/// lock-up side of the operator's stability question.
 fn leader_view_window(lines: &[String]) -> bool {
     let views: Vec<u64> = lines
         .iter()
@@ -1656,15 +1437,6 @@ fn leader_view_window(lines: &[String]) -> bool {
     }
 }
 
-/// The leader Commit stream's largest gap (the heartbeat noise floor's
-/// continuity), on the driver receive-clock column: the wall-ms the
-/// switch fabric recorded each Commit. The stamp is the fabric's own
-/// clock — the standby-side record, never the leader's send claim — so
-/// a red gap means the recorded stream broke; whether the leader SENT
-/// late is the leader's own log's question, and the two clocks
-/// together separate a late send from a late record. None when no
-/// Commit line carries the column: the verdict refuses to pass on
-/// absent evidence.
 fn max_commit_gap(lines: &[String]) -> Option<u64> {
     let mut stamps: Vec<u64> = lines
         .iter()
@@ -1684,16 +1456,8 @@ fn max_commit_gap(lines: &[String]) -> Option<u64> {
     Some(max_gap)
 }
 
-/// STAGE 1: a genesis two-node cluster; the driver feeds a raw GET and a
-/// raw SET down the UDS and asserts the reply shapes and the trace line
-/// shapes. This proves the host speaks ANYTHING we tell it. (A one-member
-/// cluster cannot serve: the core's `plan_propose` addresses only
-/// `backups()`, which excludes self, so a lone primary emits no Prepare
-/// and nothing ever commits — the smallest servable shape is two nodes.)
 pub fn stage1(mut cluster: Cluster) -> Vec<Verdict> {
     let mut out = Vec::new();
-    // Readiness: the heartbeat GET loop is live (its reply rides the
-    // driver back to the beef-* actor).
     let ready = cluster.wait_until(5000, |lines| {
         lines.iter().any(|l| l.starts_with("node44,beef-"))
     });
@@ -1707,8 +1471,6 @@ pub fn stage1(mut cluster: Cluster) -> Vec<Verdict> {
         },
     ));
 
-    // The raw GET: the reply shape the audit pins
-    // (`{"op":"get",...,"lease":null,"executed_at":<ms>}`).
     let mid = Uuid::new_v4();
     let get = format!(
         "{{\"op\":\"get\",\"message_id\":\"{mid}\",\"client_id\":900001,\"request_num\":1,\
@@ -1738,9 +1500,6 @@ pub fn stage1(mut cluster: Cluster) -> Vec<Verdict> {
         format!("rtt_ms={rtt}"),
     ));
 
-    // The raw SET: granted, the lease echoes the offered holder. The
-    // request asks for a DURATION on the new protocol — the leader
-    // stamps the expiry off its own execution clock.
     let holder = Uuid::new_v4();
     let mid = Uuid::new_v4();
     let set = format!(
@@ -1766,7 +1525,6 @@ pub fn stage1(mut cluster: Cluster) -> Vec<Verdict> {
         format!("reply={set_reply:?}"),
     ));
 
-    // The trace line shape: every line is `from,to,json`.
     let mut bad = 0;
     for line in &cluster.lines {
         if parse_line(line).is_none() {
@@ -1785,12 +1543,8 @@ fn cluster_lines_granted(lines: &[String], to: &str) -> bool {
     !grants(lines, to).is_empty()
 }
 
-/// STAGE 2: two nodes that think they are in a cluster of three; one
-/// polite contender holds and renews; the third client joins later and
-/// must probe politely without stealing.
 pub fn stage2(mut cluster: Cluster) -> Vec<Verdict> {
     let mut out = Vec::new();
-    // Quorum of two settles: a leader Commit stream appears.
     let ready = cluster.wait_until(8000, |lines| {
         lines.iter().filter_map(|l| parse_line(l)).any(|l| {
             l.from.starts_with("node")
@@ -1818,7 +1572,6 @@ pub fn stage2(mut cluster: Cluster) -> Vec<Verdict> {
         std::thread::sleep(Duration::from_millis(1));
     }
 
-    // The polite contender on node 44 holds and renews (~250 ms cadence).
     cluster.client_start("client1");
     let held = cluster.wait_until(3000, |lines| !grants(lines, "client1").is_empty());
     let holder = cluster.client_holder("client1");
@@ -1839,8 +1592,6 @@ pub fn stage2(mut cluster: Cluster) -> Vec<Verdict> {
         format!("granted_sets={renewals} in 700ms window"),
     ));
 
-    // The third client joins: it must re-enter as a NON-holder probing
-    // politely (GET gaps >= 900 ms), never stealing, never erroring.
     let before = cluster.lines.len();
     cluster.client_start("client2");
     let probe_at = millis();
@@ -1903,10 +1654,6 @@ pub fn stage2(mut cluster: Cluster) -> Vec<Verdict> {
     out
 }
 
-/// STAGE 3: the full three-node cluster with one polite client per DC; on
-/// driver command the holder is PAUSED (gate-silence) and a successor must
-/// take the lock inside the honest takeover bound, then the paused client
-/// re-enters cleanly as a non-holder.
 pub fn stage3(mut cluster: Cluster) -> Vec<Verdict> {
     let mut out = Vec::new();
     let ready = cluster.wait_until(8000, |lines| {
@@ -1962,8 +1709,6 @@ pub fn stage3(mut cluster: Cluster) -> Vec<Verdict> {
         ),
     ));
 
-    // THE WELL-ASKED QUESTION: pause the holder; does a successor take the
-    // lock, and how long did it take (from the trace timestamps)?
     let anchor = millis();
     cluster.client_pause("client1");
     let successors: Vec<&str> = vec!["client2", "client3"];
@@ -1994,8 +1739,6 @@ pub fn stage3(mut cluster: Cluster) -> Vec<Verdict> {
         ),
     ));
 
-    // The paused client re-enters cleanly: first action a GET probe, never
-    // a blind BUMP, and no steal while the successor renews.
     let before = cluster.lines.len();
     let ops_before = cluster.client_ops("client1").len();
     cluster.client_start("client1");
@@ -2019,12 +1762,6 @@ pub fn stage3(mut cluster: Cluster) -> Vec<Verdict> {
         format!("grants_after_resume={}", re_grants.len()),
     ));
 
-    // Budgets: the 10 ms RTT bucket holds over the run outside the pause
-    // window, and the <= 1 ms driver hop at p99. A few violations are
-    // tolerable only while the suite runs beside other binaries' CPU
-    // load; a real livelock/blocking shows as hundreds, so the pass
-    // bound stays far below that. The list is reported in_FULL either
-    // way.
     out.push(verdict(
         "stage3: RTT bucket respected (violations <= 5 of the 10 ms bucket)",
         cluster.rtt_violations.len() <= 5,
@@ -2042,12 +1779,6 @@ pub fn stage3(mut cluster: Cluster) -> Vec<Verdict> {
             cluster.max_hop_detail
         ),
     ));
-    // Storms: view-change frames in the FULLY settled window — after the
-    // resumed client's re-entry completes. The re-entry window itself
-    // legitimately carries takeover churn (the fence burst shortens as
-    // the quorum replaces the paused lease); the settled service after
-    // re-entry must be fence-free AND leader-stable, which is the
-    // operator's "does it stabilize or lock up" question.
     let storms_window = &cluster.lines[reentered..];
     let storms = view_change_count(storms_window);
     let leader_slots = leader_view_window(storms_window);
@@ -2059,13 +1790,6 @@ pub fn stage3(mut cluster: Cluster) -> Vec<Verdict> {
             storms_window.len()
         ),
     ));
-    // The heartbeat noise floor: the Commit stream the standby side
-    // records stays continuous — the leader's idle heartbeat rides a
-    // Commit every follower's leader timeout re-arms on. The gap is
-    // measured on the driver receive-clock column (the fabric's own
-    // stamp — what the standby recorded), so a red names the recorded
-    // stream's break; the leader's own log separates a late send from
-    // a late record.
     let gap = max_commit_gap(&cluster.lines);
     out.push(verdict(
         "stage3: heartbeat noise floor continuous",
@@ -2078,18 +1802,6 @@ pub fn stage3(mut cluster: Cluster) -> Vec<Verdict> {
     out
 }
 
-/// STAGE 4: the simultaneous bring-up race — three polite contenders
-/// started TOGETHER against one free lock. The Service serializes the
-/// three SET races: one contender is granted, the other two are DENIED
-/// with the incumbent's live lease echoed (the exact reply shape the
-/// wire clients see). The denied contenders must withdraw their stakes
-/// and return to the probe cadence — the op mix shows a GET after the
-/// denied renewal — never renewing a lease they do not hold; a paused
-/// holder's lease is then taken through the probe→SET-race path (the
-/// successor's SECOND set op), never through a blind renewal; and the
-/// paused contender re-enters as a probe. The verdicts key on the trace
-/// and op ordering, never on wall-clock bounds, so a loaded host cannot
-/// flake the scenario's truth.
 pub fn stage4(mut cluster: Cluster) -> Vec<Verdict> {
     let mut out = Vec::new();
     let ready = cluster.wait_until(8000, |lines| {
@@ -2114,7 +1826,6 @@ pub fn stage4(mut cluster: Cluster) -> Vec<Verdict> {
     cluster.max_driver_hop_us = 0;
     cluster.max_hop_detail.clear();
 
-    // The simultaneous bring-up: all three chase the free lock at once.
     for client in ["client1", "client2", "client3"] {
         cluster.client_start(client);
     }
@@ -2141,17 +1852,12 @@ pub fn stage4(mut cluster: Cluster) -> Vec<Verdict> {
         .map(|client| client.to_string())
         .collect();
 
-    // Observe the chase: the holder renews on its cadence, the denied
-    // contenders back off and re-probe at the polite floor.
     let observe_at = millis();
     while millis() < observe_at + 4000 {
         cluster.poll(millis());
         std::thread::sleep(Duration::from_millis(1));
     }
 
-    // The denial itself: each loser's first SET reply carries
-    // granted:false with the incumbent's lease echoed — the race's
-    // outcome as the leader stated it.
     let first_set_denied = |lines: &[String], client: &str| {
         lines
             .iter()
@@ -2170,10 +1876,6 @@ pub fn stage4(mut cluster: Cluster) -> Vec<Verdict> {
         ));
     }
 
-    // THE regression: a contender that staked on a denied race must
-    // re-probe — its op mix shows a GET after the denied renewal. A
-    // contender that keeps renewing against a foreign holder's lease
-    // echo never probes again (its ops stay get, set, extend, extend, …).
     let extended_then_probed = |client: &str| {
         let ops = cluster.client_ops(client);
         ops.iter()
@@ -2191,11 +1893,6 @@ pub fn stage4(mut cluster: Cluster) -> Vec<Verdict> {
         ));
     }
 
-    // THE sustain check: the race's winner KEEPS the lease — its
-    // renewals are granted to it alone (many granted SETs, no other
-    // client acquiring) for as long as nothing external intervenes. A
-    // holder that discards its own granted renewals rotates the lock
-    // every window instead: the other contenders acquire in turn.
     let sustain_before = cluster.lines.len();
     let sustain_at = millis();
     while millis() < sustain_at + 2000 {
@@ -2217,14 +1914,6 @@ pub fn stage4(mut cluster: Cluster) -> Vec<Verdict> {
         ),
     ));
 
-    // The holder lapses (gate-silenced): a successor must take the
-    // lease through the probe→SET-race path — its SECOND set op. A
-    // takeover through a blind renewal has no second set. The wait is a
-    // liveness bound, not the verdict's truth: a pause coinciding with
-    // a suspicion-driven view change makes the contenders probe through
-    // `not_leader` backoffs until a leader re-stabilizes, so the bound
-    // tolerates a transient storm; the discriminator is the successor's
-    // op mix, which no amount of waiting can fake.
     let anchor = millis();
     cluster.client_pause(&winner);
     let successors: Vec<String> = losers.clone();
@@ -2260,8 +1949,6 @@ pub fn stage4(mut cluster: Cluster) -> Vec<Verdict> {
         return out;
     }
 
-    // The paused contender re-enters as a probe, never a blind renewal,
-    // and does not steal the successor's lease.
     let lines_before = cluster.lines.len();
     let ops_before = cluster.client_ops(&winner).len();
     cluster.client_start(&winner);

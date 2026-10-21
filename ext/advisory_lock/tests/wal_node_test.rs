@@ -1,14 +1,3 @@
-//! The WAL store at the node's construction, driven through the real C
-//! ABI: the mounted store's counters through `lunet_lock_node_state_tick`
-//! and `lunet_lock_node_state_status`, the stop path's
-//! submit-before-flush order on the census tape, and the
-//! construction-refusal fallback that boots without the artefact.
-//!
-//! The rig is three in-process nodes wired by hand: the sends one node's
-//! output queue releases are delivered to the addressed peer's `receive`,
-//! round by round, until the leader commits a client lock. The same C
-//! ABI the Lunet runtime drives, no smaller a fake.
-
 use std::ffi::c_void;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -75,7 +64,6 @@ unsafe extern "C" {
 
 const DATAGRAM: usize = 65507;
 
-/// The scratch tree, inside the repo (`.tmp` is scratch).
 fn scratch(name: &str) -> PathBuf {
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.tmp/wal-node");
@@ -89,8 +77,6 @@ fn scratch(name: &str) -> PathBuf {
     dir
 }
 
-/// A three-member descriptor: distinct provisioned identities, the
-/// genesis succession order, NUL-separated, no trailing NUL.
 fn members() -> String {
     [1u32, 2, 3]
         .iter()
@@ -112,8 +98,6 @@ struct AbiNode {
 }
 
 impl AbiNode {
-    /// A node through the C ABI's own construction — the WAL store's
-    /// mount seat. The handle is freed on drop.
     fn new(root: &Path, name: &str) -> AbiNode {
         unsafe {
             let state = root.join(format!("{name}.nonce"));
@@ -139,8 +123,6 @@ impl AbiNode {
         }
     }
 
-    /// The AOF-backed sibling: the same mount seat, the write-behind
-    /// writer in the journal's place.
     fn new_aof(root: &Path, name: &str, aof_dir: &Path) -> AbiNode {
         unsafe {
             let state = root.join(format!("{name}.nonce"));
@@ -209,7 +191,6 @@ impl AbiNode {
         }
     }
 
-    /// The output queue, drained: `(kind, to, bytes)` per output.
     fn outputs(&self, buf: &mut [u8]) -> Vec<(u32, u32, Vec<u8>)> {
         unsafe {
             let mut outputs = Vec::new();
@@ -251,9 +232,6 @@ impl Drop for AbiNode {
     }
 }
 
-/// One delivery round: idle every node (the heartbeat's tick), drain
-/// every queue, hand each send to its addressee's `receive` attributed
-/// to the sender's live id, and hand every reply back to the caller.
 fn round(rig: &mut [AbiNode], buf: &mut [u8]) -> Vec<Vec<u8>> {
     let mut replies = Vec::new();
     let mut deliveries: Vec<(u32, u32, Vec<u8>)> = Vec::new();
@@ -281,9 +259,6 @@ fn round(rig: &mut [AbiNode], buf: &mut [u8]) -> Vec<Vec<u8>> {
     replies
 }
 
-/// Wire the rig until some node is leader, then return the leader's
-/// index. The genesis primary is seated from provision; the rounds ride
-/// the ordinary idle ticks.
 fn elect(rig: &mut [AbiNode], buf: &mut [u8]) -> usize {
     for _ in 0..64 {
         round(rig, buf);
@@ -296,9 +271,6 @@ fn elect(rig: &mut [AbiNode], buf: &mut [u8]) -> usize {
     panic!("no leader emerged in 64 rounds");
 }
 
-/// Drive one client lock through the rig until the leader's reply
-/// arrives, delivering every protocol output along the way. The reply
-/// bytes are the caller's to assert on.
 fn take_lock(rig: &mut [AbiNode], leader: usize, json: &str, buf: &mut [u8]) -> Vec<u8> {
     assert_eq!(rig[leader].request(json), 0, "the leader proposes the lock");
     for _ in 0..64 {
@@ -310,18 +282,12 @@ fn take_lock(rig: &mut [AbiNode], leader: usize, json: &str, buf: &mut [u8]) -> 
     panic!("the lock never committed in 64 rounds");
 }
 
-/// The reply marker the rig's matcher waits for: `"granted":true`.
 const GRANTED: &[u8] = b"\"granted\":true";
 
-/// The byte-level membership test the reply matcher runs: a window of
-/// the needle's length compared for equality — no string allocation on
-/// the rig's hot path.
 fn contains(bytes: &[u8], needle: &[u8]) -> bool {
     bytes.windows(needle.len()).any(|window| window == needle)
 }
 
-/// A set request the state machine grants: an unnamed lock (the
-/// ephemeral class) with a canonical message id.
 fn set_json(message_id: &str, lock_id: u64, lease_id: u64, holder: &str) -> String {
     format!(
         "{{\"op\":\"set\",\"message_id\":\"{message_id}\",\"client_id\":1,\"request_num\":1,\
@@ -330,12 +296,6 @@ fn set_json(message_id: &str, lock_id: u64, lease_id: u64, holder: &str) -> Stri
     )
 }
 
-/// The mounted WAL store, end to end: the node constructs with the store
-/// beside its state path, a committed lock rides `state_tick` into the
-/// ephemeral stream (the per-stream counters move through the FFI), the
-/// store's artefact sits pre-laid-out at the `.wal` path, and the stop
-/// walks its submit-before-flush seat — `state.tick` strictly inside the
-/// drain window, before the eager flush — and completes clean.
 #[test]
 fn the_wal_store_mounts_ticks_and_stops_through_the_ffi() {
     let root = scratch("mount-tick-stop");
@@ -423,12 +383,6 @@ fn the_wal_store_mounts_ticks_and_stops_through_the_ffi() {
     );
 }
 
-/// The stop-before-demand case: a clean boot that never served a client
-/// op never took the lazy load — and its stop still owes the eager
-/// flush the table the artefact holds. The stop takes the load itself
-/// (the same guard: clean verdict, empty table, once), notes the loaded
-/// locks, ticks, and the flush reconciles — and the artefact is
-/// rewritten with the same table, not destroyed by an empty flush.
 #[test]
 fn the_stop_takes_the_load_it_owes_the_flush() {
     let root = scratch("stop-before-demand");
@@ -490,10 +444,6 @@ fn the_stop_takes_the_load_it_owes_the_flush() {
     );
 }
 
-/// The AOF-backed mount, end to end: the creator refuses an empty AOF
-/// directory rather than falling back, a mounted node elects and serves
-/// through the real C ABI, and a clean stop leaves the AOF series on
-/// disk beside the same WAL state artefact the counters ride.
 #[test]
 fn the_aof_mount_serves_stops_and_leaves_the_series() {
     let root = scratch("aof-mount");
@@ -563,11 +513,6 @@ fn the_aof_mount_serves_stops_and_leaves_the_series() {
     );
 }
 
-/// The sweeper: a lease left to expire leaves the live table at the
-/// leader's heartbeat cadence — reaped as a committed break that rides
-/// the replication log (the generation counter advances), not merely
-/// filtered at the next request. A live lease survives the same beats
-/// untouched.
 #[test]
 fn the_sweeper_reaps_an_expired_lease_at_the_heartbeat() {
     let root = scratch("sweeper");
@@ -650,11 +595,6 @@ fn the_sweeper_reaps_an_expired_lease_at_the_heartbeat() {
     }
 }
 
-/// The construction-refusal fallback (R4): a corrupt artefact refuses
-/// the store's open, the node boots anyway — the WAL is a fallback,
-/// never a safety mechanism — and the fallback store reports no
-/// counters. The node remains correct: it elects, serves, and stops
-/// clean.
 #[test]
 fn a_refused_wal_mount_boots_without_the_artefact() {
     let root = scratch("mount-refused");

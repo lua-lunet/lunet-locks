@@ -3,8 +3,7 @@
 The lock-event journal is an append-only, per-replica binary log of committed
 lock transitions. It exists to give the console and other observers a durable,
 replayable view of what the cluster has done. The journal is observability
-data: it never participates in replication, consensus, or recovery, and a
-journal failure never affects the service path.
+data: it never participates in replication, consensus, or recovery.
 
 ## What is journaled
 
@@ -118,14 +117,11 @@ were, exactly like a release record.
 
 ## Durability posture
 
-The journal is **observability data**. Its design invariant is that it must
-never block, poison, or fail the replication path:
+The journal is **observability data**. Its write failures follow the
+let-it-crash law ([architecture](architecture.md)): every write failure on
+the journal crashes the process — there is no disable-and-continue and no
+degraded mode.
 
-- A journal I/O error logs once to stderr and disables journaling for the
-  remainder of the process lifetime. The node continues serving clients and
-  participating in replication normally.
-- Journal errors are never propagated to the core, never trigger a fault, and
-  never cause a view change.
 - The journal directory and roll threshold are optional. An empty
   `--event-journal-dir` disables journaling entirely.
 

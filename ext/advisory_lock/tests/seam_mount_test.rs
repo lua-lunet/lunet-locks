@@ -1,35 +1,3 @@
-//! The public injection point, proven on a real node: an OUT-OF-CRATE
-//! `Disk`, `StateStore`, `CommitHook` and boot-fence `LifecycleStore`
-//! mounted through the one public door, `Node::open_with_seams`, driving
-//! the real protocol with real peers.
-//!
-//! This file is its own crate. Every name it can reach is the library's
-//! public surface — the seam's names all come through `spi`, the seam's
-//! front door. The local implementations are real, never fakes of the
-//! traits under test: the disk delegates to [`StdDisk`] (the smallest
-//! embedder implementation there is), the store is the industrial
-//! [`FileStateStore`] framing over that disk with its own observation
-//! tally, the hook is a real callback tallying the commits it observes,
-//! and the fence is a real marker store — the machine's uniform 4x
-//! rounds as lines on the real disk, a quorum read over them, the
-//! drain's sync — the shape upstream's boot-gate chapter names a test
-//! store. The peer nodes run the machinery's own defaults, so the
-//! seam-mounted node is driven by exactly the protocol the cluster
-//! speaks, over the public `receive` only.
-//!
-//! Two claims:
-//!
-//! (a) a node mounted through the public door boots through the fence,
-//!     applies a client commit (the mounted hook observes it, and the
-//!     first life's verdict refuses the lazy load before the mounted
-//!     store is ever touched), and stops clean with the census schedule
-//!     intact and the flushed file loadable;
-//! (b) the fence door carries the boot classification: a clean stop's
-//!     stopped quorum read through the mounted fence classifies the next
-//!     life CLEAN, and the law rides it — the clean resume's first
-//!     demand loads the flushed table through the mounted store, once,
-//!     and the restored lock is served.
-
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -50,9 +18,6 @@ use vrr::lifecycle::{CopyState, Marker, SuperblockCopies};
 // The out-of-crate implementations
 // ---------------------------------------------------------------------------
 
-/// The out-of-crate disk: every method delegates to the wrapped
-/// [`StdDisk`] through the trait's own surface. Nothing here names a
-/// library internal — from out here there are none to name.
 struct SeamDisk {
     inner: StdDisk,
 }
@@ -137,11 +102,6 @@ impl Disk for SeamDisk {
     }
 }
 
-/// The out-of-crate state store: the industrial [`FileStateStore`] framing
-/// over the out-of-crate disk, plus the store's own tally of the calls
-/// the node made through the trait. The tally is the proof the node
-/// speaks to THE MOUNTED STORE — a counter on a real implementation, not
-/// a stand-in for one.
 struct SeamStore {
     inner: FileStateStore,
     disk: Arc<dyn Disk>,
@@ -197,8 +157,6 @@ impl StateStore for SeamStore {
     }
 }
 
-/// The out-of-crate commit hook: a real callback, tallying the applied
-/// commits it observes — the slots the machinery named, in order.
 #[derive(Clone, Default)]
 struct SeamHook {
     slots: Arc<Mutex<Vec<u64>>>,
@@ -222,17 +180,10 @@ impl CommitHook for SeamHook {
     }
 }
 
-/// The out-of-crate boot fence: the machine's marker rounds as plain
-/// marker lines on the real disk — four uniform copies per commit, the
-/// quorum read over them, the drain's directory sync. The shape upstream's
-/// boot-gate chapter names a test store, and a real one: the durable
-/// bytes are on the disk through the out-of-crate [`Disk`], and the next
-/// life's classification reads what this life's stop wrote.
 #[derive(Clone)]
 struct SeamFence {
     disk: Arc<dyn Disk>,
     path: PathBuf,
-    /// The calls the machinery made through the trait, in order.
     tape: Arc<Mutex<Vec<String>>>,
 }
 
@@ -275,9 +226,6 @@ impl SeamFence {
 impl LifecycleStore for SeamFence {
     type Error = io::Error;
 
-    /// The quorum read: the four copies the file holds, or `None` when no
-    /// marker has ever been written (the first life). A short file is a
-    /// refusal — the four-copies contract is the store's own.
     fn read_copies(&mut self) -> Result<Option<SuperblockCopies>, Self::Error> {
         if !self.disk.exists(&self.path) {
             self.tape
@@ -319,11 +267,6 @@ impl LifecycleStore for SeamFence {
         Ok(Some(SuperblockCopies { copies }))
     }
 
-    /// The forced write: every copy, durably, flushed and synced before
-    /// the call returns — through the atomic durable-write shape (a
-    /// staging file, fsync, rename), so a shorter round never leaves a
-    /// longer round's tail behind. The uniform-4x invariant is the
-    /// machine's own; the store asserts it as the disk backend does.
     fn commit(&mut self, copies: &SuperblockCopies) -> Result<(), Self::Error> {
         let copy = copies.copies[0];
         assert!(
@@ -357,7 +300,6 @@ impl LifecycleStore for SeamFence {
         Ok(())
     }
 
-    /// The drain: the host forces its durable state to stable storage.
     fn drain(&mut self) -> Result<(), Self::Error> {
         self.disk.sync_path(
             self.path
@@ -376,11 +318,6 @@ impl LifecycleStore for SeamFence {
 // The switchboard: three real nodes on one thread
 // ---------------------------------------------------------------------------
 
-/// Three nodes on one thread with a switchboard: each node's sends are
-/// routed to the addressed member's inbox through the public `receive`,
-/// replies collected. A switchboard, not a fake: every byte the
-/// seam-mounted node exchanges with its peers crosses the public surface,
-/// exactly as a datagram socket would carry it.
 struct Cluster {
     nodes: Vec<Node>,
     ids: [u32; 3],
@@ -440,8 +377,6 @@ fn reply_message_id(reply: &Response) -> Uuid {
     }
 }
 
-/// A three-member descriptor: distinct provisioned identities, the
-/// genesis succession order, NUL-separated, no trailing NUL.
 fn members() -> String {
     [1u32, 2, 3]
         .iter()
@@ -461,7 +396,6 @@ fn member_id(system: u32) -> u32 {
     (system << 16) | 1
 }
 
-/// A lock-take request, the lock-verb JSON the public `request` decodes.
 fn set_request(message_id: Uuid, client_id: u64, request_num: u64, lock_id: u64) -> Vec<u8> {
     serde_json::json!({
         "op": "set",
@@ -481,7 +415,6 @@ fn set_request(message_id: Uuid, client_id: u64, request_num: u64, lock_id: u64)
     .into_bytes()
 }
 
-/// A lock-read request.
 fn get_request(message_id: Uuid, client_id: u64, request_num: u64, lock_id: u64) -> Vec<u8> {
     serde_json::json!({
         "op": "get",
@@ -494,12 +427,10 @@ fn get_request(message_id: Uuid, client_id: u64, request_num: u64, lock_id: u64)
     .into_bytes()
 }
 
-/// The lock's holder, the same UUID every take names.
 fn holder() -> Uuid {
     Uuid::from_u128(0x0f1e_2d3c_0000_0000_0000_0000_0000_0001u128)
 }
 
-/// The scratch tree, inside the repo (`.tmp` is scratch).
 fn scratch(name: &str) -> PathBuf {
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.tmp/seam-mount");
@@ -514,10 +445,6 @@ fn scratch(name: &str) -> PathBuf {
     dir
 }
 
-/// The seam-mounted node's parts: the four seams, out-of-crate, over the
-/// case directory. The tallies are clones of the implementations' own
-/// observation tapes, so the test reads what the node wrote through the
-/// mounted implementations after the implementations are mounted.
 struct Seams {
     disk: Arc<dyn Disk>,
     store: SeamStore,
@@ -540,9 +467,6 @@ fn seams(dir: &Path) -> Seams {
     }
 }
 
-/// Boot the seam node (life one: a fresh marker, the mounted fence's
-/// first read finding nothing) and its two peers on the machinery's own
-/// defaults.
 fn first_life(dir: &Path, seams: &Seams) -> Cluster {
     let _ = census_paths();
     let a = Node::open_with_seams(
@@ -597,9 +521,6 @@ fn first_life(dir: &Path, seams: &Seams) -> Cluster {
     }
 }
 
-/// Drive a client request to its reply through the real protocol: the
-/// node is first driven to its seat (the boot-fenced promotion tick),
-/// then the propose runs, then the commit's reply arrives.
 fn drive_request(cluster: &mut Cluster, json: &[u8], message_id: &Uuid) -> Vec<u8> {
     cluster.drive_until(
         |cluster| {
@@ -625,9 +546,6 @@ fn drive_request(cluster: &mut Cluster, json: &[u8], message_id: &Uuid) -> Vec<u
     cluster.reply(message_id)
 }
 
-/// The stop's census schedule, the proving shape: the drain window opens,
-/// the state flush lands inside it, and the drain-proven round and the
-/// completion come after.
 fn assert_stop_schedule(tape: &[&'static str]) {
     let at = |name: &str| {
         tape.iter()
@@ -646,12 +564,6 @@ fn assert_stop_schedule(tape: &[&'static str]) {
     );
 }
 
-/// (a) The full mount: boot through the mounted fence, apply a client
-/// commit through the mounted hook (the first life's verdict refusing the
-/// lazy load before the mounted store is ever touched), stop clean with
-/// the census schedule intact — the marker rounds through the mounted
-/// fence, the eager flush through the mounted store, and the flushed file
-/// loadable.
 #[test]
 fn a_node_mounts_all_four_seams_through_the_public_door() {
     let dir = scratch("full-mount");
@@ -731,12 +643,6 @@ fn a_node_mounts_all_four_seams_through_the_public_door() {
     );
 }
 
-/// (b) The fence door carries the boot classification, and the law rides
-/// it: life one boots, takes a lock, and stops clean — the mounted fence
-/// holds the stopped quorum — and life two, booted through the same fence
-/// file, classifies CLEAN (never crashed), latches through the mounted
-/// fence, and at its first demand loads the flushed table through the
-/// mounted store, once. The restored lock is served.
 #[test]
 fn the_fence_door_carries_the_boot_classification_and_the_law_rides_it() {
     let dir = scratch("fence-classification");

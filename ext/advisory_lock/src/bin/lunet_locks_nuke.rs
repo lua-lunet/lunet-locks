@@ -1,34 +1,7 @@
-//! The `lunet_locks_nuke` admin tool: an operator's raw look at a marker
-//! store and a deliberate, confirmed reset of it. A testing-time
-//! instrument — NOT part of the shipped surface, NOT referenced from any
-//! documentation.
-//!
-//! THE OPERATOR'S LAW (confirmed):
-//!
-//! - The tool is EXPLICIT operator intent, outside the never-self-heal
-//!   rule: a commanded write over a corrupt block is the operator's own
-//!   call (hand-deleting the marker file instead would destroy strictly
-//!   more, projection included).
-//! - It NEVER panics, including on a corrupt store: the corruption is
-//!   shown, labelled, and every failure is a one-line stderr message
-//!   with a nonzero exit.
-//! - Default (no write args): print-only what is there — a corrupt
-//!   store gets per-copy `BAD CHECKSUM` rows and an overall corrupt
-//!   verdict line, and exit 0 (the investigation succeeded).
-//! - Overwrite: show the dump first (corrupt labelled), prompt on
-//!   STDERR (N/y, default NO), act, exit success — and NO reprint of
-//!   what it wrote (the operator re-runs with no args to confirm).
-//! - `--dangerously-skip-review` alone is non-interactive (the flag IS
-//!   the consent); `-q/--quiet` is additionally quiet (stdout minimal,
-//!   errors still on stderr; it does NOT suppress the prompt).
-//! - The write argument is the stringified state NAME — resolved via
-//!   the shared const tables (`marker::STATE_NAMES`/`state_name`) —
-//!   never a number.
-//! - GNU unix conventions: stdout = data, stderr = errors; 0 success
-//!   (a declined prompt is not an error, POSIX `rm -i` style); 2 usage
-//!   (clap's convention too); 66 (BSD sysexits `EX_NOINPUT`) not-found;
-//!   1 any real failure. Corrupt-copy garbage never prints as fake
-//!   decimal facts — hex only.
+//! The `lunet_locks_nuke` admin tool: print a marker store (corruption
+//! labelled) and reset it — a destructive, confirmed operator action.
+//! Never panics, including on a corrupt store: every failure is a
+//! one-line stderr message with a nonzero exit.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -64,17 +37,15 @@ struct Args {
     #[arg(long)]
     set_state: Option<String>,
 
-    /// Reset target system identifier (the identity pair's high half).
-    /// Defaults to the working quorum's resolved identity when the store
-    /// resolves one; required together with `--set-crash` when it does
-    /// not.
+    /// Reset target system identifier; defaults to the working quorum's
+    /// resolved identity, and requires `--set-crash` alongside when it
+    /// does not resolve.
     #[arg(long)]
     set_system: Option<u16>,
 
-    /// Reset target crash counter (the identity pair's low half — the
-    /// life's number, one-indexed). Defaults to the working quorum's
-    /// resolved identity when the store resolves one; required together
-    /// with `--set-system` when it does not.
+    /// Reset target crash counter (the life's number, one-indexed);
+    /// defaults to the working quorum's resolved identity, and requires
+    /// `--set-system` alongside when it does not resolve.
     #[arg(long)]
     set_crash: Option<u16>,
 
@@ -83,9 +54,8 @@ struct Args {
     #[arg(long)]
     dangerously_skip_review: bool,
 
-    /// Suppress informational stdout (the dump and the reset plan).
-    /// Errors still go to stderr; the interactive prompt is NOT
-    /// suppressed.
+    /// Suppress informational stdout; errors still go to stderr and the
+    /// prompt is NOT suppressed.
     #[arg(short = 'q', long)]
     quiet: bool,
 }
@@ -96,18 +66,12 @@ fn main() -> std::process::ExitCode {
 }
 
 fn run(args: &Args) -> i32 {
-    // One seam for the whole tool: the projection and the superblock's
-    // raw-zone dump are the only files it touches directly — the marker
-    // copies themselves are the vendored store's own boundary, not this
-    // row's.
     let disk = std_disk();
     let writing = args.set_state.is_some() || args.set_system.is_some() || args.set_crash.is_some();
     let superblock = superblock_path(&args.state);
 
-    // Not-found (print-only): neither the projection nor the superblock
-    // exists — a one-line stderr error, EX_NOINPUT, no stdout data.
-    // (A write over a fresh path is the store's seeding path: the fresh
-    // format creates the copies.)
+    // Not-found (print-only): a one-line stderr error, EX_NOINPUT, no
+    // stdout data; a write over a fresh path is the store's seeding path.
     if !writing && !disk.exists(&args.state) && !disk.exists(&superblock) {
         eprintln!(
             "{PREFIX}: {}: no such file or directory",
@@ -134,10 +98,8 @@ fn run(args: &Args) -> i32 {
 
     let copies = marker::inspect(&superblock).unwrap_or_default();
 
-    // The reset target: the explicitly named identity pair, else the
-    // working quorum's resolved one — the highest-sequence checksum-valid
-    // copy's pair. Nothing is guessed beyond that: with no valid copy,
-    // the operator names both halves.
+    // The reset target: the named pair, else the working quorum's
+    // resolved one; with no valid copy, the operator names both halves.
     let resolved = copies
         .iter()
         .filter(|copy| copy.readable == 1 && copy.valid_checksum == 1)
@@ -182,8 +144,6 @@ fn run(args: &Args) -> i32 {
                 return EXIT_USAGE;
             }
         },
-        // State kept: the working quorum's state (or the running
-        // sentinel when nothing resolves).
         None => copies
             .iter()
             .filter(|copy| copy.readable == 1 && copy.valid_checksum == 1)
@@ -210,9 +170,8 @@ fn run(args: &Args) -> i32 {
     }
 
     if !args.dangerously_skip_review {
-        // The prompt lives on STDERR (POSIX `rm -i`): stdout carries
-        // data only. EOF, an empty line, or anything but y/Y declines —
-        // the default is NO, and a decline is not an error.
+        // The prompt lives on STDERR (POSIX `rm -i`); anything but y/Y
+        // declines — the default is NO, and a decline is not an error.
         eprint!("{PREFIX}: proceed with the reset? [y/N] ");
         let _ = std::io::stderr().flush();
         let mut answer = String::new();
@@ -222,11 +181,8 @@ fn run(args: &Args) -> i32 {
         }
     }
 
-    // The write: the operator's explicit intent. No rotted-store
-    // refusal — a commanded reset over a corrupt block IS the command
-    // (the fresh format reads nothing first; the boot-path read/write
-    // refusals are untouched). Every failure is a one-line stderr
-    // message + exit 1; NO reprint of what it wrote.
+    // A commanded reset over a corrupt block IS the command: no
+    // rotted-store refusal. NO reprint of what it wrote.
     if let Err(code) = marker::format(&superblock, identity, state) {
         eprintln!(
             "{PREFIX}: the reset failed (FFI code {code}; -1 = the named pair is unspellable \
@@ -241,10 +197,9 @@ fn run(args: &Args) -> i32 {
     0
 }
 
-/// The `--set-state` argument resolved through the shared const tables:
-/// any `marker::STATE_NAMES` spelling is accepted, plus the documented
-/// alias `running` for the on-disk running sentinel (`unflushed`). No
-/// private lookup table — the tool consumes the one shared table.
+/// The `--set-state` argument resolved through the shared const tables,
+/// plus the documented alias `running` for the on-disk `unflushed`
+/// sentinel.
 fn resolve_state_name(name: &str) -> Option<marker::MarkerState> {
     if name == RUNNING_ALIAS {
         return Some(marker::MarkerState::Unflushed);
@@ -293,9 +248,7 @@ fn print_copies(
             continue;
         }
         if copy.valid_checksum == 0 {
-            // Corrupt garbage is never reinterpreted into fake decimal
-            // sequence/incarnation facts: the raw zone head prints as
-            // hex, nothing else.
+            // Corrupt garbage never prints as fake decimal facts: hex only.
             let hex = raw
                 .as_deref()
                 .and_then(|bytes| zone_head_hex(bytes, slot, geometry))
@@ -362,9 +315,7 @@ fn verdict(copies: &[CopyInfo]) -> String {
     }
 }
 
-/// The zone head's hex dump (the first 16 bytes): the corrupt copy's
-/// raw bytes are shown, never its garbage fields reinterpreted as
-/// decimal facts.
+/// The zone head's hex dump (the first 16 bytes).
 fn zone_head_hex(bytes: &[u8], slot: usize, geometry: marker::Geometry) -> Option<String> {
     let start = geometry.copy_size.checked_mul(slot)?;
     let head = bytes.get(start..)?.iter().take(16);
@@ -407,8 +358,7 @@ fn read_projection(disk: &dyn Disk, state: &Path) -> Option<String> {
 }
 
 /// The projection write with the adapter's durability discipline:
-/// fsync, rename, dir-sync (the single-file pattern). Every failure
-/// surfaces as an error — no panic, no expect.
+/// fsync, rename, dir-sync; every failure surfaces as an error.
 fn write_projection(
     disk: &dyn Disk,
     state: &Path,

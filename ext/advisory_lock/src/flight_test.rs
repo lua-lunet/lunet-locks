@@ -1,7 +1,3 @@
-//! The Flight Recorder's reader-path unit tests: the header's commit
-//! facts, the commit gate's refusal, and the recorder's tape mechanics.
-//! These run under the `flight-recorder` feature only.
-
 use super::*;
 
 fn temp_dir(name: &str) -> PathBuf {
@@ -17,8 +13,6 @@ fn temp_dir(name: &str) -> PathBuf {
     dir
 }
 
-/// The first record of every flight recording is the header, and it names
-/// the commit hash this very build was compiled from.
 #[test]
 fn the_first_record_is_the_header_naming_this_builds_commit() {
     let dir = temp_dir("header");
@@ -36,8 +30,6 @@ fn the_first_record_is_the_header_naming_this_builds_commit() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The commit gate refuses a recording whose commit the reader is not:
-/// a recording is readable ONLY by the code as-at its commit.
 #[test]
 fn the_commit_gate_refuses_a_foreign_commit() {
     let header = FlightHeader {
@@ -56,8 +48,6 @@ fn the_commit_gate_refuses_a_foreign_commit() {
     }
 }
 
-/// Events ride one JSONL line each, monotonically sequenced, each line
-/// flushed (a crash must not lose its own evidence).
 #[test]
 fn events_are_monotonic_one_line_each_and_flushed() {
     let dir = temp_dir("events");
@@ -85,9 +75,6 @@ fn events_are_monotonic_one_line_each_and_flushed() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A node opts in per directory: one file per node under the env-named
-/// dir; the recorder never fails the node (an unwritable dir just runs
-/// unrecorded via open_from_env's None path).
 #[test]
 fn open_from_env_names_one_file_per_node() {
     let dir = temp_dir("env");
@@ -116,7 +103,6 @@ fn open_from_env_names_one_file_per_node() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The hex encoding matches the tape's frame_hex convention.
 #[test]
 fn hex_is_lowercase_two_digits_per_byte() {
     assert_eq!(hex(&[0x00, 0xab, 0xff]), "00abff");

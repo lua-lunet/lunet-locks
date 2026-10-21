@@ -8,23 +8,6 @@ made.
 
 ## Three voting nodes is the minimum
 
-A cluster that cannot commit is not a lock service, and the sizes
-below that cannot are not deployments.
-
-- **One node** has no quorum to draw from. It accepts a client
-  proposal and can never commit it: the accepted-uncommitted proposal
-  sits forever, because there is no self-addressed prepare to advance
-  it and no second member to answer one. A singleton is a
-  process that appears to serve and never does.
-- **Two nodes** are replication without fault tolerance. The quorum is
-  both members, so any one failure stops all progress; there is no
-  third member to carry a majority. The failure mode is the same as
-  the singleton's, reached one node later.
-- **Three nodes** are the smallest configuration whose majority
-  survives the loss of any single member. Two of three remain a
-  quorum, so the cluster continues to commit and elect through a
-  single-node failure.
-
 **The ruling: a cluster never runs with fewer than three voting
 members.** "Voting" is load-bearing: a member folded into the
 configuration as a learner carries weight zero, contributes nothing to
@@ -64,21 +47,6 @@ authorised against.
 Failure detection in this service is the flavoured-timeout model, and
 the model is complete without a second estimator.
 
-The flavoured-timeout model supplies failure detection itself: each
-node watches a leader over a randomised timeout and, on the deadline,
-acts — a host-forced view change, the `suspect` toggle, the flush. A
-node that observes a real failure is therefore guaranteed to act on
-its own schedule, with no further mechanism required to notice.
-
-A second estimator of the same fact is a liveness liability, not a
-redundancy. It is the same actuation, driven by a more elaborate
-measurement of the silence the leader timeout already measures. Where
-the two disagree, the extra state is a second thing that can be wrong
-about liveness, and liveness reasoning is exactly where a second
-opinion is a liability — an estimator that crosses on a healthy but
-quiet cluster manufactures an unnecessary view change, and one that
-does not cross withholds a necessary one.
-
 **The ruling: the randomised leader timeout is the sole
 failure-detection mechanism.** The detection contract a second
 estimator served is already held by the leader timeout, and every
@@ -95,8 +63,7 @@ A voting member never writes protocol state to its local disk. The cluster's
 store of record is quorum memory, and a restarting node recovers its state
 from the streams of its peers. Local disk on a voting member carries the
 lifecycle marker, which fences, and observability, which vouches for
-nothing. The question that remains is where the state is durable when every
-voting member is down, and the answer is the UI server's series.
+nothing.
 
 **The ruling: the UI server is the deployment's state holder.** Every
 deployment registers at least one UI server per data centre. A UI server is
@@ -175,14 +142,8 @@ dead record is bulk.
 
 ## The system lease is a lease, not a fault detector
 
-uVRR's own paper puts it plainly: a read that consults the replicas costs a
-round trip, and §6.3.1 names the standard cure — Harp's leader lease, the
-leader answering reads from its own memory inside a lease period it keeps
-renewed, so a read is one hop while the lease holds and the full quorum
-round only once the lease is gone.
-
-This cluster runs that shape as an embedded lock rather than as machinery.
-A leader that can serve reads from its own state holds that claim under a
+This cluster runs an embedded lock as the leader's read lease: a leader
+that can serve reads from its own state holds that claim under a
 lock in the same lock table every other lease lives in, at an address
 reserved for system use. The lock is a lease in the full sense — it is
 granted, it has an expiry, it is broken and cleared like any other — and it
@@ -227,31 +188,12 @@ interval and the failure-detection interval, not by taste.
 §6.3.1 is the upstream machinery's business, and the optimisations the
 paper describes belong to the replication core, not to a deployment. This
 repository carries the address policy, the dogfooded lock, and the timeout
-arithmetic; the core carries the mechanism. Neither is built until the
-system is released without it — a lock service ships first, and the
-optimisation follows it.
+arithmetic; the core carries the mechanism.
 
 **What this binds.** A client lock never occupies a reserved address, and a
 system lease is never granted to a client: the two spaces do not overlap,
 because one is addressed by a client and the other is a claim the cluster
 makes about itself.
-
-**What this binds.** The shutdown ceremony is enforced by the marker: the
-flushed round vouches for the local frame's end marker, never for the
-process's own intent. The artefact is a frame, not a running series: a
-dirty boot never reads it, so nothing is written to it during operation,
-and the serving path never touches the disk. The sweeper rides the
-leader's heartbeat cadence and removes expired locks from the table; no
-tombstones are written, because the frame holds the live set alone. The
-UI server's two watermarks and the three sync-point rules are the AOF
-event loop's contract, tested red-green
-around the loop: an ack for an already-flushed point, a forced flush for
-a buffered point, a held point that flushes and acks when the stream
-arrives. The end-to-end contract: a clean shutdown followed by a restart
-preserves every lock the node's own series recorded; a dirty boot never
-trusts the series it finds. See [the write-behind lock table](write-behind.md)
-for the mechanism and its nuances, and [the telemetry AOF](telemetry-aof.md)
-for the write-behind discipline both series share.
 
 ## The WAL lock snapshot is a Zig engine, and its substrates are settled
 

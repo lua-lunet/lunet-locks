@@ -1,8 +1,3 @@
--- Lock Admin console lifecycle: render the nginx conf, mint loopback
--- credentials, spawn the bun mock, lock-feed, and nginx, and babysit their
--- pidfiles. All paths live under console/tmp; the only logic-free shell is
--- in bin/.
-
 local stale_binary = require("tools.lib.stale_binary")
 
 local record Paths
@@ -114,8 +109,6 @@ local function render(template: string, vars: {string: string}): string
     return out
 end
 
--- Returns user, password, created. Credentials persist in tmp/credentials so
--- restarts keep the same loopback login.
 local function ensureCredentials(p: Paths): string, string, boolean
     local existing = readFile(p.credentials)
     local user, pw = existing:match("^([^:]+):([^\n]+)")
@@ -127,7 +120,6 @@ local function ensureCredentials(p: Paths): string, string, boolean
         io.stderr:write("ERROR: could not read /dev/urandom for credentials\n")
         os.exit(1)
     end
-    -- Fed via stdin so the password never appears in the process table.
     local hash = sh('printf "%s" "' .. pw .. '" | openssl passwd -apr1 -stdin')
     if hash == "" then
         io.stderr:write("ERROR: openssl passwd failed\n")
@@ -139,9 +131,6 @@ local function ensureCredentials(p: Paths): string, string, boolean
     return "admin", pw, true
 end
 
--- Does anything answer on this loopback port? A connection-level response
--- (any status, or even a TLS/protocol mismatch error) proves a listener;
--- curl prints 000 only when nothing accepts the connection.
 local function portHeld(port: string): boolean
     local code = sh(
         string.format(
@@ -152,7 +141,6 @@ local function portHeld(port: string): boolean
     return code ~= "000" and code ~= ""
 end
 
--- The owning pid of a listening port, for operator disclosure only.
 local function holderPid(port: string): string
     return sh("lsof -t -nP -iTCP:" .. port .. " -sTCP:LISTEN 2>/dev/null")
 end
@@ -161,11 +149,6 @@ local function startMock(p: Paths, mockPort: string)
     if alive(p.mockPid) then
         return
     end
-    -- The pidfile race: alive() trusts the pidfile, so a lost pidfile with a
-    -- live listener would spawn a second mock and EADDRINUSE-loop forever
-    -- (mock.log, Oct 2026). Probe the port before spawning; a held port with
-    -- a stale pidfile is the operator's call — never a silent kill of an
-    -- unknown process.
     if portHeld(mockPort) then
         local holder = holderPid(mockPort)
         io.stderr:write(
@@ -192,9 +175,6 @@ local function startMock(p: Paths, mockPort: string)
     writeFile(p.mockPid, pid .. "\n")
 end
 
--- Resolve the lock-feed binary path. If FEED_BIN is unset, default to the
--- debug build under ext/lock_feed/target/debug/lock-feed. If the binary is
--- missing, attempt a cargo build; fail loudly if cargo is absent.
 local function resolveFeedBin(root: string): string
     local bin = os.getenv("FEED_BIN") or ""
     if bin == "" then
@@ -205,7 +185,6 @@ local function resolveFeedBin(root: string): string
         f:close()
         return bin
     end
-    -- Binary missing: try to build it.
     io.write("lock-feed binary not found at " .. bin .. "; building…\n")
     local manifest = root .. "/../ext/lock_feed/Cargo.toml"
     local mf = io.open(manifest, "rb")
@@ -302,8 +281,6 @@ local function up(root: string): integer
     local p = paths(root)
     local port = os.getenv("PORT") or "8480"
     local mockPort = os.getenv("MOCK_PORT") or "8481"
-    -- The UI server: the process hosting the console's /api/v1/ endpoints
-    -- (the aof-console-bridge). The voting members never host this API.
     local apiPort = os.getenv("API_PORT") or "8619"
     local feedPort = os.getenv("FEED_PORT") or "8482"
     local feedDir = os.getenv("FEED_DIR") or ""
@@ -328,12 +305,8 @@ local function up(root: string): integer
     local user, pw = ensureCredentials(p)
     startMock(p, mockPort)
 
-    -- Start lock-feed if FEED_DIR is set; otherwise skip with a note.
     if feedDir ~= "" then
         local feedBin = resolveFeedBin(root)
-        -- The stale-binary rule: the feed is built only when it is absent,
-        -- so without this an edit to lock_feed's source would be served by
-        -- whatever binary an earlier run happened to leave.
         stale_binary.check(root .. "/..", stale_binary.lock_feed(feedBin))
         startFeed(p, feedPort, feedDir, feedBin)
         if not waitFeedHealthy(feedPort) then

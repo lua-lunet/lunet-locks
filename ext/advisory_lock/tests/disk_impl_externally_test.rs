@@ -1,22 +1,3 @@
-//! The seam hole closed: a `Disk` implementation written OUTSIDE the
-//! crate.
-//!
-//! This file is its own crate. Every name it can reach is the library's
-//! public surface: the seam's names all come through `spi` — the seam's
-//! front door — and nowhere else, and the round-trip's record type is the
-//! crate's public `locks` module. The local `SeamDisk` implements
-//! [`Disk`] by delegating to [`StdDisk`], the smallest embedder
-//! implementation there is; the store's own injection point
-//! (`FileStateStore::new_on`) mounts it, and the [`StateStore`] contract
-//! carries the framed round-trip over it. An out-of-crate `impl Disk`
-//! compiling at all is the proof the seam's public surface is complete;
-//! the behaviour assertions pin the delegation.
-//!
-//! The node's public injection point is the full-shape constructor
-//! (`Node::open_with_seams`), which mounts the disk, the store, the hook
-//! and the boot fence in one call; its sibling `seam_mount_test.rs` proves
-//! that door on a real node. This test pins the trait surface itself.
-
 use std::collections::BTreeMap;
 use std::fs;
 use std::io;
@@ -31,9 +12,6 @@ use lunet_advisory_lock::spi::{
 };
 use uuid::Uuid;
 
-/// The out-of-crate implementation: every method delegates to the
-/// wrapped [`StdDisk`] through the trait's own surface. Nothing here
-/// names a library internal — from out here there are none to name.
 struct SeamDisk {
     inner: StdDisk,
 }
@@ -118,7 +96,6 @@ impl Disk for SeamDisk {
     }
 }
 
-/// The scratch tree, inside the repo (`.tmp` is scratch).
 fn scratch(name: &str) -> PathBuf {
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.tmp/disk-impl-externally");

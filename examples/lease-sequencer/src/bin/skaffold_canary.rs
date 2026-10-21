@@ -1,48 +1,13 @@
-//! The rig canary: "can we find our arse with both hands on the cloud
-//! servers? Y/N" (`papers/AGENTS.md` testing methodology). It proves the
-//! environment — address binding, resolution, and reachability — OUTSIDE
-//! any service logic, binding the exact shapes `lease-sequencer` binds
-//! (a v6 UDP socket on the descriptor endpoint and a TCP client listener
-//! on the same address with the +1000 port offset) and round-tripping
-//! both a UDP datagram exchange and a newline-JSON TCP exchange with the
-//! peer. Exit 0 only when every check passes; one `Y`/`N` line per check.
-//!
-//! The canary is SYMMETRIC: run it on both ends of a pair (start them
-//! within a few seconds of each other; fire-and-forget works). Each side
-//! sends marked datagrams to the peer, echoes back every marked datagram
-//! that is not its own (a per-process run id in the payload prevents
-//! self-reflection ping-pong), retries its sends and its TCP dial until
-//! a deadline, and then lingers a few seconds as a pure echo responder
-//! so a slightly later peer still gets its echoes. This is what makes
-//! "run on both ends, nearly together" converge regardless of which
-//! side binds first.
-//!
-//! usage: skaffold_canary BIND PEER [N]
-//!   BIND  "host:port" — the UDP/peer shape this process binds (the same
-//!         string shape the descriptor's `host` + `port` produce).
-//!   PEER  "host:port" — the peer's UDP endpoint (its TCP client port is
-//!         PEER port + 1000, the service's client-port pattern).
-//!   N     canary datagram count (default 3).
-
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpStream, ToSocketAddrs, UdpSocket};
 use std::time::{Duration, Instant};
 
 const UDP_POLL: Duration = Duration::from_millis(500);
-// Rig-start budget: the peer's process is launched over a separate ssh
-// session, so "both ends nearly together" can mean tens of seconds of
-// skew. The exchange phases wait THIS long before declaring N; the
-// unit tests pass much shorter budgets for fast feedback.
 const UDP_ROUND_BUDGET: Duration = Duration::from_secs(20);
 const TCP_TIMEOUT: Duration = Duration::from_secs(3);
 const TCP_DIAL_BUDGET: Duration = Duration::from_secs(20);
 const LINGER: Duration = Duration::from_secs(3);
 
-/// Resolve an endpoint string the way the service does
-/// (`to_socket_addrs` over the `host:port` text), first as given —
-/// which handles the bracketed-literal v6 form `[..]:port` — then,
-/// on failure, with the brackets stripped so a bare literal also
-/// resolves. Returns the first candidate address.
 fn resolve(endpoint: &str) -> Option<std::net::SocketAddr> {
     if let Ok(mut addrs) = endpoint.to_socket_addrs()
         && let Some(addr) = addrs.next()
@@ -58,8 +23,6 @@ fn resolve(endpoint: &str) -> Option<std::net::SocketAddr> {
     None
 }
 
-/// The canary payload marker: every datagram and every TCP line echoes
-/// it, so a foreign packet can never satisfy a check.
 const MARKER: &str = "lunet-canary";
 
 fn main() {
@@ -91,8 +54,6 @@ fn main() {
         }
     };
 
-    // Check 1: bind the exact shapes the service binds — the UDP peer
-    // port on the BIND string and the TCP client listener on port+1000.
     let (bind_host, bind_port_text) = match bind.rsplit_once(':') {
         Some(pair) => pair,
         None => {
@@ -120,8 +81,6 @@ fn main() {
     };
     line(true, "peer-resolve", &format!("{peer} -> {peer_addr}"));
 
-    // Short-circuit the exchange checks when a bind failed: the rounds
-    // cannot run without both sockets.
     if let (Ok(sock), Ok(listener)) = (udp, tcp) {
         let udp_rounds = udp_canary_round(&sock, &runid, peer_addr, count, UDP_ROUND_BUDGET);
         line(
@@ -133,9 +92,6 @@ fn main() {
         let tcp_ok_round = tcp_echo_client(peer_client, TCP_DIAL_BUDGET);
         line(tcp_ok_round, "tcp-echo", &peer_client.to_string());
         let _ = echo_thread.join();
-        // Linger as a pure echo responder so a peer that started just
-        // after us still collects its echoes even though our checks
-        // are done.
         linger_echo(&sock, &runid);
     } else {
         line(false, "udp-echo", "skipped: no local udp socket");
@@ -145,10 +101,6 @@ fn main() {
     finish(passed, failed);
 }
 
-/// The TCP client port of a peer UDP endpoint: same host, port + 1000
-/// (the service's client-port pattern). Parsed textually first (works
-/// for bracketed and bare forms alike), resolved numerically as the
-/// fallback.
 fn client_addr(peer: &str) -> Option<std::net::SocketAddr> {
     if let Some((host, port)) = peer.rsplit_once(':')
         && let Ok(port) = port.parse::<u16>()
@@ -169,8 +121,6 @@ fn own_payload(runid: &str, i: usize) -> String {
     format!("{MARKER}:{runid}:{i}")
 }
 
-/// One marked datagram: does it carry the canary marker at all, and is
-/// it OURS (carries our run id)?
 fn classify(buf: &[u8], runid: &str) -> Option<(bool, String)> {
     let text = std::str::from_utf8(buf).ok()?;
     if !text.starts_with(MARKER) {
@@ -180,11 +130,6 @@ fn classify(buf: &[u8], runid: &str) -> Option<(bool, String)> {
     Some((ours, text.to_string()))
 }
 
-/// N echo datagrams, symmetric-peer style: keep sending the un-acked
-/// marked datagrams (re-sent every poll so a late-starting peer is
-/// still caught), echo back every foreign marked datagram, count an
-/// ack only when the exact own payload comes back from the peer's
-/// address. Returns the verified echo count.
 fn udp_canary_round(
     sock: &UdpSocket,
     runid: &str,
@@ -203,8 +148,6 @@ fn udp_canary_round(
                 let _ = sock.send_to(payload.as_bytes(), peer);
             }
         }
-        // Drain the socket for one poll window: ack own echoes, bounce
-        // foreign marked datagrams back to their sender.
         let poll_end = Instant::now() + UDP_POLL;
         while Instant::now() < poll_end {
             match sock.recv_from(&mut buf) {
@@ -228,8 +171,6 @@ fn udp_canary_round(
     acked.iter().filter(|a| **a).count()
 }
 
-/// Echo-responder-only phase: bounce every foreign marked datagram for
-/// the linger window, then return (the process exits).
 fn linger_echo(sock: &UdpSocket, runid: &str) {
     sock.set_read_timeout(Some(Duration::from_millis(200))).ok();
     let deadline = Instant::now() + LINGER;
@@ -243,10 +184,6 @@ fn linger_echo(sock: &UdpSocket, runid: &str) {
     }
 }
 
-/// The bounded TCP echo-server role: accept one connection within the
-/// deadline (non-blocking poll, never a bare blocking accept — a dead
-/// peer must time the whole canary out, not hang it), read one line,
-/// reply `{"canary":<line>}`.
 fn tcp_echo_server(listener: std::net::TcpListener, accept_budget: Duration) {
     listener.set_nonblocking(true).ok();
     let deadline = Instant::now() + accept_budget;
@@ -270,11 +207,6 @@ fn tcp_echo_server(listener: std::net::TcpListener, accept_budget: Duration) {
     }
 }
 
-/// The TCP newline-JSON round trip client role: dial the peer's client
-/// port (retrying until the deadline — the peer's listener may come up
-/// a beat after ours), send one JSON line, read one reply line. The
-/// echo server replies with the line it received, so the check is the
-/// marker's presence in the reply.
 fn tcp_echo_client(peer_client: std::net::SocketAddr, dial_budget: Duration) -> bool {
     let deadline = Instant::now() + dial_budget;
     let mut stream = loop {
@@ -305,6 +237,3 @@ fn finish(passed: usize, failed: usize) {
     }
     std::process::exit(0);
 }
-
-#[cfg(test)]
-mod tests {}

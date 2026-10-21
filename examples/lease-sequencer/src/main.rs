@@ -1,34 +1,4 @@
-//! The embedded-sequencer node: one storage node of the downstream
-//! Corfu-style design draft. The process embeds `lunet_advisory_lock::Node`
-//! (the same adapter the LuaJIT host drives through the C ABI) and owns the
-//! host loop: heartbeat timer, election timer, fenced-boot recovery drive,
-//! output drain, UDP receive pump, and the TCP client NDJSON port with the
-//! same framing rules as `src/server.tl`.
-//!
-//! The lease driver runs the sequencer policy on every node: try to hold
-//! the sentinel lock (SET, 500 ms lease), renew it 250 ms before the
-//! deadline, and — while another node holds it — poll it as a GET and
-//! schedule the next poll at the reported expiry plus `rand()*100 ms`.
-//! Every attempt is logged as one JSON line:
-//! `{"event":"lease-attempt","ts":<ms>,"node":<id>,"op":"set|renew|get|steal","expiry":<ms>,"era":<era>,"view":<view>,…}`.
-//!
-//! The embedded lock client: launched with `--embedded-client N`, the
-//! host runs N contender loops against its own `Node` in-process (the
-//! shared `embedded_client` module — the same chase machine the
-//! `lease-load` binary drives over the wire, no client→cluster TCP).
-//! Every op is submitted through the node's own request path — proposed
-//! locally when this node leads, forwarded to the leader over the peer
-//! application channel otherwise — so the committed lock transitions
-//! are the same Service calls the wire clients' verbs exercise and the
-//! AOF records identical evidence. The loops share the host's client
-//! gate: SIGUSR1 silences every embedded client (holdership forgotten,
-//! in-flight ops abandoned), SIGUSR2 starts them, boot is OFF, and a
-//! restarted client re-enters as a NON-holder — its first action is a
-//! GET probe, never a blind BUMP.
-
 mod membership;
-// The lib crate owns the timeout modules (its `timeouts` re-export must
-// exist in exactly one compilation unit — the lib rlib the bin links).
 use lease_sequencer::rejoin;
 pub use lease_sequencer::timeouts;
 use lease_sequencer::timeouts::Rng;
@@ -51,29 +21,15 @@ use tracing::info;
 use tracing_appender::non_blocking::WorkerGuard;
 use vrr::ids::NodeId;
 
-/// The sequencer lease's sentinel lock id.
 const LOCK_ID: u64 = 0x0DDBA11;
-/// The embedded lock clients' default chase target (the lease-load
-/// binary's default lock).
 const EMBEDDED_LOCK_ID: u64 = 0x0DDBA12;
-/// The embedded lock clients' client-id base (the lease-load default;
-/// client `i` uses `800_000 + i`).
 const EMBEDDED_CLIENT_ID_BASE: u64 = 800_000;
-/// The full lease the sequencer holds, in milliseconds.
 const LEASE_MS: u64 = 500;
-/// The renewal lead: the holder renews this long before its own deadline
-/// (a 500 ms lease renewed at 250 ms after each grant).
 const RENEW_MARGIN_MS: u64 = 250;
-/// The poll jitter a non-holder adds beyond a reported expiry.
 const POLL_JITTER_MS: u64 = 100;
-/// One driver op's correlation deadline (direct or forwarded).
 const OP_DEADLINE_MS: u64 = 1000;
-/// The client-verb era-advance deadline (the admin ack discipline).
 const ADMIN_DEADLINE_MS: u64 = 10000;
 const TICK_MS: u64 = 5;
-/// The lock-event journal's roll threshold: a run never rolls (the CAS
-/// chain stays one file per node per process lifetime; a bench cycle
-/// resumes the same open file).
 const JOURNAL_ROLL_BYTES: u32 = 64 * 1024 * 1024;
 const LEADER_UNKNOWN: u32 = u32::MAX;
 const MAX_CLIENT_LINE: usize = 65000;
@@ -81,18 +37,10 @@ const MAX_CLIENT_LINE: usize = 65000;
 const OUTPUT_SEND: u32 = 1;
 const OUTPUT_REPLY: u32 = 2;
 const STATE_NORMAL: u32 = 0;
-/// Inside a view change: the node has issued or joined a view change —
-/// the `timedout` toggle holds (`docs/src/failure-detection.md`).
 const STATE_VIEW_CHANGE: u32 = 1;
 const STATE_RECOVERING: u32 = 2;
-/// The boot fence of a fresh provisioned member (`vrr::progress`
-/// `Status::Joining`'s snapshot word): the node has adopted nothing and
-/// its own tick emits nothing — the rejoin gossip is the host's drive.
 const STATE_JOINING: u32 = 4;
 
-/// The compiled-in leader-failure detector, named on the boot line and
-/// in the boot trace: the randomised leader timeout, the service's only
-/// failure-detection mechanism.
 const DETECTOR: &str = "sloppy-timeout";
 
 #[derive(Clone, Debug)]
@@ -150,11 +98,8 @@ enum TcpPending {
         action: String,
         id: u32,
         endpoint: String,
-        era0: u32,
-        /// The establishing operation's choosing slot, captured from the
-        /// reconfiguration drive's own sends: the slot at which the new
-        /// configuration was chosen.
-        slot: u64,
+        proposal_era: u32,
+        establishing_slot: u64,
         deadline: u64,
     },
 }
@@ -179,109 +124,31 @@ struct Host {
     last_heartbeat: u64,
     leader_elapsed: u64,
     last_recovery: u64,
-    /// The last join-gossip resend (the rejoin gossip's own timer,
-    /// `rejoin::GOSSIP_RESEND_MS`): a fenced `Joining` boot gossips its
-    /// entry ticket to every peer until the cluster's answer installs.
     last_gossip: u64,
     last_status_note: u64,
     last_seen_leader: u32,
-    /// This node booted a dirty restart (incarnation >= 1): the §8
-    /// re-announce discipline drives `recover()` while the node is below
-    /// voting weight, not only while it is fenced — a leader change
-    /// mid-walk drops the armed forced-sequence machine (volatile leader
-    /// state), and only a fresh announcement re-arms the new leader.
     reincarnated: bool,
     driver: Driver,
     forwarded_from: HashMap<[u8; 16], (SocketAddr, u64)>,
-    /// Forwarded verbs whose committed ack arrived after this node had
-    /// already dropped the claim — by design on the driver's churn gate
-    /// (the transition pause drops the pending), by discipline on the op
-    /// deadline or a FORWARD_NOT_LEADER refusal, or on the TCP conn's
-    /// own deadline. Each late ack is drained and counted here: the
-    /// lease lapses and a fresh grant re-acquires it, so the ack's
-    /// result is dead on arrival and never a fault.
     late_acks: u64,
     conns: Vec<Conn>,
-    /// The membership model: advisory evidence, never a consensus
-    /// mechanism. It boots from the membership sidecar next to the
-    /// incarnation marker, else from the descriptor, and moves only
-    /// forward — a snapshot with a newer (era, slot) is adopted in memory,
-    /// teaches the addressing rows its membership names, and writes behind
-    /// on the lazy writer.
     model: membership::Model,
     sidecar: membership::SidecarWriter,
     discovery: Discovery,
-    /// The last Commit-send time this leader produced — "when otherwise
-    /// idle" is measured against it.
     last_leader_commit_ms: u64,
-    /// The slot frontier: the highest slot this node has put on the wire
-    /// (`flush_outputs`' established frontier, never lower). It rides
-    /// the periodic frontier line and the telemetry tape; no protocol
-    /// decision reads it.
     frontier_slot: u64,
-    /// The keepalive proposer's own client identity and request counter.
-    /// The leader's idle beat — the heartbeat of a commit — re-announces
-    /// the last commit instead of opening a client transaction, so there
-    /// is no keepalive client identity left to mint.
-    ///
-    /// The relay ledger (`relay`): every datagram this node released that
-    /// the protocol gives a response to, minus the ones a response has
-    /// retired. The cluster wait relays it, the steady quiet re-announces
-    /// its last commit from it, and the view-change poll re-asks the
-    /// armed attempt from it.
     relay: relay::Ledger,
-    /// The (config era, leader) the current detection is latched for. A
-    /// fresh era or a new leader re-arms; an arriving heartbeat from the
-    /// SAME leader does not — one detection per key.
     detected_key: Option<(u32, u32)>,
-    /// The `timedout` toggle (`docs/src/failure-detection.md`): true from
-    /// the moment this node times out on its leader and issues or joins
-    /// a view change, until a fresh commit arrives. While it holds, the
-    /// leader timeout is neither re-armed nor checked and the cluster
-    /// viewchange timeout polls instead.
     timedout: timeouts::TimeoutToggle,
-    /// The cluster viewchange timeout (`docs/src/failure-detection.md`):
-    /// a DIFFERENT timer from the leader timeout. While `timedout` holds
-    /// the node polls on `min + rand * (max - min)`; a fresh commit
-    /// disarms the poll. Validated `min <= max` at parse.
     viewchange: timeouts::ViewChangeTimer,
-    /// The leader timeout — the host's leader-failure detector: a uniform
-    /// random wait in `[min, max]` per watched (era, leader) key,
-    /// re-armed on leader evidence, firing the §14.2 forced view when due.
     leader_timeout: timeouts::LeaderTimeout,
-    /// The last replication state the transition recorder saw; a change
-    /// emits a `TelemetryStateTransition` record.
     last_state: u32,
-    /// The last voting weight the transition recorder saw; a change emits
-    /// a `TelemetryStateTransition` record (the AOF on/off story).
     last_weight: Option<u32>,
-    /// The election wait the tick loop currently runs (ms): the uniform
-    /// random draw from the leader-timeout schedule, re-armed when it
-    /// changes.
     election_wait_armed: u64,
-    /// The telemetry AOF: the envelope record layer over the
-    /// vendored TigerBeetle AOF, gated by the node's voting weight —
-    /// weight 0 (or the boot Recovering/Joining phase) = ON, weight > 0 =
-    /// OFF. Carries the boot trace (state transitions + outbound), every
-    /// received VRR message as a Wire record while active, and the
-    /// the timeout-decision records. `None` when no `--telemetry-aof-dir`
-    /// (or `--aof-dir` fallback) is configured, or after an append failure
-    /// disabled the stream for the process (telemetry contract: never
-    /// poison the replication path).
     telemetry: Option<telemetry::TelemetryLog>,
-    /// The embedded lock client runner: N contender loops against
-    /// this node's own service, ticked from the host loop behind the
-    /// host's SIGUSR1/SIGUSR2 client gate. `None` when launched without
-    /// `--embedded-client`.
     embedded: Option<Runner>,
 }
 
-/// The boot-time era-qualified discovery state: request to every node the
-/// process remembers, quorum within what it thought was the old cluster,
-/// escalation on any newer (era, slot) — every escalation drops the
-/// older-era responses and re-requests across that era's membership — and
-/// a stop at a weighted quorum of agreeing snapshots. Bounded: on the
-/// deadline the ordinary fenced boot proceeds regardless.
 struct Discovery {
     era: u32,
     slot: u64,
@@ -298,15 +165,6 @@ fn millis() -> u64 {
         .as_millis() as u64
 }
 
-/// The tracing subscriber stack. `--log` names the per-node file; its stem
-/// becomes the daily-rolling file prefix under the same directory. The
-/// returned `WorkerGuard` must live for the process lifetime.
-///
-/// The observability contract's line shape: ONE JSON object per line, the
-/// event's own fields flattened into the root object beside `level`. The
-/// formatter's own clock is off (`without_time`): every line's `ts` is the
-/// host's [`millis`], a field the emitting site carries, so the log and the
-/// protocol agree on one clock.
 fn init_tracing(log_path: &str) -> WorkerGuard {
     let path = std::path::Path::new(log_path);
     let dir = path
@@ -381,15 +239,8 @@ fn parse_config(path: &str) -> Vec<ClusterNode> {
     nodes
 }
 
-/// The deployment ruling (docs/src/decisions.md): a cluster never runs
-/// with fewer than three VOTING members. A genesis row is a voting
-/// member; a non-genesis hint row is a weight-0 learner and contributes
-/// nothing to a quorum, so it does not count toward the three.
 const VOTING_MINIMUM: usize = 3;
 
-/// The pure half of the boot refusal, unit-testable without a descriptor
-/// on disk: count the voting members and name the minimum when there are
-/// too few.
 fn check_voting_minimum(nodes: &[ClusterNode]) -> Result<(), String> {
     let voting = nodes.iter().filter(|node| node.genesis).count();
     if voting < VOTING_MINIMUM {
@@ -400,13 +251,6 @@ fn check_voting_minimum(nodes: &[ClusterNode]) -> Result<(), String> {
     Ok(())
 }
 
-/// The descriptor is a hint list of where the cluster is, not membership
-/// law. A name the descriptor carries boots exactly as before; a name it
-/// omits boots anyway as a weight-0 joining member whose identity comes
-/// from `--join-id` and `--join-endpoint`, appended after the hint rows.
-/// The node stays fenced until the leader's committed configuration
-/// carries its row (the join verb); a future PSK, not this file, is the
-/// cross-environment boundary.
 fn boot_nodes(nodes: Vec<ClusterNode>, options: &Options) -> Result<Vec<ClusterNode>, String> {
     if nodes.iter().any(|node| node.name == options.name) {
         if options.join_id != 0 || !options.join_endpoint.is_empty() {
@@ -453,71 +297,27 @@ struct Options {
     client: String,
     state: String,
     log: String,
-    /// The AOF series directory. Non-empty turns the node into the standby
-    /// telemetry host: the committed-transition hook feeds the async
-    /// write-behind writer instead of the blocking journal, and the lease
-    /// driver stays idle.
     aof_dir: String,
-    /// The AOF's periodic-fsync knob (ms). 0 = only at roll and shutdown.
     aof_flush_ms: u64,
-    /// The vendored TigerBeetle AOF's retention threshold, in MiB of
-    /// `{epoch}.aof` series on disk. Default 10.
     aof_retention_mib: u64,
-    /// The telemetry AOF's series directory. Empty = fall back to
-    /// `aof_dir`. Every node can carry one: voting nodes log the boot
-    /// trace, then the gate disarms at weight > 0; standbys stay ON.
     telemetry_aof_dir: String,
-    /// The telemetry active file's rollover threshold, in MiB.
-    /// Default 4; the series keeps exactly the current file + one closed
-    /// old.
     telemetry_rollover_mib: u64,
-    /// The leader timeout's clamp floor, in ms.
     leader_timeout_min_ms: u64,
-    /// The leader timeout's clamp ceiling, in ms.
     leader_timeout_max_ms: u64,
-    /// The cluster viewchange timeout's floor
-    /// (`docs/src/failure-detection.md`): while a node is timed out on
-    /// its leader it polls on `min + rand * (max - min)`. The minimum
-    /// must stay above 4x RTT (RTT 20 ms under load -> the 100/200
-    /// default); validated `min <= max`.
     viewchange_timeout_min_ms: u64,
-    /// The cluster viewchange timeout's ceiling (see the min).
     viewchange_timeout_max_ms: u64,
-    /// The E2 recovery-boundary flush variant (diskless | single |
-    /// double-ring). Non-diskless requires `recovery_scratch`.
     recovery_flush: RecoveryFlush,
-    /// The scratch directory the recovery-boundary flush writes against.
     recovery_scratch: String,
     heartbeat_ms: u64,
     election_ms: u64,
     recovery_ms: u64,
-    /// The embedded lock client count: N contender loops run
-    /// in-process against the node's own service, behind the host's
-    /// SIGUSR1/SIGUSR2 client gate. 0 = none (no signal registration).
     embedded_clients: usize,
-    /// The lock the embedded clients chase.
     embedded_lock_id: u64,
-    /// The embedded clients' lease window (the lease-load default).
     embedded_client_ttl_ms: u64,
-    /// The embedded clients' renewal point as a fraction of the window
-    /// (the lease-load default).
     embedded_renew_fraction: f64,
-    /// The id of a name the descriptor omits: the descriptor is a hint
-    /// list of where the cluster is, not membership law, so an absent
-    /// name boots as a weight-0 joining member with this identity.
     join_id: u32,
-    /// The joining member's endpoint (`[host]:port`), the UDP bind.
     join_endpoint: String,
-    /// The bench harness's store control socket
-    /// (`docs/src/bench-harness.md`). Non-empty puts the node on the
-    /// bench: the lifecycle marker store rides the driver's socket, the
-    /// SIGUSR1/SIGUSR2 pair carries the clean/dirty in-process cycles
-    /// (the client gate never registers), and the AOF/telemetry options
-    /// are refused — the journal (`--journal-dir`), the logs, and the
-    /// flight tape are the evidence.
     bench_store: String,
-    /// The blocking lock-event journal's directory (the committed-
-    /// transition CAS chain). Empty = journaling off, as before.
     journal_dir: String,
 }
 
@@ -612,9 +412,6 @@ fn parse_options() -> Options {
         }
         index += 2;
     }
-    // The cluster viewchange timeout's validation
-    // (`docs/src/failure-detection.md`): the randomized schedule needs a
-    // real range, `min <= max`.
     if options.viewchange_timeout_min_ms > options.viewchange_timeout_max_ms {
         eprintln!(
             "lease-sequencer: --viewchange-timeout-min-ms ({}) exceeds \
@@ -672,19 +469,10 @@ fn parse_options() -> Options {
 }
 
 impl Host {
-    /// The free-text channel: a line that carries no protocol
-    /// observable of its own — a signal, a no-op, a foreign datagram
-    /// dropped. The body rides the `text` field; it never escapes the
-    /// object, and no reader parses `key=value` tokens out of it.
     fn note(&self, body: &str) {
         info!(ts = millis(), event = "note", text = body);
     }
 
-    /// The node timed out on its leader (`docs/src/failure-detection.md`):
-    /// toggle `timedout=true`. Voters only — a lagging learner's
-    /// suspicion is noise, and its polling would wedge its own catch-up.
-    /// The toggle record rides BOTH the regular log AND the Flight
-    /// Recorder (`timeout-toggle` event, `Node::note_timeout_toggle`).
     fn suspect(&mut self, now: u64, why: &str) {
         if self.node.voting_weight().is_none_or(|weight| weight == 0) {
             return;
@@ -694,10 +482,6 @@ impl Host {
         }
     }
 
-    /// One toggle record's logging: the new state, the toggle's own
-    /// clock, the clock of the LAST toggle, and the caller's reason — in
-    /// the regular log AND the Flight Recorder
-    /// (`docs/src/failure-detection.md`).
     fn log_timeout_toggle(&mut self, record: &timeouts::ToggleRecord, why: &str) {
         let status = self.node.status();
         info!(
@@ -718,19 +502,12 @@ impl Host {
             .note_timeout_toggle(record.timedout, record.at_ms, record.previous_ms);
     }
 
-    /// One telemetry record into the gated AOF (a no-op without a series
-    /// or with the gate disarmed — telemetry never touches the
-    /// replication path).
     fn record_telemetry(&mut self, record: Record) {
         if let Some(log) = self.telemetry.as_mut() {
             log.record(record);
         }
     }
 
-    /// One `TelemetryStateTransition` record: the boot decisions
-    /// (Recovering/Restarting/Joining), the replication state changes,
-    /// and the voting-weight moves — the node's own story, with the local
-    /// nanosecond clock in the envelope header.
     fn record_state_transition(&mut self, fields: String) {
         let ns = local_ns();
         self.record_telemetry(Record::telemetry(
@@ -740,9 +517,6 @@ impl Host {
         ));
     }
 
-    /// One `TelemetryOutbound` record: what this node decided to send
-    /// (peer, era/view/slot, byte length), so the trace shows what the
-    /// node decided it was.
     fn record_outbound(&mut self, out: &lunet_advisory_lock::NodeOutput) {
         let json = format!(
             "{{\"to\":{},\"era\":{},\"view\":{},\"slot\":{},\"bytes\":{}}}",
@@ -760,17 +534,10 @@ impl Host {
         ));
     }
 
-    /// The election wait the tick loop runs: the armed uniform random in
-    /// `[min, max]` — re-armed on a leader change and the fresh-commit
-    /// resume only (`rearm_election_wait`), stable otherwise. One
-    /// `TelemetryTimeoutDecision` record per CHANGED armed wait.
     fn election_wait(&self) -> u64 {
         self.election_wait_armed
     }
 
-    /// Re-arms the election wait on leader change / fresh-commit: one
-    /// uniform random in `[min, max]`, logged with the note and the
-    /// timeout-decision record when the armed wait changed.
     fn rearm_election_wait(&mut self, _now: u64, unit: f64) {
         let (min_ms, max_ms) = (self.leader_timeout.min_ms(), self.leader_timeout.max_ms());
         let wait = timeouts::random_wait_ms(min_ms, max_ms, unit);
@@ -806,28 +573,11 @@ impl Host {
         }
     }
 
-    /// One detection tick: the leader timeout's deadline. The watched
-    /// (config era, leader) key arms a uniform random deadline at its
-    /// birth; every heartbeat Commit arriving from the current leader
-    /// re-arms it (`on_leader_commit`), as does the fresh-commit resume.
-    /// A due deadline fires the detection: the note (the silence and the
-    /// armed deadline), the §14.2 host-forced view, the `timedout` toggle,
-    /// and the output flush.
     fn leader_timeout_step(&mut self, now: u64, rng: &mut Rng) {
-        // `docs/src/failure-detection.md`: the leader timer checks `if
-        // not timedout` before doing anything — while the toggle holds
-        // the cluster viewchange timeout polls instead, and the next
-        // tick resumes on the fresh commit.
         if self.timedout.timed_out() {
             return;
         }
         let status = self.node.status();
-        // Detection stands down in the establishing-era window: a
-        // committed reconfiguration's new era awaits the view that enters
-        // it (§8.7.8), and inside that window a forced view restarts the
-        // fence instead of letting it close. The driver already holds the
-        // client stream for this bounded window; the detector stands down
-        // with it and re-arms when the era folds.
         if status.config_era != status.era {
             return;
         }
@@ -839,20 +589,11 @@ impl Host {
         };
         let watched = (status.config_era, status.leader);
         if self.leader_timeout.watched() != Some(watched) {
-            // The key's birth: a leader change (or a re-keying era)
-            // arms a fresh uniform random wait — a re-elected id can
-            // never inherit an old deadline and fire in a loop.
             self.leader_timeout.watch(watched, now, rng.unit());
         }
         if !self.leader_timeout.due(now) {
             return;
         }
-        // One detection per (era, leader) — but only while THIS node is
-        // Normal: inside the limbo (the §14.2 forced view can name a
-        // primary that never arrives) the latch must not hold, or the
-        // wedged cluster has no driver left and sits in view_change
-        // forever. In the limbo the detection re-fires on each armed
-        // window until a live primary takes the view.
         let latched = self.detected_key == Some(watched) && status.state == STATE_NORMAL;
         if latched {
             return;
@@ -873,34 +614,17 @@ impl Host {
             addr = timeouts::addr_text(addr),
             "leader-timeout-detect"
         );
-        // The actuation: the §14.2 host-forced view change — the
-        // timeout's verdict drives it directly, falling back to the
-        // ordinary suspicion tick on refusal. A node below voting weight
-        // does not drive: a lagging learner's verdict is noise, and its
-        // local view churn wedges its own catch-up — the promotion walk
-        // then never completes. The detection note above still lands;
-        // only the drive is gated.
         let drives = self.node.voting_weight().is_some_and(|weight| weight > 0);
         if drives {
             let forced = self.node.force_view(status.era, status.view + 1);
             if forced != 0 {
                 let _ = self.node.leader_timeout();
             }
-            // The detection IS the node timing out on its leader: the
-            // toggle flips true, the leader timeout stands down, and the
-            // cluster viewchange timeout takes the polling
-            // (`docs/src/failure-detection.md`).
             self.suspect(now, "leader-timeout");
         }
         self.flush_outputs(now, rng);
     }
 
-    /// One Commit datagram arrived from the replica the host currently
-    /// believes is its leader — the heartbeat evidence (no trailer rides
-    /// the wire; the Commit tag at the header's head is the evidence).
-    /// Re-arms the leader deadline; while the node is timed out the
-    /// arrival IS the fresh-commit resume: the toggle flips false, the
-    /// detection latch clears, and both waits re-arm.
     fn on_leader_commit(
         &mut self,
         replica: u32,
@@ -915,9 +639,6 @@ impl Host {
         if status.leader != replica {
             return;
         }
-        // The heartbeat's own line: every Commit this node's leader
-        // sends is one line, naming the ballot it was authorised at and
-        // the frontier slot it advances.
         info!(
             ts = millis(),
             event = "commit-in",
@@ -942,12 +663,6 @@ impl Host {
         self.leader_timeout.rearm(now, rng.unit());
     }
 
-    /// One relayed datagram onto the wire: the exact bytes the core released
-    /// earlier, re-sent to the same peer — a transport replay, never a
-    /// message this host composed. The `relay-out` line is the
-    /// operator's evidence that a repeat is a repeat: it names the peer,
-    /// the ballot, the slot and the tag the original carried, so a relay
-    /// is distinguishable from a first send by the event name alone.
     fn relay_out(&mut self, datagram: &relay::Datagram, why: &str) -> bool {
         let Some(&addr) = self.peers.get(&datagram.to) else {
             return false;
@@ -973,13 +688,6 @@ impl Host {
         true
     }
 
-    /// The cluster wait's drive (`docs/src/timeout-policy.md`): the
-    /// matcher's opinion for the node's own condition and this wait, and
-    /// the host obeys it. On an agent the opinion is the relay of
-    /// everything released and not answered — phase 1 and phase 2 from a
-    /// leader, a view change's fence votes and evidence from any member —
-    /// and on a node walking the boot machine it is do-nothing. The count
-    /// returned is the relay multiset's size.
     fn cluster_timeout(&mut self, why: &str) -> usize {
         let status = self.node.status();
         let sends = relay::cluster_timeout(status.state, &mut self.relay, status.era, status.view);
@@ -992,12 +700,6 @@ impl Host {
         sent
     }
 
-    /// The leader's idle beat — the heartbeat of a commit. A leader with
-    /// no Commit left in the last interval re-announces its LAST COMMIT:
-    /// the frontier announcement and the proof of life in one datagram,
-    /// byte-identical to the commit it repeats. No client transaction is
-    /// opened and no proposal is minted, so an idle leader's beats cost
-    /// the journal no slots at all.
     fn heartbeat_op(&mut self, now: u64) {
         let status = self.node.status();
         if status.state != STATE_NORMAL
@@ -1009,8 +711,6 @@ impl Host {
         }
         let beat = relay::heartbeat(self.relay.last_commit(status.era, status.view));
         let Some(beat) = beat else {
-            // A leader that has committed nothing at this ballot has no
-            // frontier to announce: the beat is empty, never a minted op.
             return;
         };
         let slot = beat.first().map(|datagram| datagram.slot).unwrap_or(0);
@@ -1039,13 +739,6 @@ impl Host {
         );
     }
 
-    /// The slot frontier onto the telemetry tape: one periodic record
-    /// carrying the frontier this node reached and the ballot that
-    /// authorised it. The frontier is not gate-silenced — a voting node's
-    /// lifecycle gate is disarmed, and that is exactly the node an
-    /// operator asks the tape about. Telemetry stays downstream of the
-    /// recorder: a failed append disables the stream and no protocol
-    /// decision reads this record.
     fn record_frontier(&mut self, status: &lunet_advisory_lock::NodeStatus) {
         let json = format!(
             "{{\"event\":\"slot-frontier\",\"era\":{},\"view\":{},\"leader\":{},\
@@ -1088,10 +781,6 @@ impl Host {
         let _ = self.sock.send_to(&packet, addr);
     }
 
-    /// The forwarding channel's three sends, each one line: a verb this
-    /// node handed to the leader, the leader's committed reply, and the
-    /// refusal that tells a non-leader's client to re-route. The message
-    /// id is the correlation the whole stream is read by.
     fn send_forward_request(&mut self, addr: SocketAddr, message_id: &[u8; 16], json: &str) {
         let mut payload = Vec::with_capacity(1 + 16 + json.len());
         payload.push(transport::FORWARD_REQUEST);
@@ -1158,12 +847,6 @@ impl Host {
         self.send_application(addr, &payload);
     }
 
-    /// The join gossip's resend (the rejoin gossip's joiner half,
-    /// `rejoin`): the entry ticket at the node's current view to every
-    /// peer it knows. The datagram rides the ordinary VRR peer channel;
-    /// every peer that hears it records this node as a gossip-witness and
-    /// the leader answers with the missed-range push the boot fence
-    /// qualifies.
     fn join_gossip(&mut self) {
         let status = self.node.status();
         let payload = rejoin::gossip_datagram(status.era, status.view);
@@ -1210,10 +893,6 @@ impl Host {
                     out.bytes.len()
                 );
                 let &addr = self.peers.get(&out.to).unwrap();
-                // The leader's Commit datagrams carry no trailer: the
-                // datagram the network carries is the datagram the core
-                // produced, so the exact-length wire contract (W3) is
-                // untouched.
                 let status = self.node.status();
                 let payload = if status.state == STATE_NORMAL
                     && status.leader == self.own_id
@@ -1228,10 +907,6 @@ impl Host {
                 let packet =
                     transport::encode_peer(transport::PEER_VRR, &self.fingerprint, &payload);
                 let _ = self.sock.send_to(&packet, addr);
-                // The relay ledger: this datagram joins the un-answered
-                // set the cluster wait relays and the steady quiet
-                // re-announces (`docs/src/timeout-policy.md`). Recorded
-                // after the send, from the bytes the core released.
                 if let Some(header) = transport::vrr_header(&out.bytes)
                     && let Some(tag) = vrr::wire::Tag::from_u32(header.tag)
                 {
@@ -1244,9 +919,6 @@ impl Host {
                         bytes: out.bytes.clone(),
                     });
                 }
-                // The outbound trace: what this node decided it
-                // was — one TelemetryOutbound record per sent datagram
-                // while the AOF gate is active.
                 self.record_outbound(&out);
             } else if out.kind == OUTPUT_REPLY {
                 if let Some((dest, _)) = self.forwarded_from.remove(&out.message_id) {
@@ -1263,7 +935,6 @@ impl Host {
                     };
                     self.driver_complete(op, &out.bytes, now, rng);
                 } else if self.embedded_reply(now, rng, &out.message_id, &out.bytes) {
-                    // An embedded contender's op completed in-process.
                 } else {
                     let mut claimant = None;
                     for (index, conn) in self.conns.iter_mut().enumerate() {
@@ -1281,12 +952,6 @@ impl Host {
                     if let Some(index) = claimant {
                         client_reply(self, index, "lock", &out.bytes);
                     } else {
-                        // The maybe: an operation's committed reply reached
-                        // the drain with no live claimant (the conn's 30 s
-                        // pending expired and its client retried with a
-                        // fresh id in the window). Unexpected, not provably
-                        // impossible, survivable — reported with full
-                        // context, never silent.
                         self.late_acks += 1;
                         let status = self.node.status();
                         tracing::warn!(
@@ -1309,11 +974,6 @@ impl Host {
         established_slot
     }
 
-    /// Learns the addressing row for a member the model already names
-    /// when that member's socket speaks for the first time (a changed
-    /// leader re-learns a joined standby from the standby's own first
-    /// datagram; the standby's identity comes from the model's endpoint
-    /// match, never guessed from the wire). `true` when a row was added.
     fn learn_member_row(&mut self, addr: SocketAddr) -> bool {
         for member in self.model.members.iter() {
             if let Ok(mut addrs) = member.endpoint.to_socket_addrs()
@@ -1340,9 +1000,6 @@ impl Host {
         false
     }
 
-    /// Adds the addressing rows an adopted snapshot's membership names:
-    /// rows grow additively and never regress (a departed member's rows
-    /// leave through the leave verb's flow, never through a snapshot).
     fn add_member_rows(&mut self, members: &[membership::SnapshotMember]) {
         for member in members {
             if self.peers.contains_key(&member.id) {
@@ -1357,9 +1014,6 @@ impl Host {
         }
     }
 
-    /// Adopts a newer (era, slot) snapshot into the model: rows, lazy
-    /// write-behind, and the operator-visible record. An equal or older
-    /// snapshot is a no-op.
     fn adopt(&mut self, snapshot: membership::Snapshot, source: &str) {
         if !self.model.adopt(snapshot.clone()) {
             return;
@@ -1383,12 +1037,6 @@ impl Host {
         );
     }
 
-    /// The leader's post-commit dissemination: the as-at-new-generation
-    /// snapshot goes to the (new) membership — the departed member's row
-    /// is already gone for a leave, the joining member's row was added at
-    /// proposal time — and the committed fact writes behind. Recipients
-    /// only check up-to-dateness (era plus slot); a lower-era snapshot is
-    /// ignored everywhere.
     fn disseminate(&mut self) {
         let snapshot = self.model.snapshot();
         let payload = membership::encode_response(&snapshot);
@@ -1421,8 +1069,6 @@ impl Host {
         );
     }
 
-    /// The boot-time discovery round: one request per remembered peer, on
-    /// the fixed cadence, until the deadline or the quorum.
     fn discovery_step(&mut self, now: u64) {
         if !self.discovery.active {
             return;
@@ -1472,9 +1118,6 @@ impl Host {
         }
     }
 
-    /// One lock op's submission route: propose locally as the leader, or
-    /// forward to the leader over the application channel; anything else is
-    /// a backoff-and-retry for the policy loop.
     fn route_op(
         &mut self,
         rc: i32,
@@ -1628,14 +1271,6 @@ impl Host {
     }
 
     fn driver_step(&mut self, now: u64, rng: &mut Rng) {
-        // Host policy: the client stream pauses unless this node is a
-        // Normal member of the current view whose folded configuration era
-        // matches it. A committed reconfiguration's establishing era
-        // completes only through the §8.7.8 fence into the established
-        // era, and the primary's client stream is the activity that keeps
-        // that fence from arming — so every node holds its lease driver
-        // (and its forwarded traffic) for the transition's bounded window;
-        // the lease lapses and a fresh grant re-acquires it.
         let status = self.node.status();
         if status.config_era != status.era || status.state != STATE_NORMAL {
             self.driver.pending = None;
@@ -1646,16 +1281,6 @@ impl Host {
             if now < pending.deadline {
                 return;
             }
-            // The correlation window closed: the cluster wait fired, and
-            // its opinion is the relay of the un-acknowledged traffic
-            // (`docs/src/timeout-policy.md`). While the relay has
-            // something to send the operation is STILL IN FLIGHT — its
-            // traffic is on the wire and its reply is still expected — so
-            // the pending op is re-armed on the same window and NOTHING
-            // is re-proposed on the client's behalf. Only when the relay
-            // is empty is the op retired and the next one scheduled on the
-            // backoff, which is the client's own recovery for traffic the
-            // relay could not cover.
             if self.cluster_timeout("op-deadline") > 0 {
                 if let Some(pending) = &mut self.driver.pending {
                     pending.deadline = now + OP_DEADLINE_MS;
@@ -1681,10 +1306,6 @@ impl Host {
         self.submit_get(now, rng);
     }
 
-    /// Feed one kind-2 reply to the embedded runner: the client whose
-    /// in-flight op carries this message id absorbs it (and submits the
-    /// free-probe SET race its absorption decides on). `true` when the
-    /// runner claimed the reply.
     fn embedded_reply(
         &mut self,
         now: u64,
@@ -1702,9 +1323,6 @@ impl Host {
         absorbed
     }
 
-    /// A forwarded embedded op's not-leader refusal: the pending op is
-    /// dropped and the chase backs off. `true` when the runner owned the
-    /// message id.
     fn embedded_not_leader(&mut self, now: u64, message_id: &[u8; 16]) -> bool {
         let Some(mut runner) = self.embedded.take() else {
             return false;
@@ -1714,10 +1332,6 @@ impl Host {
         dropped
     }
 
-    /// One embedded action's submission route — the same route the
-    /// lease driver's ops take: propose locally as the leader, forward
-    /// to the leader over the application channel; anything else is a
-    /// refusal the runner absorbs as a backoff-and-reprobe.
     fn submit_embedded(&mut self, now: u64, rng: &mut Rng, action: &Action) -> bool {
         let rc = self.node.request(action.request.as_bytes());
         if rc == OK {
@@ -1738,26 +1352,11 @@ impl Host {
     }
 }
 
-/// The process's signal flags, registered once and shared across the
-/// bench's in-process cycles: SIGTERM/SIGINT/SIGQUIT form the clean-stop
-/// catch set — all three flip the one `stopped` flag and process exit
-/// through the same drain point — and the per-signal latches record
-/// WHICH member fired so the stop-begin record names it. SIGHUP latches
-/// its own flag: the serve loop logs it as a no-op and never stops on
-/// it. On the bench (`--bench-store`) SIGUSR1 requests the clean
-/// shutdown+startup cycle and SIGUSR2 the dirty restart cycle
-/// (`docs/src/bench-harness.md`). Off the bench the cycle flags are
-/// never registered and the embedded clients' gate owns SIGUSR1/SIGUSR2.
 struct Lifecycle {
     stopped: std::sync::Arc<std::sync::atomic::AtomicBool>,
     caught_term: std::sync::Arc<std::sync::atomic::AtomicBool>,
     caught_int: std::sync::Arc<std::sync::atomic::AtomicBool>,
     caught_quit: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// SIGHUP: the serve loop consumes this flag and carries on. It will
-    /// reload the runtime config — the passive witness list (never-voting,
-    /// out-of-region, loaded at startup, outside the cluster config) and
-    /// the cluster jsonl — but that wiring is a scheduled item; until it
-    /// lands every HUP is the logged no-op.
     hup: std::sync::Arc<std::sync::atomic::AtomicBool>,
     clean_cycle: std::sync::Arc<std::sync::atomic::AtomicBool>,
     dirty_cycle: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -1809,10 +1408,6 @@ impl Lifecycle {
     }
 }
 
-/// One `serve` run's ending: the process exits (the SIGTERM/SIGINT/SIGQUIT
-/// clean stop), or the bench re-boots in-process — clean (the stop path
-/// ran, the store shows the drain-proven marker) or dirty (no stop path,
-/// the running sentinel stands).
 enum Serve {
     Exit(i32),
     CleanCycle,
@@ -1826,21 +1421,8 @@ fn main() {
         exit(2);
     });
 
-    // The subscriber stack (the binary owns it; the library stays
-    // subscriber-free): the JSON line formatter, `RUST_LOG` env-filter,
-    // ANSI off, no formatter timestamp (every line's `ts` is the host's
-    // own `millis()`), through `NonBlocking` over a per-node daily
-    // rolling file. The guard is held for the process lifetime and
-    // flushes on an orderly shutdown — the Exit arm drops it explicitly,
-    // because `exit()` skips the drop and would lose the stop path's
-    // final records still sitting in the writer's buffer.
     let mut worker_guard = Some(init_tracing(&options.log));
     let lifecycle = Lifecycle::register(!options.bench_store.is_empty());
-    // The bench cycle loop: a SIGUSR1/SIGUSR2 cycle returns from `serve`
-    // and the node re-boots in-process — the adapter, its session, and
-    // every volatile host state are rebuilt exactly as a process restart
-    // rebuilds them; the tracing stack and the signal registrations are
-    // the process's and survive. Off the bench `serve` runs once.
     loop {
         match serve(&options, &nodes, &lifecycle) {
             Serve::Exit(code) => {
@@ -1862,8 +1444,6 @@ fn serve(options: &Options, nodes: &[ClusterNode], lifecycle: &Lifecycle) -> Ser
         unreachable!("boot_nodes guarantees the own row");
     };
     let own_desc_id = own.id;
-    // The member buffer, in descriptor line order: plain entries are the
-    // genesis succession sequence, `:j` entries are post-genesis joiners.
     let members = nodes
         .iter()
         .map(|node| {
@@ -1888,15 +1468,6 @@ fn serve(options: &Options, nodes: &[ClusterNode], lifecycle: &Lifecycle) -> Ser
     let fingerprint = transport::genesis_fingerprint(&genesis);
 
     let standby = !options.aof_dir.is_empty();
-    // The telemetry AOF: the envelope record layer over the
-    // vendored TigerBeetle AOF, gated by the node's voting weight. The
-    // series directory is `--telemetry-aof-dir`, falling back to
-    // `--aof-dir` (the standby's). EVERY node can carry one: the boot
-    // Recovering/Restarting/Joining trace always logs; once the node's
-    // voting weight exceeds 0 the gate disarms (the flusher stops, the
-    // trace pauses), and 1→0 re-arms it. An open failure logs and
-    // disables the stream for the process; the node keeps serving (the
-    // telemetry contract).
     let telemetry_dir = if options.telemetry_aof_dir.is_empty() {
         options.aof_dir.clone()
     } else {
@@ -1929,8 +1500,6 @@ fn serve(options: &Options, nodes: &[ClusterNode], lifecycle: &Lifecycle) -> Ser
     };
     let journal_dir = (!options.journal_dir.is_empty()).then_some(options.journal_dir.as_str());
     let node = if !options.bench_store.is_empty() {
-        // The bench boot: the lifecycle marker store rides the driver's
-        // control socket; the journal is real (the run's CAS chain).
         Node::open_bench(
             &members,
             &options.name,
@@ -1943,9 +1512,6 @@ fn serve(options: &Options, nodes: &[ClusterNode], lifecycle: &Lifecycle) -> Ser
             exit(2);
         })
     } else if standby {
-        // The standby telemetry host: the committed-transition hook feeds
-        // the async AOF writer (the LKE1 journal producer path, deferred
-        // durability target) and the lease driver stays idle.
         Node::open_aof(
             &members,
             &options.name,
@@ -1971,8 +1537,6 @@ fn serve(options: &Options, nodes: &[ClusterNode], lifecycle: &Lifecycle) -> Ser
             exit(2);
         })
     } else {
-        // The E2 variant boot: the recovery-boundary flush executes at the
-        // dirty-boot classification inside the adapter.
         if options.recovery_scratch.is_empty() {
             eprintln!(
                 "lease-sequencer: --recovery-flush {} requires --recovery-scratch-dir",
@@ -1995,9 +1559,6 @@ fn serve(options: &Options, nodes: &[ClusterNode], lifecycle: &Lifecycle) -> Ser
         })
     };
     let own_id = node.own_id();
-    // The marker pair vouches for the life: the announced id is the
-    // packed identity (MSB system, LSB crash counter), the marker's next
-    // life when the boot bumped. The crash counter is the life's number.
     let incarnation = u64::from(
         NodeId::from(own_id)
             .crash_counter()
@@ -2032,10 +1593,6 @@ fn serve(options: &Options, nodes: &[ClusterNode], lifecycle: &Lifecycle) -> Ser
         .iter()
         .position(|node| node.name == options.name)
         .unwrap_or_default() as u64;
-    // The membership model boots from the membership sidecar next to the
-    // incarnation marker (the node's last-known adopted facts), else from
-    // the descriptor. A sidecar that does not parse is ignored entirely:
-    // the descriptor is the fallback and discovery re-learns.
     let mut model_source = "descriptor";
     let (model_era, model_slot, model_rows) = match membership::load_sidecar(&options.state) {
         Some(snapshot) => {
@@ -2069,12 +1626,6 @@ fn serve(options: &Options, nodes: &[ClusterNode], lifecycle: &Lifecycle) -> Ser
         next_action_at: millis() + 300,
         pending: None,
     };
-    // The embedded lock client: N contender loops against this
-    // node's own service. Off the bench they run behind the host's client
-    // gate and the SIGUSR1/SIGUSR2 flags register only when clients run —
-    // a gateless host ignores them. On the bench the SIGUSR pair carries
-    // the node's lifecycle, so the clients run ungated (`always_on`) and
-    // never listen for it.
     let embedded = (options.embedded_clients > 0).then(|| {
         let signals = if options.bench_store.is_empty() {
             embedded_client::Signals::register()
@@ -2186,12 +1737,6 @@ fn serve(options: &Options, nodes: &[ClusterNode], lifecycle: &Lifecycle) -> Ser
             "membership-model"
         );
     }
-    // The boot trace: every node's startup decision —
-    // Restarting on a dirty restart (incarnation bump), Recovering when
-    // the core boots into the recovering state, Joining for a fresh
-    // member already Normal — lands in its AOF with the outbound messages
-    // that follow while the gate is ON, whatever the node's future
-    // weight.
     {
         let status = host.node.status();
         let decision = if incarnation > 1 {
@@ -2216,13 +1761,6 @@ fn serve(options: &Options, nodes: &[ClusterNode], lifecycle: &Lifecycle) -> Ser
     let mut rng = Rng::new(millis() ^ (own_desc_id as u64) ^ (std::process::id() as u64));
     host.flush_outputs(now, &mut rng);
 
-    // SIGTERM/SIGINT/SIGQUIT (the clean-stop catch set): the flag flips,
-    // the loop exits through the teardown discipline — the
-    // boot-marker/teardown record LAST, then the unconditional flush.
-    // SIGHUP is a consumed no-op: the flag is read and cleared, the loop
-    // carries on. SIGKILL skips all of it and loses the last unflushed
-    // window (documented). The bench's SIGUSR1/SIGUSR2 cycle flags ride
-    // the same loop top.
     loop {
         if lifecycle
             .hup
@@ -2256,9 +1794,6 @@ fn serve(options: &Options, nodes: &[ClusterNode], lifecycle: &Lifecycle) -> Ser
             .clean_cycle
             .swap(false, std::sync::atomic::Ordering::Relaxed)
         {
-            // The bench clean cycle: the loop return IS the drain point,
-            // exactly as the SIGTERM break — the stop path runs below and
-            // the process re-boots in-process from the flushed marker.
             host.note("sigusr1: bench clean cycle");
             let code = host.node.stop();
             if code != OK {
@@ -2270,10 +1805,6 @@ fn serve(options: &Options, nodes: &[ClusterNode], lifecycle: &Lifecycle) -> Ser
             .dirty_cycle
             .swap(false, std::sync::atomic::Ordering::Relaxed)
         {
-            // The bench dirty cycle: NO stop path — the adapter is
-            // dropped with the running sentinel standing, and the
-            // in-process re-boot reincarnates off it (the crash shape,
-            // without the process death).
             host.note("sigusr2: bench dirty cycle");
             return Serve::DirtyCycle;
         }
@@ -2285,27 +1816,16 @@ fn serve(options: &Options, nodes: &[ClusterNode], lifecycle: &Lifecycle) -> Ser
         host.driver_step(now, &mut rng);
         embedded_step(&mut host, now, &mut rng);
         host.flush_outputs(now, &mut rng);
-        // The AOF lifecycle gate + the 1000 ms forced flusher + the
-        // rollover: the gate follows the node's voting
-        // weight, the flusher runs only while the AOF is ON.
         if let Some(log) = host.telemetry.as_mut() {
             log.on_weight(host.node.voting_weight(), now);
             log.tick(now);
         }
         std::thread::sleep(Duration::from_millis(TICK_MS));
     }
-    // Clean stop (the uVRR termination obligations): the loop break IS
-    // the drain point — no inbound pumping happens after it. The node
-    // stop closes the wire, writes the `stopped` marker, drains the
-    // committed-transition sink to quiescence, and writes `flushed`; the
-    // next boot continues under the SAME incarnation (no resurrection).
-    // SIGKILL skips all of it: the running sentinel stays behind and the
-    // next boot reincarnates — the documented crash shape.
     let code = host.node.stop();
     if code != OK {
         eprintln!("lease-sequencer: node stop failed with code {code}");
     }
-    // The telemetry teardown record LAST and the unconditional flush.
     if let Some(log) = host.telemetry.as_mut()
         && let Err(error) = log.teardown()
     {
@@ -2329,8 +1849,6 @@ fn timers(host: &mut Host, now: u64, rng: &mut Rng) {
             frontier_slot = host.frontier_slot,
             "leader"
         );
-        // The host re-arms the election wait on a leader change (the
-        // fresh-commit resume re-arms it at `on_leader_commit`).
         host.rearm_election_wait(now, rng.unit());
     }
     if now.saturating_sub(host.last_heartbeat) >= host.heartbeat_ms {
@@ -2339,29 +1857,10 @@ fn timers(host: &mut Host, now: u64, rng: &mut Rng) {
         host.flush_outputs(now, rng);
         host.heartbeat_op(now);
     }
-    // `docs/src/failure-detection.md`: a node INSIDE a view change has,
-    // by definition, issued or joined one (its own fence, a peer's
-    // StartViewChange, or its evidence vote) — the toggle holds until a
-    // fresh commit arrives, whatever the entry path was.
     if status.state == STATE_VIEW_CHANGE {
         host.suspect(now, "view-change");
     }
     host.leader_timeout_step(now, rng);
-    // The cluster viewchange timeout (`docs/src/failure-detection.md`):
-    // a DIFFERENT timer from the leader timeout. While the node is timed
-    // out on its leader it polls on the randomized schedule
-    // `min + rand * (max - min)` — it may be pleasantly surprised when
-    // the partition heals and the SAME leader returns, in which case a
-    // fresh commit disarms the poll and the leader timeout resumes. The
-    // poll's drive is the MATCHER's opinion for this node's condition and
-    // this wait (`relay::poll_opinion`): inside the view-change limbo the
-    // attempt is volatile and nothing else re-asks it, so the poll
-    // RE-ASKS THE ARMED ATTEMPT — the same ballot, the same fence votes
-    // and the same evidence, re-sent byte for byte. The view number does
-    // not move on a retransmit: a poll that fired a fresh view change
-    // would manufacture an attempt the protocol never asked for and
-    // inflate the view for as long as the leader stays silent. Outside
-    // the limbo the ordinary suspicion tick is the drive.
     if host.timedout.timed_out() {
         if !host.viewchange.armed() {
             host.viewchange.arm(now, rng.unit());
@@ -2415,13 +1914,6 @@ fn timers(host: &mut Host, now: u64, rng: &mut Rng) {
         host.leader_elapsed = 0;
     } else {
         host.leader_elapsed += TICK_MS;
-        // The election wait: the host tick loop owns the timeout. The
-        // armed wait is the uniform random draw the leader-timeout
-        // schedule arms; one TelemetryTimeoutDecision record per changed
-        // wait, and the drive still happens: leader_timeout, the core's
-        // ordinary suspicion input. While the node is timed out the wait
-        // stands down: the cluster viewchange timeout polls instead
-        // (`docs/src/failure-detection.md`).
         if !host.timedout.timed_out() {
             let wait = host.election_wait();
             if host.leader_elapsed >= wait + host.stagger_ms {
@@ -2446,9 +1938,6 @@ fn timers(host: &mut Host, now: u64, rng: &mut Rng) {
             }
         }
     }
-    // The state-transition trace: Recovering/Restarting/Joining
-    // decisions and the voting-weight moves land in the AOF while its
-    // gate is active.
     if status.state != host.last_state {
         host.last_state = status.state;
         host.record_state_transition(format!(
@@ -2475,10 +1964,6 @@ fn timers(host: &mut Host, now: u64, rng: &mut Rng) {
     }
     if now.saturating_sub(host.last_status_note) >= 2000 {
         host.last_status_note = now;
-        // `voting` is the E1 runner's rejoin-serving signal: the
-        // reincarnated node is back at voting weight in the folded
-        // configuration once the leader's forced reconfiguration walk
-        // completes.
         let voting = u32::from(host.node.voting_weight().unwrap_or(0) > 0);
         info!(
             ts = millis(),
@@ -2494,9 +1979,6 @@ fn timers(host: &mut Host, now: u64, rng: &mut Rng) {
             sidecar_drops = host.sidecar.drops(),
             "status"
         );
-        // The slot frontier onto the telemetry tape, on the same periodic
-        // cadence as the status note: every node states how far it got,
-        // not only the one that happens to lead.
         host.record_frontier(&status);
     }
     if (status.state == STATE_RECOVERING
@@ -2507,15 +1989,6 @@ fn timers(host: &mut Host, now: u64, rng: &mut Rng) {
         let _ = host.node.recover();
         host.flush_outputs(now, rng);
     }
-    // The rejoin gossip's joiner half (`rejoin`): a fenced `Joining` boot
-    // — a fresh provisioned voter whose engine sits at the boot fence —
-    // never assumes the cluster will come to it. A bumped boot awaiting
-    // its first seat is the same fence shape: the engine boots unseated
-    // (voting weight 0) and the cluster is views ahead. Both gosssip the
-    // entry ticket to every peer on the resend timer; the leader's
-    // answering push is the evidence the boot fence qualifies, so the
-    // node catches up and stays a streamed witness until a view change
-    // seats it.
     let unseated_reincarnation =
         host.reincarnated && host.node.voting_weight().is_none_or(|weight| weight == 0);
     if (status.state == STATE_JOINING || unseated_reincarnation)
@@ -2526,12 +1999,6 @@ fn timers(host: &mut Host, now: u64, rng: &mut Rng) {
     }
 }
 
-/// One host-loop tick of the embedded lock client runner: drain
-/// the process signal flags into every embedded client's gate and step
-/// each chase — one op in flight at a time, submitted through the node's
-/// own request path. A correlation window that closed on this tick is the
-/// cluster wait firing, and the host relays the un-acknowledged traffic
-/// in answer before the next op goes out.
 fn embedded_step(host: &mut Host, now: u64, rng: &mut Rng) {
     let Some(mut runner) = host.embedded.take() else {
         return;
@@ -2550,14 +2017,6 @@ fn pump_udp(host: &mut Host, now: u64, rng: &mut Rng) {
             return;
         };
         let Some(&replica) = host.addr_to_id.get(&addr) else {
-            // An unregistered endpoint whose socket matches a member the
-            // model already names IS that member: learn the row (the join
-            // verb's proposal-time row only lives on the leader that
-            // accepted the verb — a changed leader re-learns it here from
-            // the member's own first datagram, whose fingerprint the
-            // transport already validated). The AOF standby never speaks
-            // until it is spoken to, so the first learn rides whatever it
-            // sent.
             if !host.learn_member_row(addr) {
                 tracing::warn!(source = %addr, len, "datagram from an unregistered endpoint dropped");
                 continue;
@@ -2585,11 +2044,6 @@ fn handle_packet(
         return;
     };
     if fingerprint != host.fingerprint {
-        // Unexpected but survivable: a datagram from outside the
-        // deployment's genesis fingerprint. Membership snapshots are
-        // advisory evidence, so a foreign deployment's snapshot drops
-        // without ceremony (here: for every packet kind this host
-        // carries, and never a quarantine).
         host.note("dirty-fingerprint; datagram dropped");
         return;
     }
@@ -2598,11 +2052,6 @@ fn handle_packet(
         return;
     }
     if kind == transport::PEER_VRR {
-        // Nothing rides behind the core's message bytes: the datagram the
-        // network carries is byte-identical to what the core produced,
-        // so the core's exact-length wire contract (W3) is untouched.
-        // The Commit-from-leader arrival is the heartbeat evidence
-        // `on_leader_commit` consumes.
         if let Some(header) = transport::vrr_header(payload)
             && let Some(tag) = vrr::wire::Tag::from_u32(header.tag)
         {
@@ -2610,27 +2059,9 @@ fn handle_packet(
                 .answered(replica, header.era, header.view, header.slot, tag);
         }
         host.on_leader_commit(replica, transport::vrr_header(payload), now, rng);
-        // The telemetry AOF stream: EVERY VRR datagram this node
-        // sees is one `Wire` envelope record — the datagram's VRR payload
-        // byte-identical to what the network carried — with the local
-        // nanosecond clock in the envelope header — appended while the
-        // lifecycle gate is active (weight 0 / boot phase). An append
-        // failure disables the stream for the process and logs once —
-        // telemetry must never poison the replication path.
         if host.telemetry.is_some() {
             host.record_telemetry(Record::wire(local_ns(), payload));
         }
-        // The reincarnation remap: a `Reincarnation(old, new)` announcement
-        // arriving from the socket the learned map attributes to `old` IS
-        // the restarted process's entry ticket. The row for the bumped id
-        // is ADDED at the source socket and the socket is re-attributed to
-        // the bumped id, so THIS datagram and every later one from the
-        // same socket are delivered as the new identity — the core's own
-        // anti-spoof guard then sees `from == new` and the leader drives
-        // the two-era resurrection. The old id's row STAYS: the serving
-        // configuration still names it, its sends target the same socket
-        // the new identity binds, and the row leaves only when the forced
-        // steps evict the old identity.
         if let Some((old, new)) = transport::reincarnation_pair(payload)
             && old == replica
             && NodeId::from(old).is_lawful()
@@ -2666,7 +2097,6 @@ fn handle_packet(
     }
     match payload[0] {
         0x01 => {
-            // FORWARD_REQUEST: execute as the leader or redirect.
             if payload.len() > 1 + 16 {
                 let mut message_id = [0u8; 16];
                 message_id.copy_from_slice(&payload[1..17]);
@@ -2700,11 +2130,6 @@ fn handle_packet(
             }
         }
         0x02 => {
-            // FORWARD_RESPONSE: correlate to the driver's pending op, an
-            // embedded contender's, or a forwarded TCP client's. An ack
-            // that correlates to nothing is a maybe: unexpected, not
-            // provably impossible (the pending op may have timed out and
-            // been retried in the window), and survivable.
             if payload.len() > 1 + 16
                 && host
                     .driver
@@ -2734,7 +2159,6 @@ fn handle_packet(
                     "forward-response-in"
                 );
                 if host.embedded_reply(now, rng, &message_id, &payload[17..]) {
-                    // The embedded contender's forwarded op completed.
                 } else if let Some(index) = host.conns.iter().position(|conn| {
                     matches!(
                         conn.pending,
@@ -2742,20 +2166,9 @@ fn handle_packet(
                             if pending_id == message_id
                     )
                 }) {
-                    // The forwarded TCP client's op committed on the
-                    // leader: one reply line, then the conn is idle.
                     host.conns[index].pending = None;
                     client_reply(host, index, "lock", &payload[17..]);
                 } else {
-                    // The late ack: the verb's claim was already gone —
-                    // by design on the driver's churn gate (the
-                    // transition pause drops the pending long before the
-                    // leader's committed reply can arrive), by
-                    // discipline on the op deadline or a
-                    // FORWARD_NOT_LEADER refusal, or on the TCP conn's
-                    // own deadline. The lease lapses and a fresh grant
-                    // re-acquires it, so the ack's result is dead on
-                    // arrival: drained and counted, never a fault.
                     host.late_acks += 1;
                     let status = host.node.status();
                     tracing::warn!(
@@ -2774,8 +2187,6 @@ fn handle_packet(
                 }
             }
         }
-        // FORWARD_NOT_LEADER: drop the pending op — the driver's or an
-        // embedded contender's; the policy retries.
         0x03 if payload.len() == 1 + 16 + 8 => {
             let mut message_id = [0u8; 16];
             message_id.copy_from_slice(&payload[1..17]);
@@ -2801,8 +2212,6 @@ fn handle_packet(
                 host.driver.pending = None;
                 host.driver.next_action_at = now + rng.below(80) + 20;
             } else if host.embedded_not_leader(now, &message_id) {
-                // The embedded contender's forwarded op was refused; the
-                // chase backs off and re-probes.
             } else if let Some(index) = host.conns.iter().position(|conn| {
                 matches!(
                     conn.pending,
@@ -2810,9 +2219,6 @@ fn handle_packet(
                         if pending_id == message_id
                 )
             }) {
-                // The forwarded TCP client's op was refused (the leader
-                // stood down mid-flight); the conn answers not_leader and
-                // its client retries or rotates.
                 host.conns[index].pending = None;
                 client_reply(host, index, "not_leader", b"{\"error\":\"not_leader\"}");
             }
@@ -2821,15 +2227,6 @@ fn handle_packet(
     }
 }
 
-/// One PEER_SNAPSHOT packet: the request is answered from this node's
-/// current membership model (no leader has to be known first), and a
-/// response — from a discovery answer or from the leader's post-commit
-/// dissemination, the same wire shape serving both — is fed to the
-/// discovery state machine. While discovery is running a response only
-/// escalates the era or tallies agreement within it: the model adopts at a
-/// weighted quorum, never from one node's word. Afterwards the
-/// dissemination semantics apply: only the up-to-dateness check, newer
-/// (era, slot) adopted immediately, equal or older ignored everywhere.
 fn handle_snapshot_packet(host: &mut Host, addr: SocketAddr, payload: &[u8]) {
     if membership::decode_request(payload) {
         let response = membership::encode_response(&host.model.snapshot());
@@ -2840,8 +2237,6 @@ fn handle_snapshot_packet(host: &mut Host, addr: SocketAddr, payload: &[u8]) {
     let Some(snap) = membership::decode_response(payload) else {
         return;
     };
-    // The responder is attributed through the addressing tables; an
-    // unattributed source contributes nothing (its weight is unknown).
     let Some(&responder) = host.addr_to_id.get(&addr) else {
         return;
     };
@@ -2913,7 +2308,6 @@ fn pump_tcp(host: &mut Host, now: u64, rng: &mut Rng) {
             pending: None,
         });
     }
-    // Sweep the forward-correlation deadlines.
     let stale: Vec<[u8; 16]> = host
         .forwarded_from
         .iter()
@@ -2947,7 +2341,6 @@ fn pump_tcp(host: &mut Host, now: u64, rng: &mut Rng) {
     }
 }
 
-/// One non-blocking read into a connection's buffer; false closes it.
 fn read_conn(conn: &mut Conn) -> bool {
     let mut chunk = [0u8; 8192];
     loop {
@@ -2965,7 +2358,6 @@ fn read_conn(conn: &mut Conn) -> bool {
     }
 }
 
-/// Pop one NDJSON line (same framing rules as `transport.feed_ndjson`).
 fn pop_line(conn: &mut Conn) -> Option<Vec<u8>> {
     let newline = conn.buf.iter().position(|byte| *byte == b'\n')?;
     let mut line: Vec<u8> = conn.buf.drain(..=newline).collect();
@@ -2979,10 +2371,6 @@ fn pop_line(conn: &mut Conn) -> Option<Vec<u8>> {
     Some(line)
 }
 
-/// One answer written back down a client connection: the bytes on the
-/// wire, the outcome they name, and the ballot the client is being
-/// answered under. Every reply the client stream produces goes through
-/// here, so the request/response stream is transparent in one place.
 fn client_reply(host: &mut Host, index: usize, outcome: &str, bytes: &[u8]) {
     let status = host.node.status();
     info!(
@@ -3002,16 +2390,6 @@ fn client_reply(host: &mut Host, index: usize, outcome: &str, bytes: &[u8]) {
     let _ = host.conns[index].stream.flush();
 }
 
-/// The pending verb's deadline discipline (the admin ack's era-advance wait,
-/// the lock reply's client deadline); false closes the connection.
-///
-/// The window closing is the cluster wait, and its opinion is the relay
-/// of the un-acknowledged traffic (`docs/src/timeout-policy.md`): the
-/// verb's own protocol traffic is re-sent before the connection is
-/// closed, and nothing is re-proposed for it. A verb whose relay is empty
-/// — a follower whose outstanding traffic is the forwarded request, not
-/// this node's own — still closes on the deadline as the client's own
-/// recovery.
 fn pending_deadline(host: &mut Host, index: usize, now: u64) -> bool {
     let Some(pending) = host.conns[index].pending.clone() else {
         return true;
@@ -3021,18 +2399,14 @@ fn pending_deadline(host: &mut Host, index: usize, now: u64) -> bool {
             action,
             id,
             endpoint,
-            era0,
-            slot,
+            proposal_era,
+            establishing_slot,
             deadline,
         } => {
             let status = host.node.status();
-            let reply = if status.era > era0 {
-                // Post-commit dissemination: the leader's membership model
-                // takes the committed verb's change, moves to its next
-                // generation at the establishing slot, and sends the
-                // as-at-new-generation snapshot to the (new) membership.
+            let reply = if status.era > proposal_era {
                 if host.model.apply_change(&action, id, &endpoint) {
-                    host.model.advance(slot);
+                    host.model.advance(establishing_slot);
                     host.disseminate();
                 }
                 format!("\"action\":\"{action}\",\"id\":{id},\"accepted\":true")
@@ -3064,8 +2438,6 @@ fn handle_client_line(host: &mut Host, index: usize, line: &str, now: u64, rng: 
         return true;
     };
     let Some(action) = value["action"].as_str().map(|s| s.to_string()) else {
-        // A lock verb: propose locally; a non-leader answers the error the
-        // operator (or the run.sh driver) re-routes.
         let Some(message_id_hex) = value["message_id"].as_str() else {
             client_reply(host, index, "bad_request", b"{\"error\":\"bad_request\"}");
             return true;
@@ -3097,12 +2469,6 @@ fn handle_client_line(host: &mut Host, index: usize, line: &str, now: u64, rng: 
             });
             return true;
         }
-        // The non-leader route: the op is FORWARDED to the leader over the
-        // peer application channel (the same wire the lease driver and the
-        // embedded clients use). The leader's committed reply rides back
-        // the FORWARD_RESPONSE datagram and this conn answers once. When
-        // no leader is known yet (or the forwarding route is unlearned),
-        // the error reply stands so the client retries or rotates.
         if rc == NOT_LEADER
             && status.leader != LEADER_UNKNOWN
             && status.leader != host.own_id
@@ -3123,8 +2489,6 @@ fn handle_client_line(host: &mut Host, index: usize, line: &str, now: u64, rng: 
         client_reply(host, index, "rejected", reply.as_bytes());
         return true;
     };
-    // An admin verb: leader-only in this host; the run.sh driver retries the
-    // next replica until one accepts.
     let op = match action.as_str() {
         "join" => RECONFIGURE_JOIN,
         "increment" => RECONFIGURE_INCREMENT,
@@ -3159,10 +2523,6 @@ fn handle_client_line(host: &mut Host, index: usize, line: &str, now: u64, rng: 
         return true;
     }
     let rc = host.node.reconfigure(op, id, POSITION_APPEND);
-    // The reconfiguration drive's sends are the establishing Prepare(s),
-    // all stamped with the entry slot at which the new configuration was
-    // chosen; the max send slot is the establishing slot. The drive and
-    // the drain run in the same loop slice, so the capture races nothing.
     let establishing_slot = host.flush_outputs(now, rng);
     if rc != OK {
         let reply = format!("{{\"action\":\"{action}\",\"id\":{id},\"accepted\":false}}");
@@ -3170,11 +2530,6 @@ fn handle_client_line(host: &mut Host, index: usize, line: &str, now: u64, rng: 
         return true;
     }
     let endpoint = value["endpoint"].as_str().unwrap_or_default().to_string();
-    // The joining member's addressing row is learned AT PROPOSAL TIME
-    // from the verb's own endpoint: without it the leader cannot fan out
-    // to the new member at all, and a standby never folds (its datagrams
-    // die as unregistered-endpoint drops). Rows grow additively and the
-    // snapshot path's dedupe keeps a double-learn harmless.
     if action == "join"
         && let Ok(mut addrs) = endpoint.to_socket_addrs()
         && let Some(addr) = addrs.next()
@@ -3186,44 +2541,15 @@ fn handle_client_line(host: &mut Host, index: usize, line: &str, now: u64, rng: 
         action,
         id,
         endpoint,
-        era0: status.era,
-        slot: establishing_slot,
+        proposal_era: status.era,
+        establishing_slot,
         deadline: now + ADMIN_DEADLINE_MS,
     });
     true
 }
 
 #[cfg(test)]
-#[cfg(test)]
-mod forward_tests {
-    //! The external TCP client channel's forwarding route: a lock verb
-    //! addressed to a NON-LEADER voter's client port is forwarded to the
-    //! leader over the peer application channel, and the leader's
-    //! committed reply rides FORWARD_RESPONSE back to the same conn. The
-    //! regression is the rig's takeover failure: the non-leader answered
-    //! `{"error":"not_leader"}` and never forwarded, so external
-    //! contenders whose local voter was not the leader never committed a
-    //! get or a set — and, when the holder died, no contender could ever
-    //! see the lease expire and race for the takeover.
-}
-
-#[cfg(test)]
-mod boot_hint_tests {
-    //! The descriptor-as-hint regression: run 1's replacement refused to
-    //! boot with `--name not in descriptor` and needed a hand-edited
-    //! descriptor listing the joining node. A name the descriptor omits
-    //! must boot as a weight-0 joiner from `--join-id`/`--join-endpoint`
-    //! (the file says where the cluster is, never who may exist), and a
-    //! listed name must not take join flags.
-}
-
-#[cfg(test)]
 mod voting_minimum_tests {
-    //! The deployment ruling (docs/src/decisions.md): a descriptor naming
-    //! fewer than three VOTING members is refused at boot. The count is
-    //! over genesis rows only — a non-genesis hint row is a weight-0
-    //! learner and contributes nothing to a quorum, so a descriptor
-    //! padding its voting rows out with learners is still refused.
 
     use super::{ClusterNode, check_voting_minimum};
 
@@ -3281,20 +2607,4 @@ mod voting_minimum_tests {
     fn a_singleton_descriptor_is_refused() {
         assert!(check_voting_minimum(&[]).is_err());
     }
-}
-
-#[cfg(test)]
-mod reincarnation_remap_tests {
-    //! The transport attribution obligation: a `Reincarnation(old, new)`
-    //! announcement arriving from the socket the learned map attributes to
-    //! `old` is the restarted process's entry ticket — the row for the
-    //! bumped id is added at the source socket, the source socket is
-    //! re-attributed to the bumped id (so THIS and every later datagram
-    //! from it are delivered as the new identity, where the core's own
-    //! anti-spoof gates apply), and the old id's row stays (the serving
-    //! configuration still names it; it leaves only when the forced steps
-    //! evict the identity). An announcement whose body's `old` is not the
-    //! socket's current attribution is delivered under the current
-    //! attribution and the core refuses it by name — zero reconfiguration,
-    //! the lawful outcome for a mis-attributed sender.
 }

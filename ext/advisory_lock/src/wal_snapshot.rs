@@ -1,74 +1,4 @@
-//! The WAL lock snapshot store: a [`StateStore`] over the WAL C ABI
-//! (`wal_open` / `wal_submit` / `wal_pump` / `wal_event_fd` /
-//! `wal_flush_sync` / `wal_load` / `wal_status` / `wal_close`, plus the
-//! record exchange `wal_record_encode` / `wal_record_decode` over the
-//! engine's own codec), backed by the double-ring rotating engine in the
-//! vendored Zig store (docs/src/wal-snapshot.md is the binding design).
-//!
-//! The law, as this store carries it:
-//!
-//! - **No threads.** The store serializes every record on the calling
-//!   thread — the node's loop thread, where every FFI call into the engine
-//!   runs — and makes the syscall through the ABI. The handle is only ever
-//!   driven from the thread that opened it; the `Send + Sync` the trait
-//!   demands is satisfied under that single-thread contract (the same
-//!   contract the ABI itself states), never by interior locking.
-//! - **Steady state, zero fsync.** The tick path (`WalSnapshotStore::note`
-//!   + [`WalSnapshotStore::submit`] + [`WalSnapshotStore::pump`]) writes
-//!   page-cached generations; a crash mid-period is a dirty boot and the
-//!   dirty boot never reads the artefact. On Linux completions come back
-//!   through the ring's eventfd ([`WalSnapshotStore::event_fd`], whose
-//!   wake the host folds into the tick cadence — the pinned runtime seats
-//!   no raw-fd poll); on darwin every write completes inline at submit.
-//! - **The shutdown generation.** [`StateStore::flush`] writes the whole
-//!   live set in the foreground and the engine fsyncs exactly once,
-//!   blocking, before it returns. A refusal (`StorageFull` for capacity,
-//!   `InvalidInput` for a diverged set) is a FAILED stop — an `Err`, never
-//!   a silent skip.
-//! - **LOAD is LAZY and never blocks the boot.** [`StateStore::load`]
-//!   answers "nothing trustworthy" with `Ok(None)`: a cold start, and
-//!   everything content-shaped the engine cannot vouch for. An `Err` is
-//!   only IO trouble or this wrapper's own sizing bug — never a content
-//!   refusal.
-//! - **Content refusals surface at construction.** The frozen ABI refuses
-//!   corrupt content (rotten checksums, twin disagreement, everything
-//!   expired) at `wal_open` — it cannot reach `wal_load`. A refused
-//!   construction is an `Err` from [`WalSnapshotStore::new`]; the mount
-//!   site's fallback (boot without the store, rebuild from the replica
-//!   stream) is where the cold-start answer lives, exactly like the
-//!   marker gate's verdict.
-//! - **The changed set.** The tick path carries only what changed since
-//!   the last completed submit: the loop notes each committed lock
-//!   transition ([`WalSnapshotStore::note`]), and
-//!   [`WalSnapshotStore::submit`] serializes those locks — a live record
-//!   for a lock the snapshot still holds, a **tombstone** for one it has
-//!   dropped (a release; natural expiry writes nothing — the lock is
-//!   simply absent from the next generation). The set clears on a clean
-//!   submit; any refusal keeps it so the tick retries.
-//! - **Units.** The record's `expiry` rides the engine's clock — wall
-//!   nanoseconds (the write stamp's unit, the drift threshold's unit).
-//!   The lock table's lease expiry is leader-stamped milliseconds;
-//!   this wrapper converts on the way in and out.
-//! - **One codec, one checksum.** Exactly one record codec and one
-//!   checksum exist — the engine's, over the vendored Aegis-128
-//!   primitive. The wrapper carries no codec and no checksum code of
-//!   its own: it converts the record's fields through the ABI's
-//!   `wal_record_encode` / `wal_record_decode` exports, and the engine
-//!   stamps and verifies the checksum behind them.
-//!
-//! The two streams carry different amounts of a lease, by design. An
-//! **ephemeral** lock is one cache line and "is" its caller-supplied u64:
-//! what rides its record is the identity — lease id, holder (16 bytes),
-//! absolute expiry, the granted window — and nothing else. A lease's
-//! `name`, `labels`, `taken_at_ms` and `renew_count` have no room in 64
-//! bytes, so an ephemeral record does not persist them and a loaded
-//! ephemeral carries them defaulted. A **durable** lock's fat frame is 12
-//! cache lines and does carry them, in the frame's name and tags areas,
-//! round-tripped byte-exact (see [`DurableFrame`]).
-//!
-//! Whichever stream a lock rode, a loaded snapshot installs only into an
-//! empty table (the lazy-load guard), so live state is never overwritten
-//! by what came off the artefact.
+//! The WAL lock snapshot store: a [`StateStore`] over the WAL C ABI.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
@@ -82,23 +12,15 @@ use uuid::Uuid;
 use crate::locks::{Lease, StateSnapshot};
 use crate::state::StateStore;
 
-/// The record size, bytes: exactly one cache line — 32 bytes of identity
-/// (stamp, expiry, lock id, lease id), the 16-byte holder, the granted
-/// window, the tag, and the checksum. The on-disk bytes ARE the struct's
-/// bytes: layout-exact and memcpy-round-trippable (zero padding, every
-/// field naturally aligned).
+/// The record size, bytes: exactly one cache line, layout-exact with
+/// [`WalRecord`].
 pub const RECORD_SIZE: usize = 64;
 
-/// The engine's default capacity (records per ring). A caller passing
-/// The engine's default ring capacity (wal_c.zig's `capacity_default`):
-/// [`DEFAULT_CAPACITY_MARKER`] (0) opens with this.
 const DEFAULT_CAPACITY: u32 = 1024;
 
 /// The capacity argument that selects [`DEFAULT_CAPACITY`] at the engine.
 const DEFAULT_CAPACITY_MARKER: u32 = 0;
 
-/// Nanoseconds per millisecond: the lease expiry's conversion, in both
-/// directions (`expiry_to_ns` in, `expiry_to_ms` out).
 const NS_PER_MS: u64 = 1_000_000;
 
 // The ABI's errno-style result codes (wal_c.zig).
@@ -109,13 +31,9 @@ const EINVAL: i32 = -22;
 const ENOSPC: i32 = -28;
 const ENOBUFS: i32 = -105;
 
-/// The opaque WAL handle the Zig side owns.
 enum WalHandleRaw {}
 
-/// The ABI's status record (wal_c.zig `WalStreamStatus`), C-ABI layout
-/// mirrored: one stream's completion-driven counters. Private: the ABI
-/// mirror exists for this module's `wal_status` read alone — the seam's
-/// named [`StoreStatus`](crate::state::StoreStatus) is what callers see.
+/// The ABI's status record (wal_c.zig `WalStreamStatus`), C-ABI layout mirrored.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct WalStreamStatusRaw {
@@ -125,9 +43,8 @@ struct WalStreamStatusRaw {
     in_flight: u32,
 }
 
-/// The ABI's status record (wal_c.zig `WalStatus`), C-ABI layout
-/// mirrored: one row per stream — the ephemeral stream's counters and
-/// the durable stream's — plus the last completion's wall timestamp.
+/// The ABI's status record (wal_c.zig `WalStatus`), C-ABI layout mirrored:
+/// one row per stream plus the last completion's wall timestamp.
 #[repr(C)]
 struct WalStatusRaw {
     ephemeral: WalStreamStatusRaw,
@@ -136,14 +53,13 @@ struct WalStatusRaw {
 }
 
 unsafe extern "C" {
-    /// Open (create or open, never truncate) the fixed-size WAL file.
-    /// Returns null on refusal: a bad path, a wrong-size file, a busy
-    /// file, corrupt content at open, or an engine-refused config.
+    /// Open (create or open, never truncate) the fixed-size WAL file;
+    /// null on refusal (a bad path, a wrong-size file, a busy file,
+    /// corrupt content at open, a refused config).
     fn wal_open(path: *const core::ffi::c_char, capacity: u32) -> *mut WalHandleRaw;
 
-    /// Close the handle. No fsync — the documented dirty-close loss
-    /// window; the shutdown flush belongs to `wal_flush_sync`, called
-    /// before this.
+    /// Close the handle. No fsync — the shutdown flush belongs to
+    /// `wal_flush_sync`, called before this.
     fn wal_close(handle: *mut WalHandleRaw);
 
     /// Submit one serialized ephemeral generation (a nonzero multiple of
@@ -160,10 +76,9 @@ unsafe extern "C" {
     /// The ring's eventfd, or -1 where there is no ring.
     fn wal_event_fd(handle: *mut WalHandleRaw) -> i32;
 
-    /// The shutdown generation: the caller's full live sets — the
-    /// ephemeral set and the durable set — written forward and fsynced
-    /// exactly once, blocking, reconciled per stream against the
-    /// engine's mirrors.
+    /// The shutdown generation: the caller's full live sets written
+    /// forward and fsynced exactly once, blocking, reconciled per stream
+    /// against the engine's mirrors.
     fn wal_flush_sync(
         handle: *mut WalHandleRaw,
         buf: *const u8,
@@ -188,23 +103,18 @@ unsafe extern "C" {
     /// The counters, per stream.
     fn wal_status(handle: *mut WalHandleRaw, out: *mut WalStatusRaw) -> i32;
 
-    /// Encode one record through the engine's own codec — the only codec
-    /// and the only checksum there is: the struct in, the 64-byte
-    /// on-disk form out, the checksum stamped engine-side. Refusals
-    /// (a zero lock id, an unknown kind code, a short buffer) are
-    /// negative codes.
+    /// Encode one record through the engine's own codec — the struct in,
+    /// the 64-byte on-disk form out, the checksum stamped engine-side.
+    /// Refusals are negative codes.
     fn wal_record_encode(out: *mut u8, out_cap: usize, record: *const WalRecord) -> i32;
 
     /// Decode one on-disk record through the engine's own codec — the
-    /// checksum verified engine-side. Refusals (a rotted checksum, a
-    /// foreign format version, an unknown kind, a zero lock id, a wrong
-    /// length) are negative codes.
+    /// checksum verified engine-side. Refusals are negative codes.
     fn wal_record_decode(out: *mut WalRecord, buf: *const u8, len: usize) -> i32;
 
     /// Encode one durable fat frame through the engine's own codec: the
-    /// header fields (the durable kind's code in `tag`) plus the caller's
-    /// name and tag bytes and the counters, the 768-byte on-disk form
-    /// out — the sha and the frame checksum stamped engine-side.
+    /// header fields plus the caller's name and tag bytes and the
+    /// counters, the 768-byte on-disk form out, stamped engine-side.
     fn wal_frame_encode(
         out: *mut u8,
         out_cap: usize,
@@ -218,19 +128,10 @@ unsafe extern "C" {
     ) -> i32;
 
     /// Decode one on-disk fat frame through the engine's own codec — both
-    /// integrity layers verified engine-side, the mirror struct out, the
-    /// durable kind's code handed back in `tag`.
+    /// integrity layers verified engine-side, the mirror struct out.
     fn wal_frame_decode(out: *mut FatFrame, bytes: *const u8, len: usize) -> i32;
 }
 
-/// The ABI's per-stream counters → the seam's own record: the one
-/// deliberate mirror in this module. [`WalStatusRaw`] is the C ABI's
-/// layout (wal_c.zig's status, one row per stream); the seam's
-/// [`StoreStatus`](crate::state::StoreStatus) is the named surface the
-/// trait's `state_status` answers and the host ABI reads. The four
-/// counters per stream are the same four facts in both, so they are
-/// converted here, once, rather than mapped field by field at each of the
-/// two call sites.
 impl From<&WalStatusRaw> for crate::state::StoreStatus {
     fn from(raw: &WalStatusRaw) -> Self {
         fn counters(raw: &WalStreamStatusRaw) -> crate::state::StreamCounters {
@@ -249,33 +150,23 @@ impl From<&WalStatusRaw> for crate::state::StoreStatus {
     }
 }
 
-/// The record kind, encoded in the tag's low nibble (the format version
-/// rides the second byte; version 1 is the only one this build reads).
+/// The record kind, encoded in the tag's low nibble.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecordKind {
     /// A live record: acquire/renew.
     Live,
-    /// A tombstone: the release record. A natural expiry writes nothing.
+    /// A tombstone: the release record.
     Tombstone,
 }
 
-/// The record kind's ABI code (the engine's `Kind` enum values). Pinned
-/// behaviourally, not by a compile-time assert — the round-trip tests
-/// encode each kind through the engine's codec and read it back, so a
-/// renumbering on either side fails a test rather than a production
-/// write.
+/// The record kind's ABI code (the engine's `Kind` enum values), pinned
+/// behaviourally by the round-trip tests, not a compile-time assert.
 const KIND_LIVE: u32 = 1;
 const KIND_TOMBSTONE: u32 = 2;
 
-/// The engine's record struct, shared with the C ABI (`WalRecordIn` in
-/// wal_c.zig) and byte-exact with the engine's on-disk layout: 64 bytes,
-/// zero padding, every field naturally aligned — the on-disk bytes ARE
-/// this struct's bytes (memcpy-exact, one cache line). The binding layout
-/// is pinned by the const asserts below — a layout drift is a compile
-/// error, never a silent corruption. The `tag` the host exchanges is the
-/// record kind's code (1 = live, 2 = tombstone); the engine's encode
-/// stamps the format-version bits and the checksum into the struct's own
-/// fields, decode verifies both and hands the kind code back.
+/// The engine's record struct, shared with the C ABI and byte-exact with
+/// the engine's on-disk layout (64 bytes, zero padding); layout pinned by
+/// [`RECORD_LAYOUT`].
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WalRecord {
@@ -289,12 +180,7 @@ pub struct WalRecord {
     pub checksum: u32,
 }
 
-/// The record's binding layout, asserted at compile time on every build
-/// (size, every offset, one cache line). Private: no downstream build
-/// imports it (the copy canary is the engine's own Zig test, it pins the
-/// C layout from that side); the byte-image accessor below demands the
-/// pin on every build, so a struct drift is a compile error, never a
-/// silent corruption.
+/// The record's binding layout, asserted at compile time on every build.
 const RECORD_LAYOUT: () = assert!(
     size_of::<WalRecord>() == RECORD_SIZE
         && size_of::<WalRecord>() == 64
@@ -308,11 +194,9 @@ const RECORD_LAYOUT: () = assert!(
         && offset_of!(WalRecord, checksum) == 60
 );
 
-/// The one unsafe in this module: the record's layout-exact byte image —
-/// the memcpy round trip's Rust half (`std.mem.asBytes` on the engine
-/// side). Sound because [`RECORD_LAYOUT`] pins the struct to exactly 64
-/// bytes of plain little-endian fields with no padding, and the pin is
-/// demanded here on every build this function is compiled into.
+/// The record's layout-exact byte image. Sound because [`RECORD_LAYOUT`]
+/// pins the struct to exactly 64 bytes of plain little-endian fields with
+/// no padding, and the pin is demanded here on every build.
 pub fn record_as_bytes(record: &WalRecord) -> &[u8; RECORD_SIZE] {
     const _: () = RECORD_LAYOUT;
     unsafe { &*(record as *const WalRecord as *const [u8; RECORD_SIZE]) }
@@ -334,10 +218,7 @@ fn kind_from_code(tag: u32) -> Option<RecordKind> {
 }
 
 /// Encode one record into its 64-byte on-disk form through the ABI — the
-/// engine's own codec stamps the checksum. This wrapper computes no
-/// checksum and carries no codec of its own: there is exactly one of
-/// each, in the engine over the vendored primitive. `None` is a refusal:
-/// a zero lock id or an unknown kind cannot become a record.
+/// engine's own codec stamps the checksum. `None` is a content refusal.
 pub fn record_encode(record: &Record) -> Option<[u8; RECORD_SIZE]> {
     let fields = WalRecord {
         stamp: record.stamp,
@@ -355,8 +236,7 @@ pub fn record_encode(record: &Record) -> Option<[u8; RECORD_SIZE]> {
 }
 
 /// The record the 64 bytes carry, or `None` when the engine's codec
-/// refuses them: a failed checksum, a foreign format version, an unknown
-/// kind, or a zero lock id. Every refusal is a content refusal.
+/// refuses them. Every refusal is a content refusal.
 pub fn record_decode(bytes: &[u8; RECORD_SIZE]) -> Option<Record> {
     let mut fields = WalRecord {
         stamp: 0,
@@ -383,22 +263,11 @@ pub fn record_decode(bytes: &[u8; RECORD_SIZE]) -> Option<Record> {
     })
 }
 
-// ---------------------------------------------------------------------------
-// The durable stream: the fat frame's binding mirror and its codec
-// access, over the engine's own codec behind the ABI.
-// ---------------------------------------------------------------------------
-
-/// The fat frame size, bytes: exactly 12 cache lines — the 64-byte
-/// header record, the name area (CL1-5), the counters and tag bytes
-/// (CL6-7), and the consistency area (CL8-11).
+/// The fat frame size, bytes: exactly 12 cache lines.
 pub const FAT_FRAME_SIZE: usize = 768;
 
 // The frame's fixed offsets, the engine's own (data-area offsets are
 // frame offsets; the mirror's `data` starts after the 64-byte header).
-// Public: the binding's offsets, the mirror tests' and the canary's
-// shared pin. The areas' byte budgets are the engine's to enforce — a
-// name or tag span that overruns its area is a refusal at
-// `wal_frame_encode`, and this binding carries no budget of its own.
 pub const FAT_NAME_LEN_OFFSET: usize = 64;
 pub const FAT_NAME_OFFSET: usize = 66;
 pub const FAT_TAKEN_AT_OFFSET: usize = 384;
@@ -406,53 +275,39 @@ pub const FAT_RENEW_COUNT_OFFSET: usize = 392;
 pub const FAT_TAG_LEN_OFFSET: usize = 396;
 pub const FAT_TAG_BYTES_OFFSET: usize = 398;
 
-/// The durable record kind, encoded in the header tag's low nibble (the
-/// format version rides the second byte; version 1 is the only one this
-/// build reads).
+/// The durable record kind, encoded in the header tag's low nibble.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DurableKind {
     /// A live durable lock: acquire/create.
     Live,
-    /// Released but not destroyed: the record stands with its identity,
-    /// the fencing token survives.
+    /// Released but not destroyed: the record stands with its identity.
     Kept,
-    /// The destruction: the real tombstone of the durable kind. The
-    /// format carries the kind and the scan honours it (a delete frame
-    /// drops the record on load); no operation produces one in this
-    /// release — the durable kind's destroy verb lands with the
-    /// durable-lock model, and until then nothing writes it.
+    /// The destruction: the durable kind's real tombstone; nothing in
+    /// this release writes one.
     Delete,
 }
 
-/// The durable kind's ABI code (the engine's `DurableKind` enum values).
-/// The numbers are the engine's, and no compile-time assert can reach
-/// across the C ABI to bind them — the pin is behavioural: the durable
-/// round-trip tests encode each kind through the engine's own codec and
-/// decode it back, so a renumbering on either side fails a test rather
-/// than silently mis-tagging a record.
+/// The durable kind's ABI code (the engine's `DurableKind` enum values),
+/// pinned behaviourally by the round-trip tests, not a compile-time assert.
 const DKIND_LIVE: u32 = 1;
 const DKIND_KEPT: u32 = 2;
 const DKIND_DELETE: u32 = 3;
 
 /// The engine's fat frame struct, shared with the C ABI and byte-exact
-/// with the engine's on-disk layout: 768 bytes, zero padding, the
-/// on-disk bytes ARE this struct's bytes. The binding layout is pinned
-/// by the const asserts below — a drift is a compile error, never a
-/// silent corruption. The canary (the mirror test below and the engine's
-/// own) proves the field-true interpretation across the boundary.
+/// with the engine's on-disk layout (768 bytes, zero padding); layout
+/// pinned by [`FAT_FRAME_LAYOUT`].
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FatFrame {
     /// CL0: the same record header, its tag a durable kind.
     pub header: WalRecord,
     /// CL1-11: the name area, the counters and tag bytes, the
-    /// consistency area — read through the accessors below, never by
-    /// hand-rolled offset math outside this module.
+    /// consistency area — read through the accessors below.
     pub data: [u8; FAT_FRAME_SIZE - RECORD_SIZE],
 }
 
 /// The fat frame's binding layout, asserted at compile time on every
-/// build. Public so downstream builds can import and reuse the pin.
+/// build; public for downstream reuse.
 pub const FAT_FRAME_LAYOUT: () = assert!(
     size_of::<FatFrame>() == FAT_FRAME_SIZE
         && size_of::<FatFrame>() == 768
@@ -472,9 +327,7 @@ impl FatFrame {
         &self.data[FAT_NAME_OFFSET - RECORD_SIZE..][..len]
     }
 
-    /// The counters' taken-at wall clock, milliseconds — the leader's
-    /// execution tick at the holder-changing SET that installed the
-    /// current holder.
+    /// The counters' taken-at wall clock, milliseconds.
     pub fn taken_at_ms(&self) -> u64 {
         u64::from_le_bytes(
             self.data[FAT_TAKEN_AT_OFFSET - RECORD_SIZE..][..8]
@@ -483,8 +336,8 @@ impl FatFrame {
         )
     }
 
-    /// The renew counter: the same-holder renewals the record has seen
-    /// since the current holder took it.
+    /// The renew counter: same-holder renewals since the current holder
+    /// took the lock.
     pub fn renew_count(&self) -> u32 {
         u32::from_le_bytes(
             self.data[FAT_RENEW_COUNT_OFFSET - RECORD_SIZE..][..4]
@@ -504,10 +357,9 @@ impl FatFrame {
     }
 }
 
-/// The frame's layout-exact byte image — the memcpy round trip's Rust
-/// half. Sound because [`FAT_FRAME_LAYOUT`] pins the struct to exactly
-/// 768 bytes of plain little-endian fields with no padding, and the pin
-/// is demanded here on every build this function is compiled into.
+/// The frame's layout-exact byte image. Sound because [`FAT_FRAME_LAYOUT`]
+/// pins the struct to exactly 768 bytes of plain little-endian fields with
+/// no padding, and the pin is demanded here on every build.
 pub fn frame_as_bytes(frame: &FatFrame) -> &[u8; FAT_FRAME_SIZE] {
     const _: () = FAT_FRAME_LAYOUT;
     unsafe { &*(frame as *const FatFrame as *const [u8; FAT_FRAME_SIZE]) }
@@ -531,8 +383,7 @@ fn durable_kind_from_code(tag: u32) -> Option<DurableKind> {
 }
 
 /// The durable lock's fields, decoded: the header's identity plus the
-/// frame's name, counters and tag bytes. The name and tag bytes are the
-/// engine-vouched bytes, owned.
+/// frame's name, counters and tag bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DurableFrame {
     pub stamp: u64,
@@ -549,12 +400,8 @@ pub struct DurableFrame {
 }
 
 impl DurableFrame {
-    /// The labels the tag bytes carry: the engine's tag-bytes convention
-    /// is the labels joined by a single `\n` byte each — sorted and
-    /// deduplicated, the table's canonical form, and the admission
-    /// validation guarantees a label can never contain `\n`, so the
-    /// join is unambiguous. Empty labels = empty tag bytes. This is the
-    /// exact encoding the byte-exact tests below hold.
+    /// The labels the tag bytes carry: joined by a single `\n` byte each
+    /// (admission validation guarantees a label never contains `\n`).
     pub fn labels(&self) -> Vec<String> {
         self.tag_bytes
             .split(|&b| b == b'\n')
@@ -563,10 +410,9 @@ impl DurableFrame {
     }
 }
 
-/// One durable lock's serializable content: what the lock table's lease
-/// carries past the record format's identity, exactly the frame areas'
-/// fields. `name_bytes` is the validated path's UTF-8 bytes; `tag_bytes`
-/// the labels joined per [`DurableFrame::labels`]' convention.
+/// One durable lock's serializable content: the frame areas' fields.
+/// `name_bytes` is the validated path's UTF-8 bytes; `tag_bytes` the
+/// labels joined per [`DurableFrame::labels`]' convention.
 #[derive(Clone)]
 pub struct DurableChange {
     pub lock_id: u64,
@@ -585,9 +431,7 @@ pub struct DurableChange {
 
 /// Encode one durable frame into its 768-byte on-disk form through the
 /// ABI — the engine's own codec stamps the sha and the frame checksum.
-/// This wrapper computes no checksum and carries no codec of its own.
-/// `None` is a refusal: a zero lock id, an unknown kind, or a name/tag
-/// span over the frame's budget cannot become a frame.
+/// `None` is a content refusal.
 pub fn frame_encode(stamp: u64, change: &DurableChange) -> Option<[u8; FAT_FRAME_SIZE]> {
     let fields = WalRecord {
         stamp,
@@ -617,8 +461,7 @@ pub fn frame_encode(stamp: u64, change: &DurableChange) -> Option<[u8; FAT_FRAME
 }
 
 /// The frame the 768 bytes carry, or `None` when the engine's codec
-/// refuses them: a failed integrity layer, a foreign format version, an
-/// unknown kind, a zero lock id. Every refusal is a content refusal.
+/// refuses them. Every refusal is a content refusal.
 pub fn frame_decode(bytes: &[u8; FAT_FRAME_SIZE]) -> Option<DurableFrame> {
     let mut mirror = FatFrame {
         header: WalRecord {
@@ -652,10 +495,8 @@ pub fn frame_decode(bytes: &[u8; FAT_FRAME_SIZE]) -> Option<DurableFrame> {
     })
 }
 
-/// The labels joined to the tag bytes: one `\n` byte between labels,
-/// nothing else — the convention [`DurableFrame::labels`] reads back.
-/// The admission validation (`valid_label`) guarantees a label can
-/// never contain `\n`, so the join is unambiguous.
+/// The labels joined to the tag bytes: one `\n` byte between labels —
+/// the convention [`DurableFrame::labels`] reads back.
 pub fn labels_to_tag_bytes(labels: &[String]) -> Vec<u8> {
     let mut bytes = Vec::new();
     for (i, label) in labels.iter().enumerate() {
@@ -667,10 +508,6 @@ pub fn labels_to_tag_bytes(labels: &[String]) -> Vec<u8> {
     bytes
 }
 
-/// One serialized record appended, or the loud error: the engine refuses
-/// fields that cannot become a record (a zero lock id, an unknown kind —
-/// both unreachable through this wrapper's own bookkeeping, so a refusal
-/// here is a bug named loudly).
 fn encode_into(records: &mut Vec<u8>, record: &Record) -> io::Result<()> {
     let bytes = record_encode(record)
         .ok_or_else(|| wal_error(EINVAL, "the engine refused a record's fields"))?;
@@ -678,14 +515,12 @@ fn encode_into(records: &mut Vec<u8>, record: &Record) -> io::Result<()> {
     Ok(())
 }
 
-/// One lock-table change, the record format's whole content: the identity
-/// fields the 72 bytes carry and nothing more (a lease's `name`/`labels`
-/// and counters have no room here — see the module doc).
+/// One lock-table change: the identity fields the record carries and
+/// nothing more.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Record {
-    /// The ns write stamp: the epoch selector, wall clock of the write.
-    /// The submit path writes the host's stamp through; the shutdown
-    /// flush re-stamps with its own write time.
+    /// The ns write stamp (the shutdown flush re-stamps with its own
+    /// write time).
     pub stamp: u64,
     /// Absolute, in the engine's clock (nanoseconds).
     pub expiry: u64,
@@ -720,8 +555,7 @@ impl Record {
     }
 
     /// A tombstone: the release record. `lease_id` rides when the caller
-    /// knows it; a tick that learned of the release only through the
-    /// table's absence carries zero.
+    /// knows it.
     pub fn tombstone(stamp: u64, lock_id: u64, lease_id: u64) -> Self {
         Self {
             stamp,
@@ -735,11 +569,6 @@ impl Record {
     }
 }
 
-/// The lease expiry's units: the table's leader-stamped milliseconds in,
-/// the engine's nanoseconds out. The conversion is saturating on the way in
-/// (a saturating result is a lease past the end of the engine's clock, never
-/// a wrapped one) and truncating on the way out (the read path's drift
-/// threshold is seconds wide).
 fn expiry_to_ns(expiry_ms: u64) -> u64 {
     expiry_ms.saturating_mul(NS_PER_MS)
 }
@@ -756,10 +585,7 @@ fn unix_ns() -> u64 {
 
 /// One durable lock's last-known identity, the wrapper's own bookkeeping:
 /// the fields a released durable lock's kept frame must carry once the
-/// table has dropped the lease. Refreshed from every snapshot this store
-/// serializes (submit and flush alike) for every lock that carries a
-/// name — the durable class — so a later release emits the kept frame
-/// from here.
+/// table has dropped the lease.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DurableEntry {
     name: String,
@@ -773,27 +599,21 @@ struct DurableEntry {
 }
 
 /// The store: one open WAL handle plus the changed set the tick path
-/// carries. The handle is opened at construction and closed at drop; the
-/// single-thread contract is the ABI's (see the module doc).
+/// carries; the single-thread contract is the ABI's (see the SAFETY note
+/// on the `Send`/`Sync` impls).
 pub struct WalSnapshotStore {
     handle: *mut WalHandleRaw,
-    /// The file this store reads and writes (diagnostics; the engine owns
-    /// the bytes).
     path: PathBuf,
     /// The effective capacity (records per ring) the engine opened with —
     /// the load buffer's size.
     capacity: u32,
-    /// Lock ids changed since the last completed submit, in the loop's
-    /// own bookkeeping. Cleared on a clean submit; a refusal keeps it so
-    /// the tick retries.
+    /// Lock ids changed since the last completed submit. Cleared on a
+    /// clean submit; a refusal keeps it so the tick retries.
     changed: BTreeSet<u64>,
     /// The durable class's last-known identities, keyed by lock id.
     durable: BTreeMap<u64, DurableEntry>,
-    /// The forgotten store: `forget` removed the artefact and the
-    /// reopen refused — every write-path call reports EIO until the
-    /// store is dropped. A forgotten-and-dead store never blocks the
-    /// boot (load answers none) and never fails silently (the stop's
-    /// flush refuses loudly).
+    /// A forgotten store whose reopen refused: every write-path call
+    /// reports EIO until the store is dropped.
     dead: bool,
 }
 
@@ -809,27 +629,30 @@ unsafe impl Sync for WalSnapshotStore {}
 
 impl WalSnapshotStore {
     /// Open the WAL at `path` with the default capacity
-    /// ([`DEFAULT_CAPACITY`]).
-    ///
-    /// A refusal is an `Err` — a bad path, a wrong-size file, a busy
-    /// file, or corrupt content at open (rotten checksums, twin
-    /// disagreement, everything expired: the ABI refuses content at
-    /// open). The mount site's fallback for a refused construction is
-    /// the cold-start answer (boot without the store, rebuild from the
-    /// replica stream); a load is never handed a store that failed to
-    /// open.
+    /// ([`DEFAULT_CAPACITY`]); a refusal is an `Err`.
     pub fn new(path: &Path) -> io::Result<Self> {
         Self::new_with_capacity(path, DEFAULT_CAPACITY_MARKER)
     }
 
     /// [`WalSnapshotStore::new`] with an explicit capacity (records per
-    /// ring, the operator's sizing knob). 0 selects the default; a
-    /// capacity beyond the ring geometry is refused like any other open
-    /// refusal.
+    /// ring); 0 selects the default.
+    pub fn new_with_capacity(path: &Path, capacity: u32) -> io::Result<Self> {
+        Ok(Self {
+            handle: Self::open_handle(path, capacity)?,
+            path: path.to_path_buf(),
+            capacity: if capacity == DEFAULT_CAPACITY_MARKER {
+                DEFAULT_CAPACITY
+            } else {
+                capacity
+            },
+            changed: BTreeSet::new(),
+            durable: BTreeMap::new(),
+            dead: false,
+        })
+    }
+
     /// Open (create or open, never truncate) the pre-laid-out file at
-    /// `path` with `capacity` records per ring, or the refusal. The one
-    /// place the handle is ever opened: construction and the forget's
-    /// reopen both come through here, so neither can drift from the other.
+    /// `path`, or the refusal. The one place the handle is ever opened.
     fn open_handle(path: &Path, capacity: u32) -> io::Result<*mut WalHandleRaw> {
         let cpath = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| {
             io::Error::new(
@@ -847,39 +670,16 @@ impl WalSnapshotStore {
         Ok(handle)
     }
 
-    pub fn new_with_capacity(path: &Path, capacity: u32) -> io::Result<Self> {
-        Ok(Self {
-            handle: Self::open_handle(path, capacity)?,
-            path: path.to_path_buf(),
-            // The engine's effective capacity: 0 selects the default.
-            capacity: if capacity == DEFAULT_CAPACITY_MARKER {
-                DEFAULT_CAPACITY
-            } else {
-                capacity
-            },
-            changed: BTreeSet::new(),
-            durable: BTreeMap::new(),
-            dead: false,
-        })
-    }
-
-    /// Record a changed lock: the loop calls this on every committed lock
-    /// transition (acquire, renew, release, break). The next
-    /// [`WalSnapshotStore::submit`] carries the lock — a live record if
-    /// the snapshot still holds it, a tombstone if it does not.
+    /// Record a changed lock; the next [`WalSnapshotStore::submit`]
+    /// carries it.
     pub fn note(&mut self, lock_id: u64) {
         crate::invariant!(lock_id != 0, "wal snapshot: lock id 0 is not a lock");
         self.changed.insert(lock_id);
     }
 
     /// The steady tick's write: every noted lock, serialized as one
-    /// generation per stream and submitted forward — unnamed locks ride
-    /// the ephemeral stream as records (a live record, a tombstone for a
-    /// release), named locks ride the durable stream as fat frames (a
-    /// live frame; a release's kept frame, the identity retained). Both
-    /// calls must succeed for a clean submit; a refusal keeps the set so
-    /// the next tick retries — what landed is last-wins-identical, what
-    /// was refused is not lost.
+    /// generation per stream and submitted forward. A refusal keeps the
+    /// changed set so the next tick retries.
     pub fn submit(&mut self, snap: &StateSnapshot) -> io::Result<usize> {
         if self.changed.is_empty() {
             return Ok(0);
@@ -896,13 +696,6 @@ impl WalSnapshotStore {
         for &lock_id in &self.changed {
             match snap.locks.get(&lock_id) {
                 Some(lease) if lease.name.is_some() => {
-                    // The classification the flush carries: a named lease
-                    // with an expiry (a live durable lock) is a live
-                    // frame; a named record with none (a loaded kept
-                    // lock, or the keeper record a break leaves) is the
-                    // kept frame as it stands. Tick and flush must
-                    // classify identically — the flush reconciles its
-                    // frames against the mirror these submits built.
                     let kept = lease.expiry == 0;
                     self.durable.insert(
                         lock_id,
@@ -915,10 +708,6 @@ impl WalSnapshotStore {
                             kept,
                         },
                     );
-                    // Both frames read the lease, not the map: the entry
-                    // above is the release path's record of this identity,
-                    // and the frame for the lease in hand is one builder
-                    // either way.
                     frames.extend_from_slice(&if kept {
                         self.durable_frame_kept_from_lease(stamp, lock_id, lease)?
                     } else {
@@ -936,22 +725,16 @@ impl WalSnapshotStore {
                         lease.lease_ms,
                     ),
                 )?,
-                None => {
-                    // A release. The durable class: the kept frame from
-                    // the last-known identity (already kept in the
-                    // engine's mirror means nothing to write). The
-                    // ephemeral class: the tombstone.
-                    match self.durable.get_mut(&lock_id) {
-                        Some(entry) => {
-                            if entry.kept {
-                                continue;
-                            }
-                            entry.kept = true;
-                            frames.extend_from_slice(&self.durable_frame_kept(stamp, lock_id)?);
+                None => match self.durable.get_mut(&lock_id) {
+                    Some(entry) => {
+                        if entry.kept {
+                            continue;
                         }
-                        None => encode_into(&mut records, &Record::tombstone(stamp, lock_id, 0))?,
+                        entry.kept = true;
+                        frames.extend_from_slice(&self.durable_frame_kept(stamp, lock_id)?);
                     }
-                }
+                    None => encode_into(&mut records, &Record::tombstone(stamp, lock_id, 0))?,
+                },
             }
         }
 
@@ -986,9 +769,6 @@ impl WalSnapshotStore {
         Ok(records.len() / RECORD_SIZE + frames.len() / FAT_FRAME_SIZE)
     }
 
-    /// The live durable frame for `lock_id`, the fields from the
-    /// snapshot's lease (the name and labels through the frame areas'
-    /// encoding — see [`DurableFrame::labels`]).
     fn durable_frame_live(
         &self,
         stamp: u64,
@@ -1020,10 +800,6 @@ impl WalSnapshotStore {
         })
     }
 
-    /// The kept frame for `lock_id`: the identity the entry retained —
-    /// the fencing token, the name, the counters — with the holder
-    /// cleared and no expiry (a kept record carries none; the engine's
-    /// scan never drops one).
     fn durable_frame_kept(&self, stamp: u64, lock_id: u64) -> io::Result<[u8; FAT_FRAME_SIZE]> {
         let entry = self.durable.get(&lock_id).expect("the durable entry");
         let change = DurableChange {
@@ -1046,10 +822,9 @@ impl WalSnapshotStore {
         })
     }
 
-    /// Drain completions non-blocking. A no-op success on the
-    /// inline-completion platforms (darwin); on Linux it reaps the ring's
-    /// completions and moves the counters. Call this on the eventfd wake
-    /// and before the next submit.
+    /// Drain completions non-blocking; a no-op success on the
+    /// inline-completion platforms (darwin). Call this on the eventfd
+    /// wake and before the next submit.
     pub fn pump(&mut self) -> io::Result<()> {
         if self.dead {
             return Err(wal_error(
@@ -1065,17 +840,10 @@ impl WalSnapshotStore {
         }
     }
 
-    /// THE DIRTY BOOT'S FORGET: the write half of the law's third
-    /// clause. A boot whose verdict is not a clean stop never reads the
-    /// artefact — and this store must not carry the old artefact's
-    /// bookkeeping forward either: the engine's mirrors are seeded from
-    /// the open scan, and a flush reconciles the caller's sets against
-    /// them. A stale mirror would fail a correct stop. So the dirty
-    /// boot's store closes the handle, removes the artefact (it is a
-    /// fallback; nothing vouches for it), and reopens the pre-laid-out
-    /// empty file: the mirrors start empty and the tick path rebuilds
-    /// them from every lock the replica stream re-commits (each is
-    /// noted as it lands).
+    /// The dirty boot's forget: close the handle, remove the artefact
+    /// (a fallback nothing vouches for), and reopen the pre-laid-out
+    /// empty file — the engine's mirrors start empty and the tick path
+    /// rebuilds them from every lock the replica stream re-commits.
     pub fn forget_artifact(&mut self) {
         if self.dead {
             return;
@@ -1097,12 +865,9 @@ impl WalSnapshotStore {
             }
         }
         // The reopen, with a transient belt: the forget runs at boot,
-        // off the serving path, and the reopen's refusal under load —
-        // the ring's setup and the exclusive flock contending with the
-        // cohort's own teardowns — is transient, not a property of the
-        // artefact. Three attempts over ~50 ms; a refusal that persists
-        // is real, and the store dies loudly below. The boot is never
-        // blocked longer than that.
+        // off the serving path, so a refusal under load is transient —
+        // three attempts over ~50 ms; a persistent one kills the store
+        // loudly below.
         let mut opened = None;
         for attempt in 0..3 {
             match Self::open_handle(&self.path, DEFAULT_CAPACITY_MARKER) {
@@ -1127,10 +892,6 @@ impl WalSnapshotStore {
             }
         }
         if let Some(handle) = opened {
-            // The fresh handle, and the bookkeeping the old life held
-            // dropped with it: the changed set and the durable map are
-            // this life only, and the engine's mirrors behind the new
-            // handle start empty.
             self.handle = handle;
             self.changed = BTreeSet::new();
             self.durable = BTreeMap::new();
@@ -1138,22 +899,15 @@ impl WalSnapshotStore {
     }
 
     /// The ring's eventfd to poll (Linux), or `None` where there is no
-    /// ring (darwin completes inline). The platform fact is the whole of
-    /// this accessor: the pinned host runtime seats no raw-fd poll, so the
-    /// host folds the wake into the tick cadence — each
-    /// [`WalSnapshotStore::pump`] reaps the previous generation before the
-    /// next [`WalSnapshotStore::submit`] — and reads this to know which of
-    /// the two platforms it is on.
+    /// ring (darwin completes inline).
     pub fn event_fd(&self) -> Option<i32> {
         let fd = unsafe { wal_event_fd(self.handle) };
         (fd >= 0).then_some(fd)
     }
 
-    /// The counters, the seam's record: one row per stream (the
-    /// generations and records landed since open, the refusals, the
-    /// submissions outstanding) plus the last completion's wall
-    /// timestamp. `Err` only when the store is dead (see
-    /// [`WalSnapshotStore::forget_artifact`]).
+    /// The counters, the seam's record: one row per stream plus the last
+    /// completion's wall timestamp. `Err` only when the store is dead
+    /// (see [`WalSnapshotStore::forget_artifact`]).
     pub fn status(&self) -> io::Result<crate::state::StoreStatus> {
         if self.dead {
             return Err(wal_error(
@@ -1173,11 +927,8 @@ impl WalSnapshotStore {
         }
     }
 
-    /// The snapshot the artefact carries, as the load path hands it: the
-    /// engine's live set decoded. A tombstone in the load stream, or any
-    /// record the engine's codec refuses (a failed checksum, a foreign
-    /// format version, an unknown kind, a zero lock id) is a content
-    /// refusal — `Ok(None)`, the cold-start answer.
+    /// The ephemeral stream's live set decoded; a tombstone or a refused
+    /// record is `None` — the cold-start answer.
     fn decode_records(records: &[u8]) -> Option<StateSnapshot> {
         let mut locks = std::collections::BTreeMap::new();
         for chunk in records.chunks_exact(RECORD_SIZE) {
@@ -1194,8 +945,6 @@ impl WalSnapshotStore {
                     holder: Uuid::from_bytes(record.holder),
                     expiry: expiry_to_ms(record.expiry),
                     lease_ms: record.lease_ms,
-                    // The record format carries no more than the lease's
-                    // identity: the rest is defaulted, never guessed.
                     name: None,
                     labels: None,
                     taken_at_ms: 0,
@@ -1203,11 +952,6 @@ impl WalSnapshotStore {
                 },
             );
         }
-        // The watermark the stream can answer: the highest id each
-        // loaded record carries. The ids a retired generation spent
-        // beyond the live set ride the tombstones, which the load path
-        // drops — the known bound of a WAL-loaded table's monotonicity,
-        // the engine's own ticket to lift.
         let generations = locks
             .iter()
             .map(|(&lock_id, lease)| (lock_id, lease.lease_id))
@@ -1215,10 +959,8 @@ impl WalSnapshotStore {
         Some(StateSnapshot { locks, generations })
     }
 
-    /// The durable stream's live set decoded: one named lease per fat
-    /// frame, the display fields from the frame areas. A delete kind in
-    /// the load stream, or any frame the engine's codec refuses, is a
-    /// content refusal — `None`, the cold-start answer.
+    /// The durable stream's live set decoded; a delete kind or a refused
+    /// frame is `None` — the cold-start answer.
     fn decode_frames(frames: &[u8]) -> Option<StateSnapshot> {
         let mut locks = std::collections::BTreeMap::new();
         for chunk in frames.chunks_exact(FAT_FRAME_SIZE) {
@@ -1247,8 +989,6 @@ impl WalSnapshotStore {
                 },
             );
         }
-        // The watermark the durable stream can answer, the same bound
-        // the ephemeral load states beside it.
         let generations = locks
             .iter()
             .map(|(&lock_id, lease)| (lock_id, lease.lease_id))
@@ -1256,9 +996,6 @@ impl WalSnapshotStore {
         Some(StateSnapshot { locks, generations })
     }
 
-    /// The kept frame for a lease the snapshot still holds with no
-    /// expiry (a loaded kept lock, re-flushed as it stands): the
-    /// identity from the lease itself.
     fn durable_frame_kept_from_lease(
         &self,
         stamp: u64,
@@ -1292,39 +1029,26 @@ impl WalSnapshotStore {
 }
 
 impl StateStore for WalSnapshotStore {
-    /// One changed lock, the loop's note.
     fn note(&mut self, lock_id: u64) {
         self.note(lock_id)
     }
 
-    /// The steady tick's write: the noted locks, one generation per
-    /// stream (see [`WalSnapshotStore::submit`]).
     fn tick(&mut self, snap: &StateSnapshot) -> io::Result<usize> {
         self.submit(snap)
     }
 
-    /// Drain completions (see [`WalSnapshotStore::pump`]).
     fn pump(&mut self) -> io::Result<()> {
         self.pump()
     }
 
-    /// The dirty boot's forget (see [`WalSnapshotStore::forget_artifact`]).
     fn forget(&mut self) {
         self.forget_artifact()
     }
 
-    /// The per-stream counters, read straight off the engine (see
-    /// [`WalSnapshotStore::status`]).
     fn state_status(&self) -> Option<crate::state::StoreStatus> {
         self.status().ok()
     }
 
-    /// The shutdown generation: the whole live sets, serialized here on
-    /// the calling thread — the ephemeral set as records, the durable set
-    /// as fat frames — written forward by the engine and fsynced exactly
-    /// once, blocking. The engine reconciles each set against its
-    /// stream's mirror; a refusal is a FAILED stop — an `Err`, never a
-    /// silent skip.
     fn flush(&mut self, snap: &StateSnapshot) -> io::Result<()> {
         if self.dead {
             return Err(wal_error(
@@ -1339,13 +1063,6 @@ impl StateStore for WalSnapshotStore {
         for (&lock_id, lease) in &snap.locks {
             crate::invariant!(lock_id != 0, "wal snapshot: lock id 0 is not a lock");
             if lease.name.is_some() {
-                // The durable class: a live frame while the lease holds
-                // (a nonzero expiry), the kept frame once it does not
-                // (a released durable lock carries no expiry — the
-                // loaded kept locks come back exactly so). The same
-                // classification the tick path makes, deliberately: the
-                // flush reconciles these frames against the mirror the
-                // ticks built, and the two must agree lock for lock.
                 let kept = lease.expiry == 0;
                 frames.extend_from_slice(&if kept {
                     self.durable_frame_kept_from_lease(stamp, lock_id, lease)?
@@ -1378,10 +1095,6 @@ impl StateStore for WalSnapshotStore {
             }
         }
 
-        // The durable locks the snapshot no longer names: released (or
-        // expired) since the last serialize — the kept frame from the
-        // last-known identity, and it stays in the set: the engine's
-        // mirror holds it and every flush rewrites the full durable set.
         for (&lock_id, entry) in self.durable.iter_mut() {
             if snap
                 .locks
@@ -1440,18 +1153,13 @@ impl StateStore for WalSnapshotStore {
         }
     }
 
-    /// The lazy load: both streams' live sets, the ephemeral records and
-    /// the durable frames decoded into one snapshot (a named lock's
-    /// display fields ride the frame areas; a loaded kept lock carries
-    /// its identity, no holder, no expiry). `Ok(None)` — the cold-start
-    /// answer for "there is nothing trustworthy here", for either
-    /// stream. An `Err` is only IO trouble or this wrapper's own sizing
-    /// bug; a content refusal cannot block a boot.
+    /// The lazy load: both streams' live sets decoded into one snapshot;
+    /// `Ok(None)` is the cold-start answer for "nothing trustworthy
+    /// here" — a content refusal never blocks a boot.
     fn load(&self) -> io::Result<Option<StateSnapshot>> {
         if self.dead {
-            // A forgotten-and-dead store holds no handle and no artefact,
-            // so there is nothing to read: the cold-start answer, never a
-            // failure and never a call into a closed handle.
+            // A dead store holds no handle and no artefact: the
+            // cold-start answer, never a call into a closed handle.
             return Ok(None);
         }
         let mut buf = vec![0u8; self.capacity as usize * RECORD_SIZE];
@@ -1465,7 +1173,6 @@ impl StateStore for WalSnapshotStore {
                 }
                 Self::decode_records(&buf[..out_len])
             }
-            // 1 = none: the cold start.
             1 => Some(StateSnapshot::default()),
             ENOBUFS => {
                 return Err(wal_error(
@@ -1510,7 +1217,6 @@ impl StateStore for WalSnapshotStore {
             return Ok(None);
         };
         if !ephemeral_found && !durable_found {
-            // Both streams answered none: the cold start.
             return Ok(None);
         }
         let mut ephemeral = ephemeral;
@@ -1523,8 +1229,6 @@ impl StateStore for WalSnapshotStore {
             }
         }
         ephemeral.locks.append(&mut durable.locks);
-        // The streams' watermarks merge with the records: a durable lock's
-        // spent generations are as spent as an ephemeral one's.
         ephemeral.generations.append(&mut durable.generations);
         Ok(Some(ephemeral))
     }
@@ -1539,14 +1243,9 @@ impl Drop for WalSnapshotStore {
     }
 }
 
-/// The error an ABI result code maps to. The kind carries the discipline
-/// (capacity refusals are `StorageFull`, an outstanding batch is
-/// `WouldBlock`); the message names the path.
-///
-/// `EIO` — a poisoned handle and every other IO failure — and any code
-/// this build does not know are one class, `Other`: the store's callers
-/// surface both as a failed operation, and a code this build cannot name
-/// must not be given a discipline it does not carry.
+/// The error an ABI result code maps to: the kind carries the discipline
+/// (`StorageFull`, `WouldBlock`), the message names the path; `EIO` and
+/// any code this build does not know are one class, `Other`.
 fn wal_error(code: i32, what: &str) -> io::Error {
     let kind = match code {
         EINVAL => io::ErrorKind::InvalidInput,

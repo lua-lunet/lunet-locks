@@ -259,34 +259,13 @@ handle.
 ## The one-outstanding rule
 
 One outstanding request per client is a **safety** property of this
-topology, not a throughput preference: the nexus maps a command's uuid to the
-socket the command arrived on, and the number of entries a connection may hold
-at once is one. A second, different command arriving on a connection that
-already holds one is **refused by name**, never queued behind it.
-
-The refusal is a named line on the same socket, in the same JSON shapes the
-protocol already uses:
-
-```json
-{"error":"request_outstanding","message_id":"02020202-0202-0202-0202-020202020202"}
-```
-
-The refused command never enters the replication log, never reaches the lock
-state machine, and never allocates a nexus entry. A retry of the command that
-*is* outstanding — the same `message_id` — is not a second outstanding request:
-it attaches to the entry already held and is answered by it.
-
-The decision is taken at **arrival**, which is the only moment the law has
-teeth. A connection's commands are served one at a time to their replies, so a
-read that carries more than one command is a client that wrote a second before
-reading the first reply, and every command after the first in that write
-arrived while the first was outstanding: all of them are refused by name. The
-connection survives the refusal, and the next command — written after the reply
-is read — is served normally. A client that waits for each response, as
-[the client protocol](client-protocol.md) requires, never sees a refusal.
-
-The refusal is observable as its own named log event, carrying the era and view
-the refusal was taken under:
+topology: the nexus maps a command's uuid to the socket the command
+arrived on, and the number of entries a connection may hold at once is
+one. The refusal line, the arrival decision, and the never-queued
+semantics are [the client protocol's](client-protocol.md). The refusal
+is observable as its own named log event, `client-request-refused`,
+carrying the era and view the refusal was taken under and the
+`message_id` it refused:
 
 ```json
 {"ts":1789725518000,"level":"INFO","event":"client-request-refused","node":1,"era":4,"view":4,"state":"normal","reason":"request_outstanding","message_id":"02020202-0202-0202-0202-020202020202"}
@@ -298,46 +277,14 @@ The balancer stops sending new connections to a node its health check has
 marked unhealthy. A client whose connection was on that node observes one of
 the three behaviours above, re-drives its **unchanged** envelope, and the new
 TCP connection lands on a healthy node — possibly in the other datacentre.
-Replication deduplicates the re-driven envelope by `(client_id, request_num)`
-and replays the first execution's reply if the command had in fact committed
-before the node went away, so a re-drive after a committed-but-unanswered
-command returns the original answer rather than executing twice.
-
-A client that re-drives onto a *follower* has its command forwarded to the
-leader over the VRR peer channel and the committed reply returned on the same
-forward. A client that re-drives onto the *leader* has it executed locally. The
-client cannot tell which it got, and does not need to.
+Replication deduplicates the re-driven envelope and replays the first
+execution's reply if the command had in fact committed before the node went
+away.
 
 No session migrates. The socket a client held before the failure is gone, and
 the replacement socket is a different socket with a different entry in the
 balancer's connection tracking. The nexus is per-command and per-connection, so
 nothing carries over except the client's own envelope.
-
-## What this topology proves, and what it does not
-
-**It proves.** That a client can hold a connection to a datacentre VIP, have a
-command's uuid hold the reply against the socket the command arrived on, and
-receive that reply on that socket, while a node behind the balancer dies and
-the balancer's own failover behaviour — a reset on AWS, continued flows and a
-client-side deadline on Azure, the backend's own reset on GCP — is survived by
-re-driving the unchanged envelope. It proves the one-outstanding rule is
-enforced by name rather than absorbed by a queue, and that the nexus entry is
-dropped on every exit path. It proves that no balancer-level affinity is needed
-for correctness, because the leader holds the authority and not the connection.
-
-**It does not prove.** That a request survives the balancer: a request in flight
-on a connection the balancer tears down is answered by re-drive, never by the
-original connection. That the load balancer is a member of the trust boundary:
-the TCP client channel has no separate authentication, exactly as
-[the client protocol](client-protocol.md) states, and every balancer here
-preserves the client source address only where its own defaults allow it
-(AWS disables client IP preservation by default for IP-type TCP target groups
-and cannot disable it for UDP,
-[target group attributes](https://docs.aws.amazon.com/elasticloadbalancing/latest/network/edit-target-group-attributes.html);
-GCP's passthrough balancer preserves it by not proxying at all). And
-nothing here says anything about the peer protocol between datacentres, which
-[architecture](architecture.md) specifies and which is expected to run on a
-private network with encryption supplied by the deployment.
 
 ## The load balancer comparison
 
@@ -368,38 +315,3 @@ Sources, per row and per provider:
   [traffic distribution](https://docs.cloud.google.com/load-balancing/docs/network/ext-netlb-traffic-distribution),
   [health checks overview](https://docs.cloud.google.com/load-balancing/docs/health-check-concepts),
   [configure failover](https://docs.cloud.google.com/load-balancing/docs/network/networklb-setting-up-failover).
-
-## Where the nexus pattern came from
-
-The uuid-to-socket nexus is the same shape as the frame-multiplexed broker in
-[lunet-backproxy](https://github.com/lua-lunet/lunet-backproxy), read for its
-abstractions rather than its code. Backproxy's DMZ broker holds a pool of
-outbound worker connections and multiplexes framed requests over them; each
-frame's header carries an explicit `kind`, an explicit `id` and an explicit
-length, and a reply is accepted only when `resp.kind` and `resp.id` match the
-request that was sent — a mismatch is a protocol fault that removes the peer
-rather than a reply that is quietly attributed to the wrong caller
-(`app/dmz/broker.lua`, `app/common/frame.lua`).
-
-Taken: the **id-in-the-header** discipline, which is this service's 16-byte
-`message_id` as the frame id and therefore the nexus key; the
-**reply-must-match-the-request-id-or-it-is-a-fault** rule, which is why the
-nexus is keyed by the uuid rather than by connection order; the **pool entry
-is removed when its socket fails** discipline, which is why a nexus entry is
-dropped on every exit path; the **named refusal at admission** — backproxy
-answers `BUSY` on the wire when a pool is at its bound rather than queueing
-silently — which is the one-outstanding refusal's shape; and the **readable
-pool status** an operator can ask for.
-
-Rejected: backproxy's **idle-worker poll** (`wait_for_idle` retrying a fixed
-number of times before failing), because a timed poll is a silent queue with a
-timer on it and this design refuses by name instead; its **silent three-attempt
-dispatch retry** of the same request id across workers, because this service's
-duplicate handling replays the first execution's reply and never re-executes;
-its **`math.random` request id**, because the request id here is the client's
-own UUID carried through unchanged; its **whole-handler `pcall` that closes the
-socket on any fault without naming the fault**, because every refusal in this
-protocol is named; and its **free-text service registry** (`HELLO <service>`
-with no authentication of the service name), because the membership verbs are
-already operator-trusted on the client channel by stated policy and a second,
-weaker identity system beside it would be a worse one.

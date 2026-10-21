@@ -1,20 +1,3 @@
-//! Out-of-crate proof that the disk seam is mountable at the HANDLE level,
-//! not only at the directory level.
-//!
-//! `disk_impl_externally_test.rs` proves a foreign [`Disk`] mounts, but its
-//! open shapes all delegate to [`StdDisk`], so it never answers the
-//! question the seam exists for: can an embedder serve an open file from
-//! its own engine? That question lives in `EngineFile` — this file
-//! implements it outside the crate, out of nothing but the public surface,
-//! and drives a real node over it.
-//!
-//! The engine here is deliberately NOT a filesystem wrapper: it is an
-//! in-memory byte store, so every assertion that passes is the machinery
-//! talking to a file that does not exist on any disk. The AOF's io_uring
-//! fast path is exercised too — an engine handle has no operating-system
-//! descriptor, so the AOF must fall back to the engine's own write and
-//! still land every byte.
-
 use std::collections::BTreeMap;
 use std::io::{self, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -24,8 +7,6 @@ use lunet_advisory_lock::spi::{
     Disk, DiskDirEntry, DiskFile, EngineFile, FileStateStore, StateSnapshot, StateStore,
 };
 
-/// The engine: a named byte store, shared by every handle the disk opens.
-/// There is no file behind any of this.
 #[derive(Clone, Default)]
 struct MemoryEngine {
     files: Arc<Mutex<BTreeMap<String, Vec<u8>>>>,
@@ -41,7 +22,6 @@ impl MemoryEngine {
     }
 }
 
-/// One open file on the engine: a path, a cursor, and no descriptor.
 struct MemoryFile {
     engine: MemoryEngine,
     key: String,
@@ -161,8 +141,6 @@ impl EngineFile for MemoryFile {
     }
 }
 
-/// A foreign `Disk` whose open shapes answer from the engine and whose
-/// path-shaped operations answer from an in-memory directory listing.
 struct EngineDisk {
     engine: MemoryEngine,
     dirs: Arc<Mutex<Vec<PathBuf>>>,
@@ -207,9 +185,6 @@ impl Disk for EngineDisk {
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no such engine file"))
     }
 
-    /// Bytes, exactly as stored: the state seam's framed file is binary, so
-    /// this is the operation a reader of that file uses and the one an engine
-    /// must answer without a text conversion in the way.
     fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
         let files = self.engine.store();
         files
@@ -312,9 +287,6 @@ impl Disk for EngineDisk {
     }
 }
 
-/// The store the persistence law is stated over, mounted on the engine:
-/// the state file's own bytes live in the engine's memory, staged and
-/// renamed exactly as the file store does.
 struct EngineStateStore {
     disk: Arc<dyn Disk>,
     path: PathBuf,
@@ -343,8 +315,6 @@ impl StateStore for EngineStateStore {
     }
 }
 
-/// A foreign `DiskFile` mounts from `EngineFile`, and every operation on it
-/// reaches the engine — the seam's handle level, proven out of crate.
 #[test]
 fn a_foreign_engine_file_mounts_and_answers_every_operation() {
     let disk = EngineDisk::mount();
@@ -379,8 +349,6 @@ fn a_foreign_engine_file_mounts_and_answers_every_operation() {
     );
 }
 
-/// The state seam over a foreign store and a foreign disk: flush stages,
-/// renames and syncs through the engine, and load reads it back.
 #[test]
 fn the_state_seam_flushes_and_loads_over_a_foreign_store() {
     let disk = EngineDisk::mount();
@@ -406,8 +374,6 @@ fn the_state_seam_flushes_and_loads_over_a_foreign_store() {
     );
 }
 
-/// `FileStateStore` itself, mounted over the foreign disk: the crate's own
-/// store on top of an embedder's engine.
 #[test]
 fn the_crates_own_state_store_runs_on_a_foreign_disk() {
     let disk = EngineDisk::mount();

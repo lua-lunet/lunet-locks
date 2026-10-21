@@ -1,7 +1,3 @@
-//! The demo's control client: drives one NDJSON verb (lock or admin) over a
-//! node's TCP client port and prints the reply line, or prints the epoch
-//! millisecond clock (`now`) for the shell orchestrator.
-
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};

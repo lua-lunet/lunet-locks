@@ -1,15 +1,3 @@
-//! The chase driver's SET payload against the engine's lease contract.
-//! The binary's `submit_hold`/`submit_renew` send
-//! [`lease_sequencer::chase_set_payload`]'s exact shape, so this test
-//! executes THAT payload against the engine's `Service` and pins three
-//! facts: the payload decodes, a hold is GRANTED (with the
-//! leader-stamped `expiry = execution_time + lease_ms`), and the
-//! same-holder renewal renews (`Transition::Renew`, `renew_count` bump).
-//! The negative leg refuses the retired absolute-`expiry` candidate —
-//! a payload drifted back to the retired shape decodes to an error, and
-//! on a live cluster it spins grantless (zero grants, zero renews): the
-//! v0.14.0 standby-lane failure this test pins.
-
 use lunet_advisory_lock::locks::{Request, Service, Transition};
 use serde_json::Value;
 use uuid::Uuid;

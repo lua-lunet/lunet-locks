@@ -1,25 +1,3 @@
-//! The WAL snapshot store at the real boundary: the Rust `StateStore`
-//! over the real Zig engine's C ABI — no fake of either side, because a
-//! fake proves only that the fake agrees with itself.
-//!
-//! The claims:
-//!
-//! (a) a flushed table roundtrips: the loaded snapshot reproduces the
-//!     flushed table's durable fields, and the record codec behind the
-//!     ABI (the engine's own) reproduces the engine's on-disk bytes;
-//! (b) a release's tombstone drops the lock on load;
-//! (c) the read path's expiry skip (the ~3 s drift threshold) drops a
-//!     lease expired far past it and keeps a live one;
-//! (d) a capacity overrun refuses the flush — the failed stop — and
-//!     counts;
-//! (e) the counters move when the flush completes;
-//! (f) corrupt content (a zeroed data record under a live header, a twin
-//!     disagreement) refuses at open — the frozen ABI refuses content
-//!     before `wal_load`, so the wrapper surfaces it as a construction
-//!     `Err` whose mount-site fallback is the cold start.
-//!
-//! Real files in the repo's scratch tree (`.tmp` is scratch).
-
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -32,7 +10,6 @@ use lunet_advisory_lock::wal_snapshot::{
 };
 use uuid::Uuid;
 
-/// The scratch tree, inside the repo (`.tmp` is scratch).
 fn scratch(name: &str) -> PathBuf {
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.tmp/wal-snapshot");
@@ -52,16 +29,6 @@ fn wal_path(dir: &Path) -> PathBuf {
     dir.join("node.marker.wal")
 }
 
-/// The node's beat, compressed. The pump reaps only completions the
-/// kernel has posted, and the linux ring posts them with real time —
-/// the darwin backend completes synchronously inside the submit
-/// itself. The beat is the cadence the IO ruling names: the submit
-/// cadence is the drain point. Pump, then a bounded wait for both
-/// streams' outstanding batch to complete, pumping as the completions
-/// arrive — the same thing the node's ~1000 ms loop does, sped up.
-/// Every assertion below that reads a completed counter or submits
-/// again, or flushes against the engine's mirror, holds only past a
-/// beat.
 fn beat(store: &mut WalSnapshotStore) {
     store.pump().expect("the pump drains");
     for _ in 0..80 {
@@ -75,19 +42,12 @@ fn beat(store: &mut WalSnapshotStore) {
     panic!("the store's batch never completed");
 }
 
-/// The ephemeral data ring holds the record's bitwise NOT — every byte
-/// flipped — as the redundant second copy. The flip is its own inverse:
-/// the read path un-flips and demands byte-exact agreement with the
-/// header twin plus the checksum.
 fn flip_bytes(bytes: &mut [u8]) {
     for b in bytes.iter_mut() {
         *b = !*b;
     }
 }
 
-/// A stored ephemeral lease: no name, no labels, no counters — the WAL
-/// record carries none of them, and the test leans on that (the loaded
-/// view is the record format's content and nothing more).
 fn lease(lock_id: u64, lease_id: u64, expiry_ms: u64) -> Lease {
     Lease {
         lease_id,
@@ -103,9 +63,6 @@ fn lease(lock_id: u64, lease_id: u64, expiry_ms: u64) -> Lease {
     }
 }
 
-/// A stored durable (named) lease: the display fields ride the fat
-/// frame's areas — name, labels, the counters — and the loaded view
-/// restores them byte-exact.
 fn named_lease(lock_id: u64, lease_id: u64, expiry_ms: u64) -> Lease {
     Lease {
         name: Some(format!("/lock-{lock_id}")),
@@ -132,11 +89,6 @@ fn now_millis() -> u64 {
         .as_millis() as u64
 }
 
-/// The record's byte layout is exact: the struct's byte image (the one
-/// auditable as-bytes helper) places every field at its binding offset —
-/// the same offsets the engine's comptime asserts pin, 64 bytes, one
-/// cache line. This is the Rust half of the layout pin; a drift here is
-/// a test failure, a drift in the engine a compile error.
 #[test]
 fn record_layout_is_exact() {
     let record = WalRecord {
@@ -160,13 +112,6 @@ fn record_layout_is_exact() {
     assert_eq!(record.checksum.to_le_bytes(), bytes[60..64]);
 }
 
-/// The codec: encode then decode reproduces the record, and the record
-/// bytes refuse a rotted checksum, a foreign format version, or an
-/// unknown kind. The codec is the engine's own, behind the ABI — the
-/// wrapper computes no checksum of its own (there is exactly one, in the
-/// engine over the vendored primitive; the vendored vectors are asserted
-/// in the engine's suite, and the byte-exactness below is the
-/// cross-check).
 #[test]
 fn record_codec_roundtrip_and_refusals() {
     let record = Record::live(123, 456, 7, 70, *Uuid::nil().as_bytes(), 5_000);
@@ -202,11 +147,6 @@ fn record_codec_roundtrip_and_refusals() {
     );
 }
 
-/// (a) The round trip: the tick carries the table's changes, the
-/// shutdown flush lands the whole live set, and the loaded snapshot
-/// reproduces it — while the wrapper's codec is byte-identical to the
-/// engine's own on-disk bytes (decode validates the engine's checksum,
-/// re-encode must reproduce it bit for bit).
 #[test]
 fn flush_load_roundtrip_byte_exact() {
     let dir = scratch("roundtrip");
@@ -311,9 +251,6 @@ fn flush_load_roundtrip_byte_exact() {
     );
 }
 
-/// (b) The release path: the lock's live record lands, the release's
-/// tombstone lands after it, and the reopen finds nothing — the
-/// tombstone drops the lock, the empty live set is the cold start.
 #[test]
 fn release_tombstone_drops_the_lock() {
     let dir = scratch("tombstone");
@@ -353,8 +290,6 @@ fn release_tombstone_drops_the_lock() {
     );
 }
 
-/// (c) The read path's expiry skip: a lease expired far past the ~3 s
-/// drift threshold drops on load; a live lease survives.
 #[test]
 fn expiry_drift_skip_honored() {
     let dir = scratch("expiry-drift");
@@ -388,9 +323,6 @@ fn expiry_drift_skip_honored() {
     assert_eq!(kept.lease_id, 20);
 }
 
-/// (d) The capacity refusal: the live set overrunning the pair's
-/// remaining room refuses the flush — the failed stop — and the counter
-/// says so.
 #[test]
 fn capacity_refusal_fails_stop() {
     let dir = scratch("capacity");
@@ -428,7 +360,6 @@ fn capacity_refusal_fails_stop() {
     );
 }
 
-/// (e) The counters move when the shutdown generation completes.
 #[test]
 fn status_counters_move_after_flush() {
     let dir = scratch("counters");
@@ -479,9 +410,6 @@ fn status_counters_move_after_flush() {
     }
 }
 
-/// The changed set carries only what changed: a noted lock submits one
-/// record, a re-noted lock submits one more, and an unchanged set
-/// submits nothing.
 #[test]
 fn submit_carries_only_the_changed_locks() {
     let dir = scratch("changed-set");
@@ -511,10 +439,6 @@ fn submit_carries_only_the_changed_locks() {
     );
 }
 
-/// (f) Corrupt content refuses at open — the frozen ABI's content
-/// refusals (a zeroed data record under a live header, a twin
-/// disagreement) never reach `wal_load`; the wrapper surfaces them as a
-/// construction `Err`, and the mount site's fallback is the cold start.
 #[test]
 fn content_refusals_refuse_open() {
     let good = scratch("content-good");
@@ -589,13 +513,6 @@ fn content_refusals_refuse_open() {
     );
 }
 
-/// The tick and the flush classify a named record's state identically:
-/// a named lease carrying an expiry is a live frame, a named record
-/// with none (a loaded kept lock, or the keeper a break leaves) is the
-/// kept frame — the same classification both paths carry, because the
-/// flush reconciles its frames against the mirror the tick built. A
-/// divergence here is the loud failed stop; this test is the regression
-/// that keeps the two paths one.
 #[test]
 fn tick_and_flush_classify_expiry_zero_named_leases_alike() {
     let dir = scratch("kept-classification");
@@ -635,13 +552,6 @@ fn tick_and_flush_classify_expiry_zero_named_leases_alike() {
     );
 }
 
-/// THE STOP PATH'S ORDER (R2), at the seam the node drives: the flush
-/// reconciles each set against the engine's own mirror, so a changed
-/// lock that never rode the tick is the LOUD failed stop — and the tick
-/// before the flush is what makes the clean stop possible. The node
-/// wires pump/tick/pump before its eager flush (`state.tick` on the
-/// census tape); this test pins the store-level contract that wiring
-/// exists to satisfy.
 #[test]
 fn a_flush_without_a_prior_tick_is_the_loud_failed_stop() {
     let dir = scratch("tick-before-flush");
@@ -673,10 +583,6 @@ fn a_flush_without_a_prior_tick_is_the_loud_failed_stop() {
     store.flush(&released).expect("the flush reconciles");
 }
 
-/// The clean restart's catch-up: a loaded table is noted back into the
-/// store, the first tick re-submits the whole loaded set (the mirrors
-/// start empty in a new life), and the stop's flush then reconciles —
-/// the exact flow the node's lazy load and stop path drive.
 #[test]
 fn the_loaded_table_rides_the_tick_before_a_clean_flush() {
     let dir = scratch("loaded-catch-up");
@@ -720,12 +626,6 @@ fn the_loaded_table_rides_the_tick_before_a_clean_flush() {
     reopened.flush(&loaded).expect("the flush reconciles");
 }
 
-/// The dirty boot's forget: a store that forgets its artefact drops the
-/// stale bookkeeping the open scan seeded (the engine's mirrors), so a
-/// later flush reconciles against what the tick path rebuilt — never
-/// against the pre-crash artefact. Without the forget, a correct stop
-/// after a dirty boot would fail against the stale mirror: this test is
-/// that hole's regression.
 #[test]
 fn the_forgotten_store_reconciles_against_the_rebuilt_mirrors() {
     let dir = scratch("forget");
@@ -783,12 +683,6 @@ fn the_forgotten_store_reconciles_against_the_rebuilt_mirrors() {
     assert_eq!(status.ephemeral.refusals, 0);
 }
 
-/// A forget whose reopen is refused leaves the store DEAD, and the dead
-/// store's answers are the discipline the trait promises: the ops are
-/// the EIO refusal mapped to `Other` (a poisoned handle is no kind of
-/// content refusal, and an unknown code must not be given a discipline
-/// it does not carry), and the load is the cold-start `Ok(None)` —
-/// never a call into the closed handle, never an `Err` a boot trips on.
 #[test]
 fn a_dead_store_refuses_other_and_loads_none() {
     let dir = scratch("dead-store");
@@ -878,8 +772,6 @@ const _: () = assert!(
         && (CHECKSUM_SENTINEL as u64) + BUMP_COUNT < u32::MAX as u64
 );
 
-/// The sentinel record with the bump fields already applied (`bump` of
-/// the two bumps), as the raw 64-byte image — the caller's slot content.
 fn canary_record(bump: u64) -> WalRecord {
     WalRecord {
         stamp: STAMP_SENTINEL + bump,
@@ -893,20 +785,9 @@ fn canary_record(bump: u64) -> WalRecord {
     }
 }
 
-/// The three slots, one caller-owned array: 8-aligned (the export's
-/// documented alignment requirement), each slot exactly one record.
 #[repr(C, align(8))]
 struct Slots([[u8; RECORD_SIZE]; 3]);
 
-/// The cross-ABI copy canary, against the real cdylib: Rust packs the
-/// wide-bit sentinels into the real `WalRecord`, Zig copies-and-bumps
-/// through three caller-owned slots (+1 per copy, checked, no wrap), and
-/// Rust verifies the last slot byte-exact and field-true. What it proves
-/// on this build (darwin/arm64 here; every CI arch builds it): the C
-/// layout is the same struct on both sides, the size/shape/C field math
-/// agree, little-endian carries through the boundary, and the Zig side
-/// interprets the fields for what they are (a plain copy proves nothing;
-/// the bump is the proof). Memory-only by design — no disk, no flush.
 #[test]
 fn copy_canary_cross_abi_three_slots() {
     let mut slots = Slots([[0u8; RECORD_SIZE]; 3]);
@@ -976,9 +857,6 @@ fn copy_canary_cross_abi_three_slots() {
     }
 }
 
-/// The canary's refusals: a null pointer, overlapping slots, and a
-/// misaligned buffer are refused with a negative code — never
-/// dereferenced, never copied, never wrapped.
 #[test]
 fn copy_canary_refusals() {
     let mut slots = Slots([[0u8; RECORD_SIZE]; 3]);
@@ -1024,11 +902,6 @@ use lunet_advisory_lock::wal_snapshot::{
     frame_decode, frame_encode, labels_to_tag_bytes,
 };
 
-/// The fat frame's byte layout is exact: the struct's byte image places
-/// every area at its binding offset — 768 bytes, the header at 0, the
-/// name length at 64, the counters at 384, the tag bytes at 398, the
-/// consistency area at 512. The Rust half of the layout pin; a drift
-/// here is a test failure, a drift in the engine a compile error.
 #[test]
 fn fat_frame_layout_is_exact() {
     let _: () = FAT_FRAME_LAYOUT;
@@ -1064,15 +937,9 @@ fn fat_frame_layout_is_exact() {
 
 const FAT_TAKEN_AT_AREA: usize = 384 - RECORD_SIZE;
 
-/// The three fat slots, one caller-owned array: 8-aligned (the export's
-/// documented alignment requirement), each slot exactly one frame.
 #[repr(C, align(8))]
 struct FatSlots([[u8; FAT_FRAME_SIZE]; 3]);
 
-/// The codec: encode then decode reproduces the durable frame's fields
-/// byte-exact through the engine's codec behind the ABI — the name and
-/// the labels' joined tag bytes included — and the frame refuses rotted
-/// content.
 #[test]
 fn frame_codec_roundtrip_byte_exact() {
     let change = DurableChange {
@@ -1183,13 +1050,6 @@ fn canary_fat_frame(bump: u64) -> FatFrame {
     frame
 }
 
-/// The fat canary against the real cdylib: Rust packs wide-bit unique
-/// sentinels into the real mirror struct — header fields, both area
-/// lengths, both counters, the name/tag byte patterns — and Zig copies
-/// the frame through three caller-owned slots, bumping the four bump
-/// fields +1 per copy. The last slot verifies field-true through the
-/// mirror's own accessors, and byte-exact against the locally computed
-/// expectation.
 #[test]
 fn fat_canary_cross_abi_three_slots_field_true() {
     const _: () = assert!(FAT_TAKEN_AT_SENTINEL + 2 < u64::MAX);
@@ -1267,18 +1127,12 @@ fn fat_canary_cross_abi_three_slots_field_true() {
     assert_ne!(bumped[0], bumped[1]);
 }
 
-/// The mirror's raw accessors on bytes handed straight back from the
-/// engine — the canary's fields are NOT valid frames (the sentinels
-/// break every integrity layer), so the accessors run on a byte-cast
-/// mirror, not through the codec.
 fn frame_decode_raw_for_test(bytes: &[u8; FAT_FRAME_SIZE]) -> FatFrame {
     let mut out = [0u8; FAT_FRAME_SIZE];
     out.copy_from_slice(bytes);
     unsafe { std::ptr::read(out.as_ptr() as *const FatFrame) }
 }
 
-/// The fat canary's refusals: a null pointer, overlapping slots, a
-/// misaligned buffer.
 #[test]
 fn fat_canary_refusals() {
     let mut slots = FatSlots([[0u8; FAT_FRAME_SIZE]; 3]);
@@ -1309,9 +1163,6 @@ fn fat_canary_refusals() {
 // The two-stream store: the durable path through WalSnapshotStore.
 // ---------------------------------------------------------------------------
 
-/// The durable round trip through the store: named locks submit as fat
-/// frames, the loaded snapshot restores every frame-area field
-/// byte-exact, and the ephemeral load stays empty.
 #[test]
 fn durable_submit_load_roundtrip_byte_exact() {
     let dir = scratch("durable-roundtrip");
@@ -1369,9 +1220,6 @@ fn durable_submit_load_roundtrip_byte_exact() {
     }
 }
 
-/// A durable release is a kept frame: the lock stands with its identity
-/// (the fencing token, the name, the counters), no holder, no expiry —
-/// and it survives the reopen.
 #[test]
 fn durable_release_keeps_the_identity() {
     let dir = scratch("durable-kept");
@@ -1420,8 +1268,6 @@ fn durable_release_keeps_the_identity() {
     assert_eq!(kept.holder, Uuid::nil(), "no holder");
 }
 
-/// A durable lock re-taken after a kept generation: a live frame again,
-/// the identity fields refreshed, the reopen reads the live state.
 #[test]
 fn durable_retake_after_kept() {
     let dir = scratch("durable-retake");
@@ -1465,9 +1311,6 @@ fn durable_retake_after_kept() {
     assert!(live.expiry > now_millis(), "the live expiry is back");
 }
 
-/// The durable stream's capacity refusal: counted on the durable row,
-/// the ephemeral row untouched — and the refused set survives for the
-/// tick's retry.
 #[test]
 fn durable_capacity_refusal_counts_per_stream() {
     let dir = scratch("durable-capacity");

@@ -1,18 +1,3 @@
-//! The Flight Recorder's skaffold tape bin (the corfu
-//! inverse-paste shape): a pure-Rust debugger — no Lua, no py, no
-//! network. It reads ONE node's flight recording and streams the exact
-//! message/event sequence as the `from,to,{json}` tape the scenario
-//! playback engine consumes — the same engine the telemetry tape feeds.
-//!
-//! Two reads, one commit gate: the default read is the stable
-//! `from,to,jsonl` playback slice; `--deep` (or any kind beyond `wire`)
-//! is the deep read of the full internal event log, allowed ONLY by the
-//! code as-at the recording's commit and loudly refused otherwise.
-//!
-//! The third read is not a tape at all: `--check-shutdown` reads a run
-//! directory or a `snapshot_run.lua` archive and cross-checks the logs
-//! against the durable markers (`src/shutdown_check.rs`).
-
 use lease_sequencer::flight_tape::{FlightTapeOptions, stream_recording};
 use lease_sequencer::shutdown_check;
 use std::io::Write;
@@ -113,7 +98,6 @@ fn main() -> ExitCode {
     let mut index = 0;
     while index < args.len() {
         let arg = args[index].as_str();
-        // The valueless flags consume only themselves.
         match arg {
             "--help" | "-h" => {
                 print!("{HELP}");

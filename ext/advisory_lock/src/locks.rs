@@ -1,22 +1,7 @@
-//! The lock service: our gateway envelope over the core's machinery.
-//!
-//! The machinery is upstream's (`vrr::locks`): the four verbs, the
-//! CAS grant, the generation watermark that never hands a generation out
-//! twice, the truthful release, and the nil holder no request can name.
-//! This module owns the envelope — the gateway wire the clients and the
-//! console speak — and adapts between the two, keeping the lease
-//! semantics the deployment already runs: the executing node hands its
-//! own wallclock as the core's clock, so `expiry = clock + window` is
-//! the leader-stamped absolute expiry the clients have always seen.
-//!
-//! Ours, beside the envelope: the display identity (`name`/`labels`, the
-//! sticky, validated, canonically sorted identity a SET installs and a
-//! release keeps), the counters (`taken_at_ms`/`renew_count`), and the
-//! [`Transition`] classification the journal and the changed-set notes
-//! ride. The core's generation watermark mints every `lease_id`: the
-//! candidate's `lease_id` field stays on the wire for the envelope's
-//! compatibility and crosses nowhere — a client can never name a
-//! generation.
+//! The lock service: our gateway envelope over the core's machinery
+//! (`vrr::locks`) — the executing node hands its own wallclock as the
+//! core's clock, so `expiry = clock + window` is the leader-stamped
+//! absolute expiry the clients see.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -26,12 +11,9 @@ use vrr::locks::{
     Service as CoreService, StateSnapshot as CoreSnapshot,
 };
 
-/// The wire's UUID identity discipline: every id a client puts on the wire
-/// must be the canonical hyphenated lowercase rendering (`Uuid::to_string`)
-/// — exactly the form the leader echoes back. The Contender regression
-/// (a bare 32-hex draw) parsed silently and only missed at the client's
-/// string comparison, so decode now refuses every non-canonical id loudly,
-/// before the request can enter the replication log.
+/// The wire's UUID identity discipline: every id on the wire must be the
+/// canonical hyphenated lowercase rendering; decode refuses every other
+/// form.
 mod canonical_uuid {
     use super::Uuid;
 
@@ -73,10 +55,9 @@ pub enum Transition {
         holder: [u8; 16],
         expiry: u64,
     },
-    /// The privileged holder-break: the stored record (a live lease or an
-    /// expired one) was force-released and replaced by the bumped, cleared
-    /// keeper record. The fields are the broken lease's values as they were,
-    /// so the journal record is self-describing exactly like a release's.
+    /// The privileged holder-break: the stored record was force-replaced
+    /// by the bumped, cleared keeper record; the fields are the broken
+    /// lease's values as they were.
     Break {
         lock_id: u64,
         lease_id: u64,
@@ -86,8 +67,6 @@ pub enum Transition {
 }
 
 impl Transition {
-    /// The transition's lock: the address every committed lock
-    /// transition is noted under (the tick path's changed set).
     pub fn lock_id(&self) -> u64 {
         match self {
             Transition::Hold { lock_id, .. }
@@ -98,47 +77,31 @@ impl Transition {
     }
 }
 
-/// The state machine's stored lease record and the reply shape. Every field
-/// is serialized in every reply (`name`/`labels` as `null` when the lock
-/// carries none), so observers classify events without diffing successive
-/// states.
+/// The state machine's stored lease record and the reply shape.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Lease {
     pub lease_id: u64,
     pub holder: Uuid,
     /// The leader-stamped absolute expiry: `execution_time + lease_ms` on
-    /// the executing host's wallclock. Requests never carry it — the
-    /// client names a duration and the leader stamps the instant.
+    /// the executing host's wallclock.
     pub expiry: u64,
-    /// The granted window in milliseconds: the duration the SET asked
-    /// for, echoed so the reply is self-describing (`expiry - executed_at`
-    /// is the remaining life the leader measured).
+    /// The granted window in milliseconds.
     pub lease_ms: u64,
     pub name: Option<String>,
     pub labels: Option<Vec<String>>,
-    /// The leader's execution tick at the holder-changing SET that installed
-    /// the current holder; cleared on release, expiry, and break. Requests
-    /// never carry it: the state machine sets it.
+    /// The leader's execution tick at the holder-changing SET that
+    /// installed the current holder.
     #[serde(default)]
     pub taken_at_ms: u64,
-    /// Incremented on a same-holder renewal. A holder change, a release, an
-    /// expiry, and a break zero it. The state machine sets it, never the
-    /// client.
+    /// Incremented on a same-holder renewal; zeroed on a holder change,
+    /// a release, an expiry, and a break.
     #[serde(default)]
     pub renew_count: u32,
 }
 
-/// The SET request's lease candidate: what the client asks for. The client
-/// names a DURATION and can never name an absolute expiry — the leader
-/// stamps `expiry = execution_time + lease_ms` on its own wallclock, so no
-/// client clock enters the lease's semantics. The shape decodes strictly:
-/// a candidate that still carries the retired absolute-`expiry` field is
-/// refused at decode, before the request can enter the replication log.
-///
-/// The `lease_id` field is the envelope's vestige: the core's generation
-/// watermark mints every id, so the value a client sends crosses nowhere.
-/// It stays on the wire because the clients already send it, and the reply
-/// carries the minted id.
+/// The SET request's lease candidate: the client names a duration, never
+/// an absolute expiry — the leader stamps it. The `lease_id` field is the
+/// envelope's vestige; the core's watermark mints every id.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct LeaseCandidate {
@@ -146,8 +109,8 @@ pub struct LeaseCandidate {
     pub lease_id: u64,
     #[serde(deserialize_with = "canonical_uuid::deserialize")]
     pub holder: Uuid,
-    /// The requested lease window in milliseconds. The grant condition is
-    /// `lease_ms > 0`; a zero (or absent) window is refused.
+    /// The requested lease window in milliseconds; the grant condition is
+    /// `lease_ms > 0`.
     pub lease_ms: u64,
 }
 
@@ -230,8 +193,7 @@ fn validate_identity(
 }
 
 /// The `taken_at_ms` a holder-changing SET stores: the execution tick,
-/// bumped by 1 ms when it collides with the replaced record's value so
-/// consecutive takes remain distinguishable.
+/// bumped by 1 ms when it collides with the replaced record's value.
 pub fn taken_at_ms_on_holder_change(prior_taken_at_ms: u64, execution_time: u64) -> u64 {
     if prior_taken_at_ms == execution_time {
         execution_time.saturating_add(1)
@@ -242,9 +204,7 @@ pub fn taken_at_ms_on_holder_change(prior_taken_at_ms: u64, execution_time: u64)
 
 /// The client request, as the gateway's envelope carries it: the
 /// replication identity (`message_id`/`client_id`/`request_num`) beside
-/// the lock operation. The state machine reads none of the envelope —
-/// the leader stamps its own clock and the holder names itself inside the
-/// operation's payload.
+/// the lock operation.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
@@ -261,19 +221,17 @@ pub enum Request {
         client_id: u64,
         request_num: u64,
         lock_id: u64,
-        /// The candidate: the duration the client asks for. Never an
-        /// absolute expiry — the leader stamps `expiry` at execution.
+        /// The candidate: the duration the client asks for, never an
+        /// absolute expiry.
         lease: LeaseCandidate,
         /// Optional lock display name; absent leaves the stored name
-        /// unchanged. Validated and stored canonically at decode.
+        /// unchanged.
         name: Option<String>,
         /// Optional operator labels; absent leaves the stored set
-        /// unchanged. Validated and canonically sorted and deduplicated on
-        /// receipt.
+        /// unchanged.
         labels: Option<Vec<String>>,
-        /// The client's send timestamp, purely observational (latency
-        /// measurement). NO protocol decision may read it: the grant
-        /// condition, the expiry stamp, and the counters never touch it.
+        /// The client's send timestamp, purely observational; no protocol
+        /// decision may read it.
         #[serde(default)]
         sent_at_ms: Option<u64>,
     },
@@ -288,8 +246,7 @@ pub enum Request {
         lease_id: u64,
     },
     /// The privileged holder-break: an unconditional force-release that
-    /// names no holder. Authorization is owned by the admin edge, never by
-    /// the state machine.
+    /// names no holder.
     Break {
         #[serde(deserialize_with = "canonical_uuid::deserialize")]
         message_id: Uuid,
@@ -341,9 +298,7 @@ pub enum Response {
         request_num: u64,
         lock_id: u64,
         lease: Option<Lease>,
-        /// The leader's execution tick (§7): the client interprets the
-        /// lease's expiry against the leader's timeline without assuming
-        /// synchronized clocks.
+        /// The leader's execution tick.
         executed_at: u64,
     },
     Set {
@@ -352,7 +307,7 @@ pub enum Response {
         lock_id: u64,
         granted: bool,
         lease: Option<Lease>,
-        /// The leader's execution tick (see `Get`).
+        /// The leader's execution tick.
         executed_at: u64,
     },
     Release {
@@ -361,53 +316,40 @@ pub enum Response {
         lock_id: u64,
         released: bool,
         lease: Option<Lease>,
-        /// The leader's execution tick (see `Get`).
+        /// The leader's execution tick.
         executed_at: u64,
     },
     Break {
         message_id: Uuid,
         request_num: u64,
         lock_id: u64,
-        /// Whether a stored record was broken. `false` reports that nothing
-        /// was stored under the lock: the lock was already free, with no
-        /// record to break and no journal event.
+        /// Whether a stored record was broken; `false` when the lock was
+        /// already free.
         broken: bool,
         /// On a successful break, the post-break keeper record: the bumped
-        /// `lease_id`, the retained `name` and `labels`, the nil holder,
-        /// and `expiry: 0` — never live.
+        /// `lease_id`, the retained identity, the nil holder, `expiry: 0`.
         lease: Option<Lease>,
-        /// The leader's execution tick (see `Get`).
+        /// The leader's execution tick.
         executed_at: u64,
     },
 }
 
-/// The lock table's whole durable state as one serialisable value: every
-/// lock id's stored record — its holder, its lease id, its expiry, its
-/// window, its display identity and its counters — and every lock id's
-/// generation watermark.
-///
-/// This is the payload the state seam flushes and loads (see
-/// [`crate::state`]): the table is the only state the lock service keeps,
-/// so its serialisable view IS its state. The watermark is deliberately
-/// not defaulted: a snapshot without it is a decode refusal, never an
-/// empty one, because a resumed table that read it as absent would hand
-/// out a generation the lock had already spent.
+/// The lock table's whole durable state as one serialisable value — the
+/// state seam's flush and load payload. The watermark is deliberately not
+/// defaulted: a snapshot without it is a decode refusal, never an empty
+/// one.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct StateSnapshot {
     /// The table itself: lock id -> stored record, ordered so the encoded
-    /// bytes are a function of the state and never of the map's insertion
-    /// history.
+    /// bytes are a function of the state.
     pub locks: BTreeMap<u64, Lease>,
     /// Every lock's generation watermark: the highest generation the lock
-    /// has ever handed out or reserved, which outlives the record a
-    /// release removes.
+    /// has ever handed out, which outlives the record a release removes.
     pub generations: BTreeMap<u64, u64>,
 }
 
-/// The display identity and the counters the envelope keeps beside the
-/// core's machinery: the sticky identity a SET installs and a release
-/// keeps (the durable class's kept frame carries it), and the counters
-/// the console's audit reads. Never a protocol decision's input.
+/// The display identity and counters kept beside the core's machinery;
+/// never a protocol decision's input.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct DurableEntry {
     name: Option<String>,
@@ -417,8 +359,7 @@ struct DurableEntry {
 }
 
 /// The lock service: the core's machinery wrapped in the gateway's
-/// envelope. Clone and default because a node constructs an empty table
-/// and installs a loaded snapshot wholesale.
+/// envelope.
 #[derive(Clone, Default)]
 pub struct Service {
     core: CoreService,
@@ -431,8 +372,6 @@ impl Service {
         if let Request::Set { name, labels, .. } = &mut request {
             validate_identity(name, labels)?;
             if let Some(list) = labels {
-                // Canonical form on receipt: sorted, deduplicated; an empty
-                // list is no labels.
                 list.sort();
                 list.dedup();
             }
@@ -449,16 +388,8 @@ impl Service {
     }
 
     /// Executes one committed operation against the lock table.
-    ///
-    /// The machinery is the core's: the payload crosses into the core's
-    /// request shape (the holder's 128 bits become the core's client
-    /// identity, the nil pair refused at this door exactly as the core
-    /// refuses it at its own), the core executes against the leader's
-    /// own wallclock, and the reply crosses back into the envelope's
-    /// shape with the display identity and the counters the side table
-    /// holds. The [`Transition`] classification — the journal's and the
-    /// changed set's feed — derives from the reply and the
-    /// pre-execution record.
+    // The (reply bytes, transition) pair is the shape; a named type would
+    // not carry more than the tuple does.
     #[allow(clippy::type_complexity)]
     pub fn execute(
         &mut self,
@@ -474,11 +405,6 @@ impl Service {
                 "replicated envelope does not match lock payload",
             ));
         }
-        // The pre-execution facts, read off the core's own state at the
-        // moment: the stored record (live or expired — the break's prior
-        // and the counters' prior), the live incumbent (the grant's
-        // classification prior), and the sticky identity the side table
-        // holds.
         let lock_id = match &request {
             Request::Get { lock_id, .. }
             | Request::Set { lock_id, .. }
@@ -496,9 +422,6 @@ impl Service {
             _ => (None, None),
         };
 
-        // The translation: the envelope's request into the core's payload.
-        // The candidate's lease_id crosses nowhere — the core's watermark
-        // mints every id.
         let core_request = match request {
             Request::Get { lock_id, .. } => CoreRequest::Get { lock_id },
             Request::Set { lock_id, lease, .. } => CoreRequest::Set {
@@ -557,8 +480,6 @@ impl Service {
                     )
                 } else {
                     let granted_lease = lease.expect("a granted Set carries the stored lease");
-                    // The counters: a renewal over the live incumbent
-                    // extends the take; a fresh grant installs one.
                     let entry = if incumbent.is_some() {
                         DurableEntry {
                             name: set_name.or(prior_entry.name),
@@ -615,16 +536,12 @@ impl Service {
                 executed_at,
             } => {
                 if released {
-                    // The retired lease's fields, as they were: the journal
-                    // record is self-describing exactly like the core's.
                     let transition = incumbent.map(|lease| Transition::Release {
                         lock_id,
                         lease_id: lease.lease_id,
                         holder: client_bytes(&lease.holder),
                         expiry: lease.expiry,
                     });
-                    // The counters clear; the identity sticks (the kept
-                    // frame the durable class carries).
                     if let Some(entry) = self.durable.get_mut(&lock_id) {
                         entry.taken_at_ms = 0;
                         entry.renew_count = 0;
@@ -661,18 +578,12 @@ impl Service {
                 executed_at,
             } => {
                 if broken {
-                    // The broken record's fields as they were: the stored
-                    // record (a live lease or an expired one), read before
-                    // the machinery moved.
                     let transition = stored.map(|lease| Transition::Break {
                         lock_id,
                         lease_id: lease.lease_id,
                         holder: client_bytes(&lease.holder),
                         expiry: lease.expiry,
                     });
-                    // The counters clear; the identity sticks — the
-                    // keeper the reply carries composes from the side
-                    // table after the clear.
                     if let Some(entry) = self.durable.get_mut(&lock_id) {
                         entry.taken_at_ms = 0;
                         entry.renew_count = 0;
@@ -721,16 +632,14 @@ impl Service {
     }
 
     /// Whether the table holds nothing at all: the core's records and
-    /// watermarks. The sticky identity a released lock leaves in the side
-    /// table does not hold the table up — a load replaces it wholesale,
-    /// exactly as the load always replaced the records.
+    /// watermarks (the side table's sticky identity does not hold it up).
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.core.is_empty()
     }
 
-    /// The table's whole state as one serialisable value, captured at the
-    /// moment the caller asks. The state seam's flush payload.
+    /// The table's whole state as one serialisable value: the state
+    /// seam's flush payload.
     #[must_use]
     pub fn snapshot(&self) -> StateSnapshot {
         let core = self.core.snapshot();
@@ -744,14 +653,8 @@ impl Service {
         }
     }
 
-    /// Install a loaded snapshot as the table's whole contents.
-    ///
-    /// Wholesale, not a merge: the loaded value is the pre-stop table, so
-    /// a merge against whatever the node holds would fabricate records
-    /// the stop never wrote. The seam calls this on the lazy-load path
-    /// only, against a table it has just established is empty. The
-    /// watermarks install with the records: a resumed table that dropped
-    /// them would hand out a generation the lock had already spent.
+    /// Install a loaded snapshot as the table's whole contents —
+    /// wholesale, not a merge; the watermarks install with the records.
     pub fn restore(&mut self, snapshot: StateSnapshot) {
         let mut locks = BTreeMap::new();
         let mut durable = BTreeMap::new();
@@ -761,11 +664,8 @@ impl Service {
                 CoreLease {
                     lease_id: lease.lease_id,
                     holder: client_of(lease.holder).unwrap_or_else(|_| {
-                        // The keeper record's nil holder: the one identity
-                        // the mint refuses and a restored table may lawfully
-                        // carry. It re-enters by the serde door — the core's
-                        // derived deserialiser constructs the private halves
-                        // the public mint refuses.
+                        // The keeper record's nil holder: the one identity the
+                        // mint refuses, lawful on restore.
                         core_nil_client()
                     }),
                     expiry: lease.expiry,
@@ -806,9 +706,9 @@ impl Service {
     }
 }
 
-/// The holder's 128 bits as the core's client identity. The nil pair is
+/// The holder's 128 bits as the core's client identity; the nil pair is
 /// refused here, at the envelope's own door, exactly as the core refuses
-/// it at its own: a request that names no holder names nothing.
+/// it at its own.
 fn client_of(holder: Uuid) -> Result<ClientId, serde_json::Error> {
     let bytes = holder.as_bytes();
     let msb = u64::from_be_bytes(bytes[0..8].try_into().expect("the holder's first half"));
@@ -818,10 +718,9 @@ fn client_of(holder: Uuid) -> Result<ClientId, serde_json::Error> {
     })
 }
 
-/// The nil client identity, by the serde door: the core's derived
-/// deserialiser constructs the private halves the public mint refuses.
-/// The one lawful use is the keeper record's restore — the record a
-/// break writes and a snapshot may carry back.
+/// The nil client identity, by the serde door: the derived deserialiser
+/// constructs the private halves the public mint refuses. Lawful only for
+/// the keeper record's restore.
 fn core_nil_client() -> ClientId {
     serde_json::from_value(serde_json::json!({"msb": 0, "lsb": 0}))
         .expect("the core's deserialiser constructs the nil identity")
@@ -832,10 +731,8 @@ fn holder_uuid(client: ClientId) -> Uuid {
     Uuid::from_bytes(client_bytes(&client))
 }
 
-/// The identity's 128 bits, big-endian, as the UUID wire form and the
-/// journal's holder field carry them. The halves are the core's private;
-/// the serde shape is the one door they cross by — the same door the nil
-/// identity's restore uses, in the other direction.
+/// The identity's 128 bits, big-endian, as the UUID wire form; the serde
+/// shape is the door the core's private halves cross by.
 fn client_bytes(client: &ClientId) -> [u8; 16] {
     let bits: ClientIdBits = serde_json::from_value(
         serde_json::to_value(client).expect("the client identity serialises"),
@@ -847,8 +744,6 @@ fn client_bytes(client: &ClientId) -> [u8; 16] {
     bytes
 }
 
-/// The holder pair as the serde wire carries it, the door the private
-/// halves cross by.
 #[derive(Deserialize)]
 struct ClientIdBits {
     msb: u64,

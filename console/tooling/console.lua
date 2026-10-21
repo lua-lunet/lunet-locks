@@ -1,5 +1,4 @@
 #!/usr/bin/env -S luajit
--- Entry point: `bin/up.sh` (or down/status) runs this.
 
 local here = dofile((arg[0]:match("^(.*)/[^/]*$") or ".") .. "/bootstrap.lua")
 

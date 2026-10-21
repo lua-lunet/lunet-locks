@@ -1,19 +1,6 @@
-//! The bench oracle: the CAS-chain evidence checks
-//! (`docs/src/bench-harness.md`).
-//!
-//! Every bench node journals every committed lock transition it applies
-//! (the LKE1 event journal, `ext/advisory_lock/src/journal.rs`): three
-//! replicas applying one replicated log must produce one chain. The
-//! oracle decodes each node's journal, compares the chains on their
-//! semantic content (the apply timestamp is each node's own), checks
-//! every lease a client observed appears in the chain in order, and
-//! scans the node logs for the adapter's invariant-violation voice. Any
-//! violation is a run failure; there is no tolerance and no repair.
-
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// The record kinds (the journal's `KIND_*`).
 pub const KIND_HOLD: u8 = 1;
 pub const KIND_RENEW: u8 = 2;
 pub const KIND_RELEASE: u8 = 3;
@@ -23,8 +10,6 @@ const RECORD_MAGIC: &[u8; 4] = b"LKE1";
 const RECORD_SIZE: usize = 61;
 const RECORD_PAYLOAD_LEN: u32 = 53;
 
-/// One decoded journal record's semantic content. The apply timestamp
-/// is each node's own wall clock and is never compared.
 #[derive(Debug, Clone)]
 pub struct Transition {
     pub kind: u8,
@@ -35,11 +20,6 @@ pub struct Transition {
 }
 
 impl Transition {
-    /// The deterministic comparison: the transition kind, the lock, the
-    /// lease id, and the holder are the replicated content. The expiry
-    /// is stamped from the executing node's own clock at apply
-    /// (`locks.rs`'s `execution_time`) and the apply timestamp likewise;
-    /// neither is consensus content, so neither is compared.
     fn same_content(&self, other: &Transition) -> bool {
         self.kind == other.kind
             && self.lock_id == other.lock_id
@@ -62,9 +42,6 @@ impl Transition {
     }
 }
 
-/// The CRC-32 (IEEE, reflected, polynomial 0xEDB88320) the journal
-/// stamps over bytes `kind..=expiry`; the table is computed, matching
-/// the writer's (`journal.rs`).
 fn crc32_ieee(data: &[u8]) -> u32 {
     let mut table = [0u32; 256];
     for (index, slot) in table.iter_mut().enumerate() {
@@ -85,9 +62,6 @@ fn crc32_ieee(data: &[u8]) -> u32 {
     crc ^ 0xFFFF_FFFF
 }
 
-/// Decode one journal file's records. A truncated, malformed, or
-/// crc-divergent record is an oracle failure: the chain is the
-/// evidence, and broken evidence proves nothing.
 pub fn decode_file(path: &Path) -> Result<Vec<Transition>, String> {
     let bytes = fs::read(path)
         .map_err(|error| format!("the journal file {} does not read: {error}", path.display()))?;
@@ -130,8 +104,6 @@ pub fn decode_file(path: &Path) -> Result<Vec<Transition>, String> {
     Ok(out)
 }
 
-/// The journal files of one node's directory in chain order: rolled
-/// files by their first op, the open file (at most one) last.
 fn journal_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
     let mut rolled: Vec<(u64, PathBuf)> = Vec::new();
     let mut open: Vec<(u64, PathBuf)> = Vec::new();
@@ -168,7 +140,6 @@ fn journal_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
         .collect())
 }
 
-/// One node's CAS chain: every journal file decoded in order.
 pub fn node_chain(dir: &Path) -> Result<Vec<Transition>, String> {
     let mut chain = Vec::new();
     for file in journal_files(dir)? {
@@ -177,8 +148,6 @@ pub fn node_chain(dir: &Path) -> Result<Vec<Transition>, String> {
     Ok(chain)
 }
 
-/// Check 1 — chain equality: every node's transition sequence is
-/// identical. The error names the first divergence.
 pub fn chains_agree(chains: &[(&str, Vec<Transition>)]) -> Result<(), String> {
     let Some((reference_name, reference)) = chains.first() else {
         return Err("the oracle was given no chains".to_string());
@@ -204,10 +173,6 @@ pub fn chains_agree(chains: &[(&str, Vec<Transition>)]) -> Result<(), String> {
     Ok(())
 }
 
-/// Check 2 — client consistency: every lease a client observed through
-/// one node's service (holder, lease_id) appears in the chain, in
-/// observation order. A client seeing a state the chain does not
-/// contain, or states out of the chain's order, is a divergence.
 pub fn client_history_consistent(
     chain: &[Transition],
     history: &[([u8; 16], u64)],
@@ -235,11 +200,6 @@ pub fn client_history_consistent(
     Ok(())
 }
 
-/// Check 3 — the invariant-violation voice: the adapter's `invariant!`
-/// asserts the invariant in every build; a sighting crashes the process,
-/// so a log line carrying one names a node that ran an older build or a
-/// rebuilt binary whose crash went unobserved. Any occurrence in any node
-/// log fails the run — the belt behind the crash.
 pub fn logs_without_invariant_violations(logs: &[(&str, String)]) -> Result<(), String> {
     for (name, text) in logs {
         for (line, content) in text.lines().enumerate() {
@@ -253,6 +213,3 @@ pub fn logs_without_invariant_violations(logs: &[(&str, String)]) -> Result<(), 
     }
     Ok(())
 }
-
-#[cfg(test)]
-mod tests {}

@@ -1,27 +1,7 @@
-//! The read-only information console: what a build says about itself.
-//!
-//! Every field is stamped at BUILD time by the build script from git
-//! facts (`build.rs`), so a production boot answers "what am I running"
-//! without a build host, a network round trip, or a runtime that has to
-//! reach a `.git` it does not carry.
-//!
-//! The surface is read-only by construction. It holds no node, no handle,
-//! and no state: the values are compile-time constants and the functions
-//! here are pure functions over them. There is deliberately no entry on
-//! this module that reaches a [`crate::Node`], so no call through it can
-//! write protocol state or anything else.
-//!
-//! The payload is the Maven `version.properties` shape: `key=value` lines,
-//! LF-terminated. `GET /info` ([`info_response`]) is exactly that text in
-//! an HTTP/1.1 response; the socket that carries it belongs to the host
-//! and is separate from the lock's client port.
-//!
-//! A fact that is unavailable is reported `unknown`, never guessed: a
-//! local untagged checkout, a source tarball without `.git`, and the
-//! Docker build context (the committed-tree snapshot with `.git`
-//! excluded) all report `version=unknown`. `version` names the release
-//! tag this build IS — a build whose HEAD is not at a tag reports
-//! `unknown` rather than the nearest tag it does not carry.
+//! The read-only information console: build-time-stamped facts about the
+//! build, the Maven `version.properties` shape (`key=value` lines,
+//! LF-terminated). Read-only by construction — no node, no handle, no
+//! state — and an unavailable fact is reported `unknown`, never guessed.
 
 /// The release tag naming this build, or `unknown`.
 pub const VERSION: &str = env!("LUNET_INFO_VERSION");
@@ -34,8 +14,7 @@ pub const SHA: &str = env!("LUNET_INFO_SHA");
 /// production build is exactly `production`.
 pub const FEATURE_SHAPE: &str = env!("LUNET_INFO_FEATURES");
 
-/// Whether this build's working tree carried uncommitted changes. A
-/// build whose git facts could not be read at all is stamped dirty: an
+/// Whether this build's working tree carried uncommitted changes; an
 /// unproven clean tree is never reported clean.
 #[must_use]
 pub fn dirty() -> bool {
@@ -46,7 +25,6 @@ pub fn dirty() -> bool {
 pub const KEYS: [&str; 4] = ["version", "sha", "dirty", "feature_shape"];
 
 /// One property by name, or `None` for a name the console does not carry.
-/// The read path: it names a field and gets a constant back.
 #[must_use]
 pub fn field(name: &str) -> Option<&'static str> {
     match name {
@@ -73,9 +51,7 @@ pub fn properties() -> String {
 }
 
 /// The `GET /info` response: the properties text as a complete HTTP/1.1
-/// message. The console answers this one request; there is no request
-/// parsing here at all, so there is no verb other than GET and no path
-/// that mutates anything.
+/// message.
 #[must_use]
 pub fn info_response() -> String {
     let body = properties();
