@@ -604,6 +604,8 @@ fn read_telemetry_log(log_dir: Option<&Path>, aof_dir: &Path) -> TelemetryLog {
 
 fn read_file_records(path: &Path, metrics: &mut BridgeMetrics) -> Vec<Record> {
     let mut records = Vec::new();
+    let mut offset = 0u64;
+    let mut index = 0u64;
     // SAFETY: the FFI reads only through the returned iterator and needs a
     // byte-encoded path to an existing file; `path` is an `.aof` entry just
     // listed from the series directory.
@@ -615,20 +617,82 @@ fn read_file_records(path: &Path, metrics: &mut BridgeMetrics) -> Vec<Record> {
     };
     loop {
         match iterator.next_entry() {
-            Ok(Some(entry)) => match Record::decode(&entry.bytes) {
-                Some(record) => records.push(record),
-                None => {
-                    metrics.undecodable += 1;
+            Ok(Some(entry)) => {
+                match Record::decode(&entry.bytes) {
+                    Some(record) => records.push(record),
+                    None => {
+                        metrics.undecodable += 1;
+                    }
                 }
-            },
+                offset += entry.bytes.len() as u64;
+                index += 1;
+            }
             Ok(None) => break,
-            Err(_) => {
-                metrics.undecodable += 1;
-                break;
+            Err(code) => {
+                eprintln!(
+                    "aof-console-bridge: the ui-tape file {} is corrupt: record {index} at \
+                     byte offset {offset} does not read (FFI code {code}); the let-it-crash \
+                     law aborts the process",
+                    path.display()
+                );
+                std::process::abort();
             }
         }
     }
     records
+}
+
+/// The cassette inventory: every ui-tape file on disk, named with its
+/// size — the finalized `{epoch}.aof` cassettes and the active
+/// `ev-open-*.bin` file the writer has not finalized yet. The bridge
+/// logs it at boot, on SIGUSR1, and never silently skips it.
+pub fn series_inventory(dir: &Path) -> String {
+    let files = series_files(dir);
+    let mut lines = vec![format!(
+        "ui-tape: {} finalized cassette{} on disk in {}",
+        files.len(),
+        if files.len() == 1 { "" } else { "s" },
+        dir.display()
+    )];
+    for (position, path) in files.iter().enumerate() {
+        let size = std::fs::metadata(path).map_or(0, |meta| meta.len());
+        lines.push(format!(
+            "  {}. {} ({size} bytes, finalized)",
+            position + 1,
+            path.display()
+        ));
+    }
+    let active: Vec<PathBuf> = std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .filter_map(|entry| entry.ok())
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.is_file()
+                        && path
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .is_some_and(|name| name.starts_with("ev-open-"))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    for path in &active {
+        let size = std::fs::metadata(path).map_or(0, |meta| meta.len());
+        lines.push(format!(
+            "  active file {} ({size} bytes, not yet finalized)",
+            path.display()
+        ));
+    }
+    if files.is_empty() && active.is_empty() {
+        lines.push("  no cassettes on disk".to_string());
+    }
+    lines.join("\n")
+}
+
+/// Print the cassette inventory to the bridge's stdout.
+pub fn log_series_inventory(dir: &Path) {
+    println!("{}", series_inventory(dir));
 }
 
 fn operation_id_bytes(id: vrr::ids::OperationId) -> [u8; 16] {

@@ -1,4 +1,5 @@
-use lease_sequencer::bridge::Server;
+use lease_sequencer::bridge::{Server, log_series_inventory};
+use signal_hook::consts::SIGUSR1;
 use std::path::PathBuf;
 
 fn main() {
@@ -6,6 +7,7 @@ fn main() {
     let mut log_dir: Option<PathBuf> = None;
     let mut bind = String::from("127.0.0.1:8619");
     let mut follow = false;
+    let mut quiet = false;
     let mut argv = std::env::args().skip(1);
     while let Some(arg) = argv.next() {
         match arg.as_str() {
@@ -23,6 +25,7 @@ fn main() {
                 bind = argv.next().unwrap_or_else(|| die("--bind needs ADDR:PORT"));
             }
             "--follow" => follow = true,
+            "--quiet" => quiet = true,
             "--help" | "-h" => {
                 print_usage();
                 std::process::exit(0);
@@ -43,6 +46,18 @@ fn main() {
         die(&format!("not a directory: {}", log_dir.display()));
     }
 
+    if !quiet {
+        log_series_inventory(&dir);
+    }
+    let dir_for_signals = dir.clone();
+    let mut signals = signal_hook::iterator::Signals::new([SIGUSR1])
+        .unwrap_or_else(|e| die(&format!("cannot register SIGUSR1: {e}")));
+    std::thread::spawn(move || {
+        for _ in signals.forever() {
+            log_series_inventory(&dir_for_signals);
+        }
+    });
+
     let server = Server::spawn(&dir, log_dir.as_deref(), &bind, follow)
         .unwrap_or_else(|e| die(&format!("cannot bind {bind}: {e}")));
     println!(
@@ -60,7 +75,8 @@ fn main() {
 
 fn print_usage() {
     eprintln!(
-        "usage: aof-console-bridge --aof-dir PATH [--log-dir PATH] [--bind ADDR:PORT] [--follow]"
+        "usage: aof-console-bridge --aof-dir PATH [--log-dir PATH] [--bind ADDR:PORT] \
+         [--follow] [--quiet]\n       SIGUSR1 re-prints the ui-tape cassette inventory"
     );
 }
 
