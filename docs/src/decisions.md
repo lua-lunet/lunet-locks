@@ -68,10 +68,10 @@ nothing.
 **The ruling: the UI server is the deployment's state holder.** Every
 deployment registers at least one UI server per data centre. A UI server is
 outside the roster, never votes, and receives the full phase-2 and commit
-stream from every leader in turn. Its append-only series is the durable
+stream from every leader in turn. Its ui-tape is the durable
 copy of the stream: the UI server records what it receives and tracks two
 high-watermarks, the highest frontier it holds in its buffer and the
-highest frontier it has flushed. The series is more than observability: it
+highest frontier it has flushed. The ui-tape is more than observability: it
 is the shutdown certificate, the console's record, and the operator's
 backup.
 
@@ -93,7 +93,7 @@ itself flushed: its lock table durable under its own write-behind series.
    frontier is in its buffer it forces the flush and acknowledges; if it
    has not yet seen the frontier it holds the point open, flushes the
    moment the stream covers it, and acknowledges then. No reply is
-   awaited: the UI servers' series are the backup certificate, and the
+   awaited: the UI servers' ui-tapes are the backup certificate, and the
    node's certificate is its own flush.
 2. The node stops its message loop. No further protocol traffic is
    accepted, and anything arriving after this point is dropped.
@@ -113,7 +113,7 @@ itself flushed: its lock table durable under its own write-behind series.
 
 ### The startup side
 
-The UI server's series is never on the startup path. A starting node reads
+The UI server's ui-tape is never on the startup path. A starting node reads
 its boot fence, and the classification chooses the path:
 
 - **Clean** (the marker reads flushed): the node reads its own

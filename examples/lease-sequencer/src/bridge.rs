@@ -1,7 +1,7 @@
-//! The AOF console bridge: the standby's AOF series replayed through the
+//! The AOF console bridge: the UI server's ui-tape replayed through the
 //! real `Service` state machine and served as the console's HTTP surface.
 //! The replay reads read-only — it never writes, renames, or takes the
-//! writer's lock; the standby owns the series.
+//! writer's lock; the UI server owns the ui-tape.
 
 use lunet_advisory_lock::locks::{Response, Service, Transition};
 use serde_json::{Value, json};

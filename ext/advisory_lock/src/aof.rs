@@ -1,4 +1,5 @@
-//! The AOF write-behind log: producers enqueue complete `LKE1` records to a
+//! The AOF write-behind log (the ui-tape): producers enqueue complete
+//! `LKE1` records to a
 //! dedicated writer thread and never wait on disk; a full queue or a failed
 //! write crashes the process (a dead process is the cheapest signal, a
 //! silently dropped event the most expensive bug).

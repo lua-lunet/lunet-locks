@@ -346,19 +346,19 @@ waits over time, and the per-node slot frontiers. A line that is not a
 JSON object carrying `ts` (the Lua host's stdout captured beside a node's
 own log) is counted `unparsed`, never served.
 
-## The lock telemetry capture file: the write-behind series
+## The ui-tape: the UI server's write-behind series
 
 A zero-voting-weight telemetry node can host the console's telemetry: it
 applies the replication stream like any member and writes its lock-event
-records to an async write-behind log (the lock telemetry capture file)
-instead of the blocking journal. The console's feed and SPA serve off the
-telemetry node's own capture series, never off a cluster replica's journal
-files, and the cluster's latency cadence is unaffected.
+records to an async write-behind log — the **ui-tape** — instead of the
+blocking journal. The console's feed and SPA serve off the UI server's
+ui-tape, never off a voting member's journal files, and the cluster's
+latency cadence is unaffected.
 
-See [the lock telemetry capture file](telemetry-aof.md) for the writer
+See [the ui-tape](telemetry-aof.md) for the writer
 design, the rotation, the rolling and reader-valid-prefix rules, and the
 headless console wiring. The per-node INTERNAL trace — everything the
-capture file never sees — is the [Flight Recorder](flight-recorder.md).
+ui-tape never sees — is the [Flight Recorder](flight-recorder.md).
 
 ## Time, reincarnation, and durability
 
@@ -429,7 +429,7 @@ the core keeps protocol state in quorum memory, not local storage: a voting
 node never writes protocol state to its own disk. A restarting node
 reincarnates and recovers its state from the live nodes, whose memory
 holds the live locks and the inflight commands whole; the UI server's
-series is never on the startup path. The UI server holds the durable copy
+ui-tape is never on the startup path. The ui-tape holds the durable copy
 of the stream as the deployment's state holder, and the clean-shutdown
 sync ceremony flushes it current at a clean halt: the broadcast sync
 point drives the UI server's early flush, while the node's certificate is

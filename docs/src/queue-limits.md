@@ -1,6 +1,6 @@
 # The write-behind queue's limits
 
-The write-behind capture is a bounded-queue design. Two bounded queues
+The ui-tape's writer is a bounded-queue design. Two bounded queues
 carry the two streams a deployment produces, and each states its own law
 at its boundary. This page states the limits and what crossing them
 means.
@@ -45,7 +45,7 @@ block device.
 Because the producers never block, the queue converts the disk stall
 into bounded memory: the capture absorbs up to 4,096 events of stall and
 then crashes the process. At the demo rig's measured steady state —
-about **100 events per second** arriving at a UI server that fronts a
+about **100 events per second** arriving at a ui-tape writer that fronts a
 three-member voting fleet — the queue holds about **41 seconds** of
 total disk stall before the boundary. Operators who expect slower disks
 raise `queue_cap`: the stall tolerance grows linearly with the cap, and

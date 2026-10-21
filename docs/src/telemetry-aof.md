@@ -1,6 +1,6 @@
-# The lock telemetry capture file: the write-behind series
+# The ui-tape: the write-behind series
 
-The lock telemetry capture file is the cluster's public telemetry: the
+The ui-tape is the cluster's public telemetry: the
 console follows a non-voting telemetry node's own async write-behind log
 (the **AOF**, append-only file) instead of any replica's replication-path
 journal. The telemetry node is a zero-voting-weight member: it follows
@@ -79,7 +79,7 @@ any torn tail, and resumes appending.
 
 ## Rotation at (re)start
 
-The capture series the non-voting telemetry nodes write through the
+The ui-tape the non-voting telemetry nodes write through the
 vendored TigerBeetle store (`ext/lunet-locks-aof`, the
 `{unix_epoch_seconds}.aof` naming) ROTATES at every (re)start: a NEW
 active file opens under a fresh unix-epoch name and the pre-existing
@@ -112,7 +112,7 @@ so the console stays live while the writer rolls.
 
 The console edge (nginx) maps `/feed/` to lock-feed and serves the console
 SPA as static assets. The console UI never reads a cluster replica's journal
-files; it reads the telemetry node's deferred capture series through the feed.
+files; it reads the telemetry node's ui-tape through the feed.
 The three headless assertions the capture demo makes are that committed
 events land in the AOF files, that the feed serves them, and that the
 console's data endpoint (`/feed/files` through the edge) returns them.
@@ -122,7 +122,7 @@ Cluster cadence is unaffected: the stability assertions (renew ~250 ms, poll
 
 ## The replay tape
 
-The capture series also feeds the replay story: `skaffold_aof_tape`
+The ui-tape also feeds the replay story: `skaffold_aof_tape`
 streams a telemetry AOF directory as the `from,to,{json}` CSV tape — one
 line per record, in file order (epoch order = ns order) — and the trivial
 shell filter `... | grep "^66,99,"` reads any peer pair's raw jsonl
