@@ -177,6 +177,17 @@ pub struct Replay {
     pub log: TelemetryLog,
 }
 
+impl Replay {
+    /// The replay's own clock: the last replayed record's commit time.
+    /// The lock views' expiry classification runs on the record's
+    /// timeline — the cull never reads the serve-time wall clock, whose
+    /// lag behind the tape (the fsync cadence, the replay pass itself)
+    /// culled leases the cluster still held.
+    pub fn frontier_ms(&self) -> Option<u64> {
+        self.metrics.last_ns.map(ns_to_ms)
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct TelemetryLog {
     pub lines: Vec<Value>,
@@ -254,8 +265,10 @@ pub fn replay_series(dir: &Path) -> (Vec<LockEvent>, LockState, BridgeMetrics) {
     let mut metrics = BridgeMetrics::default();
     let mut committed: Vec<CommittedOp> = Vec::new();
 
-    for file in series_files(dir) {
-        for record in read_file_records(&file, &mut metrics) {
+    let files = series_files(dir);
+    let last = files.len().saturating_sub(1);
+    for (position, file) in files.into_iter().enumerate() {
+        for record in read_file_records(&file, position == last, &mut metrics) {
             metrics.records += 1;
             let ns = record.ns;
             if metrics.first_ns.is_none() {
@@ -578,8 +591,10 @@ fn read_telemetry_log(log_dir: Option<&Path>, aof_dir: &Path) -> TelemetryLog {
     }
 
     let mut scan = BridgeMetrics::default();
-    for file in series_files(aof_dir) {
-        for record in read_file_records(&file, &mut scan) {
+    let files = series_files(aof_dir);
+    let last = files.len().saturating_sub(1);
+    for (position, file) in files.into_iter().enumerate() {
+        for record in read_file_records(&file, position == last, &mut scan) {
             if record.marker != Marker::TelemetryStateTransition {
                 continue;
             }
@@ -602,10 +617,16 @@ fn read_telemetry_log(log_dir: Option<&Path>, aof_dir: &Path) -> TelemetryLog {
     log
 }
 
-fn read_file_records(path: &Path, metrics: &mut BridgeMetrics) -> Vec<Record> {
+fn read_file_records(path: &Path, is_last: bool, metrics: &mut BridgeMetrics) -> Vec<Record> {
     let mut records = Vec::new();
     let mut offset = 0u64;
     let mut index = 0u64;
+    // The FFI entry's `bytes` are the record payload only (aof_c.zig hands
+    // back the Prepare body); the on-disk entry adds the 16-byte magic
+    // number and the 256-byte VSR Prepare header, so a payload-length
+    // stride understates the file position. The tracked offset is the
+    // file's TRUE byte position of each record's start.
+    const ENTRY_FRAMING_BYTES: u64 = 16 + 256;
     // SAFETY: the FFI reads only through the returned iterator and needs a
     // byte-encoded path to an existing file; `path` is an `.aof` entry just
     // listed from the series directory.
@@ -621,25 +642,67 @@ fn read_file_records(path: &Path, metrics: &mut BridgeMetrics) -> Vec<Record> {
                 match Record::decode(&entry.bytes) {
                     Some(record) => records.push(record),
                     None => {
+                        // The typed decode failed on a checksum-valid
+                        // entry. The one tolerated shape: the series' last
+                        // file's final record whose bytes end
+                        // mid-envelope — the not-yet-written weather the
+                        // writer is still appending, which the follow
+                        // loop's next replay picks up. Everything else is
+                        // a corrupt record: the same named abort as an
+                        // iterator error (the let-it-crash law).
+                        let ends_mid_record = entry.bytes.len() < tbio::envelope::HEADER_BYTES;
+                        if !(is_last && ends_mid_record) {
+                            abort_corrupt_record(
+                                path,
+                                index,
+                                offset,
+                                "the typed envelope decode failed".to_string(),
+                            );
+                        }
                         metrics.undecodable += 1;
+                        // The record must also be the file's last: another
+                        // record after it (or an iterator error) makes the
+                        // failure a mid-file one.
+                        match iterator.next_entry() {
+                            Ok(None) => break,
+                            Ok(Some(_)) => abort_corrupt_record(
+                                path,
+                                index,
+                                offset,
+                                "a record follows the incomplete final one".to_string(),
+                            ),
+                            Err(code) => abort_corrupt_record(
+                                path,
+                                index + 1,
+                                offset,
+                                format!("FFI code {code}"),
+                            ),
+                        }
                     }
                 }
-                offset += entry.bytes.len() as u64;
+                offset += ENTRY_FRAMING_BYTES + entry.bytes.len() as u64;
                 index += 1;
             }
             Ok(None) => break,
             Err(code) => {
-                eprintln!(
-                    "aof-console-bridge: the ui-tape file {} is corrupt: record {index} at \
-                     byte offset {offset} does not read (FFI code {code}); the let-it-crash \
-                     law aborts the process",
-                    path.display()
-                );
-                std::process::abort();
+                abort_corrupt_record(path, index, offset, format!("FFI code {code}"));
             }
         }
     }
     records
+}
+
+/// The let-it-crash law at the read path: a corrupt record aborts the
+/// process loudly, naming the file, the record's index and its TRUE byte
+/// offset. A frozen console is the outage's quiet accomplice.
+fn abort_corrupt_record(path: &Path, index: u64, offset: u64, detail: String) -> ! {
+    eprintln!(
+        "aof-console-bridge: the ui-tape file {} is corrupt: record {index} at \
+         byte offset {offset} does not read ({detail}); the let-it-crash \
+         law aborts the process",
+        path.display()
+    );
+    std::process::abort()
 }
 
 /// The cassette inventory: every ui-tape file on disk, named with its
@@ -889,11 +952,12 @@ fn route(
         ),
         "/api/v1/locks" => {
             let now_ms = unix_millis();
+            let classify_ms = replay.frontier_ms().unwrap_or(now_ms);
             let locks: Vec<Value> = replay
                 .state
                 .locks
                 .values()
-                .map(|lock| lock.to_json(now_ms))
+                .map(|lock| lock.to_json(classify_ms))
                 .collect();
             (200, json!({"nowMs": now_ms, "locks": locks}).to_string())
         }
@@ -936,9 +1000,10 @@ fn route(
                         .take(8)
                         .map(LockEvent::to_json)
                         .collect();
+                    let classify_ms = replay.frontier_ms().unwrap_or_else(unix_millis);
                     (
                         200,
-                        json!({"lock": lock.to_json(unix_millis()), "recentEvents": recent})
+                        json!({"lock": lock.to_json(classify_ms), "recentEvents": recent})
                             .to_string(),
                     )
                 }
